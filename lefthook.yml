@@ -1,0 +1,16 @@
+# lefthook configuration
+# https://github.com/evilmartians/lefthook
+
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      glob: "*.go"
+      run: go fmt ./...
+      stage_fixed: true
+    lint:
+      glob: "*.go"
+      run: golangci-lint run --timeout 5m
+    test:
+      glob: "*.go"
+      run: go test -race ./...

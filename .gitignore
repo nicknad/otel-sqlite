@@ -1,0 +1,84 @@
+# --- Go ---
+bin/
+*.exe
+*.so
+*.dll
+*.test
+*.out
+
+# Go workspace (multi-module)
+go.work
+go.work.sum
+
+# Profiling and tracing (pprof, trace)
+*.prof
+*.trace
+*.pprof
+
+# GoLand / VS Code Go debug binaries
+__debug_bin*
+
+# Binaries produced by bare `go build` in project root
+collector
+loadtest
+
+# --- Generated code ---
+internal/generated/
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.orig
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
+
+# --- Database files ---
+# Default SQLite path: otel-logs.db
+*.db
+*.db-wal
+*.db-shm
+
+# --- User / runtime data ---
+/data/
+/tmp/
+*.pid
+
+# --- Build artifacts ---
+build/
+dist/
+
+# --- Docker ---
+.docker/
+
+# --- Dependency directories ---
+vendor/
+
+# --- Environment / secrets ---
+.env
+.env.local
+.env.*.local
+.envrc
+.envrc.local
+
+# --- Config copies ---
+# Users might copy config.example.yaml -> config.yaml
+config.yaml
+
+# --- Coverage ---
+coverage.txt
+*.coverprofile
+*.cov
+
+# --- Test output ---
+test-output/
+
+# --- Go pkg/mod cache (if GOPATH lives in the repo) ---
+.go/
