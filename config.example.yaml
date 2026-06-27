@@ -1,0 +1,23 @@
+# OTLP SQLite Collector Configuration
+# 
+# This file contains example configuration for the OTLP log collector.
+# All settings can also be provided via environment variables.
+# Environment variables take precedence over file configuration.
+
+# Server configuration
+listen_address: ":4317"          # gRPC server listen address
+metrics_address: ":9090"        # Prometheus metrics server address
+
+# SQLite configuration
+sqlite_path: "otel-logs.db"      # Path to SQLite database file
+
+# Ingestion pipeline configuration
+ingress_queue_capacity: 10000   # Maximum number of log records in ingress queue
+batch_queue_capacity: 1000      # Maximum number of batches in batch queue
+
+# Batching configuration
+batch_size: 100                 # Number of log records per batch
+flush_interval: "5s"            # Maximum time between batch flushes
+
+# Timeouts
+shutdown_timeout: "30s"         # Graceful shutdown timeout
