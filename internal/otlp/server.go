@@ -28,11 +28,11 @@ type Server struct {
 }
 
 // NewServer creates a new OTLP gRPC server.
-func NewServer(ingressQueue ingest.IngressQueue, metrics *metrics.Metrics) *Server {
+func NewServer(ingressQueue ingest.IngressQueue, m *metrics.Metrics) *Server {
 	return &Server{
 		mapper:       NewMapper(),
 		ingressQueue: ingressQueue,
-		metrics:      metrics,
+		metrics:      m,
 	}
 }
 

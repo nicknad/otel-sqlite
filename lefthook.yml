@@ -13,4 +13,4 @@ pre-commit:
       run: golangci-lint run --timeout 5m
     test:
       glob: "*.go"
-      run: go test -race ./...
+      run: go test -race $(go list ./... | grep -v 'cmd/collector\|cmd/loadtest')

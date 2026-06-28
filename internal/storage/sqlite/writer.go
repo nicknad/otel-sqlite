@@ -84,7 +84,7 @@ func NewWriter(batchQueue ingest.BatchQueue, config *WriterConfig) (*Writer, err
 
 	// Initialize schema
 	if err := initializeSchema(db); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
 
@@ -258,7 +258,7 @@ func (w *Writer) writeTransaction(batches []*model.LogBatch, totalRecords int) {
 		rollback()
 		return
 	}
-	defer txInsertResource.Close()
+	defer func() { _ = txInsertResource.Close() }()
 
 	txInsertEvent, err := tx.Prepare(
 		`INSERT INTO log_event
@@ -271,7 +271,7 @@ func (w *Writer) writeTransaction(batches []*model.LogBatch, totalRecords int) {
 		rollback()
 		return
 	}
-	defer txInsertEvent.Close()
+	defer func() { _ = txInsertEvent.Close() }()
 
 	txInsertAttr, err := tx.Prepare(
 		`INSERT INTO log_attr
@@ -281,7 +281,7 @@ func (w *Writer) writeTransaction(batches []*model.LogBatch, totalRecords int) {
 		rollback()
 		return
 	}
-	defer txInsertAttr.Close()
+	defer func() { _ = txInsertAttr.Close() }()
 
 	written := 0
 
@@ -454,7 +454,7 @@ func getBytesValue(v *model.AttributeValue) []byte {
 // cleanup closes database resources.
 func (w *Writer) cleanup() {
 	if w.db != nil {
-		w.db.Close()
+		_ = w.db.Close()
 	}
 }
 
@@ -473,24 +473,24 @@ func openDatabase(path string, walMode bool) (*sql.DB, error) {
 	// Enable WAL mode if requested
 	if walMode {
 		if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
-			db.Close()
+			_ = db.Close()
 			return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
 		}
 
 		if _, err := db.Exec("PRAGMA synchronous=NORMAL;"); err != nil {
-			db.Close()
+			_ = db.Close()
 			return nil, fmt.Errorf("failed to set synchronous mode: %w", err)
 		}
 
 		if _, err := db.Exec("PRAGMA wal_autocheckpoint=1000;"); err != nil {
-			db.Close()
+			_ = db.Close()
 			return nil, fmt.Errorf("failed to set autocheckpoint: %w", err)
 		}
 	}
 
 	// Verify connection
 	if err := db.Ping(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
