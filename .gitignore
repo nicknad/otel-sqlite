@@ -18,9 +18,6 @@ go.work.sum
 # GoLand / VS Code Go debug binaries
 __debug_bin*
 
-# Binaries produced by bare `go build` in project root
-collector
-loadtest
 
 # --- Generated code ---
 internal/generated/
