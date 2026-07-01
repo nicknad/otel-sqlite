@@ -27,10 +27,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	logsV1 "github.com/nnadolski/otel-sqlite/internal/generated/opentelemetry/proto/collector/logs/v1"
-	commonV1 "github.com/nnadolski/otel-sqlite/internal/generated/opentelemetry/proto/common/v1"
-	logsPB "github.com/nnadolski/otel-sqlite/internal/generated/opentelemetry/proto/logs/v1"
-	resourceV1 "github.com/nnadolski/otel-sqlite/internal/generated/opentelemetry/proto/resource/v1"
+	logsV1 "codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/collector/logs/v1"
+	commonV1 "codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/common/v1"
+	logsPB "codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/logs/v1"
+	resourceV1 "codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/resource/v1"
 )
 
 func main() {

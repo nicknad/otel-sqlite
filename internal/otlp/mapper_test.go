@@ -3,10 +3,10 @@ package otlp
 import (
 	"testing"
 
-	commonV1 "github.com/nnadolski/otel-sqlite/internal/generated/opentelemetry/proto/common/v1"
-	logsV1 "github.com/nnadolski/otel-sqlite/internal/generated/opentelemetry/proto/logs/v1"
-	resourceV1 "github.com/nnadolski/otel-sqlite/internal/generated/opentelemetry/proto/resource/v1"
-	"github.com/nnadolski/otel-sqlite/internal/model"
+	commonV1 "codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/common/v1"
+	logsV1 "codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/logs/v1"
+	resourceV1 "codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/resource/v1"
+	"codeberg.org/nicknad/otel-sqlite/internal/model"
 )
 
 func TestMapLogsData(t *testing.T) {

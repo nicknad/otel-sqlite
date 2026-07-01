@@ -11,11 +11,11 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/nnadolski/otel-sqlite/internal/ingest"
-	"github.com/nnadolski/otel-sqlite/internal/metrics"
+	"codeberg.org/nicknad/otel-sqlite/internal/ingest"
+	"codeberg.org/nicknad/otel-sqlite/internal/metrics"
 
 	// OTLP protobuf imports
-	logsV1 "github.com/nnadolski/otel-sqlite/internal/generated/opentelemetry/proto/collector/logs/v1"
+	logsV1 "codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/collector/logs/v1"
 )
 
 // Server implements the OTLP gRPC service for logs.

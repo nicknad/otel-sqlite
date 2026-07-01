@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nnadolski/otel-sqlite/internal/ingest"
-	"github.com/nnadolski/otel-sqlite/internal/model"
+	"codeberg.org/nicknad/otel-sqlite/internal/ingest"
+	"codeberg.org/nicknad/otel-sqlite/internal/model"
 )
 
 func TestOpenDatabase(t *testing.T) {
