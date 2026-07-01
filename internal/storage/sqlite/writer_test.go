@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/nicknad/otel-sqlite/internal/ingest"
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
+	"codeberg.org/nicknad/otel-sqlite/internal/storage"
 )
 
 func TestOpenDatabase(t *testing.T) {
@@ -23,7 +23,6 @@ func TestOpenDatabase(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Initialize schema (normally done by NewWriter)
 	if err := initializeSchema(db); err != nil {
 		t.Fatalf("initializeSchema() error: %v", err)
 	}
@@ -37,7 +36,9 @@ func TestOpenDatabase(t *testing.T) {
 	}
 
 	var tableName string
-	if err := db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='log_event'").Scan(&tableName); err != nil { //nolint:lll
+	if err := db.QueryRow(
+		"SELECT name FROM sqlite_master WHERE type='table' AND name='log_event'").
+		Scan(&tableName); err != nil {
 		t.Errorf("log_event table not found: %v", err)
 	}
 }
@@ -67,8 +68,8 @@ func TestWriterWriteAndQuery(t *testing.T) {
 	dbpath := fmt.Sprintf("test_write_%d.db", time.Now().UnixNano())
 	defer os.Remove(dbpath)
 
-	batchQueue := ingest.NewBatchQueue(10)
-	w, err := NewWriter(batchQueue, &WriterConfig{
+	cmdQueue := storage.NewCommandQueue(10)
+	w, err := NewWriter(cmdQueue, &WriterConfig{
 		Path:          dbpath,
 		BatchSize:     1,
 		FlushInterval: 100 * time.Millisecond,
@@ -85,7 +86,7 @@ func TestWriterWriteAndQuery(t *testing.T) {
 		w.Wait()
 	}()
 
-	// Create a resource and log record (no explicit ID -> writer auto-generates)
+	// Create a resource and log record
 	resource := model.NewResource(map[string]model.AttributeValue{
 		"service.name": model.NewStringValue("test-svc"),
 	})
@@ -107,8 +108,10 @@ func TestWriterWriteAndQuery(t *testing.T) {
 	batch.AddRecord(record)
 	batch.Resource = resource
 
-	if err := batchQueue.Send(ctx, batch); err != nil {
-		t.Fatalf("Send batch error: %v", err)
+	// Wrap in WriteBatchCommand and send to the command queue
+	cmd := NewWriteBatchCommand(batch)
+	if err := cmdQueue.Send(ctx, cmd); err != nil {
+		t.Fatalf("Send command error: %v", err)
 	}
 
 	// Wait for writer to process
@@ -146,8 +149,8 @@ func TestWriterMultipleBatches(t *testing.T) {
 	dbpath := fmt.Sprintf("test_multi_%d.db", time.Now().UnixNano())
 	defer os.Remove(dbpath)
 
-	batchQueue := ingest.NewBatchQueue(10)
-	w, err := NewWriter(batchQueue, &WriterConfig{
+	cmdQueue := storage.NewCommandQueue(10)
+	w, err := NewWriter(cmdQueue, &WriterConfig{
 		Path:          dbpath,
 		BatchSize:     5,
 		FlushInterval: 50 * time.Millisecond,
@@ -169,14 +172,16 @@ func TestWriterMultipleBatches(t *testing.T) {
 		"service.name": model.NewStringValue("multi-svc"),
 	})
 
-	// Send multiple batches
+	// Send multiple commands (each wrapping a batch)
 	for i := 0; i < 3; i++ {
 		batch := model.NewLogBatch(2)
 		batch.AddRecord(&model.LogRecord{Timestamp: int64(i * 100), Body: "msg"})
 		batch.AddRecord(&model.LogRecord{Timestamp: int64(i*100 + 1), Body: "msg2"})
 		batch.Resource = resource
-		if err := batchQueue.Send(ctx, batch); err != nil {
-			t.Fatalf("Send batch %d error: %v", i, err)
+
+		cmd := NewWriteBatchCommand(batch)
+		if err := cmdQueue.Send(ctx, cmd); err != nil {
+			t.Fatalf("Send command %d error: %v", i, err)
 		}
 	}
 
@@ -195,8 +200,8 @@ func TestNewWriterNilConfig(t *testing.T) {
 	dbpath := fmt.Sprintf("test_nilcfg_%d.db", time.Now().UnixNano())
 	defer os.Remove(dbpath)
 
-	batchQueue := ingest.NewBatchQueue(10)
-	w, err := NewWriter(batchQueue, nil)
+	cmdQueue := storage.NewCommandQueue(10)
+	w, err := NewWriter(cmdQueue, nil)
 	if err != nil {
 		t.Fatalf("NewWriter(nil) error: %v", err)
 	}
@@ -212,44 +217,102 @@ func TestNewWriterNilConfig(t *testing.T) {
 	w.cleanup()
 }
 
-func TestGetHelperFunctions(t *testing.T) {
-	s := "hello"
-	v := model.NewStringValue(s)
-	if got := getStringValue(&v); got == nil || *got != s {
-		t.Errorf("getStringValue() = %v, want %q", got, s)
+func TestWriteBatchCommandExecute(t *testing.T) {
+	dbpath := fmt.Sprintf("test_cmd_exec_%d.db", time.Now().UnixNano())
+	defer os.Remove(dbpath)
+
+	db, err := openDatabase(dbpath, false)
+	if err != nil {
+		t.Fatalf("openDatabase() error: %v", err)
 	}
-	var empty model.AttributeValue
-	if got := getStringValue(&empty); got != nil {
-		t.Errorf("getStringValue(empty) = %v, want nil", got)
+	defer db.Close()
+	if err := initializeSchema(db); err != nil {
+		t.Fatalf("initializeSchema() error: %v", err)
 	}
 
-	i := int64(42)
-	vi := model.NewIntValue(i)
-	if got := getIntValue(&vi); got == nil || *got != i {
-		t.Errorf("getIntValue() = %v, want %d", got, i)
-	}
-	if got := getIntValue(&empty); got != nil {
-		t.Errorf("getIntValue(empty) = %v, want nil", got)
+	resource := model.NewResource(map[string]model.AttributeValue{
+		"service.name": model.NewStringValue("cmd-svc"),
+	})
+
+	record := &model.LogRecord{
+		Timestamp:         99,
+		ObservedTimestamp: 199,
+		SeverityNumber:    model.SeverityWarn,
+		SeverityText:      "WARN",
+		Body:              "command test",
+		Attributes: map[string]model.AttributeValue{
+			"k": model.NewStringValue("v"),
+		},
 	}
 
-	f := 3.14
-	vf := model.NewDoubleValue(f)
-	if got := getDoubleValue(&vf); got == nil || *got != f {
-		t.Errorf("getDoubleValue() = %v, want %f", got, f)
+	batch := model.NewLogBatch(1)
+	batch.AddRecord(record)
+	batch.Resource = resource
+
+	cmd := NewWriteBatchCommand(batch)
+
+	// Execute inside a transaction
+	ctx := context.Background()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Begin tx error: %v", err)
 	}
 
-	b := true
-	vb := model.NewBoolValue(b)
-	if got := getBoolValue(&vb); got == nil || *got != b {
-		t.Errorf("getBoolValue() = %v, want %v", got, b)
+	if err := cmd.Execute(ctx, tx); err != nil {
+		t.Fatalf("Execute() error: %v", err)
 	}
 
-	bytes := []byte{1, 2, 3}
-	vBytes := model.NewBytesValue(bytes)
-	if got := getBytesValue(&vBytes); got == nil || len(got) != 3 {
-		t.Errorf("getBytesValue() = %v, want %v", got, bytes)
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit error: %v", err)
 	}
-	if got := getBytesValue(&empty); got != nil {
-		t.Errorf("getBytesValue(empty) = %v, want nil", got)
+
+	// Verify data
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM log_event").Scan(&count); err != nil {
+		t.Fatalf("query count: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 event, got %d", count)
+	}
+}
+
+func TestWriteBatchCommandSize(t *testing.T) {
+	batch := model.NewLogBatch(5)
+	batch.AddRecord(&model.LogRecord{Body: "a"})
+	batch.AddRecord(&model.LogRecord{Body: "b"})
+
+	cmd := NewWriteBatchCommand(batch)
+	if cmd.Size() != 2 {
+		t.Errorf("Size() = %d, want 2", cmd.Size())
+	}
+
+	// Empty batch
+	emptyCmd := NewWriteBatchCommand(model.NewLogBatch(0))
+	if emptyCmd.Size() != 0 {
+		t.Errorf("empty Size() = %d, want 0", emptyCmd.Size())
+	}
+
+	// Nil batch
+	nilCmd := NewWriteBatchCommand(nil)
+	if nilCmd.Size() != 0 {
+		t.Errorf("nil Size() = %d, want 0", nilCmd.Size())
+	}
+}
+
+func TestWriteBatchCommandImmutability(t *testing.T) {
+	// Verify that the command is constructed with its data and is not
+	// modified by any external operation.
+	batch := model.NewLogBatch(1)
+	batch.AddRecord(&model.LogRecord{Body: "immutable"})
+
+	cmd := NewWriteBatchCommand(batch)
+	if cmd.Batch() != batch {
+		t.Error("Batch() should return the same batch reference")
+	}
+	// Verify the command caches the record count correctly
+	batch.AddRecord(&model.LogRecord{Body: "extra"})
+	// Size() should return the original count, not the updated batch count
+	if cmd.Size() != 1 {
+		t.Errorf("Size() = %d, want 1 (cached at construction)", cmd.Size())
 	}
 }
