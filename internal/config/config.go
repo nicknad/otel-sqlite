@@ -6,6 +6,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"codeberg.org/nicknad/otel-sqlite/internal/maintenance"
 )
 
 // Config holds the application configuration.
@@ -30,6 +32,9 @@ type Config struct {
 
 	// Timeouts
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
+
+	// Maintenance configuration
+	Maintenance *maintenance.Config `mapstructure:"maintenance"`
 }
 
 // DefaultConfig returns a configuration with sensible defaults.
@@ -150,6 +155,11 @@ func (c *Config) Validate() error {
 	}
 	if c.ShutdownTimeout <= 0 {
 		return fmt.Errorf("shutdown_timeout must be positive, got %s", c.ShutdownTimeout)
+	}
+	if c.Maintenance != nil {
+		if err := c.Maintenance.Validate(); err != nil {
+			return fmt.Errorf("maintenance: %w", err)
+		}
 	}
 	return nil
 }
