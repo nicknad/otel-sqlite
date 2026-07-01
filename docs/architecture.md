@@ -18,20 +18,24 @@ The OTLP SQLite Collector is a high-performance log collector that receives Open
 │          │                    │                       ▼            │
 │  OTLP/gRPC                OTLP Protobuf          ┌──────────────┐    │
 │  (transport layer)        (isolated)             │   Batcher    │    │
-│                                            │──────▶│              │    │
+│                                            │──────▶│ (builds     │    │
+│                                            │       │  WriteBatch │    │
+│                                            │       │  Command)   │    │
 │                                            │       └──────────────┘    │
 │                                            │              │            │
 │                                            ▼              ▼            │
 │                                         ┌──────────────┐     ┌─────────┐ │
-│                                         │ Batch Queue  │────▶│ SQLite  │ │
-│                                         └──────────────┘     │ Writer  │ │
-│                                                               └─────────┘ │
-│                                                                      │    │
-│                                                                      ▼    │
-│                                                               ┌─────────┐ │
-│                                                               │ SQLite  │ │
-│                                                               │ DB      │ │
-│                                                               └─────────┘ │
+│                                         │ Command Queue│────▶│ SQLite  │ │
+│                                         │ (bounded,    │     │ Writer  │ │
+│                                         │  FIFO,       │     │ (executes│ │
+│                                         │  single      │     │ commands)│ │
+│                                         │  consumer)   │     └─────────┘ │
+│                                         └──────────────┘          │    │
+│                                                                   ▼    │
+│                                                              ┌─────────┐ │
+│                                                              │ SQLite  │ │
+│                                                              │ DB      │ │
+│                                                              └─────────┘ │
 │                                                                     │
 │  ┌──────────────┐     ┌──────────────┐                            │
 │  │ Metrics      │◀────│ Prometheus   │                            │
@@ -65,9 +69,9 @@ The OTLP SQLite Collector is a high-performance log collector that receives Open
   - Contain storage or transport logic
 
 ### 3. Ingestion Pipeline (`internal/ingest/`)
-- **Owns**: Queue abstractions and implementations
+- **Owns**: Queue abstractions for individual log records
 - **Responsibilities**:
-  - Provide bounded queues for backpressure
+  - Provide bounded ingress queue for backpressure
   - Ensure thread-safe access to queues
   - Block when queues are full
 - **Must NOT**:
@@ -75,35 +79,41 @@ The OTLP SQLite Collector is a high-performance log collector that receives Open
   - Access storage directly
 
 ### 4. Batcher (`internal/batcher/`)
-- **Owns**: Batch building logic
+- **Owns**: Batch building and command construction
 - **Responsibilities**:
   - Collect individual log records into batches
+  - Wrap completed batches in WriteBatchCommand objects
+  - Submit commands to the command queue
   - Manage batch size and timing
-  - Send batches to the batch queue
 - **Must NOT**:
   - Access storage directly
+  - Import SQLite packages
   - Perform mapping logic
 
 ### 5. Storage (`internal/storage/`)
-- **Owns**: Storage abstractions and implementations
+- **Owns**: Storage abstractions and the Command/CommandExecutor interfaces
 - **Responsibilities**:
-  - Define storage interfaces
-  - Implement SQLite storage backend
-  - Manage database connections and transactions
+  - Define `Command` interface for database mutations
+  - Define `CommandExecutor` interface for submission
+  - Provide `CommandQueue` bounded FIFO queue implementation
+  - Define legacy `LogStorage`, `LogWriter`, `LogReader` interfaces
 - **Must NOT**:
   - Import OTLP protobuf types
   - Perform business logic beyond persistence
 
 ### 6. SQLite Writer (`internal/storage/sqlite/`)
-- **Owns**: SQLite-specific write logic
+- **Owns**: SQLite-specific write logic via command execution
 - **Responsibilities**:
-  - Single dedicated goroutine for all SQLite writes
+  - Single dedicated goroutine for all SQLite commands
+  - Transaction lifecycle (begin, commit, rollback)
+  - Command execution within transactions
+  - Retries and error handling
   - Batched transactions for performance
   - WAL mode configuration
-  - Prepared statements for efficiency
 - **Must NOT**:
   - Allow concurrent writes from multiple goroutines
   - Perform mapping logic
+  - Begin/commit/rollback transactions from within commands
 
 ### 7. Metrics (`internal/metrics/`)
 - **Owns**: Prometheus metrics collection
@@ -114,15 +124,61 @@ The OTLP SQLite Collector is a high-performance log collector that receives Open
   - Contain business logic
   - Access storage directly
 
+## Command Architecture
+
+### Command Interface
+
+All database mutations are expressed as `Command` objects:
+
+```go
+type Command interface {
+    Execute(ctx context.Context, tx *sql.Tx) error
+}
+```
+
+Properties:
+- **Immutable**: Command data is fully initialized before submission.
+- **Self-contained**: Each command encapsulates its execution logic.
+- **Transaction-safe**: Commands receive a `*sql.Tx` and must not call `Begin`/`Commit`/`Rollback`.
+
+### Command Executor Interface
+
+The SQLite Writer implements `CommandExecutor`:
+
+```go
+type CommandExecutor interface {
+    Submit(ctx context.Context, cmd Command) error
+}
+```
+
+The rest of the system depends only on this interface.
+
+### Initial Commands
+
+| Command | Purpose |
+|---------|---------|
+| `WriteBatchCommand` | Write a LogBatch to SQLite |
+
+### Future Commands (not yet implemented)
+
+| Command | Purpose |
+|---------|---------|
+| `PurgeLogs` | Delete logs older than a retention threshold |
+| `CheckpointWAL` | Force WAL checkpoint |
+| `OptimizeDatabase` | Run PRAGMA optimize |
+| `VacuumDatabase` | Reclaim storage space |
+| `ArchiveLogs` | Move old logs to archival storage |
+| `ReindexDatabase` | Rebuild database indexes |
+
 ## Queue Flow and Backpressure
 
 ### Pipeline Stages
 
 1. **gRPC Server**: Receives OTLP requests, maps to internal models
 2. **Ingress Queue**: Bounded queue for individual log records
-3. **Batcher**: Collects records into batches
-4. **Batch Queue**: Bounded queue for batches
-5. **SQLite Writer**: Single goroutine that writes batches to SQLite
+3. **Batcher**: Collects records into batches, wraps in WriteBatchCommand
+4. **Command Queue**: Bounded FIFO queue for Command objects
+5. **SQLite Writer**: Single goroutine that executes commands within SQLite transactions
 
 ### Backpressure Behavior
 
@@ -131,12 +187,12 @@ The OTLP SQLite Collector is a high-performance log collector that receives Open
   - Client experiences increased latency
   - No data loss, but reduced throughput
 
-- **Batch Queue Full**: Batcher blocks on `Send()` to batch queue
+- **Command Queue Full**: Batcher blocks on `Send()` to command queue
   - Ingress queue fills up
   - Eventually causes backpressure to gRPC server
   - No data loss
 
-- **SQLite Writer Slow**: Batch queue fills up
+- **SQLite Writer Slow**: Command queue fills up
   - Batcher blocks
   - Ingress queue fills up
   - Backpressure propagates to gRPC server
@@ -160,18 +216,29 @@ The OTLP SQLite Collector is a high-performance log collector that receives Open
   - Database lock contention
   - Transaction serialization issues
 - The writer goroutine:
-  - Receives batches from the batch queue
-  - Groups batches into transactions
-  - Executes batched transactions
+  - Receives commands from the command queue
+  - Groups commands into transactions
+  - Executes each command's `Execute(ctx, tx)` within the transaction
   - Handles all database errors
 
 ### Transaction Batching
 
-- Multiple batches are grouped into a single transaction
+- Multiple commands are grouped into a single transaction
 - Configurable batch size for transactions
 - Configurable flush interval for time-based flushing
-- Uses prepared statements for efficiency
-- WAL mode for concurrent read/write access
+- Maximum record cap per transaction (`maxTransactionRecords = 5000`)
+- Prepared statements for efficiency
+
+### Writer Responsibilities
+
+The SQLite Writer owns:
+- SQLite connection
+- Transaction lifetime (begin, commit, rollback)
+- Command execution
+- Retries (transaction-level)
+- Metrics and logging
+
+It does NOT own command construction.
 
 ### Performance Optimizations
 
@@ -227,8 +294,11 @@ The OTLP SQLite Collector is a high-performance log collector that receives Open
 
 - **Ingestion**: Logs received, queue depths
 - **Batching**: Batches created, batch sizes
+- **Commands**: Command queue depth, execution duration, executed/failure totals
 - **Storage**: Logs written, write latency, write errors
 - **Resources**: Active resources, total resources
+
+All command metrics are labelled by command type for granular observability.
 
 ### Health Checks
 
@@ -239,6 +309,7 @@ The OTLP SQLite Collector is a high-performance log collector that receives Open
 ### Logging
 
 - Structured logging for operational events
+- Command type information included in log messages
 - Error logging with context
 - Performance logging for slow operations
 
@@ -249,7 +320,7 @@ The OTLP SQLite Collector is a high-performance log collector that receives Open
 - `LISTEN_ADDRESS`: gRPC server listen address
 - `SQLITE_PATH`: Path to SQLite database file
 - `INGRESS_QUEUE_CAPACITY`: Maximum ingress queue size
-- `BATCH_QUEUE_CAPACITY`: Maximum batch queue size
+- `BATCH_QUEUE_CAPACITY`: Maximum command queue size
 - `BATCH_SIZE`: Number of records per batch
 - `FLUSH_INTERVAL`: Maximum time between batch flushes
 - `METRICS_ADDRESS`: Prometheus metrics server address
@@ -268,9 +339,9 @@ See `config.example.yaml` for YAML configuration format.
 
 ### Database Errors
 
-- Retry transient errors
+- On command failure: rollback transaction, log error, increment failure metrics
+- Writer continues processing subsequent command batches
 - Log and count permanent errors
-- Continue processing other batches on error
 
 ### gRPC Errors
 
@@ -278,68 +349,31 @@ See `config.example.yaml` for YAML configuration format.
 - Include error details in responses
 - Handle cancellation gracefully
 
-## Future Extensions
+## Extensibility
 
-### Search API
+Adding a new maintenance command requires:
+1. Implement the `Command` interface
+2. The SQLite Writer needs no changes
+3. The command queue needs no changes
+4. Submit the command via `CommandExecutor.Submit()`
 
-- HTTP API for querying logs
-- Support for time-range queries
-- Support for attribute filtering
-- Support for full-text search
-- Pagination and sorting
-
-### Additional Protocols
-
-- HTTP/JSON OTLP endpoint
-- OpenTelemetry Protocol (OTLP) over HTTP
-- Legacy protocols (optional)
-
-### Enhanced Storage
-
-- Log rotation and retention policies
-- Database compaction
-- Backup and restore
-
-### Scaling
-
-- Horizontal scaling with shared storage
-- Partitioning by resource or time
-- Read replicas for query scaling
-
-## Performance Considerations
-
-### Throughput
-
-- Bounded queues prevent memory exhaustion
-- Batch processing reduces per-record overhead
-- Single writer eliminates write contention
-
-### Latency
-
-- Ingress queue adds minimal latency
-- Batch queue adds latency up to flush interval
-- SQLite WAL mode enables concurrent reads
-
-### Resource Usage
-
-- Memory: Proportional to queue capacities
-- CPU: Primarily in mapping and serialization
-- Disk: SQLite database size grows with data volume
-- Network: gRPC and metrics endpoints
+This is the key benefit of the command architecture: the execution path is generic and extensible without modifying the queue or the writer.
 
 ## Testing Strategy
 
 ### Unit Tests
 
 - Each package has isolated unit tests
-- Mock dependencies for testing
+- Mock Command implementations for scheduling tests
+- Mock command factory for batcher tests
 - Test edge cases and error conditions
 
 ### Integration Tests
 
 - Test complete pipeline with mock gRPC client
-- Test SQLite persistence and querying
+- Test SQLite persistence via WriteBatchCommand execution
 - Test backpressure behavior
+- Test command queue FIFO ordering
 
 ### Performance Tests
 

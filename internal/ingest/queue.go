@@ -28,41 +28,17 @@ type IngressQueue interface {
 
 	// Cap returns the capacity of the queue.
 	Cap() int
-}
 
-// BatchQueue is a bounded queue for batches of log records.
-// It provides backpressure by blocking when full.
-type BatchQueue interface {
-	// Send adds a batch to the queue.
-	// Blocks until space is available or context is canceled.
-	Send(ctx context.Context, batch *model.LogBatch) error
-
-	// Receive removes and returns a batch from the queue.
-	// Blocks until a batch is available or context is canceled.
-	Receive(ctx context.Context) (*model.LogBatch, error)
-
-	// Close closes the queue.
-	// After Close is called, Send will return an error.
-	Close()
-
-	// Len returns the current number of items in the queue.
-	Len() int
-
-	// Cap returns the capacity of the queue.
-	Cap() int
+	// Chan returns the underlying channel for use in select statements.
+	// This allows consumers to respond to both incoming records and other
+	// events (e.g., flush ticks, context cancellation) in a single select.
+	Chan() <-chan *model.LogRecord
 }
 
 // NewIngressQueue creates a new bounded ingress queue with the given capacity.
 func NewIngressQueue(capacity int) IngressQueue {
 	return &boundedIngressQueue{
 		ch: make(chan *model.LogRecord, capacity),
-	}
-}
-
-// NewBatchQueue creates a new bounded batch queue with the given capacity.
-func NewBatchQueue(capacity int) BatchQueue {
-	return &boundedBatchQueue{
-		ch: make(chan *model.LogBatch, capacity),
 	}
 }
 
@@ -104,47 +80,8 @@ func (q *boundedIngressQueue) Cap() int {
 	return cap(q.ch)
 }
 
-// boundedBatchQueue is a channel-based implementation of BatchQueue.
-type boundedBatchQueue struct {
-	ch chan *model.LogBatch
-}
-
-// Chan returns the underlying channel for use in select statements.
-func (q *boundedBatchQueue) Chan() <-chan *model.LogBatch {
+func (q *boundedIngressQueue) Chan() <-chan *model.LogRecord {
 	return q.ch
-}
-
-func (q *boundedBatchQueue) Send(ctx context.Context, batch *model.LogBatch) error {
-	select {
-	case q.ch <- batch:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (q *boundedBatchQueue) Receive(ctx context.Context) (*model.LogBatch, error) {
-	select {
-	case batch, ok := <-q.ch:
-		if !ok {
-			return nil, ErrQueueClosed
-		}
-		return batch, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
-func (q *boundedBatchQueue) Close() {
-	close(q.ch)
-}
-
-func (q *boundedBatchQueue) Len() int {
-	return len(q.ch)
-}
-
-func (q *boundedBatchQueue) Cap() int {
-	return cap(q.ch)
 }
 
 // ErrQueueClosed is returned when trying to receive from a closed queue.

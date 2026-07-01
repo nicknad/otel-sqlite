@@ -14,7 +14,6 @@ type LogStorage interface {
 	Writer() LogWriter
 
 	// Reader returns a LogReader for reading log records.
-	// This is for future search API support.
 	Reader() LogReader
 
 	// Close closes the storage backend and releases resources.
@@ -22,9 +21,11 @@ type LogStorage interface {
 }
 
 // LogWriter is the interface for writing log records to storage.
+//
+// Deprecated: Prefer CommandExecutor for new code. LogWriter is kept for
+// backward compatibility; the SQLite writer now implements CommandExecutor.
 type LogWriter interface {
 	// WriteBatch writes a batch of log records to storage.
-	// This should be called from a single goroutine only.
 	WriteBatch(ctx context.Context, batch *model.LogBatch) error
 
 	// Flush ensures all buffered data is written to persistent storage.
@@ -38,7 +39,6 @@ type LogWriter interface {
 // This is a placeholder for future search API support.
 type LogReader interface {
 	// Query executes a query and returns matching log records.
-	// This is a placeholder for future implementation.
 	Query(ctx context.Context, query *Query) ([]*model.LogRecord, error)
 
 	// GetByID retrieves a specific log record by ID.
@@ -78,8 +78,8 @@ type Query struct {
 	Offset int
 
 	// Sorting
-	SortBy    string // e.g., "timestamp", "severity"
-	SortOrder string // "asc" or "desc"
+	SortBy    string
+	SortOrder string
 }
 
 // NewQuery creates a new Query with default values.

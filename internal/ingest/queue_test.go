@@ -93,45 +93,6 @@ func TestIngressQueueCancelContext(t *testing.T) {
 	}
 }
 
-func TestBatchQueueSendReceive(t *testing.T) {
-	q := NewBatchQueue(10)
-	ctx := context.Background()
-
-	b := model.NewLogBatch(2)
-	b.AddRecord(&model.LogRecord{Body: "a"})
-	b.AddRecord(&model.LogRecord{Body: "b"})
-
-	if err := q.Send(ctx, b); err != nil {
-		t.Fatalf("Send() error: %v", err)
-	}
-
-	if q.Len() != 1 {
-		t.Errorf("Len() = %d, want 1", q.Len())
-	}
-	if q.Cap() != 10 {
-		t.Errorf("Cap() = %d, want 10", q.Cap())
-	}
-
-	got, err := q.Receive(ctx)
-	if err != nil {
-		t.Fatalf("Receive() error: %v", err)
-	}
-	if got.Size() != 2 {
-		t.Errorf("batch size = %d, want 2", got.Size())
-	}
-}
-
-func TestBatchQueueClose(t *testing.T) {
-	q := NewBatchQueue(10)
-	ctx := context.Background()
-	q.Close()
-
-	_, err := q.Receive(ctx)
-	if err != ErrQueueClosed {
-		t.Errorf("expected ErrQueueClosed, got %v", err)
-	}
-}
-
 func TestQueueError(t *testing.T) {
 	e := &QueueError{Message: "test error"}
 	if e.Error() != "test error" {
