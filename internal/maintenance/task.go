@@ -50,3 +50,14 @@ type CommandSubmitter interface {
 	// Blocks until space is available or the context is canceled.
 	Submit(ctx context.Context, cmd storage.Command) error
 }
+
+// Clock abstracts time for testability. Production code uses the real clock
+// (time.Now); tests inject a fake clock for deterministic scheduling.
+type Clock interface {
+	Now() time.Time
+}
+
+// RealClock implements Clock using the system wall clock.
+type RealClock struct{}
+
+func (RealClock) Now() time.Time { return time.Now() }
