@@ -33,6 +33,9 @@ func TestDefaultConfig(t *testing.T) {
 	if c.CheckpointInterval != 24*time.Hour {
 		t.Errorf("expected CheckpointInterval=24h, got %s", c.CheckpointInterval)
 	}
+	if c.CheckpointMode != "PASSIVE" {
+		t.Errorf("expected CheckpointMode=PASSIVE, got %q", c.CheckpointMode)
+	}
 	if !c.OptimizeEnabled {
 		t.Error("expected OptimizeEnabled to be true")
 	}
@@ -100,6 +103,17 @@ func TestLoadFromEnv(t *testing.T) {
 				}
 				if c.RetentionDeleteBatchSize != 5000 {
 					t.Errorf("expected 5000, got %d", c.RetentionDeleteBatchSize)
+				}
+			},
+		},
+		{
+			name: "override checkpoint mode",
+			env: map[string]string{
+				"CHECKPOINT_MODE": "TRUNCATE",
+			},
+			check: func(t *testing.T, c *Config) {
+				if c.CheckpointMode != "TRUNCATE" {
+					t.Errorf("expected CheckpointMode=TRUNCATE, got %q", c.CheckpointMode)
 				}
 			},
 		},
@@ -261,6 +275,24 @@ func TestValidate(t *testing.T) {
 				return c
 			}(),
 			wantErr: true,
+		},
+		{
+			name: "checkpoint enabled with invalid mode",
+			cfg: func() *Config {
+				c := DefaultConfig()
+				c.CheckpointMode = "INVALID"
+				return c
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "checkpoint enabled with empty mode (valid, defaults to PASSIVE)",
+			cfg: func() *Config {
+				c := DefaultConfig()
+				c.CheckpointMode = ""
+				return c
+			}(),
+			wantErr: false,
 		},
 		{
 			name: "vacuum disabled (should pass regardless)",

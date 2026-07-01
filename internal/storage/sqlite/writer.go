@@ -235,7 +235,22 @@ func commandRecordCount(cmd storage.Command) int {
 }
 
 // executeTransaction runs a slice of commands in a single SQLite transaction.
+// If the batch contains exactly one command that implements storage.NonTransactionalCommand,
+// it is executed directly on the database connection without a transaction wrapper.
 func (w *Writer) executeTransaction(commands []storage.Command) {
+	// Non-transactional commands (e.g., VACUUM) run outside a transaction.
+	if len(commands) == 1 {
+		if ntCmd, ok := commands[0].(storage.NonTransactionalCommand); ok {
+			if err := ntCmd.ExecuteNonTransactional(w.ctx, w.db); err != nil {
+				log.Printf("non-transactional command %T failed: %v", commands[0], err)
+				if w.aMetrics != nil {
+					w.aMetrics.IncrementWriteErrors()
+				}
+			}
+			return
+		}
+	}
+
 	startTime := time.Now()
 
 	if w.aMetrics != nil {

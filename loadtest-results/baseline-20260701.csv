@@ -1,0 +1,2 @@
+timestamp,clients,records_per_req,attrs_per_record,resources,duration_sec,requests_sent,records_sent,errors,error_pct,ingest_rate_rec_s,ingest_rate_req_s,confirmed_received,confirmed_written,write_errors,received_rate_rec_s,written_rate_rec_s,notes
+2026-07-01T17:15:08Z,8,250,4,8,30,1241,310250,8,0.64,10342.05,41.37,312250,210409,0,10408.72,7013.89,post-maintenance-tasks baseline
