@@ -38,7 +38,7 @@ func (c *PurgeLogsCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.ExecContext(ctx,
 		`DELETE FROM log_attr WHERE event_id IN (
 			SELECT id FROM log_event WHERE timestamp_ns < ?
-			LIMIT ?
+			ORDER BY id LIMIT ?
 		)`,
 		c.cutoffNanos, c.batchSize,
 	)
@@ -48,7 +48,10 @@ func (c *PurgeLogsCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 
 	// Then delete the events themselves.
 	result, err := tx.ExecContext(ctx,
-		`DELETE FROM log_event WHERE timestamp_ns < ? LIMIT ?`,
+		`DELETE FROM log_event WHERE rowid IN (
+			SELECT rowid FROM log_event WHERE timestamp_ns < ?
+			ORDER BY rowid LIMIT ?
+		)`,
 		c.cutoffNanos, c.batchSize,
 	)
 	if err != nil {
