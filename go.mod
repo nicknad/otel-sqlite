@@ -1,4 +1,4 @@
-module github.com/nnadolski/otel-sqlite
+module codeberg.org/nicknad/otel-sqlite
 
 go 1.24.0
 

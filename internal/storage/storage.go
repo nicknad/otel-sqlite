@@ -5,7 +5,7 @@ package storage
 import (
 	"context"
 
-	"github.com/nnadolski/otel-sqlite/internal/model"
+	"codeberg.org/nicknad/otel-sqlite/internal/model"
 )
 
 // LogStorage is the interface that all log storage backends must implement.

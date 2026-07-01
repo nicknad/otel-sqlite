@@ -48,7 +48,7 @@ SQLite Database (WAL mode, indexed)
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/nnadolski/otel-sqlite.git
+   git clone https://codeberg.org/nicknad/otel-sqlite.git
    cd otel-sqlite
    ```
 

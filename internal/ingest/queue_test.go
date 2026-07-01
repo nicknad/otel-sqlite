@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nnadolski/otel-sqlite/internal/model"
+	"codeberg.org/nicknad/otel-sqlite/internal/model"
 )
 
 func TestIngressQueueSendReceive(t *testing.T) {

@@ -6,9 +6,9 @@ import (
 	"context"
 	"sync"
 
-	"github.com/nnadolski/otel-sqlite/internal/ingest"
-	"github.com/nnadolski/otel-sqlite/internal/metrics"
-	"github.com/nnadolski/otel-sqlite/internal/model"
+	"codeberg.org/nicknad/otel-sqlite/internal/ingest"
+	"codeberg.org/nicknad/otel-sqlite/internal/metrics"
+	"codeberg.org/nicknad/otel-sqlite/internal/model"
 )
 
 // Batcher collects log records and groups them into batches.

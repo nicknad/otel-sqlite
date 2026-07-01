@@ -5,7 +5,7 @@ package ingest
 import (
 	"context"
 
-	"github.com/nnadolski/otel-sqlite/internal/model"
+	"codeberg.org/nicknad/otel-sqlite/internal/model"
 )
 
 // IngressQueue is a bounded queue for receiving individual log records.

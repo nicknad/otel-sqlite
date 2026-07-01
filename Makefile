@@ -29,13 +29,13 @@ generate: $(PROTO_FILES)
 	$(PROTOC) \
 		--go_out=$(GENERATED_DIR) \
 		--go_opt=paths=source_relative \
-		--go_opt=Mopentelemetry/proto/common/v1/common.proto=github.com/nnadolski/otel-sqlite/internal/generated/opentelemetry/proto/common/v1 \
-		--go_opt=Mopentelemetry/proto/resource/v1/resource.proto=github.com/nnadolski/otel-sqlite/internal/generated/opentelemetry/proto/resource/v1 \
-		--go_opt=Mopentelemetry/proto/logs/v1/logs.proto=github.com/nnadolski/otel-sqlite/internal/generated/opentelemetry/proto/logs/v1 \
-		--go_opt=Mopentelemetry/proto/collector/logs/v1/logs_service.proto=github.com/nnadolski/otel-sqlite/internal/generated/opentelemetry/proto/collector/logs/v1 \
+		--go_opt=Mopentelemetry/proto/common/v1/common.proto=codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/common/v1 \
+		--go_opt=Mopentelemetry/proto/resource/v1/resource.proto=codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/resource/v1 \
+		--go_opt=Mopentelemetry/proto/logs/v1/logs.proto=codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/logs/v1 \
+		--go_opt=Mopentelemetry/proto/collector/logs/v1/logs_service.proto=codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/collector/logs/v1 \
 		--go-grpc_out=$(GENERATED_DIR) \
 		--go-grpc_opt=paths=source_relative \
-		--go-grpc_opt=Mopentelemetry/proto/collector/logs/v1/logs_service.proto=github.com/nnadolski/otel-sqlite/internal/generated/opentelemetry/proto/collector/logs/v1 \
+		--go-grpc_opt=Mopentelemetry/proto/collector/logs/v1/logs_service.proto=codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/collector/logs/v1 \
 		-I=$(PROTO_DIR) \
 		$(PROTO_FILES)
 	@echo "Protobuf code generation complete."

@@ -15,12 +15,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 
-	"github.com/nnadolski/otel-sqlite/internal/batcher"
-	"github.com/nnadolski/otel-sqlite/internal/config"
-	"github.com/nnadolski/otel-sqlite/internal/ingest"
-	"github.com/nnadolski/otel-sqlite/internal/metrics"
-	"github.com/nnadolski/otel-sqlite/internal/otlp"
-	"github.com/nnadolski/otel-sqlite/internal/storage/sqlite"
+	"codeberg.org/nicknad/otel-sqlite/internal/batcher"
+	"codeberg.org/nicknad/otel-sqlite/internal/config"
+	"codeberg.org/nicknad/otel-sqlite/internal/ingest"
+	"codeberg.org/nicknad/otel-sqlite/internal/metrics"
+	"codeberg.org/nicknad/otel-sqlite/internal/otlp"
+	"codeberg.org/nicknad/otel-sqlite/internal/storage/sqlite"
 )
 
 // Application holds the main application components.
