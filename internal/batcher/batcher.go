@@ -148,6 +148,11 @@ func (b *Batcher) run() {
 			}
 
 			b.mu.Lock()
+			// Carry resource from the first record so the batch
+			// retains it through the record-based ingress queue.
+			if b.currentBatch.Resource == nil && record.Resource != nil {
+				b.currentBatch.Resource = record.Resource
+			}
 			b.currentBatch.AddRecord(record)
 			isFull := b.currentBatch.Size() >= b.batchSize
 			b.mu.Unlock()

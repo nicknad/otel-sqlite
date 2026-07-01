@@ -3,6 +3,8 @@ package batcher
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/ingest"
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage"
+	"codeberg.org/nicknad/otel-sqlite/internal/storage/sqlite"
 )
 
 // drainCommandQueue reads all commands until the queue is closed and returns
@@ -233,5 +236,122 @@ func TestBatcherCommandFactory(t *testing.T) {
 	cmd := b.newCmd(batch)
 	if cmd == nil {
 		t.Fatal("newCmd returned nil")
+	}
+}
+
+// TestBatcherResourceInsertion is an integration test verifying that a
+// Resource carried on a LogRecord survives the record-based ingress queue
+// and is inserted into SQLite with correct service_name and host_name.
+func TestBatcherResourceInsertion(t *testing.T) {
+	dbpath := fmt.Sprintf("test_batcher_resource_%d.db", time.Now().UnixNano())
+	defer os.Remove(dbpath)
+
+	// Create a real SQLite writer.
+	cmdQueue := storage.NewCommandQueue(100)
+	writer, err := sqlite.NewWriter(cmdQueue, &sqlite.WriterConfig{
+		Path:          dbpath,
+		BatchSize:     10,
+		FlushInterval: 100 * time.Millisecond,
+		WALMode:       false,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	writer.Start(ctx)
+	defer func() {
+		writer.Stop()
+		writer.Wait()
+	}()
+
+	// Create batcher using the real sqlite command factory.
+	ingressQueue := ingest.NewIngressQueue(100)
+	batcher := NewBatcher(ingressQueue, cmdQueue, &BatcherConfig{
+		BatchSize:     10,
+		FlushInterval: 50 * time.Millisecond,
+	})
+	batcher.WithCommandFactory(func(batch *model.LogBatch) storage.Command {
+		return sqlite.NewWriteBatchCommand(batch)
+	})
+	batcher.Start(ctx)
+	defer func() {
+		batcher.Stop()
+		batcher.Wait()
+	}()
+
+	// Build a resource and attach it to each record.
+	resource := model.NewResource(map[string]model.AttributeValue{
+		"service.name": model.NewStringValue("integration-svc"),
+		"host.name":    model.NewStringValue("integration-host"),
+	})
+	resource.ID = "res-integration-test"
+
+	// Send records through the ingress queue (record-based, not batch-based).
+	for i := 0; i < 3; i++ {
+		record := &model.LogRecord{
+			Timestamp:         int64(i * 1000),
+			ObservedTimestamp: int64(i*1000 + 500),
+			SeverityNumber:    model.SeverityInfo,
+			SeverityText:      "INFO",
+			Body:              fmt.Sprintf("msg-%d", i),
+			ResourceID:        resource.ID,
+			Resource:          resource, // carried per record
+		}
+		if err := ingressQueue.Send(ctx, record); err != nil {
+			t.Fatalf("ingress send: %v", err)
+		}
+	}
+
+	// Wait for pipeline to flush.
+	time.Sleep(300 * time.Millisecond)
+
+	// Query SQLite directly via the writer's DB to verify resource insertion.
+	var (
+		serviceName string
+		hostName    string
+	)
+	// We need access to the writer's db connection. The writer exposes it
+	// indirectly — we can open a second read-only connection to the same file.
+	db, err := sql.Open("sqlite", dbpath)
+	if err != nil {
+		t.Fatalf("open read db: %v", err)
+	}
+	defer db.Close()
+
+	err = db.QueryRow(
+		"SELECT service_name, host_name FROM log_resource WHERE id = ?",
+		resource.ID,
+	).Scan(&serviceName, &hostName)
+	if err != nil {
+		t.Fatalf("query log_resource: %v", err)
+	}
+
+	if serviceName != "integration-svc" {
+		t.Errorf("service_name = %q, want %q", serviceName, "integration-svc")
+	}
+	if hostName != "integration-host" {
+		t.Errorf("host_name = %q, want %q", hostName, "integration-host")
+	}
+
+	// Also verify log events reference the resource.
+	var eventCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM log_event").Scan(&eventCount); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if eventCount != 3 {
+		t.Errorf("expected 3 events, got %d", eventCount)
+	}
+
+	var eventResourceID string
+	if err := db.QueryRow(
+		"SELECT resource_id FROM log_event LIMIT 1",
+	).Scan(&eventResourceID); err != nil {
+		t.Fatalf("query event resource_id: %v", err)
+	}
+	if eventResourceID != resource.ID {
+		t.Errorf("event resource_id = %q, want %q", eventResourceID, resource.ID)
 	}
 }

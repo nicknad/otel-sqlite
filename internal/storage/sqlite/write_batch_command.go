@@ -109,6 +109,16 @@ func (c *WriteBatchCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 	}
 
 	// Ensure every record has a resource ID before we insert.
+	// If the batch has no resource, pull it from the first record that
+	// carries one (records retain it through the ingress queue).
+	if c.batch.Resource == nil {
+		for _, record := range c.batch.Records {
+			if record.Resource != nil {
+				c.batch.Resource = record.Resource
+				break
+			}
+		}
+	}
 	if c.batch.Resource != nil {
 		resourceID := ensureResourceID(c.batch.Resource)
 		for _, record := range c.batch.Records {

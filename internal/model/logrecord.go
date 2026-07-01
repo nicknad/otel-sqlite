@@ -99,6 +99,11 @@ type LogRecord struct {
 	// ResourceID references the resource this log record belongs to.
 	ResourceID string
 
+	// Resource is the full resource this log record belongs to.
+	// Carried on the record so it survives record-based ingress queues
+	// that drop LogBatch.Resource.
+	Resource *Resource
+
 	// ScopeName is the instrumentation scope name.
 	ScopeName string
 
