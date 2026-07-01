@@ -37,25 +37,36 @@ otel-sqlite/
 ├── go.mod                    # Go module definition
 ├── internal/
 │   ├── batcher/
-│   │   └── batcher.go        # Batch building logic
+│   │   ├── batcher.go        # Batch building + command construction
+│   │   └── batcher_test.go
 │   ├── config/
-│   │   └── config.go         # Configuration management
+│   │   ├── config.go         # Configuration management
+│   │   └── config_test.go
 │   ├── generated/            # Generated protobuf code (created by make generate)
 │   ├── ingest/
-│   │   └── queue.go          # Bounded queue abstractions
+│   │   ├── queue.go          # Bounded queue abstractions (ingress only)
+│   │   └── queue_test.go
 │   ├── metrics/
-│   │   └── metrics.go        # Prometheus metrics
+│   │   ├── metrics.go        # Prometheus metrics
+│   │   └── metrics_test.go
 │   ├── model/
 │   │   ├── logrecord.go      # LogRecord domain model
 │   │   ├── resource.go       # Resource domain model
-│   │   └── value.go          # AttributeValue domain model
+│   │   ├── value.go          # AttributeValue domain model
+│   │   └── model_test.go
 │   ├── otlp/
 │   │   ├── mapper.go         # OTLP to internal model mapper
+│   │   ├── mapper_test.go
 │   │   └── server.go         # gRPC server implementation
 │   └── storage/
-│       ├── sqlite/
-│       │   └── writer.go      # SQLite writer implementation
-│       └── storage.go        # Storage interfaces
+│       ├── command.go        # Command + CommandExecutor interfaces
+│       ├── queue.go          # CommandQueue (bounded, FIFO, channel-based)
+│       ├── queue_test.go
+│       ├── storage.go        # Storage interfaces (LogStorage, LogWriter, LogReader)
+│       └── sqlite/
+│           ├── writer.go                 # SQLite writer (command executor)
+│           ├── writer_test.go
+│           └── write_batch_command.go    # WriteBatchCommand implementation
 ├── LICENSE                   # Apache License 2.0
 ├── Makefile                  # Build targets
 ├── migrations/
@@ -73,6 +84,7 @@ otel-sqlite/
 - **Responsibilities**:
   - Load configuration
   - Initialize all components
+  - Inject command factory (wires sqlite.NewWriteBatchCommand into the batcher)
   - Start gRPC and metrics servers
   - Manage lifecycle and shutdown
   - Wire together the ingestion pipeline
@@ -101,36 +113,38 @@ otel-sqlite/
   - Isolate OTLP protobuf types to this package
 
 ### `internal/ingest/`
-- **Purpose**: Bounded queue abstractions
+- **Purpose**: Bounded queue abstractions for individual log records
 - **Responsibilities**:
   - Provide `IngressQueue` interface for individual log records
-  - Provide `BatchQueue` interface for batches of log records
-  - Implement bounded channel-based queues
+  - Implement bounded channel-based ingress queue
   - Provide backpressure through blocking sends
 
 ### `internal/batcher/`
-- **Purpose**: Batch building logic
+- **Purpose**: Batch building and command construction
 - **Responsibilities**:
   - Collect individual log records from ingress queue
   - Group records into batches based on size
-  - Send batches to batch queue
+  - Wrap completed batches in `WriteBatchCommand` objects (via injected factory)
+  - Submit commands to the command queue
   - Manage batch timing and flushing
+  - **No dependency on SQLite** — the command factory is injected externally
 
 ### `internal/storage/`
-- **Purpose**: Storage abstractions
+- **Purpose**: Storage abstractions and command infrastructure
 - **Responsibilities**:
-  - Define `LogStorage` interface
-  - Define `LogWriter` interface for writing
-  - Define `LogReader` interface for reading (future)
-  - Provide abstract access to storage backends
+  - Define `Command` interface for all database mutation commands
+  - Define `CommandExecutor` interface for command submission
+  - Provide `CommandQueue` bounded FIFO implementation (channel-based)
+  - Define legacy `LogStorage`, `LogWriter`, `LogReader` interfaces
 
 ### `internal/storage/sqlite/`
-- **Purpose**: SQLite storage implementation
+- **Purpose**: SQLite storage implementation via command execution
 - **Responsibilities**:
-  - Implement SQLite writer with single goroutine
+  - Implement SQLite writer as a command executor
+  - Provide `WriteBatchCommand` for writing log batches
   - Manage database connections and transactions
   - Configure WAL mode and performance settings
-  - Execute batched inserts efficiently
+  - Execute batched commands efficiently
   - Handle database schema and migrations
 
 ### `internal/metrics/`
@@ -138,7 +152,7 @@ otel-sqlite/
 - **Responsibilities**:
   - Define and expose application metrics
   - Provide instrumentation hooks for other components
-  - Track queue depths, batch sizes, write latency, etc.
+  - Track queue depths, batch sizes, write latency, command metrics, etc.
 
 ### `internal/generated/`
 - **Purpose**: Generated protobuf code
@@ -149,35 +163,47 @@ otel-sqlite/
 
 ## Key Design Decisions
 
-### 1. OTLP Type Isolation
+### 1. Command-Based Architecture
+- All database mutations are `Command` objects implementing `Execute(ctx, tx)`
+- The SQLite Writer is a generic command executor
+- New commands (PurgeLogs, VacuumDatabase, etc.) require no changes to the writer
+- Commands are immutable and transaction-safe
+
+### 2. OTLP Type Isolation
 - OTLP protobuf types are only imported in `internal/otlp/`
 - All other packages work with internal domain models
 - Enables independent evolution of internal models
 - Makes testing easier with mock data
 
-### 2. Single SQLite Writer
+### 3. Single SQLite Writer
 - Only one goroutine writes to SQLite
 - Prevents concurrent write conflicts
 - Eliminates database lock contention
 - Simplifies transaction management
 
-### 3. Bounded Queues
+### 4. Bounded Queues
 - All queues have configurable capacities
 - `Send()` blocks when queue is full
 - Provides natural backpressure
 - Prevents memory exhaustion
 
-### 4. Batched Transactions
-- Multiple batches grouped into single transactions
+### 5. Batched Transactions
+- Multiple commands grouped into single transactions
 - Configurable batch size and flush interval
 - Reduces commit overhead
 - Improves write throughput
 
-### 5. WAL Mode
+### 6. WAL Mode
 - SQLite WAL (Write-Ahead Logging) mode enabled
 - Allows concurrent reads while writing
 - Improves performance for write-heavy workloads
 - Better for high-concurrency scenarios
+
+### 7. Dependency Injection
+- Command factory is injected into the batcher (not hardcoded)
+- Enables testing with mock commands
+- Keeps the batcher SQLite-agnostic
+- No global state
 
 ## Build Targets
 
@@ -222,21 +248,18 @@ otel-sqlite/
 
 ## File Counts
 
-- **Go source files**: 12
+- **Go source files**: 16
 - **Protobuf files**: 4
 - **Configuration files**: 8
 - **Documentation files**: 4
 - **Migration files**: 2
 - **Script files**: 1
-- **Total files**: 31+
+- **Total files**: 35+
 
 ## Dependencies
 
 ### Direct Dependencies (in go.mod)
 - `github.com/prometheus/client_golang` - Prometheus metrics
-- `github.com/spf13/cobra` - CLI command handling
-- `github.com/spf13/viper` - Configuration management
-- `go.uber.org/zap` - Structured logging
 - `google.golang.org/grpc` - gRPC framework
 - `google.golang.org/protobuf` - Protocol Buffers
 - `modernc.org/sqlite` - SQLite driver
@@ -249,16 +272,17 @@ otel-sqlite/
 
 ## Future Extensions
 
-The architecture supports easy extension for:
+The command architecture supports easy extension for:
 
-1. **Additional Protocols**: HTTP/JSON OTLP, legacy protocols
-2. **Search API**: HTTP API for querying logs
-3. **Additional Storage Backends**: PostgreSQL, MySQL, etc.
-4. **Enhanced Metrics**: More detailed observability
-5. **Authentication**: gRPC authentication and authorization
-6. **TLS**: Secure communication
-7. **Log Retention**: Automatic log rotation and cleanup
-8. **Horizontal Scaling**: Multiple collector instances
+1. **Maintenance Commands**: PurgeLogs, VacuumDatabase, OptimizeDatabase, etc.
+2. **Additional Protocols**: HTTP/JSON OTLP, legacy protocols
+3. **Search API**: HTTP API for querying logs
+4. **Additional Storage Backends**: PostgreSQL, MySQL, etc.
+5. **Enhanced Metrics**: Per-command-type observability
+6. **Authentication**: gRPC authentication and authorization
+7. **TLS**: Secure communication
+8. **Log Retention**: Automatic log rotation and cleanup
+9. **Horizontal Scaling**: Multiple collector instances
 
 ## Verification
 
@@ -281,4 +305,4 @@ ls -la api/otlp/opentelemetry/proto/*/v1/*.proto
 ls -la internal/*/
 ```
 
-The project skeleton is now complete and ready for implementation!
+The project now uses a command-based architecture that will support future maintenance commands without modifying the queue or the writer.

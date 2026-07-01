@@ -51,6 +51,23 @@ func newTestMetrics() *Metrics {
 			Namespace: "otel_collector", Subsystem: "storage", Name: "write_errors_total",
 			Help: "Total number of write errors",
 		}),
+		CommandQueueDepth: factory.NewGauge(prometheus.GaugeOpts{
+			Namespace: "otel_collector", Subsystem: "command", Name: "queue_depth",
+			Help: "Current depth of the command queue",
+		}),
+		CommandExecutionDuration: factory.NewHistogram(prometheus.HistogramOpts{
+			Namespace: "otel_collector", Subsystem: "command", Name: "execution_duration_seconds",
+			Help:    "Duration of command execution batches in seconds",
+			Buckets: prometheus.DefBuckets,
+		}),
+		CommandsExecutedTotal: factory.NewCounter(prometheus.CounterOpts{
+			Namespace: "otel_collector", Subsystem: "command", Name: "executed_total",
+			Help: "Total number of commands executed",
+		}),
+		CommandFailuresTotal: factory.NewCounter(prometheus.CounterOpts{
+			Namespace: "otel_collector", Subsystem: "command", Name: "failures_total",
+			Help: "Total number of command execution failures",
+		}),
 		ActiveResources: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: "otel_collector", Subsystem: "storage", Name: "active_resources",
 			Help: "Number of active resources",
@@ -72,13 +89,24 @@ func TestMetricsAll(t *testing.T) {
 	m.IncrementBatchesWritten()
 	m.IncrementWriteErrors()
 	m.IncrementTotalResources()
+	m.IncrementCommandsExecuted()
+	m.IncrementCommandFailures()
 
 	// Update methods
 	m.UpdateIngressQueueDepth(50)
 	m.UpdateBatchQueueDepth(10)
 	m.RecordBatchSize(100)
 	m.RecordWriteLatency(0.05)
+	m.UpdateCommandQueueDepth(5)
+	m.RecordCommandExecutionDuration(0.1)
 	m.SetActiveResources(3)
+
+	// Verify nil-receiver safety
+	var nilM *Metrics
+	nilM.IncrementLogsReceived(1)
+	nilM.UpdateIngressQueueDepth(1)
+	nilM.RecordBatchSize(1)
+	nilM.IncrementCommandsExecuted()
 }
 
 func TestProductionNewMetrics(t *testing.T) {

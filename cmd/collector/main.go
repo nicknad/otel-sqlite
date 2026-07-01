@@ -19,7 +19,9 @@ import (
 	"github.com/nnadolski/otel-sqlite/internal/config"
 	"github.com/nnadolski/otel-sqlite/internal/ingest"
 	"github.com/nnadolski/otel-sqlite/internal/metrics"
+	"github.com/nnadolski/otel-sqlite/internal/model"
 	"github.com/nnadolski/otel-sqlite/internal/otlp"
+	"github.com/nnadolski/otel-sqlite/internal/storage"
 	"github.com/nnadolski/otel-sqlite/internal/storage/sqlite"
 )
 
@@ -32,7 +34,7 @@ type Application struct {
 
 	// Pipeline components
 	ingressQueue ingest.IngressQueue
-	batchQueue   ingest.BatchQueue
+	cmdQueue     storage.CommandQueue
 	batcher      *batcher.Batcher
 	writer       *sqlite.Writer
 
@@ -90,18 +92,22 @@ func (a *Application) initialize() error {
 
 	// Create queues
 	a.ingressQueue = ingest.NewIngressQueue(a.config.IngressQueueCapacity)
-	a.batchQueue = ingest.NewBatchQueue(a.config.BatchQueueCapacity)
+	a.cmdQueue = storage.NewCommandQueue(a.config.BatchQueueCapacity)
 
 	// Create OTLP server
 	a.otlpServer = otlp.NewServer(a.ingressQueue, a.metrics)
 
-	// Create batcher
-	a.batcher = batcher.NewBatcher(a.ingressQueue, a.batchQueue, &batcher.BatcherConfig{
-		BatchSize: a.config.BatchSize,
-		Metrics:   a.metrics,
+	// Create batcher (wraps batches as WriteBatchCommand, sends to cmd queue)
+	a.batcher = batcher.NewBatcher(a.ingressQueue, a.cmdQueue, &batcher.BatcherConfig{
+		BatchSize:     a.config.BatchSize,
+		FlushInterval: a.config.FlushInterval,
+		Metrics:       a.metrics,
+	})
+	a.batcher.WithCommandFactory(func(batch *model.LogBatch) storage.Command {
+		return sqlite.NewWriteBatchCommand(batch)
 	})
 
-	// Create SQLite writer
+	// Create SQLite writer (implements CommandExecutor)
 	writerConfig := &sqlite.WriterConfig{
 		Path:          a.config.SQLitePath,
 		BatchSize:     a.config.BatchSize,
@@ -111,7 +117,7 @@ func (a *Application) initialize() error {
 	}
 
 	var err error
-	a.writer, err = sqlite.NewWriter(a.batchQueue, writerConfig)
+	a.writer, err = sqlite.NewWriter(a.cmdQueue, writerConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create SQLite writer: %w", err)
 	}
@@ -229,8 +235,8 @@ func (a *Application) cleanup() {
 	if a.ingressQueue != nil {
 		a.ingressQueue.Close()
 	}
-	if a.batchQueue != nil {
-		a.batchQueue.Close()
+	if a.cmdQueue != nil {
+		a.cmdQueue.Close()
 	}
 
 	log.Println("Shutdown complete")
