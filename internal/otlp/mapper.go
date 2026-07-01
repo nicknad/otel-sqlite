@@ -172,9 +172,11 @@ func (m *Mapper) mapLogRecord(protoRecord *logsV1.LogRecord, resource *model.Res
 	record.Flags = protoRecord.Flags
 	record.EventName = protoRecord.EventName
 
-	// Set resource reference
+	// Set resource reference — carry the full Resource so it survives
+	// record-based ingress queues that drop LogBatch.Resource.
 	if resource != nil {
 		record.ResourceID = resource.ID
+		record.Resource = resource
 	}
 
 	// Set scope info
