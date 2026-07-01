@@ -20,6 +20,7 @@ import (
 type Worker struct {
 	config  *Config
 	metrics *Metrics
+	clock   Clock
 
 	// tasks is the set of registered maintenance tasks.
 	tasks []MaintenanceTask
@@ -42,9 +43,16 @@ func NewWorker(config *Config, submitter CommandSubmitter, metrics *Metrics) *Wo
 	return &Worker{
 		config:    config,
 		metrics:   metrics,
+		clock:     RealClock{},
 		submitter: submitter,
 		tasks:     make([]MaintenanceTask, 0),
 	}
+}
+
+// SetClock overrides the clock used for time. Intended for testing.
+// Must be called before Start.
+func (w *Worker) SetClock(c Clock) {
+	w.clock = c
 }
 
 // Register adds a maintenance task to the worker.
@@ -83,7 +91,7 @@ func (w *Worker) run() {
 		w.config.CheckInterval, len(w.tasks))
 
 	// Run immediately on startup so tasks that are overdue run right away.
-	w.evaluateAndRun(time.Now())
+	w.evaluateAndRun(w.clock.Now())
 
 	ticker := time.NewTicker(w.config.CheckInterval)
 	defer ticker.Stop()
