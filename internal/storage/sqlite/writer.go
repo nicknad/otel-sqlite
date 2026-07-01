@@ -1,5 +1,6 @@
 // Package sqlite provides SQLite storage for log records.
-// This package implements a single dedicated writer goroutine that handles all SQLite writes.
+// This package implements a single dedicated writer goroutine that handles
+// all SQLite writes via a generic command execution architecture.
 package sqlite
 
 import (
@@ -10,17 +11,19 @@ import (
 	"sync"
 	"time"
 
-	"codeberg.org/nicknad/otel-sqlite/internal/ingest"
 	"codeberg.org/nicknad/otel-sqlite/internal/metrics"
-	"codeberg.org/nicknad/otel-sqlite/internal/model"
+	"codeberg.org/nicknad/otel-sqlite/internal/storage"
 
 	_ "modernc.org/sqlite"
 )
 
-// batchQueueWithChan is an optional extension for batch queues that expose a channel.
-type batchQueueWithChan interface {
-	ingest.BatchQueue
-	Chan() <-chan *model.LogBatch
+// preparedStatementsSQL is the list of SQL statements prepared at Writer
+// startup.  They are kept in the same order as the PreparedStatements fields
+// so initPreparedStatements can prepare them in a loop.
+var preparedStatementsSQL = []string{
+	sqlInsertResource,
+	sqlInsertEvent,
+	sqlInsertAttr,
 }
 
 // WriterConfig holds configuration for the SQLite writer.
@@ -28,28 +31,41 @@ type WriterConfig struct {
 	// Database path
 	Path string
 
-	// Batch size for transactions
+	// Maximum number of commands to accumulate before flushing a transaction
 	BatchSize int
 
-	// Flush interval for automatic flushing
+	// Flush interval for automatic flushing of partial batches
 	FlushInterval time.Duration
 
 	// WAL mode settings
 	WALMode bool
 
-	// Metrics is optional. When non-nil the writer reports processed
-	// records, batches, write latency and errors.
+	// Metrics is optional. When non-nil the writer reports metrics.
 	Metrics *metrics.Metrics
 }
 
-// Writer handles writing log records to SQLite.
-// Only one goroutine should call Write() at a time.
+// Writer handles executing Command objects against SQLite.
+// Only one goroutine should submit commands; the writer owns the single
+// consumer goroutine that processes the command queue.
+//
+// The writer owns:
+//   - SQLite connection
+//   - Transaction lifecycle (begin, commit, rollback)
+//   - Command execution
+//   - Retries (transaction-level)
+//   - Metrics and logging
+//
+// The writer does NOT own command construction—that is the caller's
+// responsibility (e.g. the Batcher builds WriteBatchCommand objects).
 type Writer struct {
 	config WriterConfig
 	db     *sql.DB
 
-	// Batch queue for receiving batches
-	batchQueue ingest.BatchQueue
+	// Pre-prepared SQL statements, reused across transactions via tx.Stmt().
+	preparedStmts *PreparedStatements
+
+	// Command queue for receiving commands
+	cmdQueue storage.CommandQueue
 
 	// Control
 	ctx     context.Context
@@ -57,8 +73,8 @@ type Writer struct {
 	wg      sync.WaitGroup
 	stopped chan struct{}
 
-	// Local counters (kept for diagnostics/back-compat; metrics are
-	// reported through a.metrics when configured).
+	// Local counters (kept for diagnostics; metrics are reported through
+	// aMetrics when configured).
 	totalRecordsWritten int64
 	batchesWritten      int64
 	aMetrics            *metrics.Metrics
@@ -67,7 +83,10 @@ type Writer struct {
 }
 
 // NewWriter creates a new SQLite Writer.
-func NewWriter(batchQueue ingest.BatchQueue, config *WriterConfig) (*Writer, error) {
+//
+// The writer consumes Command objects from cmdQueue and executes them
+// inside SQLite transactions.
+func NewWriter(cmdQueue storage.CommandQueue, config *WriterConfig) (*Writer, error) {
 	if config == nil {
 		config = &WriterConfig{
 			BatchSize:     100,
@@ -88,14 +107,29 @@ func NewWriter(batchQueue ingest.BatchQueue, config *WriterConfig) (*Writer, err
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
 
+	// Prepare insert statements once so they are compiled only at startup
+	// and reused across every transaction via tx.Stmt().
+	preparedStmts, err := initPreparedStatements(db)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to prepare statements: %w", err)
+	}
+
 	return &Writer{
 		config:        *config,
 		db:            db,
-		batchQueue:    batchQueue,
+		preparedStmts: preparedStmts,
+		cmdQueue:      cmdQueue,
 		aMetrics:      config.Metrics,
 		stopped:       make(chan struct{}),
 		lastWriteTime: time.Now(),
 	}, nil
+}
+
+// Submit enqueues a command for execution.
+// Implements storage.CommandExecutor.
+func (w *Writer) Submit(ctx context.Context, cmd storage.Command) error {
+	return w.cmdQueue.Send(ctx, cmd)
 }
 
 // Start starts the writer goroutine.
@@ -125,74 +159,32 @@ func (w *Writer) run() {
 	defer close(w.stopped)
 	defer w.cleanup()
 
-	// Create a ticker for flush interval
 	flushTicker := time.NewTicker(w.config.FlushInterval)
 	defer flushTicker.Stop()
 
-	// Collect batches for transaction batching
-	batchCollection := make([]*model.LogBatch, 0, w.config.BatchSize)
+	cmdCollection := make([]storage.Command, 0, w.config.BatchSize)
 
-	// If the batch queue exposes a channel, use it directly in select for responsive flushing.
-	// Otherwise fall back to the original default-based loop.
-	if qc, ok := w.batchQueue.(batchQueueWithChan); ok {
-		w.runWithChan(qc, flushTicker, batchCollection)
-	} else {
-		w.runDefault(flushTicker, batchCollection)
-	}
-}
-
-// runWithChan uses the batch queue's channel directly in the select statement.
-func (w *Writer) runWithChan(qc batchQueueWithChan, flushTicker *time.Ticker, batchCollection []*model.LogBatch) {
 	for {
 		select {
 		case <-w.ctx.Done():
-			w.writeBatches(batchCollection)
+			w.executeCommands(cmdCollection)
 			return
 
 		case <-flushTicker.C:
-			if len(batchCollection) > 0 {
-				w.writeBatches(batchCollection)
-				batchCollection = batchCollection[:0]
+			if len(cmdCollection) > 0 {
+				w.executeCommands(cmdCollection)
+				cmdCollection = cmdCollection[:0]
 			}
 
-		case batch, ok := <-qc.Chan():
+		case cmd, ok := <-w.cmdQueue.Chan():
 			if !ok {
-				w.writeBatches(batchCollection)
+				w.executeCommands(cmdCollection)
 				return
 			}
-			batchCollection = append(batchCollection, batch)
-			if len(batchCollection) >= w.config.BatchSize {
-				w.writeBatches(batchCollection)
-				batchCollection = batchCollection[:0]
-			}
-		}
-	}
-}
-
-// runDefault uses a default case with a blocking Receive (fallback for non-channel queues).
-func (w *Writer) runDefault(flushTicker *time.Ticker, batchCollection []*model.LogBatch) {
-	for {
-		select {
-		case <-w.ctx.Done():
-			w.writeBatches(batchCollection)
-			return
-
-		case <-flushTicker.C:
-			if len(batchCollection) > 0 {
-				w.writeBatches(batchCollection)
-				batchCollection = batchCollection[:0]
-			}
-
-		default:
-			batch, err := w.batchQueue.Receive(w.ctx)
-			if err != nil {
-				w.writeBatches(batchCollection)
-				return
-			}
-			batchCollection = append(batchCollection, batch)
-			if len(batchCollection) >= w.config.BatchSize {
-				w.writeBatches(batchCollection)
-				batchCollection = batchCollection[:0]
+			cmdCollection = append(cmdCollection, cmd)
+			if len(cmdCollection) >= w.config.BatchSize {
+				w.executeCommands(cmdCollection)
+				cmdCollection = cmdCollection[:0]
 			}
 		}
 	}
@@ -204,114 +196,82 @@ func (w *Writer) runDefault(flushTicker *time.Ticker, batchCollection []*model.L
 // the writer goroutine from being blocked for seconds on oversized flushes.
 const maxTransactionRecords = 5000
 
-// writeBatches writes a collection of batches, splitting into separate
-// transactions if the total record count exceeds maxTransactionRecords.
-func (w *Writer) writeBatches(batches []*model.LogBatch) {
-	if len(batches) == 0 {
+// executeCommands runs a collection of commands, splitting into separate
+// transactions if the total estimated record count exceeds maxTransactionRecords.
+func (w *Writer) executeCommands(commands []storage.Command) {
+	if len(commands) == 0 {
 		return
 	}
 
-	// Walk the batches and flush in record-capped chunks so that a
-	// single transaction never writes more than maxTransactionRecords.
-	// This keeps each transaction fast and responsive.
+	// Walk commands and flush in record-capped chunks.
 	start := 0
-	for start < len(batches) {
-		// Determine the end of this chunk.
+	for start < len(commands) {
 		end := start
 		acc := 0
-		for end < len(batches) {
-			if acc+batches[end].Size() > maxTransactionRecords && acc > 0 {
-				// Adding this batch would exceed the cap, and we
-				// already have at least one batch accumulated.
+		for end < len(commands) {
+			// Estimate record count: WriteBatchCommand exposes Size(),
+			// other command types default to 1 for splitting purposes.
+			recs := commandRecordCount(commands[end])
+			if acc+recs > maxTransactionRecords && acc > 0 {
 				break
 			}
-			acc += batches[end].Size()
+			acc += recs
 			end++
 		}
-		w.writeTransaction(batches[start:end], acc)
+		w.executeTransaction(commands[start:end])
 		start = end
 	}
 }
 
-// writeTransaction writes a slice of batches in a single SQLite transaction.
-// The caller guarantees that batches contain at most maxTransactionRecords records.
-func (w *Writer) writeTransaction(batches []*model.LogBatch, totalRecords int) {
+// commandRecordCount returns the estimated number of log records a command
+// represents, used for transaction splitting.
+func commandRecordCount(cmd storage.Command) int {
+	if wbc, ok := cmd.(*WriteBatchCommand); ok {
+		return wbc.Size()
+	}
+	// Non-write commands (future maintenance ops) are counted as 1 record
+	// so they are never batched with other commands in a transaction.
+	return 1
+}
+
+// executeTransaction runs a slice of commands in a single SQLite transaction.
+func (w *Writer) executeTransaction(commands []storage.Command) {
 	startTime := time.Now()
+
+	if w.aMetrics != nil {
+		w.aMetrics.UpdateCommandQueueDepth(w.cmdQueue.Len())
+	}
 
 	// Begin transaction
 	tx, err := w.db.Begin()
 	if err != nil {
+		log.Printf("error beginning transaction: %v", err)
 		w.aMetrics.IncrementWriteErrors()
 		return
 	}
-	rollback := func() {
-		_ = tx.Rollback()
-		w.aMetrics.IncrementWriteErrors()
+
+	// Inject pre-prepared statements into WriteBatchCommand instances so
+	// they use tx.Stmt() instead of re-compiling SQL every transaction.
+	for _, cmd := range commands {
+		if wbc, ok := cmd.(*WriteBatchCommand); ok {
+			wbc.SetPreparedStatements(w.preparedStmts)
+		}
 	}
 
-	// Prepare transaction-specific statements
-	txInsertResource, err := tx.Prepare(
-		`INSERT OR IGNORE INTO log_resource
-		(id, service_name, host_name, schema_url, attributes_json)
-		VALUES (?, ?, ?, ?, ?)`)
-	if err != nil {
-		rollback()
-		return
-	}
-	defer func() { _ = txInsertResource.Close() }()
-
-	txInsertEvent, err := tx.Prepare(
-		`INSERT INTO log_event
-		(id, resource_id, timestamp_ns, observed_timestamp_ns,
-		severity_number, severity_text, trace_id, span_id,
-		body, event_name, flags, dropped_attributes_count,
-		scope_name, scope_version)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	if err != nil {
-		rollback()
-		return
-	}
-	defer func() { _ = txInsertEvent.Close() }()
-
-	txInsertAttr, err := tx.Prepare(
-		`INSERT INTO log_attr
-		(event_id, key, value_type, string_value, int_value, double_value, bool_value, bytes_value)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-	if err != nil {
-		rollback()
-		return
-	}
-	defer func() { _ = txInsertAttr.Close() }()
-
-	written := 0
-
-	for _, batch := range batches {
-		// Process resource
-		if batch.Resource != nil {
-			resourceID := w.ensureResource(tx, txInsertResource, batch.Resource)
-
-			// Update all records in batch with resource ID
-			for _, record := range batch.Records {
-				record.ResourceID = resourceID
-			}
+	executed := 0
+	for _, cmd := range commands {
+		if err := cmd.Execute(w.ctx, tx); err != nil {
+			log.Printf("command %T failed: %v", cmd, err)
+			w.aMetrics.IncrementWriteErrors()
+			// Rollback the entire transaction on command failure.
+			_ = tx.Rollback()
+			return
 		}
 
-		// Process each record in the batch
-		for _, record := range batch.Records {
-			// Insert event
-			eventID, err := w.insertEvent(tx, txInsertEvent, record)
-			if err != nil {
-				log.Printf("error inserting event: %v", err)
-				continue
-			}
+		executed++
 
-			// Insert attributes
-			if err := w.insertAttributes(tx, txInsertAttr, eventID, record.Attributes); err != nil {
-				log.Printf("error inserting attributes for event %d: %v", eventID, err)
-				continue
-			}
-
-			written++
+		if w.aMetrics != nil {
+			w.aMetrics.IncrementCommandsExecuted()
 		}
 	}
 
@@ -322,137 +282,34 @@ func (w *Writer) writeTransaction(batches []*model.LogBatch, totalRecords int) {
 		return
 	}
 
-	w.totalRecordsWritten += int64(written)
-	w.batchesWritten += int64(len(batches))
+	// Update metrics for WriteBatchCommand executions.
+	var recordsInTransaction int
+	for _, cmd := range commands {
+		if wbc, ok := cmd.(*WriteBatchCommand); ok {
+			recordsInTransaction += wbc.Size()
+		}
+	}
+
+	w.totalRecordsWritten += int64(recordsInTransaction)
+	w.batchesWritten += int64(executed)
 
 	if w.aMetrics != nil {
-		w.aMetrics.IncrementLogsWritten(written)
+		w.aMetrics.IncrementLogsWritten(recordsInTransaction)
 		w.aMetrics.IncrementBatchesWritten()
-		w.aMetrics.RecordWriteLatency(time.Since(startTime).Seconds())
+		duration := time.Since(startTime).Seconds()
+		w.aMetrics.RecordWriteLatency(duration)
+		w.aMetrics.RecordCommandExecutionDuration(duration)
 	}
 
 	w.lastWriteTime = time.Now()
 	w.writeLatency = time.Since(startTime)
 }
 
-// ensureResource ensures a resource exists in the database and returns its ID.
-// Uses INSERT OR IGNORE so it's safe to call multiple times with the same ID.
-// Sets resource.ID to the generated or existing ID.
-func (w *Writer) ensureResource(tx *sql.Tx, insertStmt *sql.Stmt, resource *model.Resource) string {
-	resourceID := resource.ID
-	if resourceID == "" {
-		// Generate a unique ID for this resource
-		resourceID = fmt.Sprintf("res-%d", time.Now().UnixNano())
-		resource.ID = resourceID
-	}
-
-	// Extract service and host names
-	serviceName := resource.GetServiceName()
-	hostName := resource.GetHostName()
-
-	// Insert resource (INSERT OR IGNORE handles duplicates safely)
-	_, err := insertStmt.Exec(
-		resourceID,
-		serviceName,
-		hostName,
-		resource.SchemaURL,
-		"{}",
-	)
-	if err != nil {
-		log.Printf("error inserting resource %q: %v", resourceID, err)
-	}
-
-	return resourceID
-}
-
-// insertEvent inserts a log event into the database.
-func (w *Writer) insertEvent(tx *sql.Tx, stmt *sql.Stmt, record *model.LogRecord) (int64, error) {
-	result, err := stmt.Exec(
-		nil, // ID will be auto-generated
-		record.ResourceID,
-		record.Timestamp,
-		record.ObservedTimestamp,
-		int64(record.SeverityNumber),
-		record.SeverityText,
-		record.TraceID,
-		record.SpanID,
-		record.Body,
-		record.EventName,
-		uint64(record.Flags),
-		uint64(record.DroppedAttributesCount),
-		record.ScopeName,
-		record.ScopeVersion,
-	)
-	if err != nil {
-		return 0, err
-	}
-
-	return result.LastInsertId()
-}
-
-// insertAttributes inserts attributes for a log event.
-func (w *Writer) insertAttributes(tx *sql.Tx, stmt *sql.Stmt, eventID int64, attributes map[string]model.AttributeValue) error { //nolint:lll
-	if len(attributes) == 0 {
-		return nil
-	}
-
-	for key, value := range attributes {
-		_, err := stmt.Exec(
-			eventID,
-			key,
-			value.Type(),
-			getStringValue(&value),
-			getIntValue(&value),
-			getDoubleValue(&value),
-			getBoolValue(&value),
-			getBytesValue(&value),
-		)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// Helper functions for extracting values from AttributeValue
-func getStringValue(v *model.AttributeValue) *string {
-	if v.StringValue != nil {
-		return v.StringValue
-	}
-	return nil
-}
-
-func getIntValue(v *model.AttributeValue) *int64 {
-	if v.IntValue != nil {
-		return v.IntValue
-	}
-	return nil
-}
-
-func getDoubleValue(v *model.AttributeValue) *float64 {
-	if v.DoubleValue != nil {
-		return v.DoubleValue
-	}
-	return nil
-}
-
-func getBoolValue(v *model.AttributeValue) *bool {
-	if v.BoolValue != nil {
-		return v.BoolValue
-	}
-	return nil
-}
-
-func getBytesValue(v *model.AttributeValue) []byte {
-	if v.BytesValue != nil {
-		return v.BytesValue
-	}
-	return nil
-}
-
 // cleanup closes database resources.
 func (w *Writer) cleanup() {
+	if w.preparedStmts != nil {
+		w.preparedStmts.Close()
+	}
 	if w.db != nil {
 		_ = w.db.Close()
 	}
@@ -460,17 +317,14 @@ func (w *Writer) cleanup() {
 
 // openDatabase opens a SQLite database with appropriate settings.
 func openDatabase(path string, walMode bool) (*sql.DB, error) {
-	// Open database using modernc.org/sqlite driver (registered via blank import)
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
 
-	// Set connection pool settings
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	// Enable WAL mode if requested
 	if walMode {
 		if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
 			_ = db.Close()
@@ -488,7 +342,6 @@ func openDatabase(path string, walMode bool) (*sql.DB, error) {
 		}
 	}
 
-	// Verify connection
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to ping database: %w", err)
@@ -497,10 +350,32 @@ func openDatabase(path string, walMode bool) (*sql.DB, error) {
 	return db, nil
 }
 
+// initPreparedStatements prepares the hot-path insert statements once
+// at startup.  The returned PreparedStatements is reused across every
+// transaction via tx.Stmt() so that SQLite compiles the SQL only once.
+func initPreparedStatements(db *sql.DB) (*PreparedStatements, error) {
+	stmts := make([]*sql.Stmt, len(preparedStatementsSQL))
+	for i, query := range preparedStatementsSQL {
+		stmt, err := db.Prepare(query)
+		if err != nil {
+			// Close any already-prepared statements on failure.
+			for j := 0; j < i; j++ {
+				stmts[j].Close()
+			}
+			return nil, fmt.Errorf("prepare statement: %w", err)
+		}
+		stmts[i] = stmt
+	}
+	return &PreparedStatements{
+		InsertResource: stmts[0],
+		InsertEvent:    stmts[1],
+		InsertAttr:     stmts[2],
+	}, nil
+}
+
 // initializeSchema creates the database schema if it doesn't exist.
 func initializeSchema(db *sql.DB) error {
 	schema := `
-	-- Log resources table
 	CREATE TABLE IF NOT EXISTS log_resource (
 		id TEXT PRIMARY KEY,
 		service_name TEXT NOT NULL,
@@ -509,8 +384,7 @@ func initializeSchema(db *sql.DB) error {
 		attributes_json TEXT,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
-	
-	-- Log events table
+
 	CREATE TABLE IF NOT EXISTS log_event (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		resource_id TEXT NOT NULL,
@@ -528,8 +402,7 @@ func initializeSchema(db *sql.DB) error {
 		scope_version TEXT,
 		FOREIGN KEY (resource_id) REFERENCES log_resource(id)
 	);
-	
-	-- Log attributes table
+
 	CREATE TABLE IF NOT EXISTS log_attr (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		event_id INTEGER NOT NULL,
@@ -542,8 +415,7 @@ func initializeSchema(db *sql.DB) error {
 		bytes_value BLOB,
 		FOREIGN KEY (event_id) REFERENCES log_event(id) ON DELETE CASCADE
 	);
-	
-	-- Indexes for query performance
+
 	CREATE INDEX IF NOT EXISTS idx_log_event_timestamp ON log_event(timestamp_ns);
 	CREATE INDEX IF NOT EXISTS idx_log_event_severity ON log_event(severity_number);
 	CREATE INDEX IF NOT EXISTS idx_log_event_trace_id ON log_event(trace_id);
@@ -552,13 +424,10 @@ func initializeSchema(db *sql.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_log_attr_key ON log_attr(key);
 	CREATE INDEX IF NOT EXISTS idx_log_event_severity_text ON log_event(severity_text);
 	CREATE INDEX IF NOT EXISTS idx_log_event_body ON log_event(body);
-	
-	-- Composite indexes for common query patterns
 	CREATE INDEX IF NOT EXISTS idx_log_event_resource_timestamp ON log_event(resource_id, timestamp_ns);
 	CREATE INDEX IF NOT EXISTS idx_log_event_trace_timestamp ON log_event(trace_id, timestamp_ns);
 	`
 
-	// Execute schema creation
 	_, err := db.Exec(schema)
 	return err
 }

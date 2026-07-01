@@ -23,6 +23,12 @@ type Metrics struct {
 	WriteLatency prometheus.Histogram
 	WriteErrors  prometheus.Counter
 
+	// Command execution metrics
+	CommandQueueDepth        prometheus.Gauge
+	CommandExecutionDuration prometheus.Histogram
+	CommandsExecutedTotal    prometheus.Counter
+	CommandFailuresTotal     prometheus.Counter
+
 	// Resource metrics
 	ActiveResources prometheus.Gauge
 	TotalResources  prometheus.Counter
@@ -80,7 +86,7 @@ func NewMetrics() *Metrics {
 			Subsystem: "batcher",
 			Name:      "batch_size",
 			Help:      "Size of batches (number of log records)",
-			Buckets:   prometheus.ExponentialBuckets(1, 2, 10), // 1, 2, 4, 8, 16, 32, 64, 128, 256, 512
+			Buckets:   prometheus.ExponentialBuckets(1, 2, 10),
 		}),
 
 		// Storage metrics
@@ -97,6 +103,36 @@ func NewMetrics() *Metrics {
 			Subsystem: "storage",
 			Name:      "write_errors_total",
 			Help:      "Total number of write errors",
+		}),
+
+		// Command execution metrics
+		CommandQueueDepth: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: "otel_collector",
+			Subsystem: "command",
+			Name:      "queue_depth",
+			Help:      "Current depth of the command queue",
+		}),
+
+		CommandExecutionDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+			Namespace: "otel_collector",
+			Subsystem: "command",
+			Name:      "execution_duration_seconds",
+			Help:      "Duration of command execution batches in seconds",
+			Buckets:   prometheus.DefBuckets,
+		}),
+
+		CommandsExecutedTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: "otel_collector",
+			Subsystem: "command",
+			Name:      "executed_total",
+			Help:      "Total number of commands executed",
+		}),
+
+		CommandFailuresTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: "otel_collector",
+			Subsystem: "command",
+			Name:      "failures_total",
+			Help:      "Total number of command execution failures",
 		}),
 
 		// Resource metrics
@@ -189,6 +225,38 @@ func (m *Metrics) IncrementWriteErrors() {
 		return
 	}
 	m.WriteErrors.Inc()
+}
+
+// UpdateCommandQueueDepth updates the command queue depth metric.
+func (m *Metrics) UpdateCommandQueueDepth(depth int) {
+	if m == nil {
+		return
+	}
+	m.CommandQueueDepth.Set(float64(depth))
+}
+
+// RecordCommandExecutionDuration records the duration of a command execution batch.
+func (m *Metrics) RecordCommandExecutionDuration(durationSeconds float64) {
+	if m == nil {
+		return
+	}
+	m.CommandExecutionDuration.Observe(durationSeconds)
+}
+
+// IncrementCommandsExecuted increments the commands executed counter.
+func (m *Metrics) IncrementCommandsExecuted() {
+	if m == nil {
+		return
+	}
+	m.CommandsExecutedTotal.Inc()
+}
+
+// IncrementCommandFailures increments the command failures counter.
+func (m *Metrics) IncrementCommandFailures() {
+	if m == nil {
+		return
+	}
+	m.CommandFailuresTotal.Inc()
 }
 
 // SetActiveResources sets the number of active resources.
