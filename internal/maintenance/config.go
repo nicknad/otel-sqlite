@@ -24,6 +24,7 @@ type Config struct {
 	// Checkpoint config.
 	CheckpointEnabled  bool          `yaml:"-"`
 	CheckpointInterval time.Duration `yaml:"interval"`
+	CheckpointMode     string        `yaml:"-"`
 
 	// Optimize config.
 	OptimizeEnabled  bool          `yaml:"-"`
@@ -45,6 +46,7 @@ func DefaultConfig() *Config {
 		RetentionDeleteBatchSize: 10000,
 		CheckpointEnabled:        true,
 		CheckpointInterval:       24 * time.Hour,
+		CheckpointMode:           "PASSIVE",
 		OptimizeEnabled:          true,
 		OptimizeInterval:         24 * time.Hour,
 		VacuumEnabled:            false,
@@ -64,6 +66,7 @@ func (c *Config) LoadFromEnv() (int, error) {
 		"RETENTION_DELETE_BATCH_SIZE": func(v string) error { return parseInt(&c.RetentionDeleteBatchSize, v) },
 		"CHECKPOINT_ENABLED":          func(v string) error { return parseBool(&c.CheckpointEnabled, v) },
 		"CHECKPOINT_INTERVAL":         func(v string) error { return parseDuration(&c.CheckpointInterval, v) },
+		"CHECKPOINT_MODE":             func(v string) error { c.CheckpointMode = v; return nil },
 		"OPTIMIZE_ENABLED":            func(v string) error { return parseBool(&c.OptimizeEnabled, v) },
 		"OPTIMIZE_INTERVAL":           func(v string) error { return parseDuration(&c.OptimizeInterval, v) },
 		"VACUUM_ENABLED":              func(v string) error { return parseBool(&c.VacuumEnabled, v) },
@@ -103,8 +106,16 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.CheckpointEnabled && c.CheckpointInterval <= 0 {
-		return fmt.Errorf("checkpoint.interval must be positive, got %s", c.CheckpointInterval)
+	if c.CheckpointEnabled {
+		if c.CheckpointInterval <= 0 {
+			return fmt.Errorf("checkpoint.interval must be positive, got %s", c.CheckpointInterval)
+		}
+		switch c.CheckpointMode {
+		case "PASSIVE", "FULL", "RESTART", "TRUNCATE", "":
+			// valid
+		default:
+			return fmt.Errorf("checkpoint.mode must be one of PASSIVE, FULL, RESTART, TRUNCATE, got %q", c.CheckpointMode)
+		}
 	}
 
 	if c.OptimizeEnabled && c.OptimizeInterval <= 0 {

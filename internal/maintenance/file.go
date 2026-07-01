@@ -24,6 +24,7 @@ type fileMaintenanceConfig struct {
 	Checkpoint struct {
 		Enabled  *bool  `yaml:"enabled"`
 		Interval string `yaml:"interval"`
+		Mode     string `yaml:"mode"`
 	} `yaml:"checkpoint"`
 	Optimize struct {
 		Enabled  *bool  `yaml:"enabled"`
@@ -93,6 +94,9 @@ func (c *Config) LoadFile(path string) error {
 			return fmt.Errorf("checkpoint.interval: %w", err)
 		}
 		c.CheckpointInterval = d
+	}
+	if fc.Checkpoint.Mode != "" {
+		c.CheckpointMode = fc.Checkpoint.Mode
 	}
 
 	// Optimize section.

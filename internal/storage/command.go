@@ -21,6 +21,18 @@ type Command interface {
 	Execute(ctx context.Context, tx *sql.Tx) error
 }
 
+// NonTransactionalCommand is an optional interface that commands may implement
+// for operations that cannot run inside a SQLite transaction (e.g., VACUUM).
+// The writer detects this interface and executes such commands directly
+// on the database connection, bypassing the normal transaction lifecycle.
+type NonTransactionalCommand interface {
+	Command
+
+	// ExecuteNonTransactional runs the command directly on the database.
+	// Implementations must not call Begin/Commit/Rollback.
+	ExecuteNonTransactional(ctx context.Context, db *sql.DB) error
+}
+
 // CommandExecutor is the interface for submitting commands for execution.
 //
 // The SQLite Writer implements this interface. The rest of the system

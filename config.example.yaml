@@ -51,6 +51,7 @@ retention:
 checkpoint:
   enabled: true
   interval: "24h"
+  mode: "PASSIVE"        # PASSIVE | FULL | RESTART | TRUNCATE
 
 # Optimize: runs PRAGMA optimize to update query planner statistics.
 optimize:
@@ -90,6 +91,7 @@ vacuum:
 #   RETENTION_DELETE_BATCH_SIZE (default: 10000)
 #   CHECKPOINT_ENABLED          (default: true)
 #   CHECKPOINT_INTERVAL         (default: 24h)
+#   CHECKPOINT_MODE             (default: PASSIVE)
 #   OPTIMIZE_ENABLED            (default: true)
 #   OPTIMIZE_INTERVAL           (default: 24h)
 #   VACUUM_ENABLED              (default: false)

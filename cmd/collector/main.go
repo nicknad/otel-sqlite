@@ -251,6 +251,22 @@ func (a *Application) startMaintenance() {
 		maintCfg.RetentionDeleteBatchSize,
 	))
 
+	a.maintenanceWorker.Register(tasks.NewCheckpointTask(
+		maintCfg.CheckpointEnabled,
+		sqlite.CheckpointMode(maintCfg.CheckpointMode),
+		maintCfg.CheckpointInterval,
+	))
+
+	a.maintenanceWorker.Register(tasks.NewVacuumTask(
+		maintCfg.VacuumEnabled,
+		maintCfg.VacuumInterval,
+	))
+
+	a.maintenanceWorker.Register(tasks.NewOptimizeTask(
+		maintCfg.OptimizeEnabled,
+		maintCfg.OptimizeInterval,
+	))
+
 	a.maintenanceWorker.Start(context.Background())
 	log.Printf("maintenance worker: started with %d registered tasks", a.maintenanceWorker.TaskCount())
 }
