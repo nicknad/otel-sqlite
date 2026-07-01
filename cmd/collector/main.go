@@ -18,6 +18,8 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/batcher"
 	"codeberg.org/nicknad/otel-sqlite/internal/config"
 	"codeberg.org/nicknad/otel-sqlite/internal/ingest"
+	"codeberg.org/nicknad/otel-sqlite/internal/maintenance"
+	"codeberg.org/nicknad/otel-sqlite/internal/maintenance/tasks"
 	"codeberg.org/nicknad/otel-sqlite/internal/metrics"
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
 	"codeberg.org/nicknad/otel-sqlite/internal/otlp"
@@ -40,6 +42,10 @@ type Application struct {
 
 	// OTLP server
 	otlpServer *otlp.Server
+
+	// Maintenance
+	maintenanceWorker  *maintenance.Worker
+	maintenanceMetrics *maintenance.Metrics
 }
 
 func main() {
@@ -76,12 +82,40 @@ func main() {
 	app.cleanup()
 }
 
-// loadConfig loads configuration with defaults overridden by environment variables.
+// loadConfig loads configuration with defaults overridden by environment variables
+// and an optional YAML config file.
 func loadConfig() (*config.Config, error) {
 	cfg := config.DefaultConfig()
+
+	// Load optional YAML config file.
+	if configPath := os.Getenv("CONFIG_FILE"); configPath != "" {
+		log.Printf("Loading config file from CONFIG_FILE")
+		if err := cfg.LoadFile(configPath); err != nil {
+			return nil, fmt.Errorf("failed to load config file: %w", err)
+		}
+	}
+
+	// Environment variables override file values.
 	if _, err := cfg.LoadFromEnv(); err != nil {
 		return nil, fmt.Errorf("failed to load config from environment: %w", err)
 	}
+
+	// Load maintenance config (merged with defaults and env overrides).
+	maintCfg := maintenance.DefaultConfig()
+
+	// Load maintenance config from file if available.
+	if configPath := os.Getenv("CONFIG_FILE"); configPath != "" {
+		if err := maintCfg.LoadFile(configPath); err != nil {
+			return nil, fmt.Errorf("failed to load maintenance config from file: %w", err)
+		}
+	}
+
+	// Environment variables override file values for maintenance too.
+	if _, err := maintCfg.LoadFromEnv(); err != nil {
+		return nil, fmt.Errorf("failed to load maintenance config from environment: %w", err)
+	}
+	cfg.Maintenance = maintCfg
+
 	return cfg, nil
 }
 
@@ -143,6 +177,9 @@ func (a *Application) start() error {
 	// Start SQLite writer
 	a.writer.Start(context.Background())
 
+	// Start maintenance worker
+	a.startMaintenance()
+
 	log.Println("OTLP collector started successfully")
 	log.Printf("gRPC server listening on %s", a.config.ListenAddress)
 	log.Printf("Metrics server listening on %s", a.config.MetricsAddress)
@@ -195,6 +232,29 @@ func (a *Application) startGRPCServer() error {
 	return nil
 }
 
+// startMaintenance initializes and starts the maintenance worker.
+func (a *Application) startMaintenance() {
+	maintCfg := a.config.Maintenance
+	if maintCfg == nil {
+		maintCfg = maintenance.DefaultConfig()
+	}
+
+	a.maintenanceMetrics = maintenance.NewMetrics()
+
+	a.maintenanceWorker = maintenance.NewWorker(maintCfg, a.writer, a.maintenanceMetrics)
+
+	// Register tasks. Disabled tasks are filtered by the worker at runtime.
+	a.maintenanceWorker.Register(tasks.NewRetentionTask(
+		maintCfg.RetentionEnabled,
+		maintCfg.RetentionKeepLogs,
+		maintCfg.RetentionCleanupInterval,
+		maintCfg.RetentionDeleteBatchSize,
+	))
+
+	a.maintenanceWorker.Start(context.Background())
+	log.Printf("maintenance worker: started with %d registered tasks", a.maintenanceWorker.TaskCount())
+}
+
 // waitForShutdown waits for a shutdown signal.
 func (a *Application) waitForShutdown() {
 	sigChan := make(chan os.Signal, 1)
@@ -224,6 +284,11 @@ func (a *Application) cleanup() {
 
 	// Stop pipeline components
 	a.batcher.Stop()
+
+	// Stop maintenance worker
+	if a.maintenanceWorker != nil {
+		a.maintenanceWorker.Stop()
+	}
 
 	// Stop SQLite writer
 	if a.writer != nil {

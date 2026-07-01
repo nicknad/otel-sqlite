@@ -3,6 +3,9 @@
 # This file contains example configuration for the OTLP log collector.
 # All settings can also be provided via environment variables.
 # Environment variables take precedence over file configuration.
+#
+# To use a config file, set the CONFIG_FILE environment variable:
+#   export CONFIG_FILE=/path/to/config.yaml
 
 # Server configuration
 listen_address: ":4317"          # gRPC server listen address
@@ -21,3 +24,73 @@ flush_interval: "5s"            # Maximum time between batch flushes
 
 # Timeouts
 shutdown_timeout: "30s"         # Graceful shutdown timeout
+
+# ---------------------------------------------------------------------------
+# Maintenance framework configuration
+# ---------------------------------------------------------------------------
+# The maintenance framework schedules periodic database tasks. Each task is
+# independently configurable and can be disabled. Tasks NEVER access SQLite
+# directly; all mutations flow through the Command Queue → SQLite Writer.
+#
+# Duration values support Go duration strings ("1h", "30m") and "d" for days:
+#   30d, 7d, 365d, etc.
+
+maintenance:
+  enabled: true                  # Master switch for the maintenance worker
+  check_interval: "1h"           # How often the worker evaluates tasks
+
+# Retention: purges log records older than keep_logs.
+# Runs on its own cleanup_interval, independent of check_interval.
+retention:
+  enabled: true
+  keep_logs: "30d"               # Delete logs older than this
+  cleanup_interval: "24h"        # How often to run retention
+  delete_batch_size: 10000      # Max records per delete batch
+
+# Checkpoint: runs SQLite WAL checkpoint to keep WAL file size bounded.
+checkpoint:
+  enabled: true
+  interval: "24h"
+
+# Optimize: runs PRAGMA optimize to update query planner statistics.
+optimize:
+  enabled: true
+  interval: "24h"
+
+# Vacuum: rebuilds the database file to reclaim disk space.
+# Disabled by default since it requires an exclusive lock.
+vacuum:
+  enabled: false
+  interval: "7d"
+
+# ---------------------------------------------------------------------------
+# Environment variable reference (all config fields)
+# ---------------------------------------------------------------------------
+# Core:
+#   LISTEN_ADDRESS          - gRPC server address (default: :4317)
+#   SQLITE_PATH             - Database file path (default: otel-logs.db)
+#   METRICS_ADDRESS         - Prometheus metrics address (default: :9090)
+#
+# Pipeline:
+#   INGRESS_QUEUE_CAPACITY  - Ingress queue capacity (default: 10000)
+#   BATCH_QUEUE_CAPACITY    - Command queue capacity (default: 1000)
+#   BATCH_SIZE              - Records per batch (default: 100)
+#   FLUSH_INTERVAL          - Max flush interval (default: 5s)
+#   SHUTDOWN_TIMEOUT        - Graceful shutdown timeout (default: 30s)
+#
+# Maintenance:
+#   CONFIG_FILE             - Path to YAML config file
+#   MAINTENANCE_ENABLED     - Master switch (default: true)
+#   MAINTENANCE_CHECK_INTERVAL - Worker evaluation interval (default: 1h)
+#
+# Task-specific (env overrides use Go durations, not "d" suffix):
+#   RETENTION_ENABLED           (default: true)
+#   RETENTION_KEEP_LOGS         (default: 720h i.e. 30d)
+#   RETENTION_CLEANUP_INTERVAL  (default: 24h)
+#   RETENTION_DELETE_BATCH_SIZE (default: 10000)
+#   CHECKPOINT_ENABLED          (default: true)
+#   CHECKPOINT_INTERVAL         (default: 24h)
+#   OPTIMIZE_ENABLED            (default: true)
+#   OPTIMIZE_INTERVAL           (default: 24h)
+#   VACUUM_ENABLED              (default: false)
+#   VACUUM_INTERVAL             (default: 168h i.e. 7d)
