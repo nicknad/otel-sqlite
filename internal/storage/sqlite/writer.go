@@ -101,10 +101,10 @@ func NewWriter(cmdQueue storage.CommandQueue, config *WriterConfig) (*Writer, er
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// Initialize schema
-	if err := initializeSchema(db); err != nil {
+	// Apply all pending database migrations.
+	if err := RunMigrations(db); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("failed to initialize schema: %w", err)
+		return nil, fmt.Errorf("failed to run migrations: %w", err)
 	}
 
 	// Prepare insert statements once so they are compiled only at startup
@@ -392,55 +392,4 @@ func initPreparedStatements(db *sql.DB) (*PreparedStatements, error) {
 	}, nil
 }
 
-// initializeSchema creates the database schema if it doesn't exist.
-func initializeSchema(db *sql.DB) error {
-	schema := `
-	CREATE TABLE IF NOT EXISTS log_resource (
-		id TEXT PRIMARY KEY,
-		service_name TEXT NOT NULL,
-		host_name TEXT,
-		schema_url TEXT,
-		attributes_json TEXT,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
 
-	CREATE TABLE IF NOT EXISTS log_event (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		resource_id TEXT NOT NULL,
-		timestamp_ns INTEGER NOT NULL,
-		observed_timestamp_ns INTEGER NOT NULL,
-		severity_number INTEGER NOT NULL,
-		severity_text TEXT,
-		trace_id BLOB,
-		span_id BLOB,
-		body TEXT,
-		event_name TEXT,
-		flags INTEGER NOT NULL,
-		dropped_attributes_count INTEGER NOT NULL,
-		scope_name TEXT,
-		scope_version TEXT,
-		attributes_json TEXT,
-		FOREIGN KEY (resource_id) REFERENCES log_resource(id)
-	);
-
-	CREATE TABLE IF NOT EXISTS log_attr (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		event_id INTEGER NOT NULL,
-		key TEXT NOT NULL,
-		value_type TEXT NOT NULL,
-		string_value TEXT,
-		int_value INTEGER,
-		double_value REAL,
-		bool_value INTEGER,
-		bytes_value BLOB,
-		FOREIGN KEY (event_id) REFERENCES log_event(id) ON DELETE CASCADE
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_log_event_timestamp ON log_event(timestamp_ns);
-	CREATE INDEX IF NOT EXISTS idx_log_event_resource_id ON log_event(resource_id);
-	CREATE INDEX IF NOT EXISTS idx_log_attr_event_id ON log_attr(event_id);
-	`
-
-	_, err := db.Exec(schema)
-	return err
-}
