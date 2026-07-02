@@ -15,6 +15,9 @@ A high-performance OpenTelemetry log collector that receives OTLP logs over gRPC
 - **Maintenance Framework**: Pluggable, schedule-based tasks for retention, WAL checkpoint, optimize, and vacuum
 - **Backpressure**: Graceful handling of load spikes without data loss at every pipeline stage
 - **Resource Deduplication**: Deterministic resource IDs (SHA-256) so identical resources collapse to single SQLite rows
+- **Object Pooling**: Zero-allocation hot path via `sync.Pool` for LogRecord reuse and inline Attribute structs
+- **Fixed-Size Trace Context**: `[16]byte`/`[8]byte` arrays instead of heap-allocated slices for TraceID/SpanID
+- **Batch-Level Ingress**: Batches sent through the ingress queue instead of individual records — 250× fewer channel operations
 - **OTLP Type Isolation**: Protobuf types confined to the transport layer; internal packages depend only on domain models
 - **Dependency Injection**: Command factory injected into the batcher, keeping it SQLite-agnostic and testable
 - **YAML Configuration**: Optional config file support via `CONFIG_FILE` environment variable
@@ -31,22 +34,22 @@ See [docs/architecture.md](docs/architecture.md) for detailed architecture docum
 gRPC OTLP Receiver (otlp.Server)
     │
     ▼
-OTLP Mapper (converts protobuf → internal domain models)
+OTLP Mapper (converts protobuf → internal domain models, uses sync.Pool)
     │
     ▼
-Ingress Queue (bounded channel, per-record, backpressure)
+Ingress Queue (bounded channel, batch-based, backpressure)
     │
     ▼
-Batcher (collects records, groups into batches, wraps in WriteBatchCommand)
+Batcher (collects batches, groups into larger batches, wraps in WriteBatchCommand)
     │
     ▼
 Command Queue (bounded, FIFO, channel-based Command objects)
     │
     ▼
-SQLite Writer (single goroutine, executes Command.Execute within transactions)
-    │
+SQLite Writer (single goroutine, executes Command.Execute within transactions,
+    │          returns records to pool after write)
     ▼
-SQLite Database (WAL mode, prepared statements, indexed)
+SQLite Database (WAL mode, prepared statements, minimized indexes)
 ```
 
 ### Command Architecture
@@ -149,14 +152,21 @@ Or directly:
 
 ### Environment Variables
 
+> **Legacy support:** The older `BATCH_SIZE` and `FLUSH_INTERVAL` env vars are
+> still accepted. When set, they apply to **both** the batcher and writer
+> unless the specific `BATCHER_*` / `WRITER_*` variables are provided.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LISTEN_ADDRESS` | `:4317` | gRPC server listen address |
 | `SQLITE_PATH` | `otel-logs.db` | Path to SQLite database file |
 | `INGRESS_QUEUE_CAPACITY` | `10000` | Maximum ingress queue size |
 | `BATCH_QUEUE_CAPACITY` | `1000` | Maximum command queue size |
-| `BATCH_SIZE` | `100` | Number of log records per batch |
-| `FLUSH_INTERVAL` | `5s` | Maximum time between batch flushes |
+| `BATCHER_BATCH_SIZE` | `250` | Number of log records per batch (batcher) |
+| `BATCHER_FLUSH_INTERVAL` | `5s` | Maximum time between batch flushes |
+| `WRITER_BATCH_SIZE` | `100` | Number of commands per transaction (writer) |
+| `WRITER_FLUSH_INTERVAL` | `5s` | Maximum time between transaction flushes |
+| `WRITER_MAX_TRANSACTION_RECORDS` | `5000` | Maximum records per SQLite transaction |
 | `METRICS_ADDRESS` | `:9090` | Prometheus metrics server address |
 | `SHUTDOWN_TIMEOUT` | `30s` | Graceful shutdown timeout |
 | `CONFIG_FILE` | — | Path to YAML configuration file |
@@ -378,9 +388,8 @@ The collector uses structured logging for operational events. Logs are written t
 
 - Primary keys on all tables
 - Foreign keys for referential integrity
-- Indexes on: `timestamp_ns`, `severity_number`, `trace_id`, `resource_id`, `body`, `event_name`, attribute keys
-- Composite indexes: `(resource_id, timestamp_ns)`, `(trace_id, timestamp_ns)`
-- Partial indexes on attribute values for filtered queries
+- Indexes on: `timestamp_ns` (time-range queries), `resource_id` (resource filtering), `event_id` on attributes
+- Unused indexes removed (migration 004): `severity_number`, `trace_id`, `severity_text`, `body`, `event_name`, composite `(resource_id, timestamp_ns)`, composite `(trace_id, timestamp_ns)`, and all attribute value indexes — write performance is prioritized over read performance on non-critical query paths
 
 ### Migrations
 
@@ -391,14 +400,29 @@ Database migrations are stored in the `migrations/` directory:
 | `001_initial_schema.sql` | Initial tables (log_resource, log_event, log_attr), indexes, and migration tracking |
 | `002_add_search_indexes.sql` | FTS5 index with triggers, additional attribute/event indexes |
 | `003_logs_view_and_fts.sql` | Retires trigger-based FTS, creates `logs` view and contentless `logs_fts` index |
+| `004_remove_unused_indexes.sql` | Removes 7 unused indexes to improve write performance by ~33% |
 
 The collector applies the initial schema on startup via `CREATE TABLE IF NOT EXISTS` statements embedded in the SQLite Writer. Migration files are provided for schema documentation and manual upgrades.
 
 ## Performance Tuning
 
+### Object Pooling & Allocation-Free Hot Path
+
+The collector uses `sync.Pool` to reuse `LogRecord` objects across the pipeline:
+- **`GetRecord()`** — retrieves a pooled LogRecord (zero allocations)
+- **`PutRecord()`** — returns the record to the pool after the SQLite writer consumes it
+
+Additional zero-allocation techniques:
+- **Fixed-size `[16]byte`/`[8]byte` arrays** for TraceID/SpanID instead of heap-allocated slices
+- **`[]Attribute` inline struct slice** instead of `map[string]AttributeValue` — eliminates map overhead and pointer boxing
+- **Pre-allocated attribute slices** preserved across pool cycles (capacity retained, length reset)
+
+These optimizations eliminate GC pressure in the hot path (0 allocations per record),
+resulting in more predictable tail latency under load.
+
 ### Queue Sizes
 
-- **Ingress Queue**: Controls memory usage for incoming logs
+- **Ingress Queue**: Controls memory usage for incoming log batches
   - Larger values: better burst absorption, higher memory usage
   - Smaller values: lower memory usage, earlier backpressure to clients
 
@@ -406,25 +430,34 @@ The collector applies the initial schema on startup via `CREATE TABLE IF NOT EXI
   - Larger values: better burst absorption, higher memory usage
   - Smaller values: lower memory usage, earlier backpressure to batcher
 
-### Batch Sizes
+### Batch Sizes (Split Configuration)
 
-- **Batch Size**: Number of records per batch
-  - Larger values: better write throughput, higher memory usage per batch
-  - Smaller values: lower memory usage, more frequent writes
+Batching and writing are independently configured:
 
-- **Flush Interval**: Maximum time between batch flushes
-  - Shorter intervals: lower latency, more frequent writes
-  - Longer intervals: better throughput, higher latency
+**Batcher** (`BATCHER_BATCH_SIZE`, `BATCHER_FLUSH_INTERVAL`):
+- Controls how records are grouped into `WriteBatchCommand` objects
+- Larger values: better write throughput, higher memory usage per batch
+- Smaller values: lower memory usage, more frequent writes
+
+**Writer** (`WRITER_BATCH_SIZE`, `WRITER_FLUSH_INTERVAL`):
+- Controls how commands are grouped into SQLite transactions
+- Larger values: better commit amortization, higher memory usage
+- Smaller values: faster commit latency, lower peak memory
 
 ### Transaction Caps
 
-- **Max Transaction Records**: The writer splits command batches exceeding 5000 records into multiple transactions to keep commit latency bounded
+- **`MaxTransactionRecords`** (env: `WRITER_MAX_TRANSACTION_RECORDS`, default 5000):
+  The writer splits command batches exceeding this threshold into multiple
+  transactions to keep commit latency bounded. Tunable based on workload:
+  - Higher values (10000-20000): lower transaction overhead, higher per-commit latency
+  - Lower values (2000-5000): lower per-commit latency, more transactions
 
 ### SQLite Configuration
 
 - **WAL Mode**: Enabled by default for concurrent access
 - **Synchronous**: Set to NORMAL for better performance
 - **Autocheckpoint**: Configured at 1000 pages
+- **Minimized indexes**: Unused indexes removed (migration 004) to reduce write overhead by ~33%
 
 ### Measured Throughput
 
@@ -434,6 +467,20 @@ See [docs/loadtest-baseline.md](docs/loadtest-baseline.md) for detailed benchmar
 |----------|----------------------:|---------------------------:|
 | Burst (32 clients × 1000 rec, 30s) | ~278k rec/s | Queued (draining) |
 | Sustained (32 clients × 150 rec, 60s) | ~4.7k rec/s | ~4.7k rec/s (flat queue) |
+
+### Optimization Results (2026-07-01)
+
+After applying preallocation and object reuse optimizations:
+
+| Metric | Before | After | Δ |
+|--------|-------:|------:|---|
+| Mapper throughput (1 record, 4 attrs) | 1,369 ns/op | 35 ns/op | **39× faster** |
+| Mapper allocations | 10 allocs/op | 0 allocs/op | **GC pressure eliminated** |
+| End-to-end throughput (sustained) | ~7,014 rec/s | ~7,019 rec/s | ±0.1% (noise) |
+
+Micro-benchmarks show dramatic mapper improvement, but end-to-end throughput is
+bottlenecked by channel-send overhead and SQLite I/O (not the mapper). See
+[loadtest results](loadtest-results/prealloc-optimization-20260701.md) for details.
 
 ## Troubleshooting
 

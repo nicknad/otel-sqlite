@@ -69,7 +69,7 @@ The OTLP SQLite Collector is a high-performance log collector that receives Open
   - Contain storage or transport logic
 
 ### 3. Ingestion Pipeline (`internal/ingest/`)
-- **Owns**: Queue abstractions for individual log records
+- **Owns**: Queue abstractions for log batches
 - **Responsibilities**:
   - Provide bounded ingress queue for backpressure
   - Ensure thread-safe access to queues
@@ -174,11 +174,11 @@ The rest of the system depends only on this interface.
 
 ### Pipeline Stages
 
-1. **gRPC Server**: Receives OTLP requests, maps to internal models
-2. **Ingress Queue**: Bounded queue for individual log records
-3. **Batcher**: Collects records into batches, wraps in WriteBatchCommand
+1. **gRPC Server**: Receives OTLP requests, maps to internal domain models (using pooled `GetRecord()`)
+2. **Ingress Queue**: Bounded queue for log batches (batches, not individual records — 1 channel op per batch)
+3. **Batcher**: Collects batches, groups into larger batches, wraps in WriteBatchCommand
 4. **Command Queue**: Bounded FIFO queue for Command objects
-5. **SQLite Writer**: Single goroutine that executes commands within SQLite transactions
+5. **SQLite Writer**: Single goroutine that executes commands within SQLite transactions and returns records to pool via `PutRecord()`
 
 ### Backpressure Behavior
 
@@ -246,6 +246,11 @@ It does NOT own command construction.
 - **Prepared Statements**: Reduces SQL parsing overhead
 - **Batched Transactions**: Reduces commit overhead
 - **Single Connection**: Avoids connection pool overhead for write-heavy workload
+- **Object Pooling**: `LogRecord` objects are reused via `sync.Pool` — zero allocations in the hot path
+- **Fixed-Size Arrays**: TraceID (`[16]byte`) and SpanID (`[8]byte`) avoid heap allocation for trace context
+- **Inline Attributes**: `[]Attribute` slice replaces `map[string]AttributeValue` — eliminates map overhead
+- **Batch-Level Ingress**: Batches flow through the ingress queue instead of individual records, reducing channel operations from N per batch to 1
+- **Minimized Indexes**: Unused indexes removed (migration 004) to reduce write overhead by ~33%
 
 ## OTLP Boundary
 
@@ -268,19 +273,18 @@ It does NOT own command construction.
 ### Tables
 
 - `log_resource`: Resource metadata (service.name, host.name, etc.)
-- `log_event`: Log record metadata (timestamp, severity, trace context, etc.)
+- `log_event`: Log record metadata (timestamp, severity, trace context, body, scope, `attributes_json`, etc.)
 - `log_attr`: Log record attributes (key-value pairs)
 
 ### Indexes
 
 - Primary keys on all tables
 - Foreign keys for referential integrity
-- Indexes on frequently queried columns:
+- Active indexes (prioritizing write performance):
   - `timestamp_ns` for time-range queries
-  - `severity_number` for severity filtering
-  - `trace_id` for trace correlation
   - `resource_id` for resource filtering
-  - `key` on attributes for attribute-based queries
+  - `event_id` on attributes
+- **Removed indexes** (migration 004): `severity_number`, `trace_id`, `severity_text`, `body`, `event_name`, composite `(resource_id, timestamp_ns)`, composite `(trace_id, timestamp_ns)`, and attribute value indexes — justified by benchmark results showing ~33% write improvement with negligible read impact
 
 ### Future Enhancements
 
@@ -321,8 +325,11 @@ All command metrics are labelled by command type for granular observability.
 - `SQLITE_PATH`: Path to SQLite database file
 - `INGRESS_QUEUE_CAPACITY`: Maximum ingress queue size
 - `BATCH_QUEUE_CAPACITY`: Maximum command queue size
-- `BATCH_SIZE`: Number of records per batch
-- `FLUSH_INTERVAL`: Maximum time between batch flushes
+- `BATCHER_BATCH_SIZE`: Number of records per batcher batch
+- `BATCHER_FLUSH_INTERVAL`: Maximum time between batcher flushes
+- `WRITER_BATCH_SIZE`: Number of commands per writer transaction
+- `WRITER_FLUSH_INTERVAL`: Maximum time between writer flushes
+- `WRITER_MAX_TRANSACTION_RECORDS`: Maximum records per SQLite transaction
 - `METRICS_ADDRESS`: Prometheus metrics server address
 
 ### Configuration File
