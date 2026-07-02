@@ -16,6 +16,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
+	_ "google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/keepalive"
 
 	"codeberg.org/nicknad/otel-sqlite/internal/batcher"
@@ -268,7 +269,7 @@ func (a *Application) startGRPCServer() error {
 			MaxConnectionAge:      30 * time.Minute,
 			MaxConnectionAgeGrace: 5 * time.Second,
 			Time:                  2 * time.Minute,
-			Timeout:              20 * time.Second,
+			Timeout:               20 * time.Second,
 		}),
 	}
 
