@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -116,6 +117,13 @@ func loadConfig() (*config.Config, error) {
 	}
 	cfg.Maintenance = maintCfg
 
+	// Writer tuning
+	if v := os.Getenv("WRITER_MAX_TRANSACTION_RECORDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.WriterMaxTransactionRecords = n
+		}
+	}
+
 	return cfg, nil
 }
 
@@ -133,8 +141,8 @@ func (a *Application) initialize() error {
 
 	// Create batcher (wraps batches as WriteBatchCommand, sends to cmd queue)
 	a.batcher = batcher.NewBatcher(a.ingressQueue, a.cmdQueue, &batcher.BatcherConfig{
-		BatchSize:     a.config.BatchSize,
-		FlushInterval: a.config.FlushInterval,
+		BatchSize:     a.config.BatcherBatchSize,
+		FlushInterval: a.config.BatcherFlushInterval,
 		Metrics:       a.metrics,
 	})
 	a.batcher.WithCommandFactory(func(batch *model.LogBatch) storage.Command {
@@ -144,10 +152,15 @@ func (a *Application) initialize() error {
 	// Create SQLite writer (implements CommandExecutor)
 	writerConfig := &sqlite.WriterConfig{
 		Path:          a.config.SQLitePath,
-		BatchSize:     a.config.BatchSize,
-		FlushInterval: a.config.FlushInterval,
+		BatchSize:     a.config.WriterBatchSize,
+		FlushInterval: a.config.WriterFlushInterval,
 		WALMode:       true,
 		Metrics:       a.metrics,
+	}
+
+	// Apply writer tuning configuration
+	if a.config.WriterMaxTransactionRecords > 0 {
+		sqlite.MaxTransactionRecords = a.config.WriterMaxTransactionRecords
 	}
 
 	var err error

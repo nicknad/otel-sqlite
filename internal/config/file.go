@@ -16,8 +16,13 @@ type FileConfig struct {
 	SQLitePath           string `yaml:"sqlite_path"`
 	IngressQueueCapacity int    `yaml:"ingress_queue_capacity"`
 	BatchQueueCapacity   int    `yaml:"batch_queue_capacity"`
-	BatchSize            int    `yaml:"batch_size"`
-	FlushInterval        string `yaml:"flush_interval"`
+	BatcherBatchSize     int    `yaml:"batcher_batch_size"`
+	BatcherFlushInterval string `yaml:"batcher_flush_interval"`
+	WriterBatchSize      int    `yaml:"writer_batch_size"`
+	WriterFlushInterval  string `yaml:"writer_flush_interval"`
+	// Legacy fields (mapped to both batcher and writer if specific fields unset)
+	BatchSize     int    `yaml:"batch_size"`
+	FlushInterval string `yaml:"flush_interval"`
 	MetricsAddress       string `yaml:"metrics_address"`
 	ShutdownTimeout      string `yaml:"shutdown_timeout"`
 }
@@ -54,17 +59,46 @@ func (c *Config) LoadFile(path string) error {
 	if fc.BatchQueueCapacity != 0 {
 		c.BatchQueueCapacity = fc.BatchQueueCapacity
 	}
-	if fc.BatchSize != 0 {
-		c.BatchSize = fc.BatchSize
+
+	// Apply batcher/writer batch sizes. Legacy BatchSize applies to both
+	// if the specific fields are not set.
+	if fc.BatcherBatchSize != 0 {
+		c.BatcherBatchSize = fc.BatcherBatchSize
+	} else if fc.BatchSize != 0 {
+		c.BatcherBatchSize = fc.BatchSize
+	}
+	if fc.WriterBatchSize != 0 {
+		c.WriterBatchSize = fc.WriterBatchSize
+	} else if fc.BatchSize != 0 {
+		c.WriterBatchSize = fc.BatchSize
 	}
 
 	// Parse duration fields.
-	if fc.FlushInterval != "" {
+	if fc.BatcherFlushInterval != "" {
+		d, err := parseDurationExt(fc.BatcherFlushInterval)
+		if err != nil {
+			return fmt.Errorf("batcher_flush_interval: %w", err)
+		}
+		c.BatcherFlushInterval = d
+	} else if fc.FlushInterval != "" {
 		d, err := parseDurationExt(fc.FlushInterval)
 		if err != nil {
 			return fmt.Errorf("flush_interval: %w", err)
 		}
-		c.FlushInterval = d
+		c.BatcherFlushInterval = d
+	}
+	if fc.WriterFlushInterval != "" {
+		d, err := parseDurationExt(fc.WriterFlushInterval)
+		if err != nil {
+			return fmt.Errorf("writer_flush_interval: %w", err)
+		}
+		c.WriterFlushInterval = d
+	} else if fc.FlushInterval != "" {
+		d, err := parseDurationExt(fc.FlushInterval)
+		if err != nil {
+			return fmt.Errorf("flush_interval: %w", err)
+		}
+		c.WriterFlushInterval = d
 	}
 	if fc.ShutdownTimeout != "" {
 		d, err := parseDurationExt(fc.ShutdownTimeout)

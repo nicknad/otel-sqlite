@@ -20,11 +20,17 @@ func TestDefaultConfig(t *testing.T) {
 	if c.BatchQueueCapacity != 1000 {
 		t.Errorf("expected 1000, got %d", c.BatchQueueCapacity)
 	}
-	if c.BatchSize != 100 {
-		t.Errorf("expected 100, got %d", c.BatchSize)
+	if c.BatcherBatchSize != 250 {
+		t.Errorf("expected 250, got %d", c.BatcherBatchSize)
 	}
-	if c.FlushInterval != 5*time.Second {
-		t.Errorf("expected 5s, got %s", c.FlushInterval)
+	if c.BatcherFlushInterval != 5*time.Second {
+		t.Errorf("expected 5s, got %s", c.BatcherFlushInterval)
+	}
+	if c.WriterBatchSize != 100 {
+		t.Errorf("expected 100, got %d", c.WriterBatchSize)
+	}
+	if c.WriterFlushInterval != 5*time.Second {
+		t.Errorf("expected 5s, got %s", c.WriterFlushInterval)
 	}
 	if c.MetricsAddress != ":9090" {
 		t.Errorf("expected :9090, got %q", c.MetricsAddress)
@@ -82,7 +88,8 @@ func TestLoadFromEnv(t *testing.T) {
 			env: map[string]string{
 				"INGRESS_QUEUE_CAPACITY": "5000",
 				"BATCH_QUEUE_CAPACITY":   "200",
-				"BATCH_SIZE":             "50",
+				"BATCHER_BATCH_SIZE":     "50",
+				"WRITER_BATCH_SIZE":      "75",
 			},
 			check: func(t *testing.T, c *Config) {
 				if c.IngressQueueCapacity != 5000 {
@@ -91,20 +98,27 @@ func TestLoadFromEnv(t *testing.T) {
 				if c.BatchQueueCapacity != 200 {
 					t.Errorf("expected 200, got %d", c.BatchQueueCapacity)
 				}
-				if c.BatchSize != 50 {
-					t.Errorf("expected 50, got %d", c.BatchSize)
+				if c.BatcherBatchSize != 50 {
+					t.Errorf("expected 50, got %d", c.BatcherBatchSize)
+				}
+				if c.WriterBatchSize != 75 {
+					t.Errorf("expected 75, got %d", c.WriterBatchSize)
 				}
 			},
 		},
 		{
 			name: "override duration fields",
 			env: map[string]string{
-				"FLUSH_INTERVAL":   "10s",
-				"SHUTDOWN_TIMEOUT": "60s",
+				"BATCHER_FLUSH_INTERVAL": "10s",
+				"WRITER_FLUSH_INTERVAL":  "15s",
+				"SHUTDOWN_TIMEOUT":       "60s",
 			},
 			check: func(t *testing.T, c *Config) {
-				if c.FlushInterval != 10*time.Second {
-					t.Errorf("expected 10s, got %s", c.FlushInterval)
+				if c.BatcherFlushInterval != 10*time.Second {
+					t.Errorf("expected 10s, got %s", c.BatcherFlushInterval)
+				}
+				if c.WriterFlushInterval != 15*time.Second {
+					t.Errorf("expected 15s, got %s", c.WriterFlushInterval)
 				}
 				if c.ShutdownTimeout != 60*time.Second {
 					t.Errorf("expected 60s, got %s", c.ShutdownTimeout)
@@ -149,7 +163,7 @@ func TestLoadFromEnv_errors(t *testing.T) {
 		},
 		{
 			name: "invalid duration",
-			env:  map[string]string{"FLUSH_INTERVAL": "not-a-duration"},
+			env:  map[string]string{"BATCHER_FLUSH_INTERVAL": "not-a-duration"},
 		},
 	}
 
@@ -186,37 +200,47 @@ func TestValidate(t *testing.T) {
 		},
 		{
 			name:    "empty listen address",
-			cfg:     &Config{ListenAddress: "", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatchSize: 1, FlushInterval: time.Second, MetricsAddress: ":9090", ShutdownTimeout: time.Second}, //nolint:lll
+			cfg:     &Config{ListenAddress: "", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
 			name:    "empty sqlite path",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatchSize: 1, FlushInterval: time.Second, MetricsAddress: ":9090", ShutdownTimeout: time.Second}, //nolint:lll
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
 			name:    "zero ingress capacity",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 0, BatchQueueCapacity: 1, BatchSize: 1, FlushInterval: time.Second, MetricsAddress: ":9090", ShutdownTimeout: time.Second}, //nolint:lll
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 0, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
-			name:    "negative batch size",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatchSize: -1, FlushInterval: time.Second, MetricsAddress: ":9090", ShutdownTimeout: time.Second}, //nolint:lll
+			name:    "negative batcher batch size",
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: -1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
-			name:    "zero flush interval",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatchSize: 1, FlushInterval: 0, MetricsAddress: ":9090", ShutdownTimeout: time.Second}, //nolint:lll
+			name:    "negative writer batch size",
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: -1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", ShutdownTimeout: time.Second}, //nolint:lll
+			wantErr: true,
+		},
+		{
+			name:    "zero batcher flush interval",
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: 0, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", ShutdownTimeout: time.Second}, //nolint:lll
+			wantErr: true,
+		},
+		{
+			name:    "zero writer flush interval",
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: 0, MetricsAddress: ":9090", ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
 			name:    "empty metrics address",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatchSize: 1, FlushInterval: time.Second, MetricsAddress: "", ShutdownTimeout: time.Second}, //nolint:lll
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: "", ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
 			name:    "zero shutdown timeout",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatchSize: 1, FlushInterval: time.Second, MetricsAddress: ":9090", ShutdownTimeout: 0}, //nolint:lll
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", ShutdownTimeout: 0}, //nolint:lll
 			wantErr: true,
 		},
 	}

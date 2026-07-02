@@ -53,22 +53,19 @@ func TestLogRecordTimestamps(t *testing.T) {
 
 func TestHasTraceContext(t *testing.T) {
 	tests := []struct {
-		name  string
-		trace []byte
-		span  []byte
-		want  bool
+		name     string
+		hasTrace bool
+		hasSpan  bool
+		want     bool
 	}{
-		{"valid 16+8", make([]byte, 16), make([]byte, 8), true},
-		{"short trace", make([]byte, 15), make([]byte, 8), false},
-		{"long trace", make([]byte, 17), make([]byte, 8), false},
-		{"short span", make([]byte, 16), make([]byte, 7), false},
-		{"long span", make([]byte, 16), make([]byte, 9), false},
-		{"nil trace", nil, make([]byte, 8), false},
-		{"nil span", make([]byte, 16), nil, false},
+		{"valid both", true, true, true},
+		{"no trace", false, true, false},
+		{"no span", true, false, false},
+		{"neither", false, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r := &LogRecord{TraceID: tt.trace, SpanID: tt.span}
+			r := &LogRecord{HasTrace: tt.hasTrace, HasSpan: tt.hasSpan}
 			if got := r.HasTraceContext(); got != tt.want {
 				t.Errorf("HasTraceContext() = %v, want %v", got, tt.want)
 			}

@@ -141,19 +141,21 @@ func (b *Batcher) run() {
 		case <-flushTicker.C:
 			b.flushCurrentBatch()
 
-		case record, ok := <-b.ingressQueue.Chan():
+		case batch, ok := <-b.ingressQueue.Chan():
 			if !ok {
 				b.flushCurrentBatch()
 				return
 			}
 
 			b.mu.Lock()
-			// Carry resource from the first record so the batch
-			// retains it through the record-based ingress queue.
-			if b.currentBatch.Resource == nil && record.Resource != nil {
-				b.currentBatch.Resource = record.Resource
+			// Carry resource from the incoming batch if current batch has none
+			if b.currentBatch.Resource == nil && batch.Resource != nil {
+				b.currentBatch.Resource = batch.Resource
 			}
-			b.currentBatch.AddRecord(record)
+			// Add all records from the incoming batch
+			for _, record := range batch.Records {
+				b.currentBatch.AddRecord(record)
+			}
 			isFull := b.currentBatch.Size() >= b.batchSize
 			b.mu.Unlock()
 

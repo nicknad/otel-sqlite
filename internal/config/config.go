@@ -23,9 +23,16 @@ type Config struct {
 	IngressQueueCapacity int `mapstructure:"ingress_queue_capacity"`
 	BatchQueueCapacity   int `mapstructure:"batch_queue_capacity"`
 
-	// Batching configuration
-	BatchSize     int           `mapstructure:"batch_size"`
-	FlushInterval time.Duration `mapstructure:"flush_interval"`
+	// Batcher configuration
+	BatcherBatchSize     int           `mapstructure:"batcher_batch_size"`
+	BatcherFlushInterval time.Duration `mapstructure:"batcher_flush_interval"`
+
+	// Writer configuration
+	WriterBatchSize     int           `mapstructure:"writer_batch_size"`
+	WriterFlushInterval time.Duration `mapstructure:"writer_flush_interval"`
+
+	// Writer tuning
+	WriterMaxTransactionRecords int `mapstructure:"writer_max_transaction_records"`
 
 	// Observability
 	MetricsAddress string `mapstructure:"metrics_address"`
@@ -44,9 +51,12 @@ func DefaultConfig() *Config {
 		SQLitePath:           "otel-logs.db",
 		IngressQueueCapacity: 10000,
 		BatchQueueCapacity:   1000,
-		BatchSize:            100,
-		FlushInterval:        5 * time.Second,
-		MetricsAddress:       ":9090",
+		BatcherBatchSize:     250,
+		BatcherFlushInterval: 5 * time.Second,
+		WriterBatchSize:             100,
+		WriterFlushInterval:         5 * time.Second,
+		WriterMaxTransactionRecords: 5000,
+		MetricsAddress:              ":9090",
 		ShutdownTimeout:      30 * time.Second,
 	}
 }
@@ -64,8 +74,11 @@ var envVars = []envVar{
 	{Key: "SQLitePath", Env: "SQLITE_PATH", Description: "Path to SQLite database file"},
 	{Key: "IngressQueueCapacity", Env: "INGRESS_QUEUE_CAPACITY", Description: "Maximum ingress queue size"},
 	{Key: "BatchQueueCapacity", Env: "BATCH_QUEUE_CAPACITY", Description: "Maximum batch queue size"},
-	{Key: "BatchSize", Env: "BATCH_SIZE", Description: "Number of log records per batch"},
-	{Key: "FlushInterval", Env: "FLUSH_INTERVAL", Description: "Maximum time between batch flushes"},
+	{Key: "BatcherBatchSize", Env: "BATCHER_BATCH_SIZE", Description: "Number of log records per batch (batcher)"},
+	{Key: "BatcherFlushInterval", Env: "BATCHER_FLUSH_INTERVAL", Description: "Maximum time between batch flushes"},
+	{Key: "WriterBatchSize", Env: "WRITER_BATCH_SIZE", Description: "Number of commands per transaction (writer)"},
+	{Key: "WriterFlushInterval", Env: "WRITER_FLUSH_INTERVAL", Description: "Maximum time between transaction flushes"},
+	{Key: "WriterMaxTransactionRecords", Env: "WRITER_MAX_TRANSACTION_RECORDS", Description: "Maximum records per SQLite transaction"},
 	{Key: "MetricsAddress", Env: "METRICS_ADDRESS", Description: "Prometheus metrics server address"},
 	{Key: "ShutdownTimeout", Env: "SHUTDOWN_TIMEOUT", Description: "Graceful shutdown timeout"},
 }
@@ -106,18 +119,36 @@ func (c *Config) setField(key, value string) error {
 			return fmt.Errorf("invalid int %q: %w", value, err)
 		}
 		c.BatchQueueCapacity = n
-	case "BatchSize":
+	case "BatcherBatchSize":
 		n, err := strconv.Atoi(value)
 		if err != nil {
 			return fmt.Errorf("invalid int %q: %w", value, err)
 		}
-		c.BatchSize = n
-	case "FlushInterval":
+		c.BatcherBatchSize = n
+	case "BatcherFlushInterval":
 		d, err := time.ParseDuration(value)
 		if err != nil {
 			return fmt.Errorf("invalid duration %q: %w", value, err)
 		}
-		c.FlushInterval = d
+		c.BatcherFlushInterval = d
+	case "WriterBatchSize":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid int %q: %w", value, err)
+		}
+		c.WriterBatchSize = n
+	case "WriterFlushInterval":
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("invalid duration %q: %w", value, err)
+		}
+		c.WriterFlushInterval = d
+	case "WriterMaxTransactionRecords":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid int %q: %w", value, err)
+		}
+		c.WriterMaxTransactionRecords = n
 	case "MetricsAddress":
 		c.MetricsAddress = value
 	case "ShutdownTimeout":
@@ -144,11 +175,17 @@ func (c *Config) Validate() error {
 	if c.BatchQueueCapacity <= 0 {
 		return fmt.Errorf("batch_queue_capacity must be positive, got %d", c.BatchQueueCapacity)
 	}
-	if c.BatchSize <= 0 {
-		return fmt.Errorf("batch_size must be positive, got %d", c.BatchSize)
+	if c.BatcherBatchSize <= 0 {
+		return fmt.Errorf("batcher_batch_size must be positive, got %d", c.BatcherBatchSize)
 	}
-	if c.FlushInterval <= 0 {
-		return fmt.Errorf("flush_interval must be positive, got %s", c.FlushInterval)
+	if c.BatcherFlushInterval <= 0 {
+		return fmt.Errorf("batcher_flush_interval must be positive, got %s", c.BatcherFlushInterval)
+	}
+	if c.WriterBatchSize <= 0 {
+		return fmt.Errorf("writer_batch_size must be positive, got %d", c.WriterBatchSize)
+	}
+	if c.WriterFlushInterval <= 0 {
+		return fmt.Errorf("writer_flush_interval must be positive, got %s", c.WriterFlushInterval)
 	}
 	if c.MetricsAddress == "" {
 		return fmt.Errorf("metrics_address must not be empty")

@@ -2,6 +2,7 @@
 package model
 
 import (
+	"sync"
 	"time"
 )
 
@@ -57,6 +58,49 @@ func (s Severity) String() string {
 	}
 }
 
+// ValueType represents the type of an attribute value.
+type ValueType uint8
+
+// ValueType constants.
+const (
+	ValueNull ValueType = iota
+	ValueString
+	ValueInt
+	ValueDouble
+	ValueBool
+	ValueBytes
+)
+
+// String returns the string representation of the value type.
+func (t ValueType) String() string {
+	switch t {
+	case ValueString:
+		return "string"
+	case ValueInt:
+		return "int"
+	case ValueDouble:
+		return "double"
+	case ValueBool:
+		return "bool"
+	case ValueBytes:
+		return "bytes"
+	default:
+		return "null"
+	}
+}
+
+// Attribute represents a key-value pair stored inline (no pointer indirection).
+// This struct is designed for zero-allocation storage in slices.
+type Attribute struct {
+	Key  string
+	Str  string    // used when Kind == ValueString
+	Num  int64     // used when Kind == ValueInt
+	Dbl  float64   // used when Kind == ValueDouble
+	Flag bool      // used when Kind == ValueBool
+	Raw  []byte    // used when Kind == ValueBytes (rare, still a slice)
+	Kind ValueType
+}
+
 // LogRecord represents a single log record in the internal domain model.
 // This is the canonical representation used throughout the ingestion pipeline.
 type LogRecord struct {
@@ -76,16 +120,26 @@ type LogRecord struct {
 
 	// TraceID is a unique identifier for a trace.
 	// All logs from the same trace share the same trace_id.
-	TraceID []byte
+	// Using fixed-size array eliminates heap allocation.
+	TraceID [16]byte
 
 	// SpanID is a unique identifier for a span within a trace.
-	SpanID []byte
+	// Using fixed-size array eliminates heap allocation.
+	SpanID [8]byte
+
+	// HasTrace indicates whether TraceID is valid (non-zero).
+	HasTrace bool
+
+	// HasSpan indicates whether SpanID is valid (non-zero).
+	HasSpan bool
 
 	// Body is the body of the log record.
 	Body string
 
 	// Attributes contains additional attributes that describe the specific event occurrence.
-	Attributes map[string]AttributeValue
+	// Pre-allocated as a slice for better performance than map.
+	// For most logs, attribute count is small (0-10), so linear scan is faster than map.
+	Attributes []Attribute
 
 	// DroppedAttributesCount is the number of attributes that were dropped.
 	DroppedAttributesCount uint32
@@ -111,10 +165,86 @@ type LogRecord struct {
 	ScopeVersion string
 }
 
-// NewLogRecord creates a new LogRecord with the given parameters.
+// recordPool is a pool of LogRecord objects.
+// Records are allocated once and reused across the pipeline.
+var recordPool = sync.Pool{
+	New: func() interface{} {
+		return &LogRecord{
+			Attributes: make([]Attribute, 0, 4),
+		}
+	},
+}
+
+// GetRecord retrieves a LogRecord from the pool.
+// The caller must ensure PutRecord is called when the record is no longer needed.
+// Ownership: The caller owns the record until it's passed to the next pipeline stage.
+func GetRecord() *LogRecord {
+	r := recordPool.Get().(*LogRecord)
+	// Reset fields to zero values (slice capacity is preserved)
+	r.Timestamp = 0
+	r.ObservedTimestamp = 0
+	r.SeverityNumber = SeverityUnspecified
+	r.SeverityText = ""
+	r.TraceID = [16]byte{}
+	r.SpanID = [8]byte{}
+	r.HasTrace = false
+	r.HasSpan = false
+	r.Body = ""
+	r.Attributes = r.Attributes[:0] // Keep capacity, reset length
+	r.DroppedAttributesCount = 0
+	r.Flags = 0
+	r.EventName = ""
+	r.ResourceID = ""
+	r.Resource = nil
+	r.ScopeName = ""
+	r.ScopeVersion = ""
+	return r
+}
+
+// PutRecord returns a LogRecord to the pool.
+// IMPORTANT: The record must not be used after calling PutRecord.
+// Ownership: Only the SQLite writer should call PutRecord after writing the record.
+// Safety: All fields are zeroed to prevent stale data access.
+func PutRecord(r *LogRecord) {
+	if r == nil {
+		return
+	}
+	// Zero all fields to prevent stale data access if record is accidentally used after put
+	r.Timestamp = 0
+	r.ObservedTimestamp = 0
+	r.SeverityNumber = SeverityUnspecified
+	r.SeverityText = ""
+	r.TraceID = [16]byte{}
+	r.SpanID = [8]byte{}
+	r.HasTrace = false
+	r.HasSpan = false
+	r.Body = ""
+	r.DroppedAttributesCount = 0
+	r.Flags = 0
+	r.EventName = ""
+	r.ResourceID = ""
+	r.Resource = nil
+	r.ScopeName = ""
+	r.ScopeVersion = ""
+	// Clear attribute values but keep slice capacity
+	for i := range r.Attributes {
+		r.Attributes[i].Key = ""
+		r.Attributes[i].Str = ""
+		r.Attributes[i].Num = 0
+		r.Attributes[i].Dbl = 0
+		r.Attributes[i].Flag = false
+		r.Attributes[i].Raw = nil
+		r.Attributes[i].Kind = ValueNull
+	}
+	r.Attributes = r.Attributes[:0]
+	recordPool.Put(r)
+}
+
+// NewLogRecord creates a new LogRecord with pre-allocated attribute slice.
+// Deprecated: Use GetRecord() for better performance via object pooling.
 func NewLogRecord() *LogRecord {
 	return &LogRecord{
-		Attributes: make(map[string]AttributeValue),
+		Attributes: make([]Attribute, 0, 4),
 	}
 }
 
@@ -130,7 +260,7 @@ func (r *LogRecord) ObservedTimestampTime() time.Time {
 
 // HasTraceContext returns true if the log record has valid trace/span IDs.
 func (r *LogRecord) HasTraceContext() bool {
-	return len(r.TraceID) == 16 && len(r.SpanID) == 8
+	return r.HasTrace && r.HasSpan
 }
 
 // LogBatch represents a batch of log records.

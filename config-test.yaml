@@ -1,0 +1,7 @@
+collector:
+  listen_address: "localhost:4317"
+  sqlite_path: "otel-logs.db"
+  batch_size: 500
+  batch_timeout: 1s
+  ingress_queue_capacity: 10000
+  metrics_address: "localhost:9090"

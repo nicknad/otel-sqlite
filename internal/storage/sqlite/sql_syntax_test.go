@@ -118,20 +118,22 @@ func TestAllSQLStatements(t *testing.T) {
 			ObservedTimestamp:      2000,
 			SeverityNumber:         model.SeverityInfo,
 			SeverityText:           "INFO",
-			TraceID:                []byte{0x01, 0x02, 0x03},
-			SpanID:                 []byte{0x04, 0x05, 0x06},
+			TraceID:                [16]byte{0x01, 0x02, 0x03},
+			SpanID:                 [8]byte{0x04, 0x05, 0x06},
+			HasTrace:               true,
+			HasSpan:                true,
 			Body:                   "test log message",
 			EventName:              "test.event",
 			Flags:                  1,
 			DroppedAttributesCount: 0,
 			ScopeName:              "test.scope",
 			ScopeVersion:           "v1.0.0",
-			Attributes: map[string]model.AttributeValue{
-				"string.key": model.NewStringValue("string-val"),
-				"int.key":    model.NewIntValue(42),
-				"double.key": model.NewDoubleValue(3.14),
-				"bool.key":   model.NewBoolValue(true),
-				"bytes.key":  model.NewBytesValue([]byte{0xAA, 0xBB}),
+			Attributes: []model.Attribute{
+				{Key: "string.key", Str: "string-val", Kind: model.ValueString},
+				{Key: "int.key", Num: 42, Kind: model.ValueInt},
+				{Key: "double.key", Dbl: 3.14, Kind: model.ValueDouble},
+				{Key: "bool.key", Flag: true, Kind: model.ValueBool},
+				{Key: "bytes.key", Raw: []byte{0xAA, 0xBB}, Kind: model.ValueBytes},
 			},
 		}
 
@@ -170,7 +172,7 @@ func TestAllSQLStatements(t *testing.T) {
 			Body:                   "error message",
 			Flags:                  0,
 			DroppedAttributesCount: 0,
-			Attributes:             map[string]model.AttributeValue{},
+			Attributes:             []model.Attribute{},
 		}
 		batch2 := model.NewLogBatch(1)
 		batch2.AddRecord(record2)

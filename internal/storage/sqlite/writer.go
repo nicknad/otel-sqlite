@@ -190,14 +190,18 @@ func (w *Writer) run() {
 	}
 }
 
-// maxTransactionRecords caps the number of log records written in a single
+// MaxTransactionRecords caps the number of log records written in a single
 // SQLite transaction. Above this threshold the writer splits the work into
 // multiple smaller transactions to keep each transaction fast and prevent
 // the writer goroutine from being blocked for seconds on oversized flushes.
-const maxTransactionRecords = 5000
+//
+// This value can be tuned based on workload characteristics:
+// - Higher values (10000-20000) reduce transaction overhead but increase memory usage
+// - Lower values (2000-5000) reduce memory usage but increase transaction overhead
+var MaxTransactionRecords = 5000
 
 // executeCommands runs a collection of commands, splitting into separate
-// transactions if the total estimated record count exceeds maxTransactionRecords.
+// transactions if the total estimated record count exceeds MaxTransactionRecords.
 func (w *Writer) executeCommands(commands []storage.Command) {
 	if len(commands) == 0 {
 		return
@@ -212,7 +216,7 @@ func (w *Writer) executeCommands(commands []storage.Command) {
 			// Estimate record count: WriteBatchCommand exposes Size(),
 			// other command types default to 1 for splitting purposes.
 			recs := commandRecordCount(commands[end])
-			if acc+recs > maxTransactionRecords && acc > 0 {
+			if acc+recs > MaxTransactionRecords && acc > 0 {
 				break
 			}
 			acc += recs
@@ -415,6 +419,7 @@ func initializeSchema(db *sql.DB) error {
 		dropped_attributes_count INTEGER NOT NULL,
 		scope_name TEXT,
 		scope_version TEXT,
+		attributes_json TEXT,
 		FOREIGN KEY (resource_id) REFERENCES log_resource(id)
 	);
 
@@ -432,15 +437,8 @@ func initializeSchema(db *sql.DB) error {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_log_event_timestamp ON log_event(timestamp_ns);
-	CREATE INDEX IF NOT EXISTS idx_log_event_severity ON log_event(severity_number);
-	CREATE INDEX IF NOT EXISTS idx_log_event_trace_id ON log_event(trace_id);
 	CREATE INDEX IF NOT EXISTS idx_log_event_resource_id ON log_event(resource_id);
 	CREATE INDEX IF NOT EXISTS idx_log_attr_event_id ON log_attr(event_id);
-	CREATE INDEX IF NOT EXISTS idx_log_attr_key ON log_attr(key);
-	CREATE INDEX IF NOT EXISTS idx_log_event_severity_text ON log_event(severity_text);
-	CREATE INDEX IF NOT EXISTS idx_log_event_body ON log_event(body);
-	CREATE INDEX IF NOT EXISTS idx_log_event_resource_timestamp ON log_event(resource_id, timestamp_ns);
-	CREATE INDEX IF NOT EXISTS idx_log_event_trace_timestamp ON log_event(trace_id, timestamp_ns);
 	`
 
 	_, err := db.Exec(schema)

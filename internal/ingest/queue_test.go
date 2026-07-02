@@ -12,8 +12,10 @@ func TestIngressQueueSendReceive(t *testing.T) {
 	q := NewIngressQueue(10)
 	ctx := context.Background()
 
-	r := &model.LogRecord{Body: "hello"}
-	if err := q.Send(ctx, r); err != nil {
+	batch := model.NewLogBatch(1)
+	batch.AddRecord(&model.LogRecord{Body: "hello"})
+
+	if err := q.Send(ctx, batch); err != nil {
 		t.Fatalf("Send() error: %v", err)
 	}
 
@@ -28,8 +30,8 @@ func TestIngressQueueSendReceive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Receive() error: %v", err)
 	}
-	if got.Body != "hello" {
-		t.Errorf("Receive() body = %q, want %q", got.Body, "hello")
+	if got.Size() != 1 || got.Records[0].Body != "hello" {
+		t.Errorf("Receive() body = %q, want %q", got.Records[0].Body, "hello")
 	}
 
 	if q.Len() != 0 {
@@ -42,7 +44,7 @@ func TestIngressQueueBlockingSend(t *testing.T) {
 	ctx := context.Background()
 
 	// Fill the queue
-	if err := q.Send(ctx, &model.LogRecord{}); err != nil {
+	if err := q.Send(ctx, model.NewLogBatch(1)); err != nil {
 		t.Fatalf("Send() error: %v", err)
 	}
 
@@ -50,7 +52,7 @@ func TestIngressQueueBlockingSend(t *testing.T) {
 	ctxTimeout, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
 	defer cancel()
 
-	err := q.Send(ctxTimeout, &model.LogRecord{})
+	err := q.Send(ctxTimeout, model.NewLogBatch(1))
 	if err == nil {
 		t.Error("expected error on full queue, got nil")
 	}
@@ -60,8 +62,11 @@ func TestIngressQueueClose(t *testing.T) {
 	q := NewIngressQueue(10)
 	ctx := context.Background()
 
-	// Send a record then close
-	if err := q.Send(ctx, &model.LogRecord{Body: "test"}); err != nil {
+	batch := model.NewLogBatch(1)
+	batch.AddRecord(&model.LogRecord{Body: "test"})
+
+	// Send a batch then close
+	if err := q.Send(ctx, batch); err != nil {
 		t.Fatalf("Send() error: %v", err)
 	}
 	q.Close()
@@ -71,8 +76,8 @@ func TestIngressQueueClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Receive() after close error: %v", err)
 	}
-	if got.Body != "test" {
-		t.Errorf("got body %q, want %q", got.Body, "test")
+	if got.Records[0].Body != "test" {
+		t.Errorf("got body %q, want %q", got.Records[0].Body, "test")
 	}
 
 	// Second receive should return ErrQueueClosed
