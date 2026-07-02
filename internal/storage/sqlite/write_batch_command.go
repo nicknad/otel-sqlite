@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -165,12 +166,13 @@ func (c *WriteBatchCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 	if c.batch.Resource != nil {
 		serviceName := c.batch.Resource.GetServiceName()
 		hostName := c.batch.Resource.GetHostName()
+		attrsJSON := marshalResourceAttrs(c.batch.Resource.Attributes)
 		if _, err := insertResource.ExecContext(ctx,
 			c.batch.Resource.ID,
 			serviceName,
 			hostName,
 			c.batch.Resource.SchemaURL,
-			"{}",
+			attrsJSON,
 		); err != nil {
 			return fmt.Errorf("insert resource %q: %w", c.batch.Resource.ID, err)
 		}
@@ -241,6 +243,19 @@ func insertEventRecord(ctx context.Context, stmt *sql.Stmt, record *model.LogRec
 		return 0, err
 	}
 	return result.LastInsertId()
+}
+
+// marshalResourceAttrs serializes resource attributes to JSON for the
+// attributes_json column. Returns "{}" when the map is empty or nil.
+func marshalResourceAttrs(attrs map[string]model.AttributeValue) string {
+	if len(attrs) == 0 {
+		return "{}"
+	}
+	b, err := json.Marshal(attrs)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
 
 // insertAttributesRecord inserts attribute rows for a log event.

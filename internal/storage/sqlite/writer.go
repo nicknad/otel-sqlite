@@ -344,6 +344,14 @@ func openDatabase(path string, walMode bool) (*sql.DB, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
+	// Enable foreign key enforcement. SQLite defaults to OFF; turning it ON
+	// makes declared FK constraints actually reject violations, catching
+	// bugs like orphaned resource references at insert time.
+	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to enable foreign keys: %w", err)
+	}
+
 	if walMode {
 		if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
 			_ = db.Close()
