@@ -1,72 +1,74 @@
-version: "2"
+runner:
+  concurrency: 4
+  timeout: 5m
+  modules-download-mode: readonly
+  allow-parallel-runners: true
+
 output:
   formats:
-    text:
-      path: stdout
-      print-linter-name: true
-      print-issued-lines: true
+    - format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true
+
 linters:
   enable:
+    - errcheck
     - gocritic
+    - gofmt
+    - goimports
     - gosec
+    - gosimple
+    - govet
+    - ineffassign
     - lll
     - misspell
     - nakedret
     - staticcheck
+    - stylecheck
+    - typecheck
     - unconvert
+    - unused
     - whitespace
-  settings:
-    gocritic:
-      disabled-checks:
-        - commentFormatting
-        - whyNoLint
-      enabled-tags:
-        - diagnostic
-        - style
-        - performance
-    lll:
-      line-length: 120
-    misspell:
-      locale: US
-  exclusions:
-    generated: lax
-    presets:
-      - comments
-      - common-false-positives
-      - legacy
-      - std-error-handling
-    rules:
-      - linters:
-          - errcheck
-          - gosec
-        path: _test\.go
-      - linters:
-          - all
-        path: internal/generated/
-    paths:
-      - third_party$
-      - builtin$
-      - examples$
+
+linters-settings:
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+    disabled-checks:
+      - commentFormatting
+      - whyNoLint
+    # hugeParam is disabled by default; we explicitly exclude it for
+    # value-receiver methods (AttributeValue.Type, .String) where
+    # changing to pointer receiver would break the API contract.
+    # The writer helper functions were already fixed to use pointers.
+  gofmt:
+    simplicity: true
+  goimports:
+    local-prefixes: github.com/nnadolski/otel-sqlite
+  golint:
+    min-confidence: 0.8
+  lll:
+    line-length: 120
+    tab-length: 4
+  misspell:
+    locale: US
+
 issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gosec
+    - path: internal/generated/
+      linters:
+        - all
   max-issues-per-linter: 0
   max-same-issues: 0
+
 severity:
-  default: error
+  default-severity: error
   rules:
-    - linters:
-        - staticcheck
+    - linters: [stylecheck]
       severity: warning
-formatters:
-  enable:
-    - gofmt
-    - goimports
-  settings:
-    goimports:
-      local-prefixes:
-        - github.com/nnadolski/otel-sqlite
-  exclusions:
-    generated: lax
-    paths:
-      - third_party$
-      - builtin$
-      - examples$
