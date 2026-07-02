@@ -35,7 +35,7 @@ type Config struct {
 	VacuumInterval time.Duration `yaml:"interval"`
 
 	// FTS rebuild config.
-	FTSEnabled        bool          `yaml:"-"`
+	FTSEnabled         bool          `yaml:"-"`
 	FTSRebuildInterval time.Duration `yaml:"rebuild_interval"`
 }
 
