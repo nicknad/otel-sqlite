@@ -391,5 +391,3 @@ func initPreparedStatements(db *sql.DB) (*PreparedStatements, error) {
 		InsertAttr:     stmts[2],
 	}, nil
 }
-
-

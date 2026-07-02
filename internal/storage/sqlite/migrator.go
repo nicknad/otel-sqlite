@@ -28,9 +28,10 @@ func allMigrations() []migration {
 			sql:         migration002SQL,
 		},
 		{
-			version:     "003",
-			description: "Logs view (log_event+log_resource join) and contentless logs_fts index; retire trigger-based FTS from 002",
-			sql:         migration003SQL,
+			version: "003",
+			description: "Logs view (log_event+log_resource join) and contentless logs_fts index; " +
+				"retire trigger-based FTS from 002",
+			sql: migration003SQL,
 		},
 		{
 			version:     "004",
