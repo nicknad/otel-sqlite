@@ -21,15 +21,15 @@ type FileConfig struct {
 	WriterBatchSize      int    `yaml:"writer_batch_size"`
 	WriterFlushInterval  string `yaml:"writer_flush_interval"`
 	// Legacy fields (mapped to both batcher and writer if specific fields unset)
-	BatchSize     int    `yaml:"batch_size"`
-	FlushInterval string `yaml:"flush_interval"`
-	GrpcMaxRecvMsgSize        int     `yaml:"grpc_max_recv_msg_size"`
-	GrpcMaxSendMsgSize        int     `yaml:"grpc_max_send_msg_size"`
-	GrpcMaxConcurrentStreams  int     `yaml:"grpc_max_concurrent_streams"`
+	BatchSize                         int     `yaml:"batch_size"`
+	FlushInterval                     string  `yaml:"flush_interval"`
+	GrpcMaxRecvMsgSize                int     `yaml:"grpc_max_recv_msg_size"`
+	GrpcMaxSendMsgSize                int     `yaml:"grpc_max_send_msg_size"`
+	GrpcMaxConcurrentStreams          int     `yaml:"grpc_max_concurrent_streams"`
 	IngressQueueBackpressureThreshold float64 `yaml:"ingress_queue_backpressure_threshold"`
-	GoMemoryLimitMB           int     `yaml:"go_memory_limit_mb"`
-	MetricsAddress            string  `yaml:"metrics_address"`
-	ShutdownTimeout           string  `yaml:"shutdown_timeout"`
+	GoMemoryLimitMB                   int     `yaml:"go_memory_limit_mb"`
+	MetricsAddress                    string  `yaml:"metrics_address"`
+	ShutdownTimeout                   string  `yaml:"shutdown_timeout"`
 }
 
 // LoadFile loads configuration from a YAML file.

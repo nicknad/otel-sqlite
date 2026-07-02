@@ -252,10 +252,10 @@ func insertAttributesRecord(ctx context.Context, stmt *sql.Stmt, eventID int64,
 
 	for _, attr := range attributes {
 		var (
-			strVal  *string
-			intVal  *int64
-			dblVal  *float64
-			boolVal *bool
+			strVal   *string
+			intVal   *int64
+			dblVal   *float64
+			boolVal  *bool
 			bytesVal []byte
 		)
 

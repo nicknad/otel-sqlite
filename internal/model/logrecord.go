@@ -93,11 +93,11 @@ func (t ValueType) String() string {
 // This struct is designed for zero-allocation storage in slices.
 type Attribute struct {
 	Key  string
-	Str  string    // used when Kind == ValueString
-	Num  int64     // used when Kind == ValueInt
-	Dbl  float64   // used when Kind == ValueDouble
-	Flag bool      // used when Kind == ValueBool
-	Raw  []byte    // used when Kind == ValueBytes (rare, still a slice)
+	Str  string  // used when Kind == ValueString
+	Num  int64   // used when Kind == ValueInt
+	Dbl  float64 // used when Kind == ValueDouble
+	Flag bool    // used when Kind == ValueBool
+	Raw  []byte  // used when Kind == ValueBytes (rare, still a slice)
 	Kind ValueType
 }
 
@@ -241,6 +241,7 @@ func PutRecord(r *LogRecord) {
 }
 
 // NewLogRecord creates a new LogRecord with pre-allocated attribute slice.
+//
 // Deprecated: Use GetRecord() for better performance via object pooling.
 func NewLogRecord() *LogRecord {
 	return &LogRecord{

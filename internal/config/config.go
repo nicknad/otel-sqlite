@@ -38,9 +38,9 @@ type Config struct {
 	MetricsAddress string `mapstructure:"metrics_address"`
 
 	// gRPC configuration
-	GrpcMaxRecvMsgSize        int `mapstructure:"grpc_max_recv_msg_size"`
-	GrpcMaxSendMsgSize        int `mapstructure:"grpc_max_send_msg_size"`
-	GrpcMaxConcurrentStreams  int `mapstructure:"grpc_max_concurrent_streams"`
+	GrpcMaxRecvMsgSize       int `mapstructure:"grpc_max_recv_msg_size"`
+	GrpcMaxSendMsgSize       int `mapstructure:"grpc_max_send_msg_size"`
+	GrpcMaxConcurrentStreams int `mapstructure:"grpc_max_concurrent_streams"`
 
 	// Backpressure: when ingress queue depth exceeds this fraction (0.0–1.0)
 	// of capacity, the gRPC server rejects new requests with Unavailable.
@@ -61,22 +61,22 @@ type Config struct {
 // DefaultConfig returns a configuration with sensible defaults.
 func DefaultConfig() *Config {
 	return &Config{
-		ListenAddress:        ":4317",
-		SQLitePath:           "otel-logs.db",
-		IngressQueueCapacity: 10000,
-		BatchQueueCapacity:   1000,
-		BatcherBatchSize:     250,
-		BatcherFlushInterval: 5 * time.Second,
-		WriterBatchSize:             100,
-		WriterFlushInterval:         5 * time.Second,
-		WriterMaxTransactionRecords: 5000,
-		MetricsAddress:              ":9090",
-		GrpcMaxRecvMsgSize:          16 * 1024 * 1024, // 16 MB
-		GrpcMaxSendMsgSize:          16 * 1024 * 1024, // 16 MB
-		GrpcMaxConcurrentStreams:    100,
+		ListenAddress:                     ":4317",
+		SQLitePath:                        "otel-logs.db",
+		IngressQueueCapacity:              10000,
+		BatchQueueCapacity:                1000,
+		BatcherBatchSize:                  250,
+		BatcherFlushInterval:              5 * time.Second,
+		WriterBatchSize:                   100,
+		WriterFlushInterval:               5 * time.Second,
+		WriterMaxTransactionRecords:       5000,
+		MetricsAddress:                    ":9090",
+		GrpcMaxRecvMsgSize:                16 * 1024 * 1024, // 16 MB
+		GrpcMaxSendMsgSize:                16 * 1024 * 1024, // 16 MB
+		GrpcMaxConcurrentStreams:          100,
 		IngressQueueBackpressureThreshold: 0, // disabled by default; recommends 0.8
-		GoMemoryLimitMB:             0,       // disabled by default; recommends 2048
-		ShutdownTimeout:      30 * time.Second,
+		GoMemoryLimitMB:                   0, // disabled by default; recommends 2048
+		ShutdownTimeout:                   30 * time.Second,
 	}
 }
 
@@ -97,11 +97,13 @@ var envVars = []envVar{
 	{Key: "BatcherFlushInterval", Env: "BATCHER_FLUSH_INTERVAL", Description: "Maximum time between batch flushes"},
 	{Key: "WriterBatchSize", Env: "WRITER_BATCH_SIZE", Description: "Number of commands per transaction (writer)"},
 	{Key: "WriterFlushInterval", Env: "WRITER_FLUSH_INTERVAL", Description: "Maximum time between transaction flushes"},
-	{Key: "WriterMaxTransactionRecords", Env: "WRITER_MAX_TRANSACTION_RECORDS", Description: "Maximum records per SQLite transaction"},
+	{Key: "WriterMaxTransactionRecords", Env: "WRITER_MAX_TRANSACTION_RECORDS",
+		Description: "Maximum records per SQLite transaction"},
 	{Key: "GrpcMaxRecvMsgSize", Env: "GRPC_MAX_RECV_MSG_SIZE", Description: "Max gRPC receive message size in bytes"},
 	{Key: "GrpcMaxSendMsgSize", Env: "GRPC_MAX_SEND_MSG_SIZE", Description: "Max gRPC send message size in bytes"},
 	{Key: "GrpcMaxConcurrentStreams", Env: "GRPC_MAX_CONCURRENT_STREAMS", Description: "Max concurrent gRPC streams"},
-	{Key: "IngressQueueBackpressureThreshold", Env: "INGRESS_QUEUE_BACKPRESSURE_THRESHOLD", Description: "Ingress queue fullness fraction (0.0–1.0) to trigger early rejection"},
+	{Key: "IngressQueueBackpressureThreshold", Env: "INGRESS_QUEUE_BACKPRESSURE_THRESHOLD",
+		Description: "Ingress queue fullness fraction (0.0–1.0) to trigger early rejection"},
 	{Key: "GoMemoryLimitMB", Env: "GO_MEMORY_LIMIT_MB", Description: "Go runtime memory limit in MB (0 = disabled)"},
 	{Key: "MetricsAddress", Env: "METRICS_ADDRESS", Description: "Prometheus metrics server address"},
 	{Key: "ShutdownTimeout", Env: "SHUTDOWN_TIMEOUT", Description: "Graceful shutdown timeout"},
@@ -254,7 +256,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("grpc_max_concurrent_streams must be positive, got %d", c.GrpcMaxConcurrentStreams)
 	}
 	if c.IngressQueueBackpressureThreshold < 0 || c.IngressQueueBackpressureThreshold > 1 {
-		return fmt.Errorf("ingress_queue_backpressure_threshold must be between 0.0 and 1.0, got %f", c.IngressQueueBackpressureThreshold)
+		return fmt.Errorf("ingress_queue_backpressure_threshold must be between 0.0 and 1.0, got %f",
+			c.IngressQueueBackpressureThreshold)
 	}
 	if c.GoMemoryLimitMB < 0 {
 		return fmt.Errorf("go_memory_limit_mb must be non-negative, got %d", c.GoMemoryLimitMB)

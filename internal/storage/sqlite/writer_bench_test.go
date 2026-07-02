@@ -9,6 +9,12 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const insertEventSQL = "INSERT INTO log_event (resource_id, timestamp, severity, body, " +
+	"trace_id, span_id, flags, attributes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+
+const insertEventPrefix = "INSERT INTO log_event (resource_id, timestamp, severity, body, " +
+	"trace_id, span_id, flags, attributes_json) VALUES "
+
 func BenchmarkWriterInsert(b *testing.B) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -54,7 +60,8 @@ func BenchmarkWriterInsert(b *testing.B) {
 	}
 
 	// Insert a resource
-	if _, err := db.Exec("INSERT INTO log_resource (id, service_name) VALUES (?, ?)", "res-1", "test-service"); err != nil {
+	if _, err := db.Exec("INSERT INTO log_resource (id, service_name) VALUES (?, ?)",
+		"res-1", "test-service"); err != nil {
 		b.Fatal(err)
 	}
 
@@ -67,7 +74,7 @@ func BenchmarkWriterInsert(b *testing.B) {
 				b.Fatal(err)
 			}
 
-			stmt, err := tx.PrepareContext(ctx, "INSERT INTO log_event (resource_id, timestamp, severity, body, trace_id, span_id, flags, attributes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+			stmt, err := tx.PrepareContext(ctx, insertEventSQL)
 			if err != nil {
 				tx.Rollback()
 				b.Fatal(err)
@@ -107,7 +114,7 @@ func BenchmarkWriterInsert(b *testing.B) {
 			}
 
 			// Build batch INSERT with 100 rows
-			query := "INSERT INTO log_event (resource_id, timestamp, severity, body, trace_id, span_id, flags, attributes_json) VALUES "
+			query := insertEventPrefix
 			args := make([]interface{}, 0, 800)
 			for j := 0; j < 100; j++ {
 				if j > 0 {
@@ -139,9 +146,9 @@ func BenchmarkWriterInsert(b *testing.B) {
 
 	b.Run("PreparedBatchInsert", func(b *testing.B) {
 		ctx := context.Background()
-		
+
 		// Prepare statement once
-		stmt, err := db.PrepareContext(ctx, "INSERT INTO log_event (resource_id, timestamp, severity, body, trace_id, span_id, flags, attributes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+		stmt, err := db.PrepareContext(ctx, insertEventSQL)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -218,15 +225,16 @@ func BenchmarkWriterWithFewerIndexes(b *testing.B) {
 	}
 
 	// Insert a resource
-	if _, err := db.Exec("INSERT INTO log_resource (id, service_name) VALUES (?, ?)", "res-1", "test-service"); err != nil {
+	if _, err := db.Exec("INSERT INTO log_resource (id, service_name) VALUES (?, ?)",
+		"res-1", "test-service"); err != nil {
 		b.Fatal(err)
 	}
 
 	b.ResetTimer()
 	b.Run("FewerIndexes", func(b *testing.B) {
 		ctx := context.Background()
-		
-		stmt, err := db.PrepareContext(ctx, "INSERT INTO log_event (resource_id, timestamp, severity, body, trace_id, span_id, flags, attributes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+
+		stmt, err := db.PrepareContext(ctx, insertEventSQL)
 		if err != nil {
 			b.Fatal(err)
 		}

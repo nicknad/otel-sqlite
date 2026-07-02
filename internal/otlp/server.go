@@ -63,9 +63,9 @@ func (s *Server) Export(ctx context.Context, request *logsV1.ExportLogsServiceRe
 	// Optional early backpressure: reject before mapping if the ingress queue
 	// is already too full, protecting memory even under extreme client concurrency.
 	if s.backpressureThreshold > 0 {
-		cap := s.ingressQueue.Cap()
-		if cap > 0 {
-			fullness := float64(s.ingressQueue.Len()) / float64(cap)
+		queueCap := s.ingressQueue.Cap()
+		if queueCap > 0 {
+			fullness := float64(s.ingressQueue.Len()) / float64(queueCap)
 			if fullness >= s.backpressureThreshold {
 				s.metrics.IncrementBackpressureRejections()
 				return nil, status.Errorf(codes.Unavailable, "server overloaded: ingress queue %d%% full", int(fullness*100))

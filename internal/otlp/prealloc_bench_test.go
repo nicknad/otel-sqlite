@@ -131,14 +131,14 @@ func BenchmarkOptimized_SingleRecord_4Attrs(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		record := getOptimizedRecord()
-		
+
 		// Map timestamps
 		record.Timestamp = int64(protoRecord.TimeUnixNano)
 		record.ObservedTimestamp = int64(protoRecord.ObservedTimeUnixNano)
-		
+
 		// Map severity
 		record.SeverityText = protoRecord.SeverityText
-		
+
 		// Map trace context using fixed-size arrays (NO heap allocation)
 		if len(protoRecord.TraceId) == 16 {
 			copy(record.TraceID[:], protoRecord.TraceId)
@@ -148,21 +148,21 @@ func BenchmarkOptimized_SingleRecord_4Attrs(b *testing.B) {
 			copy(record.SpanID[:], protoRecord.SpanId)
 			record.HasSpan = true
 		}
-		
+
 		// Map body
 		if protoRecord.Body != nil {
 			if sv, ok := protoRecord.Body.Value.(*commonV1.AnyValue_StringValue); ok {
 				record.Body = sv.StringValue
 			}
 		}
-		
+
 		// Map attributes into pre-allocated slice
 		if len(protoRecord.Attributes) > 0 {
 			if cap(record.Attributes) < len(protoRecord.Attributes) {
 				record.Attributes = make([]OptimizedAttribute, 0, len(protoRecord.Attributes))
 			}
 			record.Attributes = record.Attributes[:0]
-			
+
 			for _, kv := range protoRecord.Attributes {
 				var value string
 				if sv, ok := kv.Value.Value.(*commonV1.AnyValue_StringValue); ok {
@@ -174,7 +174,7 @@ func BenchmarkOptimized_SingleRecord_4Attrs(b *testing.B) {
 				})
 			}
 		}
-		
+
 		// Return to pool
 		putOptimizedRecord(record)
 	}
@@ -226,11 +226,11 @@ func BenchmarkOptimized_100Records_4Attrs(b *testing.B) {
 		records := make([]*OptimizedLogRecord, 0, 100)
 		for _, protoRecord := range protoRecords {
 			record := getOptimizedRecord()
-			
+
 			record.Timestamp = int64(protoRecord.TimeUnixNano)
 			record.ObservedTimestamp = int64(protoRecord.ObservedTimeUnixNano)
 			record.SeverityText = protoRecord.SeverityText
-			
+
 			if len(protoRecord.TraceId) == 16 {
 				copy(record.TraceID[:], protoRecord.TraceId)
 				record.HasTrace = true
@@ -239,19 +239,19 @@ func BenchmarkOptimized_100Records_4Attrs(b *testing.B) {
 				copy(record.SpanID[:], protoRecord.SpanId)
 				record.HasSpan = true
 			}
-			
+
 			if protoRecord.Body != nil {
 				if sv, ok := protoRecord.Body.Value.(*commonV1.AnyValue_StringValue); ok {
 					record.Body = sv.StringValue
 				}
 			}
-			
+
 			if len(protoRecord.Attributes) > 0 {
 				if cap(record.Attributes) < len(protoRecord.Attributes) {
 					record.Attributes = make([]OptimizedAttribute, 0, len(protoRecord.Attributes))
 				}
 				record.Attributes = record.Attributes[:0]
-				
+
 				for _, kv := range protoRecord.Attributes {
 					var value string
 					if sv, ok := kv.Value.Value.(*commonV1.AnyValue_StringValue); ok {
@@ -263,10 +263,10 @@ func BenchmarkOptimized_100Records_4Attrs(b *testing.B) {
 					})
 				}
 			}
-			
+
 			records = append(records, record)
 		}
-		
+
 		// Return all records to pool
 		for _, record := range records {
 			putOptimizedRecord(record)
@@ -320,11 +320,11 @@ func BenchmarkOptimized_100Records_10Attrs(b *testing.B) {
 		records := make([]*OptimizedLogRecord, 0, 100)
 		for _, protoRecord := range protoRecords {
 			record := getOptimizedRecord()
-			
+
 			record.Timestamp = int64(protoRecord.TimeUnixNano)
 			record.ObservedTimestamp = int64(protoRecord.ObservedTimeUnixNano)
 			record.SeverityText = protoRecord.SeverityText
-			
+
 			if len(protoRecord.TraceId) == 16 {
 				copy(record.TraceID[:], protoRecord.TraceId)
 				record.HasTrace = true
@@ -333,19 +333,19 @@ func BenchmarkOptimized_100Records_10Attrs(b *testing.B) {
 				copy(record.SpanID[:], protoRecord.SpanId)
 				record.HasSpan = true
 			}
-			
+
 			if protoRecord.Body != nil {
 				if sv, ok := protoRecord.Body.Value.(*commonV1.AnyValue_StringValue); ok {
 					record.Body = sv.StringValue
 				}
 			}
-			
+
 			if len(protoRecord.Attributes) > 0 {
 				if cap(record.Attributes) < len(protoRecord.Attributes) {
 					record.Attributes = make([]OptimizedAttribute, 0, len(protoRecord.Attributes))
 				}
 				record.Attributes = record.Attributes[:0]
-				
+
 				for _, kv := range protoRecord.Attributes {
 					var value string
 					if sv, ok := kv.Value.Value.(*commonV1.AnyValue_StringValue); ok {
@@ -357,10 +357,10 @@ func BenchmarkOptimized_100Records_10Attrs(b *testing.B) {
 					})
 				}
 			}
-			
+
 			records = append(records, record)
 		}
-		
+
 		for _, record := range records {
 			putOptimizedRecord(record)
 		}
