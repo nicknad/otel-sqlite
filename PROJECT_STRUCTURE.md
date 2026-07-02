@@ -70,8 +70,10 @@ otel-sqlite/
 ├── LICENSE                   # Apache License 2.0
 ├── Makefile                  # Build targets
 ├── migrations/
-│   ├── 001_initial_schema.sql    # Initial database schema
-│   └── 002_add_search_indexes.sql # Search indexes migration
+│   ├── 001_initial_schema.sql        # Initial database schema
+│   ├── 002_add_search_indexes.sql    # Search indexes migration
+│   ├── 003_logs_view_and_fts.sql     # Logs view and contentless FTS5
+│   └── 004_remove_unused_indexes.sql # Remove unused indexes (~33% write improvement)
 ├── prometheus.yml            # Prometheus configuration
 ├── PROJECT_STRUCTURE.md      # This file
 └── README.md                 # Project documentation
@@ -113,9 +115,9 @@ otel-sqlite/
   - Isolate OTLP protobuf types to this package
 
 ### `internal/ingest/`
-- **Purpose**: Bounded queue abstractions for individual log records
+- **Purpose**: Bounded queue abstractions for log batches
 - **Responsibilities**:
-  - Provide `IngressQueue` interface for individual log records
+  - Provide `IngressQueue` interface for log batches
   - Implement bounded channel-based ingress queue
   - Provide backpressure through blocking sends
 
@@ -205,6 +207,12 @@ otel-sqlite/
 - Keeps the batcher SQLite-agnostic
 - No global state
 
+### 8. Object Pooling & Zero-Allocation Hot Path
+- `LogRecord` objects are reused via `sync.Pool` (`GetRecord()`/`PutRecord()`)
+- TraceID/SpanID use fixed-size arrays (`[16]byte`/`[8]byte`) instead of slices
+- Attributes use `[]Attribute` inline struct slice instead of `map[string]AttributeValue`
+- Result: 0 allocations per record in the mapper, eliminating GC pressure
+
 ## Build Targets
 
 | Target | Description |
@@ -248,13 +256,14 @@ otel-sqlite/
 
 ## File Counts
 
-- **Go source files**: 16
+- **Go source files**: 22
 - **Protobuf files**: 4
-- **Configuration files**: 8
-- **Documentation files**: 4
-- **Migration files**: 2
-- **Script files**: 1
-- **Total files**: 35+
+- **Configuration files**: 9
+- **Documentation files**: 5
+- **Migration files**: 4
+- **Script files**: 2
+- **Benchmark / loadtest files**: 5
+- **Total files**: 50+
 
 ## Dependencies
 

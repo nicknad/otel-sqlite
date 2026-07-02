@@ -1,6 +1,6 @@
 // Package batcher provides batch building functionality for the ingestion pipeline.
-// It collects individual log records and groups them into batches, then wraps
-// each completed batch in a Command and submits it to a command queue.
+// It collects log batches from the ingress queue, merges them into larger batches,
+// then wraps each completed batch in a Command and submits it to a command queue.
 //
 // The batcher has no dependency on SQLite—it accepts a generic command factory
 // that transforms a LogBatch into a storage.Command. The factory is injected
