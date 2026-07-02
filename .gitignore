@@ -51,6 +51,9 @@ Thumbs.db
 # --- Build artifacts ---
 build/
 dist/
+collector
+loadtest
+--help
 
 # --- Docker ---
 .docker/

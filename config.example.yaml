@@ -11,6 +11,10 @@
 listen_address: ":4317"          # gRPC server listen address
 metrics_address: ":9090"        # Prometheus metrics server address
 
+# gRPC configuration
+grpc_max_recv_msg_size: 16777216  # Max gRPC receive message size in bytes (default: 16 MB)
+grpc_max_send_msg_size: 16777216  # Max gRPC send message size in bytes (default: 16 MB)
+
 # SQLite configuration
 sqlite_path: "otel-logs.db"      # Path to SQLite database file
 
@@ -80,7 +84,9 @@ vacuum:
 # Core:
 #   LISTEN_ADDRESS          - gRPC server address (default: :4317)
 #   SQLITE_PATH             - Database file path (default: otel-logs.db)
-#   METRICS_ADDRESS         - Prometheus metrics address (default: :9090)
+#   METRICS_ADDRESS          - Prometheus metrics address (default: :9090)
+#   GRPC_MAX_RECV_MSG_SIZE   - Max gRPC receive message size in bytes (default: 16777216)
+#   GRPC_MAX_SEND_MSG_SIZE   - Max gRPC send message size in bytes (default: 16777216)
 #
 # Pipeline:
 #   INGRESS_QUEUE_CAPACITY          - Ingress queue capacity (default: 10000)

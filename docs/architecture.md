@@ -323,6 +323,8 @@ All command metrics are labelled by command type for granular observability.
 
 - `LISTEN_ADDRESS`: gRPC server listen address
 - `SQLITE_PATH`: Path to SQLite database file
+- `GRPC_MAX_RECV_MSG_SIZE`: Max gRPC receive message size in bytes (default: 16777216 / 16 MB)
+- `GRPC_MAX_SEND_MSG_SIZE`: Max gRPC send message size in bytes (default: 16777216 / 16 MB)
 - `INGRESS_QUEUE_CAPACITY`: Maximum ingress queue size
 - `BATCH_QUEUE_CAPACITY`: Maximum command queue size
 - `BATCHER_BATCH_SIZE`: Number of records per batcher batch
