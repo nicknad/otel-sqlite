@@ -135,7 +135,7 @@ func (m *Mapper) mapLogRecord(protoRecord *logsV1.LogRecord, resource *model.Res
 		return nil
 	}
 
-	record := model.NewLogRecord()
+	record := model.GetRecord()
 
 	// Map timestamps (protobuf fixed64 → int64; overflow impossible for reasonable dates)
 	record.Timestamp = int64(protoRecord.TimeUnixNano)                 //nolint:gosec
@@ -145,14 +145,14 @@ func (m *Mapper) mapLogRecord(protoRecord *logsV1.LogRecord, resource *model.Res
 	record.SeverityNumber = model.Severity(protoRecord.SeverityNumber)
 	record.SeverityText = protoRecord.SeverityText
 
-	// Map trace context
+	// Map trace context using fixed-size arrays (no heap allocation)
 	if len(protoRecord.TraceId) == 16 {
-		record.TraceID = make([]byte, 16)
-		copy(record.TraceID, protoRecord.TraceId)
+		copy(record.TraceID[:], protoRecord.TraceId)
+		record.HasTrace = true
 	}
 	if len(protoRecord.SpanId) == 8 {
-		record.SpanID = make([]byte, 8)
-		copy(record.SpanID, protoRecord.SpanId)
+		copy(record.SpanID[:], protoRecord.SpanId)
+		record.HasSpan = true
 	}
 
 	// Map body
@@ -160,11 +160,17 @@ func (m *Mapper) mapLogRecord(protoRecord *logsV1.LogRecord, resource *model.Res
 		record.Body = mapAnyValueToString(protoRecord.Body)
 	}
 
-	// Map attributes
+	// Map attributes into pre-allocated slice
 	if len(protoRecord.Attributes) > 0 {
-		record.Attributes = make(map[string]model.AttributeValue, len(protoRecord.Attributes))
+		// Ensure capacity (slice is already allocated from pool)
+		if cap(record.Attributes) < len(protoRecord.Attributes) {
+			record.Attributes = make([]model.Attribute, 0, len(protoRecord.Attributes))
+		}
+		record.Attributes = record.Attributes[:0]
+
+		// Convert attributes to inline Attribute structs
 		for _, kv := range protoRecord.Attributes {
-			record.Attributes[kv.Key] = mapAnyValue(kv.Value)
+			record.Attributes = append(record.Attributes, mapAttribute(kv))
 		}
 	}
 
@@ -211,6 +217,37 @@ func mapAnyValue(anyValue *commonV1.AnyValue) model.AttributeValue {
 		// Unknown type (including MapValue and StringValueStrindex), return null value
 		return model.AttributeValue{}
 	}
+}
+
+// mapAttribute converts OTLP KeyValue to internal Attribute (inline, zero-allocation).
+func mapAttribute(kv *commonV1.KeyValue) model.Attribute {
+	if kv == nil || kv.Value == nil {
+		return model.Attribute{Key: "", Kind: model.ValueNull}
+	}
+
+	attr := model.Attribute{Key: kv.Key}
+
+	switch val := kv.Value.Value.(type) {
+	case *commonV1.AnyValue_StringValue:
+		attr.Kind = model.ValueString
+		attr.Str = val.StringValue
+	case *commonV1.AnyValue_IntValue:
+		attr.Kind = model.ValueInt
+		attr.Num = val.IntValue
+	case *commonV1.AnyValue_DoubleValue:
+		attr.Kind = model.ValueDouble
+		attr.Dbl = val.DoubleValue
+	case *commonV1.AnyValue_BoolValue:
+		attr.Kind = model.ValueBool
+		attr.Flag = val.BoolValue
+	case *commonV1.AnyValue_BytesValue:
+		attr.Kind = model.ValueBytes
+		attr.Raw = val.BytesValue
+	default:
+		attr.Kind = model.ValueNull
+	}
+
+	return attr
 }
 
 // mapAnyValueToString converts OTLP AnyValue to a string representation.

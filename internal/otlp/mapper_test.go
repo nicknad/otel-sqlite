@@ -79,11 +79,11 @@ func TestMapLogsData(t *testing.T) {
 	if rec.Body != "hello" {
 		t.Errorf("Body = %q, want %q", rec.Body, "hello")
 	}
-	if len(rec.TraceID) != 16 {
-		t.Errorf("TraceID length = %d, want 16", len(rec.TraceID))
+	if !rec.HasTrace {
+		t.Error("HasTrace = false, want true")
 	}
-	if len(rec.SpanID) != 8 {
-		t.Errorf("SpanID length = %d, want 8", len(rec.SpanID))
+	if !rec.HasSpan {
+		t.Error("HasSpan = false, want true")
 	}
 	if rec.ScopeName != "my-scope" {
 		t.Errorf("ScopeName = %q, want %q", rec.ScopeName, "my-scope")
@@ -281,8 +281,18 @@ func TestMapLogRecordWithAttributes(t *testing.T) {
 	if len(r.Attributes) != 2 {
 		t.Errorf("expected 2 attributes, got %d", len(r.Attributes))
 	}
-	if r.Attributes["error.kind"].String() != "panic" {
-		t.Errorf("error.kind = %q, want %q", r.Attributes["error.kind"].String(), "panic")
+	// Find error.kind attribute
+	var errorKindAttr *model.Attribute
+	for i := range r.Attributes {
+		if r.Attributes[i].Key == "error.kind" {
+			errorKindAttr = &r.Attributes[i]
+			break
+		}
+	}
+	if errorKindAttr == nil {
+		t.Error("error.kind attribute not found")
+	} else if errorKindAttr.Str != "panic" {
+		t.Errorf("error.kind = %q, want %q", errorKindAttr.Str, "panic")
 	}
 	if r.Flags != 0xFF {
 		t.Errorf("Flags = %d, want %d", r.Flags, 0xFF)

@@ -13,6 +13,8 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage/sqlite"
+
+	_ "modernc.org/sqlite"
 )
 
 // drainCommandQueue reads all commands until the queue is closed and returns
@@ -79,21 +81,28 @@ func newTestQueues(capacity int) *testQueues {
 	}
 }
 
+// makeBatch creates a LogBatch with n records, each with Body "msg".
+func makeBatch(n int) *model.LogBatch {
+	batch := model.NewLogBatch(n)
+	for i := 0; i < n; i++ {
+		batch.AddRecord(&model.LogRecord{Body: "msg"})
+	}
+	return batch
+}
+
 func TestBatcherBatchBySize(t *testing.T) {
 	q := newTestQueues(100)
 	b := NewBatcher(q.ingress, q.cmdQueue, &BatcherConfig{BatchSize: 5})
-	// Use mock command factory to avoid sqlite dependency
 	b.WithCommandFactory(newMockCmd)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	b.Start(ctx)
 
-	// Send 12 records (2 full batches + 2 leftover)
-	for i := 0; i < 12; i++ {
-		if err := q.ingress.Send(ctx, &model.LogRecord{Body: "msg"}); err != nil {
-			t.Fatalf("Send ingress error: %v", err)
-		}
-	}
+	// Send 12 records as batches (2 batches of 5 + 1 batch of 2)
+	// This should produce 2 full batches + 1 partial on stop.
+	q.ingress.Send(ctx, makeBatch(5))
+	q.ingress.Send(ctx, makeBatch(5))
+	q.ingress.Send(ctx, makeBatch(2))
 
 	// Allow batcher to process
 	time.Sleep(50 * time.Millisecond)
@@ -119,12 +128,8 @@ func TestBatcherEmptyOnStop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	b.Start(ctx)
 
-	// Send a few records
-	for i := 0; i < 3; i++ {
-		if err := q.ingress.Send(ctx, &model.LogRecord{Body: "msg"}); err != nil {
-			t.Fatalf("Send error: %v", err)
-		}
-	}
+	// Send a batch with 3 records
+	q.ingress.Send(ctx, makeBatch(3))
 
 	time.Sleep(20 * time.Millisecond)
 	cancel()
@@ -145,10 +150,10 @@ func TestBatcherBackpressure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	b.Start(ctx)
 
-	// Fill the command queue by sending records
-	// cmd queue cap is 2, so we can send up to 2 commands before blocking
+	// Send batches — each batch of 1 record will produce 1 command.
+	// cmd queue cap is 2, so we can buffer up to 2 commands before blocking.
 	for i := 0; i < 5; i++ {
-		if err := q.ingress.Send(ctx, &model.LogRecord{Body: "msg"}); err != nil {
+		if err := q.ingress.Send(ctx, makeBatch(1)); err != nil {
 			t.Fatalf("Send error at %d: %v", i, err)
 		}
 	}
@@ -169,7 +174,7 @@ func TestBatcherBackpressure(t *testing.T) {
 	}()
 
 	// Now we can send more
-	err := q.ingress.Send(ctx, &model.LogRecord{Body: "more"})
+	err := q.ingress.Send(ctx, makeBatch(1))
 	if err != nil {
 		t.Errorf("expected send to succeed after draining, got %v", err)
 	}
@@ -187,12 +192,8 @@ func TestBatcherFlush(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	b.Start(ctx)
 
-	// Send a few records
-	for i := 0; i < 7; i++ {
-		if err := q.ingress.Send(ctx, &model.LogRecord{Body: "msg"}); err != nil {
-			t.Fatalf("Send error: %v", err)
-		}
-	}
+	// Send a batch with 7 records
+	q.ingress.Send(ctx, makeBatch(7))
 
 	time.Sleep(20 * time.Millisecond)
 
@@ -221,7 +222,6 @@ func TestBatcherFlush(t *testing.T) {
 }
 
 func TestBatcherCommandFactory(t *testing.T) {
-	// Verify that WithCommandFactory chains correctly
 	q := newTestQueues(10)
 	b := NewBatcher(q.ingress, q.cmdQueue, &BatcherConfig{BatchSize: 10})
 	b.WithCommandFactory(newMockCmd)
@@ -240,7 +240,7 @@ func TestBatcherCommandFactory(t *testing.T) {
 }
 
 // TestBatcherResourceInsertion is an integration test verifying that a
-// Resource carried on a LogRecord survives the record-based ingress queue
+// Resource carried on a LogBatch survives the batch-based ingress queue
 // and is inserted into SQLite with correct service_name and host_name.
 func TestBatcherResourceInsertion(t *testing.T) {
 	dbpath := fmt.Sprintf("test_batcher_resource_%d.db", time.Now().UnixNano())
@@ -282,45 +282,46 @@ func TestBatcherResourceInsertion(t *testing.T) {
 		batcher.Wait()
 	}()
 
-	// Build a resource and attach it to each record.
+	// Build a resource and a batch with records.
 	resource := model.NewResource(map[string]model.AttributeValue{
 		"service.name": model.NewStringValue("integration-svc"),
 		"host.name":    model.NewStringValue("integration-host"),
 	})
 	resource.ID = "res-integration-test"
 
-	// Send records through the ingress queue (record-based, not batch-based).
+	batch := model.NewLogBatch(3)
+	batch.Resource = resource
 	for i := 0; i < 3; i++ {
-		record := &model.LogRecord{
-			Timestamp:         int64(i * 1000),
-			ObservedTimestamp: int64(i*1000 + 500),
-			SeverityNumber:    model.SeverityInfo,
-			SeverityText:      "INFO",
-			Body:              fmt.Sprintf("msg-%d", i),
-			ResourceID:        resource.ID,
-			Resource:          resource, // carried per record
-		}
-		if err := ingressQueue.Send(ctx, record); err != nil {
-			t.Fatalf("ingress send: %v", err)
-		}
+		record := model.GetRecord()
+		record.Timestamp = int64(i * 1000)
+		record.ObservedTimestamp = int64(i*1000 + 500)
+		record.SeverityNumber = model.SeverityInfo
+		record.SeverityText = "INFO"
+		record.Body = fmt.Sprintf("msg-%d", i)
+		record.ResourceID = resource.ID
+		record.Resource = resource
+		batch.AddRecord(record)
+	}
+
+	// Send the batch through the ingress queue.
+	if err := ingressQueue.Send(ctx, batch); err != nil {
+		t.Fatalf("ingress send: %v", err)
 	}
 
 	// Wait for pipeline to flush.
 	time.Sleep(300 * time.Millisecond)
 
-	// Query SQLite directly via the writer's DB to verify resource insertion.
-	var (
-		serviceName string
-		hostName    string
-	)
-	// We need access to the writer's db connection. The writer exposes it
-	// indirectly — we can open a second read-only connection to the same file.
+	// Query SQLite to verify resource insertion.
 	db, err := sql.Open("sqlite", dbpath)
 	if err != nil {
 		t.Fatalf("open read db: %v", err)
 	}
 	defer db.Close()
 
+	var (
+		serviceName string
+		hostName    string
+	)
 	err = db.QueryRow(
 		"SELECT service_name, host_name FROM log_resource WHERE id = ?",
 		resource.ID,

@@ -55,12 +55,10 @@ func (s *Server) Export(ctx context.Context, request *logsV1.ExportLogsServiceRe
 		s.metrics.IncrementLogsReceived(totalLogs)
 	}
 
-	// Send each record to the ingress queue
+	// Send each batch to the ingress queue (1 channel op per batch, not per record)
 	for _, batch := range batches {
-		for _, record := range batch.Records {
-			if err := s.ingressQueue.Send(ctx, record); err != nil {
-				return nil, status.Errorf(codes.ResourceExhausted, "ingress queue full: %v", err)
-			}
+		if err := s.ingressQueue.Send(ctx, batch); err != nil {
+			return nil, status.Errorf(codes.ResourceExhausted, "ingress queue full: %v", err)
 		}
 	}
 

@@ -181,13 +181,16 @@ func (c *WriteBatchCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 		eventID, err := insertEventRecord(ctx, insertEvent, record)
 		if err != nil {
 			log.Printf("error inserting event: %v", err)
+			model.PutRecord(record) // Return to pool even on error
 			continue
 		}
 
 		if err := insertAttributesRecord(ctx, insertAttr, eventID, record.Attributes); err != nil {
 			log.Printf("error inserting attributes for event %d: %v", eventID, err)
-			continue
 		}
+
+		// Return record to pool after writing (ownership: writer releases records)
+		model.PutRecord(record)
 	}
 
 	return nil
@@ -205,6 +208,19 @@ func ensureResourceID(resource *model.Resource) string {
 
 // insertEventRecord inserts a single log event row and returns its auto-generated ID.
 func insertEventRecord(ctx context.Context, stmt *sql.Stmt, record *model.LogRecord) (int64, error) {
+	// Convert fixed-size arrays to slices for SQLite (only if present)
+	var traceID, spanID interface{}
+	if record.HasTrace {
+		traceID = record.TraceID[:]
+	} else {
+		traceID = nil
+	}
+	if record.HasSpan {
+		spanID = record.SpanID[:]
+	} else {
+		spanID = nil
+	}
+
 	result, err := stmt.ExecContext(ctx,
 		nil, // ID will be auto-generated
 		record.ResourceID,
@@ -212,8 +228,8 @@ func insertEventRecord(ctx context.Context, stmt *sql.Stmt, record *model.LogRec
 		record.ObservedTimestamp,
 		int64(record.SeverityNumber),
 		record.SeverityText,
-		record.TraceID,
-		record.SpanID,
+		traceID,
+		spanID,
 		record.Body,
 		record.EventName,
 		uint64(record.Flags),
@@ -229,62 +245,46 @@ func insertEventRecord(ctx context.Context, stmt *sql.Stmt, record *model.LogRec
 
 // insertAttributesRecord inserts attribute rows for a log event.
 func insertAttributesRecord(ctx context.Context, stmt *sql.Stmt, eventID int64,
-	attributes map[string]model.AttributeValue) error {
+	attributes []model.Attribute) error {
 	if len(attributes) == 0 {
 		return nil
 	}
 
-	for key, value := range attributes {
+	for _, attr := range attributes {
+		var (
+			strVal  *string
+			intVal  *int64
+			dblVal  *float64
+			boolVal *bool
+			bytesVal []byte
+		)
+
+		switch attr.Kind {
+		case model.ValueString:
+			strVal = &attr.Str
+		case model.ValueInt:
+			intVal = &attr.Num
+		case model.ValueDouble:
+			dblVal = &attr.Dbl
+		case model.ValueBool:
+			boolVal = &attr.Flag
+		case model.ValueBytes:
+			bytesVal = attr.Raw
+		}
+
 		_, err := stmt.ExecContext(ctx,
 			eventID,
-			key,
-			value.Type(),
-			getStringValue(&value),
-			getIntValue(&value),
-			getDoubleValue(&value),
-			getBoolValue(&value),
-			getBytesValue(&value),
+			attr.Key,
+			attr.Kind.String(),
+			strVal,
+			intVal,
+			dblVal,
+			boolVal,
+			bytesVal,
 		)
 		if err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-// --- Attribute value extraction helpers -----------------------------------
-
-func getStringValue(v *model.AttributeValue) *string {
-	if v.StringValue != nil {
-		return v.StringValue
-	}
-	return nil
-}
-
-func getIntValue(v *model.AttributeValue) *int64 {
-	if v.IntValue != nil {
-		return v.IntValue
-	}
-	return nil
-}
-
-func getDoubleValue(v *model.AttributeValue) *float64 {
-	if v.DoubleValue != nil {
-		return v.DoubleValue
-	}
-	return nil
-}
-
-func getBoolValue(v *model.AttributeValue) *bool {
-	if v.BoolValue != nil {
-		return v.BoolValue
-	}
-	return nil
-}
-
-func getBytesValue(v *model.AttributeValue) []byte {
-	if v.BytesValue != nil {
-		return v.BytesValue
 	}
 	return nil
 }

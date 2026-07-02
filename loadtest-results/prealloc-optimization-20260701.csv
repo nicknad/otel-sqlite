@@ -1,0 +1,2 @@
+timestamp,clients,records_per_req,attrs_per_record,resources,duration_sec,requests_sent,records_sent,errors,error_pct,ingest_rate_rec_s,ingest_rate_req_s,confirmed_received,confirmed_written,write_errors,received_rate_rec_s,written_rate_rec_s,notes
+2026-07-01T22:32:30Z,8,250,4,8,30,1242,310500,20,1.61,10347.98,41.39,312500,210604,0,10414.63,7018.76,post-preallocation-optimization

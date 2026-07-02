@@ -8,16 +8,19 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
 )
 
-// IngressQueue is a bounded queue for receiving individual log records.
+// IngressQueue is a bounded queue for receiving log batches.
 // It provides backpressure by blocking when full.
+//
+// Each Send enqueues an entire LogBatch in a single channel operation,
+// eliminating per-record channel overhead in the gRPC handler.
 type IngressQueue interface {
-	// Send adds a log record to the queue.
+	// Send adds a log batch to the queue.
 	// Blocks until space is available or context is canceled.
-	Send(ctx context.Context, record *model.LogRecord) error
+	Send(ctx context.Context, batch *model.LogBatch) error
 
-	// Receive removes and returns a log record from the queue.
-	// Blocks until a record is available or context is canceled.
-	Receive(ctx context.Context) (*model.LogRecord, error)
+	// Receive removes and returns a log batch from the queue.
+	// Blocks until a batch is available or context is canceled.
+	Receive(ctx context.Context) (*model.LogBatch, error)
 
 	// Close closes the queue.
 	// After Close is called, Send will return an error.
@@ -30,39 +33,40 @@ type IngressQueue interface {
 	Cap() int
 
 	// Chan returns the underlying channel for use in select statements.
-	// This allows consumers to respond to both incoming records and other
+	// This allows consumers to respond to both incoming batches and other
 	// events (e.g., flush ticks, context cancellation) in a single select.
-	Chan() <-chan *model.LogRecord
+	Chan() <-chan *model.LogBatch
 }
 
 // NewIngressQueue creates a new bounded ingress queue with the given capacity.
+// Capacity is measured in batches, not individual records.
 func NewIngressQueue(capacity int) IngressQueue {
 	return &boundedIngressQueue{
-		ch: make(chan *model.LogRecord, capacity),
+		ch: make(chan *model.LogBatch, capacity),
 	}
 }
 
 // boundedIngressQueue is a channel-based implementation of IngressQueue.
 type boundedIngressQueue struct {
-	ch chan *model.LogRecord
+	ch chan *model.LogBatch
 }
 
-func (q *boundedIngressQueue) Send(ctx context.Context, record *model.LogRecord) error {
+func (q *boundedIngressQueue) Send(ctx context.Context, batch *model.LogBatch) error {
 	select {
-	case q.ch <- record:
+	case q.ch <- batch:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (q *boundedIngressQueue) Receive(ctx context.Context) (*model.LogRecord, error) {
+func (q *boundedIngressQueue) Receive(ctx context.Context) (*model.LogBatch, error) {
 	select {
-	case record, ok := <-q.ch:
+	case batch, ok := <-q.ch:
 		if !ok {
 			return nil, ErrQueueClosed
 		}
-		return record, nil
+		return batch, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -80,7 +84,7 @@ func (q *boundedIngressQueue) Cap() int {
 	return cap(q.ch)
 }
 
-func (q *boundedIngressQueue) Chan() <-chan *model.LogRecord {
+func (q *boundedIngressQueue) Chan() <-chan *model.LogBatch {
 	return q.ch
 }
 

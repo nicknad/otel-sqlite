@@ -99,8 +99,8 @@ func TestWriterWriteAndQuery(t *testing.T) {
 		Body:              "hello world",
 		ScopeName:         "test-scope",
 		ScopeVersion:      "1.0.0",
-		Attributes: map[string]model.AttributeValue{
-			"key1": model.NewStringValue("val1"),
+		Attributes: []model.Attribute{
+			{Key: "key1", Str: "val1", Kind: model.ValueString},
 		},
 	}
 
@@ -240,8 +240,8 @@ func TestWriteBatchCommandExecute(t *testing.T) {
 		SeverityNumber:    model.SeverityWarn,
 		SeverityText:      "WARN",
 		Body:              "command test",
-		Attributes: map[string]model.AttributeValue{
-			"k": model.NewStringValue("v"),
+		Attributes: []model.Attribute{
+			{Key: "k", Str: "v", Kind: model.ValueString},
 		},
 	}
 
