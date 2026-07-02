@@ -30,8 +30,8 @@ func TestAllSQLStatements(t *testing.T) {
 	defer db.Close()
 
 	// Schema must be initialized before any sub-tests that depend on it.
-	if err := initializeSchema(db); err != nil {
-		t.Fatalf("initializeSchema: %v", err)
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("RunMigrations: %v", err)
 	}
 
 	ctx := context.Background()
@@ -50,17 +50,13 @@ func TestAllSQLStatements(t *testing.T) {
 			}
 		}
 
+		// After all migrations (including 004 which drops unused indexes),
+		// the surviving indexes are:
 		indexes := []string{
 			"idx_log_event_timestamp",
-			"idx_log_event_severity",
-			"idx_log_event_trace_id",
 			"idx_log_event_resource_id",
 			"idx_log_attr_event_id",
-			"idx_log_attr_key",
-			"idx_log_event_severity_text",
-			"idx_log_event_body",
-			"idx_log_event_resource_timestamp",
-			"idx_log_event_trace_timestamp",
+			"idx_log_resource_service_name",
 		}
 		for _, idx := range indexes {
 			var name string
@@ -404,8 +400,8 @@ func TestSQLStatementsIsolated(t *testing.T) {
 			}
 			defer db.Close()
 
-			if err := initializeSchema(db); err != nil {
-				t.Fatalf("initializeSchema: %v", err)
+			if err := RunMigrations(db); err != nil {
+				t.Fatalf("RunMigrations: %v", err)
 			}
 
 			tt.fn(t, db)

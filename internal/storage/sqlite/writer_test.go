@@ -23,8 +23,8 @@ func TestOpenDatabase(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := initializeSchema(db); err != nil {
-		t.Fatalf("initializeSchema() error: %v", err)
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("RunMigrations() error: %v", err)
 	}
 
 	var mode string
@@ -43,7 +43,7 @@ func TestOpenDatabase(t *testing.T) {
 	}
 }
 
-func TestInitializeSchema(t *testing.T) {
+func TestRunMigrations(t *testing.T) {
 	dbpath := fmt.Sprintf("test_schema_%d.db", time.Now().UnixNano())
 	defer os.Remove(dbpath)
 	defer os.Remove(dbpath + "-wal")
@@ -55,12 +55,12 @@ func TestInitializeSchema(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := initializeSchema(db); err != nil {
-		t.Fatalf("initializeSchema() error: %v", err)
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("RunMigrations() error: %v", err)
 	}
 	// Idempotency check
-	if err := initializeSchema(db); err != nil {
-		t.Fatalf("initializeSchema() second call error: %v", err)
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("RunMigrations() second call error: %v", err)
 	}
 }
 
@@ -226,8 +226,8 @@ func TestWriteBatchCommandExecute(t *testing.T) {
 		t.Fatalf("openDatabase() error: %v", err)
 	}
 	defer db.Close()
-	if err := initializeSchema(db); err != nil {
-		t.Fatalf("initializeSchema() error: %v", err)
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("RunMigrations() error: %v", err)
 	}
 
 	resource := model.NewResource(map[string]model.AttributeValue{
