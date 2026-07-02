@@ -14,6 +14,16 @@ metrics_address: ":9090"        # Prometheus metrics server address
 # gRPC configuration
 grpc_max_recv_msg_size: 16777216  # Max gRPC receive message size in bytes (default: 16 MB)
 grpc_max_send_msg_size: 16777216  # Max gRPC send message size in bytes (default: 16 MB)
+grpc_max_concurrent_streams: 100  # Max concurrent gRPC streams per connection (default: 100)
+
+# Backpressure: early rejection threshold (0 = disabled).
+# When ingress queue exceeds this fraction of capacity, new requests are
+# rejected with Unavailable instead of blocking. Recommended: 0.8
+# ingress_queue_backpressure_threshold: 0.8
+
+# Go runtime memory limit in MB (0 = disabled).
+# Recommended: set to ~80% of your container memory limit (e.g. 1600 for 2 GB).
+# go_memory_limit_mb: 1600
 
 # SQLite configuration
 sqlite_path: "otel-logs.db"      # Path to SQLite database file
@@ -84,9 +94,12 @@ vacuum:
 # Core:
 #   LISTEN_ADDRESS          - gRPC server address (default: :4317)
 #   SQLITE_PATH             - Database file path (default: otel-logs.db)
-#   METRICS_ADDRESS          - Prometheus metrics address (default: :9090)
-#   GRPC_MAX_RECV_MSG_SIZE   - Max gRPC receive message size in bytes (default: 16777216)
-#   GRPC_MAX_SEND_MSG_SIZE   - Max gRPC send message size in bytes (default: 16777216)
+#   METRICS_ADDRESS                   - Prometheus metrics address (default: :9090)
+#   GRPC_MAX_RECV_MSG_SIZE            - Max gRPC receive message size in bytes (default: 16777216)
+#   GRPC_MAX_SEND_MSG_SIZE            - Max gRPC send message size in bytes (default: 16777216)
+#   GRPC_MAX_CONCURRENT_STREAMS       - Max concurrent gRPC streams (default: 100)
+#   INGRESS_QUEUE_BACKPRESSURE_THRESHOLD - Queue fullness fraction (0–1) for early rejection (default: 0 = disabled)
+#   GO_MEMORY_LIMIT_MB                - Go runtime memory limit in MB (default: 0 = disabled)
 #
 # Pipeline:
 #   INGRESS_QUEUE_CAPACITY          - Ingress queue capacity (default: 10000)

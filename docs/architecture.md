@@ -325,6 +325,9 @@ All command metrics are labelled by command type for granular observability.
 - `SQLITE_PATH`: Path to SQLite database file
 - `GRPC_MAX_RECV_MSG_SIZE`: Max gRPC receive message size in bytes (default: 16777216 / 16 MB)
 - `GRPC_MAX_SEND_MSG_SIZE`: Max gRPC send message size in bytes (default: 16777216 / 16 MB)
+- `GRPC_MAX_CONCURRENT_STREAMS`: Max concurrent gRPC streams (default: 100)
+- `INGRESS_QUEUE_BACKPRESSURE_THRESHOLD`: Queue fullness fraction (0.0–1.0) for early rejection (default: 0 = disabled; recommends 0.8)
+- `GO_MEMORY_LIMIT_MB`: Go runtime memory limit in MB (default: 0 = disabled; recommends ~80% of container limit)
 - `INGRESS_QUEUE_CAPACITY`: Maximum ingress queue size
 - `BATCH_QUEUE_CAPACITY`: Maximum command queue size
 - `BATCHER_BATCH_SIZE`: Number of records per batcher batch
@@ -412,12 +415,95 @@ This is the key benefit of the command architecture: the execution path is gener
 
 ### Monitoring
 
-- Prometheus metrics endpoint
-- Health check endpoints
+- Prometheus metrics endpoint (`/metrics`)
+- Health check endpoint (`/health`)
+- Backpressure rejection counter (`otel_collector_ingest_backpressure_rejections_total`)
+- Queue depth gauges for capacity planning
 - Structured logging
+
+### Resource Limits & Guardrails
+
+#### Container Limits (Docker)
+
+| Profile | Memory | CPU | Throughput |
+|---|---|---|---|
+| Conservative | 512 MB | 1 | ~100K rec/s |
+| Typical | 2 GB | 2 | ~200K rec/s |
+| High-throughput | 4 GB | 4 | ~400K rec/s |
+
+Memory scales with ingress queue capacity. Reducing `INGRESS_QUEUE_CAPACITY` from
+the default 10,000 to 2,000–3,000 cuts worst-case memory from ~1.2 GB to ~250 MB
+with minimal throughput impact.
+
+#### GOMAXPROCS
+
+When using CPU limits in Docker, set `GOMAXPROCS` to match the container's CPU quota
+so Go's scheduler doesn't spawn more OS threads than available CPUs:
+
+```
+docker run -e GOMAXPROCS=2 ...
+```
+
+Alternatively, use the [automaxprocs](https://github.com/uber-go/automaxprocs)
+library to auto-detect the cgroup CPU limit.
+
+#### Ingress Queue Sizing
+
+The ingress queue is the largest memory consumer. Each slot holds a pointer to a
+LogBatch (~250 records × ~500 B/record ≈ 125 KB). Default capacity (10,000)
+buffers up to ~1.25 GB of records in-flight.
+
+- **Lower** (1,000–3,000): reduces memory, clients see backpressure sooner
+- **Higher** (10,000–20,000): absorbs larger load spikes at higher memory cost
+
+#### Backpressure Threshold
+
+`INGRESS_QUEUE_BACKPRESSURE_THRESHOLD` enables early rejection (codes.Unavailable)
+when the queue exceeds a fullness fraction, before the gRPC handler blocks.
+Recommended: `0.8` (80% full).
+
+**Trade-off:** Some requests are rejected instead of queued. Clients must retry.
+Effective throughput drops 5–15% under saturation, but memory stays bounded.
+
+#### Go Memory Limit
+
+`GO_MEMORY_LIMIT_MB` sets `debug.SetMemoryLimit()` at startup, telling the Go GC
+to be more aggressive when heap nears the limit. Set to ~80% of your container
+memory limit (e.g., 1600 for a 2 GB container).
+
+**Trade-off:** Slightly higher CPU usage from GC (5–10% overhead), but prevents
+OOM kills.
+
+#### SQLite WAL Checkpoint
+
+WAL growth is bounded by `wal_autocheckpoint=1000` pages (~4 MB). Enable the
+maintenance checkpoint task with a tighter interval for high-throughput workloads:
+
+```yaml
+checkpoint:
+  enabled: true
+  interval: "1h"       # default 24h — tighten to 1h for production
+  mode: "PASSIVE"
+```
+
+#### gRPC Keepalive & Stream Limits
+
+The collector enforces by default:
+- Max 100 concurrent streams per connection (configurable)
+- Keepalive with 30-second minimum ping interval
+- Connections idle > 5 minutes are closed
+- Connections older than 30 minutes are cycled
+
+These prevent resource exhaustion from misconfigured or malicious clients.
 
 ### Scaling
 
 - Single instance for most use cases
 - Multiple instances with shared storage for high volume
 - Read replicas for query-heavy workloads
+
+#### Partitioning by Resource
+
+For horizontal scaling across multiple collector instances, route log traffic by
+resource identifier (e.g., service.name). Each collector owns a disjoint subset
+of resources, avoiding write contention on the SQLite database.

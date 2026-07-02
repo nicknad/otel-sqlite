@@ -29,6 +29,9 @@ type Metrics struct {
 	CommandsExecutedTotal    prometheus.Counter
 	CommandFailuresTotal     prometheus.Counter
 
+	// Backpressure metrics
+	BackpressureRejections prometheus.Counter
+
 	// Resource metrics
 	ActiveResources prometheus.Gauge
 	TotalResources  prometheus.Counter
@@ -135,6 +138,14 @@ func NewMetrics() *Metrics {
 			Help:      "Total number of command execution failures",
 		}),
 
+		// Backpressure metrics
+		BackpressureRejections: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: "otel_collector",
+			Subsystem: "ingest",
+			Name:      "backpressure_rejections_total",
+			Help:      "Total number of requests rejected due to backpressure",
+		}),
+
 		// Resource metrics
 		ActiveResources: promauto.NewGauge(prometheus.GaugeOpts{
 			Namespace: "otel_collector",
@@ -150,6 +161,14 @@ func NewMetrics() *Metrics {
 			Help:      "Total number of unique resources",
 		}),
 	}
+}
+
+// IncrementBackpressureRejections increments the backpressure rejection counter.
+func (m *Metrics) IncrementBackpressureRejections() {
+	if m == nil {
+		return
+	}
+	m.BackpressureRejections.Inc()
 }
 
 // All methods are nil-receiver safe so callers (e.g. the storage writer and

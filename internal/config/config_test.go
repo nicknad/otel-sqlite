@@ -38,6 +38,21 @@ func TestDefaultConfig(t *testing.T) {
 	if c.ShutdownTimeout != 30*time.Second {
 		t.Errorf("expected 30s, got %s", c.ShutdownTimeout)
 	}
+	if c.GrpcMaxRecvMsgSize != 16*1024*1024 {
+		t.Errorf("expected %d, got %d", 16*1024*1024, c.GrpcMaxRecvMsgSize)
+	}
+	if c.GrpcMaxSendMsgSize != 16*1024*1024 {
+		t.Errorf("expected %d, got %d", 16*1024*1024, c.GrpcMaxSendMsgSize)
+	}
+	if c.GrpcMaxConcurrentStreams != 100 {
+		t.Errorf("expected 100, got %d", c.GrpcMaxConcurrentStreams)
+	}
+	if c.IngressQueueBackpressureThreshold != 0 {
+		t.Errorf("expected 0, got %f", c.IngressQueueBackpressureThreshold)
+	}
+	if c.GoMemoryLimitMB != 0 {
+		t.Errorf("expected 0, got %d", c.GoMemoryLimitMB)
+	}
 }
 
 func TestLoadFromEnv(t *testing.T) {
@@ -200,57 +215,77 @@ func TestValidate(t *testing.T) {
 		},
 		{
 			name:    "empty listen address",
-			cfg:     &Config{ListenAddress: "", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, ShutdownTimeout: time.Second}, //nolint:lll
+			cfg:     &Config{ListenAddress: "", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, GrpcMaxConcurrentStreams: 1, ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
 			name:    "empty sqlite path",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, ShutdownTimeout: time.Second}, //nolint:lll
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, GrpcMaxConcurrentStreams: 1, ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
 			name:    "zero ingress capacity",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 0, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, ShutdownTimeout: time.Second}, //nolint:lll
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 0, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, GrpcMaxConcurrentStreams: 1, ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
 			name:    "negative batcher batch size",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: -1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, ShutdownTimeout: time.Second}, //nolint:lll
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: -1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, GrpcMaxConcurrentStreams: 1, ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
 			name:    "negative writer batch size",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: -1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, ShutdownTimeout: time.Second}, //nolint:lll
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: -1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, GrpcMaxConcurrentStreams: 1, ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
 			name:    "zero batcher flush interval",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: 0, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, ShutdownTimeout: time.Second}, //nolint:lll
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: 0, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, GrpcMaxConcurrentStreams: 1, ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
 			name:    "zero writer flush interval",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: 0, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, ShutdownTimeout: time.Second}, //nolint:lll
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: 0, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, GrpcMaxConcurrentStreams: 1, ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
 			name:    "empty metrics address",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: "", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, ShutdownTimeout: time.Second}, //nolint:lll
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: "", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, GrpcMaxConcurrentStreams: 1, ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
 			name:    "zero shutdown timeout",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, ShutdownTimeout: 0}, //nolint:lll
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, GrpcMaxConcurrentStreams: 1, ShutdownTimeout: 0}, //nolint:lll
 			wantErr: true,
 		},
 		{
 			name:    "zero grpc max recv msg size",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 0, GrpcMaxSendMsgSize: 1, ShutdownTimeout: time.Second}, //nolint:lll
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 0, GrpcMaxSendMsgSize: 1, GrpcMaxConcurrentStreams: 1, ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 		{
 			name:    "zero grpc max send msg size",
-			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 0, ShutdownTimeout: time.Second}, //nolint:lll
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 0, GrpcMaxConcurrentStreams: 1, ShutdownTimeout: time.Second}, //nolint:lll
+			wantErr: true,
+		},
+		{
+			name:    "zero grpc max concurrent streams",
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, GrpcMaxConcurrentStreams: 0, ShutdownTimeout: time.Second}, //nolint:lll
+			wantErr: true,
+		},
+		{
+			name:    "backpressure threshold above 1",
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, GrpcMaxConcurrentStreams: 1, IngressQueueBackpressureThreshold: 1.5, ShutdownTimeout: time.Second}, //nolint:lll
+			wantErr: true,
+		},
+		{
+			name:    "backpressure threshold below 0",
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, GrpcMaxConcurrentStreams: 1, IngressQueueBackpressureThreshold: -0.1, ShutdownTimeout: time.Second}, //nolint:lll
+			wantErr: true,
+		},
+		{
+			name:    "negative go memory limit",
+			cfg:     &Config{ListenAddress: ":4317", SQLitePath: "db", IngressQueueCapacity: 1, BatchQueueCapacity: 1, BatcherBatchSize: 1, BatcherFlushInterval: time.Second, WriterBatchSize: 1, WriterFlushInterval: time.Second, MetricsAddress: ":9090", GrpcMaxRecvMsgSize: 1, GrpcMaxSendMsgSize: 1, GrpcMaxConcurrentStreams: 1, GoMemoryLimitMB: -1, ShutdownTimeout: time.Second}, //nolint:lll
 			wantErr: true,
 		},
 	}

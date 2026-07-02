@@ -25,15 +25,30 @@ type Server struct {
 	mapper       *Mapper
 	ingressQueue ingest.IngressQueue
 	metrics      *metrics.Metrics
+
+	// backpressureThreshold is the fraction of ingress queue capacity at which
+	// the server rejects new requests (0 = disabled).
+	backpressureThreshold float64
 }
 
 // NewServer creates a new OTLP gRPC server.
+//
+// If backpressureThreshold > 0, the server rejects Export requests when the
+// ingress queue depth exceeds that fraction of its capacity, returning
+// Unavailable to clients instead of blocking. This trades throughput for
+// memory safety by preventing queue buildup under sustained load.
 func NewServer(ingressQueue ingest.IngressQueue, m *metrics.Metrics) *Server {
 	return &Server{
 		mapper:       NewMapper(),
 		ingressQueue: ingressQueue,
 		metrics:      m,
 	}
+}
+
+// SetBackpressureThreshold enables early rejection when the ingress queue
+// fullness exceeds the given fraction (0.0–1.0) of capacity.
+func (s *Server) SetBackpressureThreshold(threshold float64) {
+	s.backpressureThreshold = threshold
 }
 
 // Export implements the Export method of the LogsServiceServer interface.
@@ -44,6 +59,19 @@ func (s *Server) Export(ctx context.Context, request *logsV1.ExportLogsServiceRe
 
 	// Map OTLP request to internal batches
 	batches := s.mapper.MapLogsData(request.ResourceLogs)
+
+	// Optional early backpressure: reject before mapping if the ingress queue
+	// is already too full, protecting memory even under extreme client concurrency.
+	if s.backpressureThreshold > 0 {
+		cap := s.ingressQueue.Cap()
+		if cap > 0 {
+			fullness := float64(s.ingressQueue.Len()) / float64(cap)
+			if fullness >= s.backpressureThreshold {
+				s.metrics.IncrementBackpressureRejections()
+				return nil, status.Errorf(codes.Unavailable, "server overloaded: ingress queue %d%% full", int(fullness*100))
+			}
+		}
+	}
 
 	// Count received logs
 	totalLogs := 0
@@ -58,7 +86,7 @@ func (s *Server) Export(ctx context.Context, request *logsV1.ExportLogsServiceRe
 	// Send each batch to the ingress queue (1 channel op per batch, not per record)
 	for _, batch := range batches {
 		if err := s.ingressQueue.Send(ctx, batch); err != nil {
-			return nil, status.Errorf(codes.ResourceExhausted, "ingress queue full: %v", err)
+			return nil, status.Errorf(codes.Unavailable, "ingress queue full: %v", err)
 		}
 	}
 
