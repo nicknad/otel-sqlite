@@ -1,3 +1,0 @@
-timestamp,clients,records_per_req,attrs_per_record,resources,duration_sec,requests_sent,records_sent,errors,error_pct,ingest_rate_rec_s,ingest_rate_req_s,confirmed_received,confirmed_written,write_errors,received_rate_rec_s,written_rate_rec_s,notes
-2026-07-01T18:51:10Z,8,250,4,8,30,1440,360000,11,0.76,12000.55,48.00,362000,265404,0,12067.22,8847.21,post-resource-tracking-fix 8-resources
-2026-07-01T18:52:03Z,8,250,4,100,30,1482,370500,8,0.54,12350.78,49.40,372500,275603,0,12417.45,9187.35,post-resource-tracking-fix 100-resources

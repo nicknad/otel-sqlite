@@ -54,6 +54,12 @@ dist/
 collector
 loadtest
 --help
+otel-sqlite
+.golangci.bck.yml
+loadtest-results/
+check_indexes.go
+config-test.yaml
+test-writer-optimization.sh
 
 # --- Docker ---
 .docker/
