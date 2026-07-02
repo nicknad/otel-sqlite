@@ -9,12 +9,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 
 	"codeberg.org/nicknad/otel-sqlite/internal/batcher"
 	"codeberg.org/nicknad/otel-sqlite/internal/config"
@@ -59,6 +61,15 @@ func main() {
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("Invalid configuration: %v", err)
+	}
+
+	// Apply Go runtime memory limit if configured.
+	// This tells the GC to be more aggressive before the process RSS exceeds
+	// the limit, reducing OOM risk in containerized deployments.
+	if cfg.GoMemoryLimitMB > 0 {
+		limit := int64(cfg.GoMemoryLimitMB) * 1024 * 1024
+		debug.SetMemoryLimit(limit)
+		log.Printf("Go memory limit set to %d MB", cfg.GoMemoryLimitMB)
 	}
 
 	// Create application
@@ -136,8 +147,13 @@ func (a *Application) initialize() error {
 	a.ingressQueue = ingest.NewIngressQueue(a.config.IngressQueueCapacity)
 	a.cmdQueue = storage.NewCommandQueue(a.config.BatchQueueCapacity)
 
-	// Create OTLP server
+	// Create OTLP server with optional backpressure threshold
 	a.otlpServer = otlp.NewServer(a.ingressQueue, a.metrics)
+	if a.config.IngressQueueBackpressureThreshold > 0 {
+		a.otlpServer.SetBackpressureThreshold(a.config.IngressQueueBackpressureThreshold)
+		log.Printf("Backpressure threshold set to %.0f%% of ingress queue capacity",
+			a.config.IngressQueueBackpressureThreshold*100)
+	}
 
 	// Create batcher (wraps batches as WriteBatchCommand, sends to cmd queue)
 	a.batcher = batcher.NewBatcher(a.ingressQueue, a.cmdQueue, &batcher.BatcherConfig{
@@ -232,12 +248,28 @@ func (a *Application) startGRPCServer() error {
 		return fmt.Errorf("failed to listen on %s: %w", a.config.ListenAddress, err)
 	}
 
-	// gRPC server options with decompression support.
+	// gRPC server options with decompression support, connection limits,
+	// and keepalive enforcement.
+	//
 	// gRPC supports gzip decompression by default; we explicitly set
-	// message size limits to accommodate compressed payloads.
+	// message size limits to accommodate compressed payloads, cap
+	// concurrent streams to prevent resource exhaustion, and enforce
+	// keepalive to clean up stale connections.
 	grpcOpts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(a.config.GrpcMaxRecvMsgSize),
 		grpc.MaxSendMsgSize(a.config.GrpcMaxSendMsgSize),
+		grpc.MaxConcurrentStreams(uint32(a.config.GrpcMaxConcurrentStreams)), //nolint:gosec
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             30 * time.Second,
+			PermitWithoutStream: false,
+		}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle:     5 * time.Minute,
+			MaxConnectionAge:      30 * time.Minute,
+			MaxConnectionAgeGrace: 5 * time.Second,
+			Time:                  2 * time.Minute,
+			Timeout:              20 * time.Second,
+		}),
 	}
 
 	a.grpcServer = grpc.NewServer(grpcOpts...)

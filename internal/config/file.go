@@ -23,10 +23,13 @@ type FileConfig struct {
 	// Legacy fields (mapped to both batcher and writer if specific fields unset)
 	BatchSize     int    `yaml:"batch_size"`
 	FlushInterval string `yaml:"flush_interval"`
-	GrpcMaxRecvMsgSize int    `yaml:"grpc_max_recv_msg_size"`
-	GrpcMaxSendMsgSize int    `yaml:"grpc_max_send_msg_size"`
-	MetricsAddress       string `yaml:"metrics_address"`
-	ShutdownTimeout      string `yaml:"shutdown_timeout"`
+	GrpcMaxRecvMsgSize        int     `yaml:"grpc_max_recv_msg_size"`
+	GrpcMaxSendMsgSize        int     `yaml:"grpc_max_send_msg_size"`
+	GrpcMaxConcurrentStreams  int     `yaml:"grpc_max_concurrent_streams"`
+	IngressQueueBackpressureThreshold float64 `yaml:"ingress_queue_backpressure_threshold"`
+	GoMemoryLimitMB           int     `yaml:"go_memory_limit_mb"`
+	MetricsAddress            string  `yaml:"metrics_address"`
+	ShutdownTimeout           string  `yaml:"shutdown_timeout"`
 }
 
 // LoadFile loads configuration from a YAML file.
@@ -55,6 +58,15 @@ func (c *Config) LoadFile(path string) error {
 	}
 	if fc.GrpcMaxSendMsgSize != 0 {
 		c.GrpcMaxSendMsgSize = fc.GrpcMaxSendMsgSize
+	}
+	if fc.GrpcMaxConcurrentStreams != 0 {
+		c.GrpcMaxConcurrentStreams = fc.GrpcMaxConcurrentStreams
+	}
+	if fc.IngressQueueBackpressureThreshold > 0 {
+		c.IngressQueueBackpressureThreshold = fc.IngressQueueBackpressureThreshold
+	}
+	if fc.GoMemoryLimitMB != 0 {
+		c.GoMemoryLimitMB = fc.GoMemoryLimitMB
 	}
 	if fc.MetricsAddress != "" {
 		c.MetricsAddress = fc.MetricsAddress
