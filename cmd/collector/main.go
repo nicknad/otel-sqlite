@@ -321,6 +321,11 @@ func (a *Application) startMaintenance() {
 		maintCfg.OptimizeInterval,
 	))
 
+	a.maintenanceWorker.Register(tasks.NewFtsRebuildTask(
+		maintCfg.FTSEnabled,
+		maintCfg.FTSRebuildInterval,
+	))
+
 	a.maintenanceWorker.Start(context.Background())
 	log.Printf("maintenance worker: started with %d registered tasks", a.maintenanceWorker.TaskCount())
 }

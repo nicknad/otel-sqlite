@@ -88,6 +88,14 @@ vacuum:
   enabled: false
   interval: "7d"
 
+# FTS rebuild: drops and recreates the logs_fts contentless FTS5 index
+# and populates it from the logs view. Runs serialized with ingestion
+# on the single writer, guaranteeing consistency. Full rebuild also
+# serves as GC for entries orphaned by retention.
+fts:
+  enabled: true
+  rebuild_interval: "1h"
+
 # ---------------------------------------------------------------------------
 # Environment variable reference (all config fields)
 # ---------------------------------------------------------------------------
@@ -129,3 +137,5 @@ vacuum:
 #   OPTIMIZE_INTERVAL           (default: 24h)
 #   VACUUM_ENABLED              (default: false)
 #   VACUUM_INTERVAL             (default: 168h i.e. 7d)
+#   FTS_ENABLED                 (default: true)
+#   FTS_REBUILD_INTERVAL        (default: 1h)

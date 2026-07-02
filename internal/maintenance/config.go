@@ -33,6 +33,10 @@ type Config struct {
 	// Vacuum config.
 	VacuumEnabled  bool          `yaml:"-"`
 	VacuumInterval time.Duration `yaml:"interval"`
+
+	// FTS rebuild config.
+	FTSEnabled        bool          `yaml:"-"`
+	FTSRebuildInterval time.Duration `yaml:"rebuild_interval"`
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -51,6 +55,8 @@ func DefaultConfig() *Config {
 		OptimizeInterval:         24 * time.Hour,
 		VacuumEnabled:            false,
 		VacuumInterval:           7 * 24 * time.Hour,
+		FTSEnabled:               true,
+		FTSRebuildInterval:       1 * time.Hour,
 	}
 }
 
@@ -71,6 +77,8 @@ func (c *Config) LoadFromEnv() (int, error) {
 		"OPTIMIZE_INTERVAL":           func(v string) error { return parseDuration(&c.OptimizeInterval, v) },
 		"VACUUM_ENABLED":              func(v string) error { return parseBool(&c.VacuumEnabled, v) },
 		"VACUUM_INTERVAL":             func(v string) error { return parseDuration(&c.VacuumInterval, v) },
+		"FTS_ENABLED":                 func(v string) error { return parseBool(&c.FTSEnabled, v) },
+		"FTS_REBUILD_INTERVAL":        func(v string) error { return parseDuration(&c.FTSRebuildInterval, v) },
 	}
 
 	count := 0
@@ -124,6 +132,10 @@ func (c *Config) Validate() error {
 
 	if c.VacuumEnabled && c.VacuumInterval <= 0 {
 		return fmt.Errorf("vacuum.interval must be positive, got %s", c.VacuumInterval)
+	}
+
+	if c.FTSEnabled && c.FTSRebuildInterval <= 0 {
+		return fmt.Errorf("fts.rebuild_interval must be positive, got %s", c.FTSRebuildInterval)
 	}
 
 	return nil

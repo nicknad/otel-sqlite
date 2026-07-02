@@ -34,6 +34,10 @@ type fileMaintenanceConfig struct {
 		Enabled  *bool  `yaml:"enabled"`
 		Interval string `yaml:"interval"`
 	} `yaml:"vacuum"`
+	Fts struct {
+		Enabled         *bool  `yaml:"enabled"`
+		RebuildInterval string `yaml:"rebuild_interval"`
+	} `yaml:"fts"`
 }
 
 // LoadFile loads maintenance configuration from a YAML file.
@@ -121,6 +125,18 @@ func (c *Config) LoadFile(path string) error {
 			return fmt.Errorf("vacuum.interval: %w", err)
 		}
 		c.VacuumInterval = d
+	}
+
+	// FTS section.
+	if fc.Fts.Enabled != nil {
+		c.FTSEnabled = *fc.Fts.Enabled
+	}
+	if fc.Fts.RebuildInterval != "" {
+		d, err := parseDurationExt(fc.Fts.RebuildInterval)
+		if err != nil {
+			return fmt.Errorf("fts.rebuild_interval: %w", err)
+		}
+		c.FTSRebuildInterval = d
 	}
 
 	return nil
