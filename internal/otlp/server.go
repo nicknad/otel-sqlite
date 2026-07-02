@@ -71,13 +71,14 @@ func RegisterServer(grpcServer *grpc.Server, server *Server) {
 }
 
 // StartGRPCServer starts a gRPC server with the OTLP service.
-func StartGRPCServer(address string, server *Server) (*grpc.Server, error) {
+// Optional gRPC server options (e.g. grpc.MaxRecvMsgSize) can be passed.
+func StartGRPCServer(address string, server *Server, opts ...grpc.ServerOption) (*grpc.Server, error) {
 	lis, err := net.Listen("tcp", address)
 	if err != nil {
 		return nil, err
 	}
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(opts...)
 	RegisterServer(grpcServer, server)
 
 	go func() {

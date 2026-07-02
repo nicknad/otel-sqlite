@@ -37,6 +37,10 @@ type Config struct {
 	// Observability
 	MetricsAddress string `mapstructure:"metrics_address"`
 
+	// gRPC configuration
+	GrpcMaxRecvMsgSize int `mapstructure:"grpc_max_recv_msg_size"`
+	GrpcMaxSendMsgSize int `mapstructure:"grpc_max_send_msg_size"`
+
 	// Timeouts
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
 
@@ -57,6 +61,8 @@ func DefaultConfig() *Config {
 		WriterFlushInterval:         5 * time.Second,
 		WriterMaxTransactionRecords: 5000,
 		MetricsAddress:              ":9090",
+		GrpcMaxRecvMsgSize:          16 * 1024 * 1024, // 16 MB
+		GrpcMaxSendMsgSize:          16 * 1024 * 1024, // 16 MB
 		ShutdownTimeout:      30 * time.Second,
 	}
 }
@@ -79,6 +85,8 @@ var envVars = []envVar{
 	{Key: "WriterBatchSize", Env: "WRITER_BATCH_SIZE", Description: "Number of commands per transaction (writer)"},
 	{Key: "WriterFlushInterval", Env: "WRITER_FLUSH_INTERVAL", Description: "Maximum time between transaction flushes"},
 	{Key: "WriterMaxTransactionRecords", Env: "WRITER_MAX_TRANSACTION_RECORDS", Description: "Maximum records per SQLite transaction"},
+	{Key: "GrpcMaxRecvMsgSize", Env: "GRPC_MAX_RECV_MSG_SIZE", Description: "Max gRPC receive message size in bytes"},
+	{Key: "GrpcMaxSendMsgSize", Env: "GRPC_MAX_SEND_MSG_SIZE", Description: "Max gRPC send message size in bytes"},
 	{Key: "MetricsAddress", Env: "METRICS_ADDRESS", Description: "Prometheus metrics server address"},
 	{Key: "ShutdownTimeout", Env: "SHUTDOWN_TIMEOUT", Description: "Graceful shutdown timeout"},
 }
@@ -149,6 +157,18 @@ func (c *Config) setField(key, value string) error {
 			return fmt.Errorf("invalid int %q: %w", value, err)
 		}
 		c.WriterMaxTransactionRecords = n
+	case "GrpcMaxRecvMsgSize":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid int %q: %w", value, err)
+		}
+		c.GrpcMaxRecvMsgSize = n
+	case "GrpcMaxSendMsgSize":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid int %q: %w", value, err)
+		}
+		c.GrpcMaxSendMsgSize = n
 	case "MetricsAddress":
 		c.MetricsAddress = value
 	case "ShutdownTimeout":
@@ -189,6 +209,12 @@ func (c *Config) Validate() error {
 	}
 	if c.MetricsAddress == "" {
 		return fmt.Errorf("metrics_address must not be empty")
+	}
+	if c.GrpcMaxRecvMsgSize <= 0 {
+		return fmt.Errorf("grpc_max_recv_msg_size must be positive, got %d", c.GrpcMaxRecvMsgSize)
+	}
+	if c.GrpcMaxSendMsgSize <= 0 {
+		return fmt.Errorf("grpc_max_send_msg_size must be positive, got %d", c.GrpcMaxSendMsgSize)
 	}
 	if c.ShutdownTimeout <= 0 {
 		return fmt.Errorf("shutdown_timeout must be positive, got %s", c.ShutdownTimeout)

@@ -225,14 +225,22 @@ func (a *Application) startMetricsServer() error {
 	return nil
 }
 
-// startGRPCServer starts the gRPC server.
+// startGRPCServer starts the gRPC server with decompression and size limits.
 func (a *Application) startGRPCServer() error {
 	lis, err := net.Listen("tcp", a.config.ListenAddress)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", a.config.ListenAddress, err)
 	}
 
-	a.grpcServer = grpc.NewServer()
+	// gRPC server options with decompression support.
+	// gRPC supports gzip decompression by default; we explicitly set
+	// message size limits to accommodate compressed payloads.
+	grpcOpts := []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(a.config.GrpcMaxRecvMsgSize),
+		grpc.MaxSendMsgSize(a.config.GrpcMaxSendMsgSize),
+	}
+
+	a.grpcServer = grpc.NewServer(grpcOpts...)
 	otlp.RegisterServer(a.grpcServer, a.otlpServer)
 
 	go func() {

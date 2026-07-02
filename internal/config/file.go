@@ -23,6 +23,8 @@ type FileConfig struct {
 	// Legacy fields (mapped to both batcher and writer if specific fields unset)
 	BatchSize     int    `yaml:"batch_size"`
 	FlushInterval string `yaml:"flush_interval"`
+	GrpcMaxRecvMsgSize int    `yaml:"grpc_max_recv_msg_size"`
+	GrpcMaxSendMsgSize int    `yaml:"grpc_max_send_msg_size"`
 	MetricsAddress       string `yaml:"metrics_address"`
 	ShutdownTimeout      string `yaml:"shutdown_timeout"`
 }
@@ -47,6 +49,12 @@ func (c *Config) LoadFile(path string) error {
 	}
 	if fc.SQLitePath != "" {
 		c.SQLitePath = fc.SQLitePath
+	}
+	if fc.GrpcMaxRecvMsgSize != 0 {
+		c.GrpcMaxRecvMsgSize = fc.GrpcMaxRecvMsgSize
+	}
+	if fc.GrpcMaxSendMsgSize != 0 {
+		c.GrpcMaxSendMsgSize = fc.GrpcMaxSendMsgSize
 	}
 	if fc.MetricsAddress != "" {
 		c.MetricsAddress = fc.MetricsAddress
