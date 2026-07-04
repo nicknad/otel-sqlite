@@ -2,6 +2,7 @@ package maintenance
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -30,7 +31,7 @@ type Worker struct {
 
 	// control
 	ctx    context.Context
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 	wg     sync.WaitGroup
 }
 
@@ -65,7 +66,7 @@ func (w *Worker) Register(task MaintenanceTask) {
 // Start begins the maintenance worker loop in a new goroutine.
 // The worker runs until ctx is canceled.
 func (w *Worker) Start(ctx context.Context) {
-	w.ctx, w.cancel = context.WithCancel(ctx)
+	w.ctx, w.cancel = context.WithCancelCause(ctx)
 	w.wg.Add(1)
 	go w.run()
 }
@@ -73,7 +74,7 @@ func (w *Worker) Start(ctx context.Context) {
 // Stop cancels the worker and waits for it to finish.
 func (w *Worker) Stop() {
 	if w.cancel != nil {
-		w.cancel()
+		w.cancel(errors.New("maintenance worker stopped"))
 	}
 	w.wg.Wait()
 }
@@ -99,7 +100,7 @@ func (w *Worker) run() {
 	for {
 		select {
 		case <-w.ctx.Done():
-			log.Println("maintenance worker: shutting down")
+			log.Printf("maintenance worker: shutting down: %v", context.Cause(w.ctx))
 			return
 		case now := <-ticker.C:
 			w.evaluateAndRun(now)

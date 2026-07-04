@@ -339,7 +339,8 @@ func TestE2E_ForeignKeysAreEnforced(t *testing.T) {
 	}
 
 	// Try inserting an event with a non-existent resource_id — must fail.
-	_, err = db.Exec(`
+	_, err = db.Exec(
+		`
 		INSERT INTO log_event (
 			resource_id, timestamp_ns, observed_timestamp_ns,
 			severity_number, severity_text, body, event_name,
@@ -389,7 +390,8 @@ func TestE2E_RetentionDeletesAllExpiredRows(t *testing.T) {
 
 	// Insert 25 events with old timestamps (batch size is 10, so 3 batches needed).
 	for i := 0; i < 25; i++ {
-		_, err = db.Exec(`
+		_, err = db.Exec(
+			`
 			INSERT INTO log_event (
 				resource_id, timestamp_ns, observed_timestamp_ns,
 				severity_number, severity_text, body, event_name,

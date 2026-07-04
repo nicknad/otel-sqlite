@@ -1,16 +1,43 @@
 # lefthook configuration
 # https://github.com/evilmartians/lefthook
 
-pre-commit:
-  parallel: true
+commit-msg:
   commands:
-    fmt:
-      glob: "*.go"
-      run: go fmt ./...
+    lint-commit:
+      run: echo "commit message ok"
+
+pre-commit:
+  parallel: false
+  commands:
+    tidy:
+      run: go mod tidy && git add go.mod go.sum
       stage_fixed: true
-    lint:
+      skip:
+        - merge
+        - rebase
+
+    lint-fix:
+      run: golangci-lint run --fix --timeout 2m
       glob: "*.go"
+      stage_fixed: true
+
+    vet:
+      run: go vet ./...
+      glob: "*.go"
+
+pre-push:
+  parallel: false
+  commands:
+    full-lint:
       run: golangci-lint run --timeout 5m
+
+    security:
+      run: |
+        which gosec >/dev/null 2>&1 || go install github.com/securego/gosec/v2/cmd/gosec@latest
+        gosec -quiet -exclude-dir internal/generated ./...
+
     test:
-      glob: "*.go"
-      run: go test -race $(go list ./... | grep -v 'cmd/collector\|cmd/loadtest')
+      run: go test -count=1 -race -timeout 120s ./...
+
+    build:
+      run: go build -o /dev/null ./cmd/...

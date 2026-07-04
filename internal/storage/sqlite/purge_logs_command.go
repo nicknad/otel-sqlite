@@ -46,9 +46,10 @@ func NewPurgeLogsCommand(cutoffAge time.Duration, batchSize int) *PurgeLogsComma
 func (c *PurgeLogsCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 	totalDeleted := int64(0)
 
-	for i := 0; i < MaxPurgeIterations; i++ {
+	for range MaxPurgeIterations {
 		// First delete attributes for expired events.
-		_, err := tx.ExecContext(ctx,
+		_, err := tx.ExecContext(
+			ctx,
 			`DELETE FROM log_attr WHERE event_id IN (
 				SELECT id FROM log_event WHERE timestamp_ns < ?
 				ORDER BY id LIMIT ?
@@ -60,7 +61,8 @@ func (c *PurgeLogsCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 		}
 
 		// Then delete the events themselves.
-		result, err := tx.ExecContext(ctx,
+		result, err := tx.ExecContext(
+			ctx,
 			`DELETE FROM log_event WHERE rowid IN (
 				SELECT rowid FROM log_event WHERE timestamp_ns < ?
 				ORDER BY rowid LIMIT ?
@@ -81,7 +83,8 @@ func (c *PurgeLogsCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 	}
 
 	// Clean up orphaned resources (resources with no remaining events).
-	_, err := tx.ExecContext(ctx,
+	_, err := tx.ExecContext(
+		ctx,
 		`DELETE FROM log_resource WHERE id NOT IN (
 			SELECT DISTINCT resource_id FROM log_event
 		)`,

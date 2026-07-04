@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"codeberg.org/nicknad/otel-sqlite/internal/storage"
@@ -25,7 +26,7 @@ func NewVacuumCommand() *VacuumCommand {
 // writer detects NonTransactionalCommand and calls ExecuteNonTransactional
 // instead.
 func (c *VacuumCommand) Execute(ctx context.Context, tx *sql.Tx) error {
-	return fmt.Errorf("VACUUM cannot run inside a transaction; writer must use ExecuteNonTransactional")
+	return errors.New("VACUUM cannot run inside a transaction; writer must use ExecuteNonTransactional")
 }
 
 // ExecuteNonTransactional runs VACUUM directly on the database connection.
@@ -38,5 +39,7 @@ func (c *VacuumCommand) ExecuteNonTransactional(ctx context.Context, db *sql.DB)
 }
 
 // Compile-time interface checks.
-var _ storage.Command = (*VacuumCommand)(nil)
-var _ storage.NonTransactionalCommand = (*VacuumCommand)(nil)
+var (
+	_ storage.Command                 = (*VacuumCommand)(nil)
+	_ storage.NonTransactionalCommand = (*VacuumCommand)(nil)
+)

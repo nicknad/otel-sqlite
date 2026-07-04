@@ -2,7 +2,6 @@
 package model
 
 import (
-	"sync"
 	"time"
 )
 
@@ -103,6 +102,11 @@ type Attribute struct {
 
 // LogRecord represents a single log record in the internal domain model.
 // This is the canonical representation used throughout the ingestion pipeline.
+//
+// Allocation strategy: use GetRecord() to obtain a LogRecord. Under the
+// default build the returned value comes from a sync.Pool; under
+// -tags nopool it is a plain heap allocation. In both cases call
+// PutRecord() to release it (no-op under nopool).
 type LogRecord struct {
 	// Timestamp is the time when the event occurred.
 	// Value is UNIX Epoch time in nanoseconds since 00:00:00 UTC on 1 January 1970.
@@ -163,90 +167,6 @@ type LogRecord struct {
 
 	// ScopeVersion is the instrumentation scope version.
 	ScopeVersion string
-}
-
-// recordPool is a pool of LogRecord objects.
-// Records are allocated once and reused across the pipeline.
-var recordPool = sync.Pool{
-	New: func() interface{} {
-		return &LogRecord{
-			Attributes: make([]Attribute, 0, 4),
-		}
-	},
-}
-
-// GetRecord retrieves a LogRecord from the pool.
-// The caller must ensure PutRecord is called when the record is no longer needed.
-// Ownership: The caller owns the record until it's passed to the next pipeline stage.
-func GetRecord() *LogRecord {
-	r := recordPool.Get().(*LogRecord)
-	// Reset fields to zero values (slice capacity is preserved)
-	r.Timestamp = 0
-	r.ObservedTimestamp = 0
-	r.SeverityNumber = SeverityUnspecified
-	r.SeverityText = ""
-	r.TraceID = [16]byte{}
-	r.SpanID = [8]byte{}
-	r.HasTrace = false
-	r.HasSpan = false
-	r.Body = ""
-	r.Attributes = r.Attributes[:0] // Keep capacity, reset length
-	r.DroppedAttributesCount = 0
-	r.Flags = 0
-	r.EventName = ""
-	r.ResourceID = ""
-	r.Resource = nil
-	r.ScopeName = ""
-	r.ScopeVersion = ""
-	return r
-}
-
-// PutRecord returns a LogRecord to the pool.
-// IMPORTANT: The record must not be used after calling PutRecord.
-// Ownership: Only the SQLite writer should call PutRecord after writing the record.
-// Safety: All fields are zeroed to prevent stale data access.
-func PutRecord(r *LogRecord) {
-	if r == nil {
-		return
-	}
-	// Zero all fields to prevent stale data access if record is accidentally used after put
-	r.Timestamp = 0
-	r.ObservedTimestamp = 0
-	r.SeverityNumber = SeverityUnspecified
-	r.SeverityText = ""
-	r.TraceID = [16]byte{}
-	r.SpanID = [8]byte{}
-	r.HasTrace = false
-	r.HasSpan = false
-	r.Body = ""
-	r.DroppedAttributesCount = 0
-	r.Flags = 0
-	r.EventName = ""
-	r.ResourceID = ""
-	r.Resource = nil
-	r.ScopeName = ""
-	r.ScopeVersion = ""
-	// Clear attribute values but keep slice capacity
-	for i := range r.Attributes {
-		r.Attributes[i].Key = ""
-		r.Attributes[i].Str = ""
-		r.Attributes[i].Num = 0
-		r.Attributes[i].Dbl = 0
-		r.Attributes[i].Flag = false
-		r.Attributes[i].Raw = nil
-		r.Attributes[i].Kind = ValueNull
-	}
-	r.Attributes = r.Attributes[:0]
-	recordPool.Put(r)
-}
-
-// NewLogRecord creates a new LogRecord with pre-allocated attribute slice.
-//
-// Deprecated: Use GetRecord() for better performance via object pooling.
-func NewLogRecord() *LogRecord {
-	return &LogRecord{
-		Attributes: make([]Attribute, 0, 4),
-	}
 }
 
 // TimestampTime returns the timestamp as a time.Time.

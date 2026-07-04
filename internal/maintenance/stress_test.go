@@ -124,11 +124,13 @@ func (c *fakeClock) Now() time.Time {
 	defer c.mu.Unlock()
 	return c.now
 }
+
 func (c *fakeClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.now = c.now.Add(d)
 }
+
 func (c *fakeClock) Set(t time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -696,6 +698,7 @@ func (t *IntegrityCheckTask) Due(now time.Time) bool {
 	}
 	return now.Sub(t.lastCheck) >= t.interval
 }
+
 func (t *IntegrityCheckTask) Run(ctx context.Context, submitter CommandSubmitter) error {
 	atomic.AddInt32(&t.runCount, 1)
 	t.lastCheck = time.Now()
