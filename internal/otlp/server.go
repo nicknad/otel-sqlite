@@ -68,7 +68,8 @@ func (s *Server) Export(ctx context.Context, request *logsV1.ExportLogsServiceRe
 			fullness := float64(s.ingressQueue.Len()) / float64(queueCap)
 			if fullness >= s.backpressureThreshold {
 				s.metrics.IncrementBackpressureRejections()
-				return nil, status.Errorf(codes.Unavailable, "server overloaded: ingress queue %d%% full", int(fullness*100))
+				return nil, status.Errorf(codes.Unavailable,
+					"server overloaded: ingress queue %d%% full", int(fullness*100))
 			}
 		}
 	}

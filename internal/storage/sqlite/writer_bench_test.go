@@ -81,7 +81,8 @@ func BenchmarkWriterInsert(b *testing.B) {
 			}
 
 			for j := 0; j < 100; j++ {
-				_, err := stmt.ExecContext(ctx,
+				_, err := stmt.ExecContext(
+					ctx,
 					"res-1",
 					time.Now().UnixNano(),
 					1,
@@ -121,7 +122,8 @@ func BenchmarkWriterInsert(b *testing.B) {
 					query += ","
 				}
 				query += "(?, ?, ?, ?, ?, ?, ?, ?)"
-				args = append(args,
+				args = append(
+					args,
 					"res-1",
 					time.Now().UnixNano(),
 					1,
@@ -163,7 +165,8 @@ func BenchmarkWriterInsert(b *testing.B) {
 
 			txStmt := tx.Stmt(stmt)
 			for j := 0; j < 100; j++ {
-				_, err := txStmt.ExecContext(ctx,
+				_, err := txStmt.ExecContext(
+					ctx,
 					"res-1",
 					time.Now().UnixNano(),
 					1,
@@ -249,7 +252,8 @@ func BenchmarkWriterWithFewerIndexes(b *testing.B) {
 
 			txStmt := tx.Stmt(stmt)
 			for j := 0; j < 100; j++ {
-				_, err := txStmt.ExecContext(ctx,
+				_, err := txStmt.ExecContext(
+					ctx,
 					"res-1",
 					time.Now().UnixNano(),
 					1,

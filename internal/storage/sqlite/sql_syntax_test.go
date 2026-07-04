@@ -210,7 +210,8 @@ func TestAllSQLStatements(t *testing.T) {
 			t.Fatalf("begin tx: %v", err)
 		}
 
-		_, err = tx.ExecContext(ctx,
+		_, err = tx.ExecContext(
+			ctx,
 			"INSERT OR IGNORE INTO log_resource(id, service_name) VALUES(?, ?)",
 			"res-delete", "delete-svc",
 		)
@@ -219,7 +220,8 @@ func TestAllSQLStatements(t *testing.T) {
 			t.Fatalf("insert resource: %v", err)
 		}
 
-		_, err = tx.ExecContext(ctx,
+		_, err = tx.ExecContext(
+			ctx,
 			`INSERT INTO log_event(id, resource_id, timestamp_ns, observed_timestamp_ns,
 			 severity_number, severity_text, flags, dropped_attributes_count)
 			 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -231,7 +233,8 @@ func TestAllSQLStatements(t *testing.T) {
 			t.Fatalf("insert old event: %v", err)
 		}
 
-		_, err = tx.ExecContext(ctx,
+		_, err = tx.ExecContext(
+			ctx,
 			`INSERT INTO log_attr(event_id, key, value_type, string_value)
 			 VALUES(?, ?, ?, ?)`,
 			100, "old.key", "string", "old.value",
@@ -252,7 +255,8 @@ func TestAllSQLStatements(t *testing.T) {
 		}
 
 		// Delete expired attributes with subquery LIMIT.
-		result1, err := tx2.ExecContext(ctx,
+		result1, err := tx2.ExecContext(
+			ctx,
 			`DELETE FROM log_attr WHERE event_id IN (
 				SELECT id FROM log_event WHERE timestamp_ns < ?
 				ORDER BY id LIMIT ?
@@ -269,7 +273,8 @@ func TestAllSQLStatements(t *testing.T) {
 		}
 
 		// Delete expired events with rowid subquery LIMIT (the fix).
-		result2, err := tx2.ExecContext(ctx,
+		result2, err := tx2.ExecContext(
+			ctx,
 			`DELETE FROM log_event WHERE rowid IN (
 				SELECT rowid FROM log_event WHERE timestamp_ns < ?
 				ORDER BY rowid LIMIT ?
@@ -286,7 +291,8 @@ func TestAllSQLStatements(t *testing.T) {
 		}
 
 		// Clean orphaned resources.
-		result3, err := tx2.ExecContext(ctx,
+		result3, err := tx2.ExecContext(
+			ctx,
 			`DELETE FROM log_resource WHERE id NOT IN (
 				SELECT DISTINCT resource_id FROM log_event
 			)`,
@@ -311,7 +317,8 @@ func TestAllSQLStatements(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin tx: %v", err)
 		}
-		_, err = tx.ExecContext(ctx,
+		_, err = tx.ExecContext(
+			ctx,
 			"INSERT OR IGNORE INTO log_resource(id, service_name) VALUES(?, ?)",
 			"res-purge", "purge-svc",
 		)
@@ -319,7 +326,8 @@ func TestAllSQLStatements(t *testing.T) {
 			tx.Rollback()
 			t.Fatalf("insert resource: %v", err)
 		}
-		_, err = tx.ExecContext(ctx,
+		_, err = tx.ExecContext(
+			ctx,
 			`INSERT INTO log_event(id, resource_id, timestamp_ns, observed_timestamp_ns,
 			 severity_number, severity_text, flags, dropped_attributes_count)
 			 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -329,7 +337,8 @@ func TestAllSQLStatements(t *testing.T) {
 			tx.Rollback()
 			t.Fatalf("insert old event: %v", err)
 		}
-		_, err = tx.ExecContext(ctx,
+		_, err = tx.ExecContext(
+			ctx,
 			`INSERT INTO log_attr(event_id, key, value_type, string_value)
 			 VALUES(?, ?, ?, ?)`,
 			200, "another.key", "string", "another.value",
@@ -419,7 +428,8 @@ func testInsertResourceSQL(t *testing.T, db *sql.DB) {
 	}
 	defer tx.Rollback()
 
-	_, err = tx.ExecContext(ctx, sqlInsertResource,
+	_, err = tx.ExecContext(
+		ctx, sqlInsertResource,
 		"res-1", "svc-a", "host-a", "http://schema", `{"key":"val"}`,
 	)
 	if err != nil {
@@ -438,14 +448,16 @@ func testInsertEventSQL(t *testing.T, db *sql.DB) {
 	}
 	defer tx.Rollback()
 
-	_, err = tx.ExecContext(ctx, sqlInsertResource,
+	_, err = tx.ExecContext(
+		ctx, sqlInsertResource,
 		"res-1", "svc-a", nil, nil, `{}`,
 	)
 	if err != nil {
 		t.Fatalf("insert resource: %v", err)
 	}
 
-	_, err = tx.ExecContext(ctx, sqlInsertEvent,
+	_, err = tx.ExecContext(
+		ctx, sqlInsertEvent,
 		nil, // id auto-generated
 		"res-1",
 		int64(1000),
@@ -477,13 +489,15 @@ func testInsertAttrSQL(t *testing.T, db *sql.DB) {
 	}
 	defer tx.Rollback()
 
-	_, err = tx.ExecContext(ctx, sqlInsertResource,
+	_, err = tx.ExecContext(
+		ctx, sqlInsertResource,
 		"res-1", "svc-a", nil, nil, `{}`,
 	)
 	if err != nil {
 		t.Fatalf("insert resource: %v", err)
 	}
-	_, err = tx.ExecContext(ctx, sqlInsertEvent,
+	_, err = tx.ExecContext(
+		ctx, sqlInsertEvent,
 		nil, "res-1",
 		int64(1000), int64(2000), int64(1), "INFO",
 		[]byte{0x01}, []byte{0x02}, "body", "event", uint64(0), uint64(0),
@@ -493,7 +507,8 @@ func testInsertAttrSQL(t *testing.T, db *sql.DB) {
 		t.Fatalf("insert event: %v", err)
 	}
 
-	_, err = tx.ExecContext(ctx, sqlInsertAttr,
+	_, err = tx.ExecContext(
+		ctx, sqlInsertAttr,
 		int64(1), "attr.key", "string", "attr.value", nil, nil, nil, nil,
 	)
 	if err != nil {
@@ -516,14 +531,16 @@ func testDeleteAttrWithSubqueryLimit(t *testing.T, db *sql.DB) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = tx.ExecContext(ctx, sqlInsertEvent,
+	_, err = tx.ExecContext(
+		ctx, sqlInsertEvent,
 		nil, "res-1", int64(10), int64(10), int64(1), "INFO",
 		nil, nil, "body", "event", uint64(0), uint64(0), "", "",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = tx.ExecContext(ctx, sqlInsertAttr,
+	_, err = tx.ExecContext(
+		ctx, sqlInsertAttr,
 		int64(1), "k", "string", "v", nil, nil, nil, nil,
 	)
 	if err != nil {
@@ -540,7 +557,8 @@ func testDeleteAttrWithSubqueryLimit(t *testing.T, db *sql.DB) {
 	defer tx2.Rollback()
 
 	// The purge attribute query exercising subquery LIMIT inside IN.
-	_, err = tx2.ExecContext(ctx,
+	_, err = tx2.ExecContext(
+		ctx,
 		`DELETE FROM log_attr WHERE event_id IN (
 			SELECT id FROM log_event WHERE timestamp_ns < ?
 			ORDER BY id LIMIT ?
@@ -564,7 +582,8 @@ func testDeleteEventWithRowidSubquery(t *testing.T, db *sql.DB) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = tx.ExecContext(ctx, sqlInsertEvent,
+	_, err = tx.ExecContext(
+		ctx, sqlInsertEvent,
 		nil, "res-1", int64(10), int64(10), int64(1), "INFO",
 		nil, nil, "body", "event", uint64(0), uint64(0), "", "",
 	)
@@ -582,7 +601,8 @@ func testDeleteEventWithRowidSubquery(t *testing.T, db *sql.DB) {
 	defer tx2.Rollback()
 
 	// The DELETE with rowid subquery LIMIT — the fix for the reported error.
-	_, err = tx2.ExecContext(ctx,
+	_, err = tx2.ExecContext(
+		ctx,
 		`DELETE FROM log_event WHERE rowid IN (
 			SELECT rowid FROM log_event WHERE timestamp_ns < ?
 			ORDER BY rowid LIMIT ?
@@ -616,7 +636,8 @@ func testDeleteOrphanResources(t *testing.T, db *sql.DB) {
 	}
 	defer tx2.Rollback()
 
-	_, err = tx2.ExecContext(ctx,
+	_, err = tx2.ExecContext(
+		ctx,
 		`DELETE FROM log_resource WHERE id NOT IN (
 			SELECT DISTINCT resource_id FROM log_event
 		)`,

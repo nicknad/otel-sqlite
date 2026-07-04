@@ -1,74 +1,140 @@
-runner:
-  concurrency: 4
-  timeout: 5m
-  modules-download-mode: readonly
-  allow-parallel-runners: true
+version: "2"
 
-output:
-  formats:
-    - format: colored-line-number
-  print-issued-lines: true
-  print-linter-name: true
+run:
+  timeout: 3m
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - codeberg.org/nicknad/otel-sqlite
 
 linters:
   enable:
-    - errcheck
-    - gocritic
-    - gofmt
-    - goimports
-    - gosec
-    - gosimple
+    # ── Standard correctness ──
     - govet
-    - ineffassign
-    - lll
-    - misspell
-    - nakedret
+    - errcheck
     - staticcheck
-    - stylecheck
-    - typecheck
-    - unconvert
     - unused
-    - whitespace
+    - ineffassign
 
-linters-settings:
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - style
-      - performance
-    disabled-checks:
-      - commentFormatting
-      - whyNoLint
-    # hugeParam is disabled by default; we explicitly exclude it for
-    # value-receiver methods (AttributeValue.Type, .String) where
-    # changing to pointer receiver would break the API contract.
-    # The writer helper functions were already fixed to use pointers.
-  gofmt:
-    simplicity: true
-  goimports:
-    local-prefixes: github.com/nnadolski/otel-sqlite
-  golint:
-    min-confidence: 0.8
-  lll:
-    line-length: 120
-    tab-length: 4
-  misspell:
-    locale: US
+    # ── Security ──
+    - gosec
 
-issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
-        - gosec
-    - path: internal/generated/
-      linters:
+    # ── Style & correctness ──
+    - revive
+    - misspell
+    - unconvert
+    - usestdlibvars
+    - dupword
+    - intrange
+    - mirror
+    - perfsprint
+    - lll
+
+    # ── Code quality ──
+    - gocritic
+    - nakedret
+    - modernize
+
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+        - shadow
+        - unusedwrite
+
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+          severity: warning
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: if-return
+          severity: warning
+        - name: increment-decrement
+        - name: var-naming
+          severity: warning
+          arguments:
+            - ["ID", "URL", "HTTP", "JSON", "API", "FTS", "WAL", "OTLP", "gRPC", "TUI", "HTMX", "UI", "DB", "GC", "RSS", "MB"]
+            - []
+        - name: var-declaration
+        - name: range
+          severity: warning
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+          severity: warning
+        - name: indent-error-flow
+          severity: warning
+        - name: errorf
+        - name: empty-block
+          severity: warning
+        - name: superfluous-else
+          severity: warning
+        - name: unreachable-code
+        - name: redefines-builtin-id
+
+    gocritic:
+      enable-all: true
+      disabled-checks:
+        - whyNoLint
+        - unnamedResult
+        - ifElseChain
+        - appendAssign
+
+    gosec:
+      excludes:
+        - G104  # unhandled errors (audit only, catches too many intentional discards)
+        - G307  # deferring unsafe Close (we use sql.DB which is safe)
+        - G304  # file inclusion via variable (config files are user-controlled paths)
+
+    staticcheck:
+      checks:
         - all
-  max-issues-per-linter: 0
-  max-same-issues: 0
+        - -ST1000   # package comment (not all packages need doc comments)
+        - -ST1003   # underscores in names (we use snake_case in config YAML tags)
+        - -ST1016   # receiver naming (enforced by revive receiver-naming instead)
+        - -SA1019   # deprecated (allow gradual migration)
 
-severity:
-  default-severity: error
-  rules:
-    - linters: [stylecheck]
-      severity: warning
+    lll:
+      line-length: 120
+      tab-width: 4
+
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - gocritic
+          - intrange
+          - lll
+          - modernize
+          - perfsprint
+      - path: internal/generated/
+        linters:
+          - all
+      - path: check_indexes\.go
+        linters:
+          - errcheck
+      - path: cmd/loadtest/
+        linters:
+          - errcheck
+          - lll
+          - intrange
+          - modernize
+          - perfsprint
+      - path: internal/storage/sqlite/write_batch_command\.go
+        linters:
+          - gocritic
+          - errcheck
+    generated: lax

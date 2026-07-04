@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -344,8 +345,11 @@ func (a *Application) cleanup() {
 	log.Println("Shutting down...")
 
 	// Create shutdown context
-	ctx, cancel := context.WithTimeout(context.Background(), a.config.ShutdownTimeout)
+	ctx, cancel := context.WithTimeoutCause(context.Background(), a.config.ShutdownTimeout,
+		errors.New("shutdown timeout"))
 	defer cancel()
+
+	var errs []error
 
 	// Stop gRPC server
 	if a.grpcServer != nil {
@@ -354,7 +358,9 @@ func (a *Application) cleanup() {
 
 	// Stop HTTP server
 	if a.httpServer != nil {
-		_ = a.httpServer.Shutdown(ctx)
+		if err := a.httpServer.Shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("http shutdown: %w", err))
+		}
 	}
 
 	// Stop pipeline components
@@ -379,5 +385,8 @@ func (a *Application) cleanup() {
 		a.cmdQueue.Close()
 	}
 
+	if len(errs) > 0 {
+		log.Printf("shutdown errors: %v", errors.Join(errs...))
+	}
 	log.Println("Shutdown complete")
 }

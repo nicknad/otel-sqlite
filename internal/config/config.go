@@ -2,6 +2,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -97,13 +98,17 @@ var envVars = []envVar{
 	{Key: "BatcherFlushInterval", Env: "BATCHER_FLUSH_INTERVAL", Description: "Maximum time between batch flushes"},
 	{Key: "WriterBatchSize", Env: "WRITER_BATCH_SIZE", Description: "Number of commands per transaction (writer)"},
 	{Key: "WriterFlushInterval", Env: "WRITER_FLUSH_INTERVAL", Description: "Maximum time between transaction flushes"},
-	{Key: "WriterMaxTransactionRecords", Env: "WRITER_MAX_TRANSACTION_RECORDS",
-		Description: "Maximum records per SQLite transaction"},
+	{
+		Key: "WriterMaxTransactionRecords", Env: "WRITER_MAX_TRANSACTION_RECORDS",
+		Description: "Maximum records per SQLite transaction",
+	},
 	{Key: "GrpcMaxRecvMsgSize", Env: "GRPC_MAX_RECV_MSG_SIZE", Description: "Max gRPC receive message size in bytes"},
 	{Key: "GrpcMaxSendMsgSize", Env: "GRPC_MAX_SEND_MSG_SIZE", Description: "Max gRPC send message size in bytes"},
 	{Key: "GrpcMaxConcurrentStreams", Env: "GRPC_MAX_CONCURRENT_STREAMS", Description: "Max concurrent gRPC streams"},
-	{Key: "IngressQueueBackpressureThreshold", Env: "INGRESS_QUEUE_BACKPRESSURE_THRESHOLD",
-		Description: "Ingress queue fullness fraction (0.0–1.0) to trigger early rejection"},
+	{
+		Key: "IngressQueueBackpressureThreshold", Env: "INGRESS_QUEUE_BACKPRESSURE_THRESHOLD",
+		Description: "Ingress queue fullness fraction (0.0–1.0) to trigger early rejection",
+	},
 	{Key: "GoMemoryLimitMB", Env: "GO_MEMORY_LIMIT_MB", Description: "Go runtime memory limit in MB (0 = disabled)"},
 	{Key: "MetricsAddress", Env: "METRICS_ADDRESS", Description: "Prometheus metrics server address"},
 	{Key: "ShutdownTimeout", Env: "SHUTDOWN_TIMEOUT", Description: "Graceful shutdown timeout"},
@@ -220,10 +225,10 @@ func (c *Config) setField(key, value string) error {
 // Validate checks the configuration for errors.
 func (c *Config) Validate() error {
 	if c.ListenAddress == "" {
-		return fmt.Errorf("listen_address must not be empty")
+		return errors.New("listen_address must not be empty")
 	}
 	if c.SQLitePath == "" {
-		return fmt.Errorf("sqlite_path must not be empty")
+		return errors.New("sqlite_path must not be empty")
 	}
 	if c.IngressQueueCapacity <= 0 {
 		return fmt.Errorf("ingress_queue_capacity must be positive, got %d", c.IngressQueueCapacity)
@@ -244,7 +249,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("writer_flush_interval must be positive, got %s", c.WriterFlushInterval)
 	}
 	if c.MetricsAddress == "" {
-		return fmt.Errorf("metrics_address must not be empty")
+		return errors.New("metrics_address must not be empty")
 	}
 	if c.GrpcMaxRecvMsgSize <= 0 {
 		return fmt.Errorf("grpc_max_recv_msg_size must be positive, got %d", c.GrpcMaxRecvMsgSize)

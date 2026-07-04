@@ -37,7 +37,8 @@ func TestOpenDatabase(t *testing.T) {
 
 	var tableName string
 	if err := db.QueryRow(
-		"SELECT name FROM sqlite_master WHERE type='table' AND name='log_event'").
+		"SELECT name FROM sqlite_master WHERE type='table' AND name='log_event'",
+	).
 		Scan(&tableName); err != nil {
 		t.Errorf("log_event table not found: %v", err)
 	}

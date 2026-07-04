@@ -37,7 +37,8 @@ func main() {
 	addr := flag.String("addr", "localhost:4317", "collector gRPC address")
 	metrics := flag.String(
 		"metrics", "",
-		"collector Prometheus /metrics URL (e.g. http://localhost:9090/metrics); empty disables scraping")
+		"collector Prometheus /metrics URL (e.g. http://localhost:9090/metrics); empty disables scraping",
+	)
 	clients := flag.Int("clients", 16, "number of mock-API clients (concurrent gRPC senders)")
 	records := flag.Int("records", 1000, "number of log records per export request")
 	duration := flag.Duration("duration", 30*time.Second, "load test duration")

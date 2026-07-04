@@ -167,7 +167,8 @@ func (c *WriteBatchCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 		serviceName := c.batch.Resource.GetServiceName()
 		hostName := c.batch.Resource.GetHostName()
 		attrsJSON := marshalResourceAttrs(c.batch.Resource.Attributes)
-		if _, err := insertResource.ExecContext(ctx,
+		if _, err := insertResource.ExecContext(
+			ctx,
 			c.batch.Resource.ID,
 			serviceName,
 			hostName,
@@ -211,7 +212,7 @@ func ensureResourceID(resource *model.Resource) string {
 // insertEventRecord inserts a single log event row and returns its auto-generated ID.
 func insertEventRecord(ctx context.Context, stmt *sql.Stmt, record *model.LogRecord) (int64, error) {
 	// Convert fixed-size arrays to slices for SQLite (only if present)
-	var traceID, spanID interface{}
+	var traceID, spanID any
 	if record.HasTrace {
 		traceID = record.TraceID[:]
 	} else {
@@ -223,7 +224,8 @@ func insertEventRecord(ctx context.Context, stmt *sql.Stmt, record *model.LogRec
 		spanID = nil
 	}
 
-	result, err := stmt.ExecContext(ctx,
+	result, err := stmt.ExecContext(
+		ctx,
 		nil, // ID will be auto-generated
 		record.ResourceID,
 		record.Timestamp,
@@ -260,7 +262,8 @@ func marshalResourceAttrs(attrs map[string]model.AttributeValue) string {
 
 // insertAttributesRecord inserts attribute rows for a log event.
 func insertAttributesRecord(ctx context.Context, stmt *sql.Stmt, eventID int64,
-	attributes []model.Attribute) error {
+	attributes []model.Attribute,
+) error {
 	if len(attributes) == 0 {
 		return nil
 	}
@@ -287,7 +290,8 @@ func insertAttributesRecord(ctx context.Context, stmt *sql.Stmt, eventID int64,
 			bytesVal = attr.Raw
 		}
 
-		_, err := stmt.ExecContext(ctx,
+		_, err := stmt.ExecContext(
+			ctx,
 			eventID,
 			attr.Key,
 			attr.Kind.String(),

@@ -6,6 +6,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -14,7 +15,7 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/metrics"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage"
 
-	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite" // SQLite driver
 )
 
 // preparedStatementsSQL is the list of SQL statements prepared at Writer
@@ -69,7 +70,7 @@ type Writer struct {
 
 	// Control
 	ctx     context.Context
-	cancel  context.CancelFunc
+	cancel  context.CancelCauseFunc
 	wg      sync.WaitGroup
 	stopped chan struct{}
 
@@ -134,7 +135,7 @@ func (w *Writer) Submit(ctx context.Context, cmd storage.Command) error {
 
 // Start starts the writer goroutine.
 func (w *Writer) Start(ctx context.Context) {
-	w.ctx, w.cancel = context.WithCancel(ctx)
+	w.ctx, w.cancel = context.WithCancelCause(ctx)
 	w.wg.Add(1)
 
 	go w.run()
@@ -143,7 +144,7 @@ func (w *Writer) Start(ctx context.Context) {
 // Stop stops the writer and waits for it to finish.
 func (w *Writer) Stop() {
 	if w.cancel != nil {
-		w.cancel()
+		w.cancel(errors.New("writer stopped"))
 	}
 	<-w.stopped
 }
@@ -167,6 +168,7 @@ func (w *Writer) run() {
 	for {
 		select {
 		case <-w.ctx.Done():
+			log.Printf("sqlite writer: shutting down: %v", context.Cause(w.ctx))
 			w.executeCommands(cmdCollection)
 			return
 
@@ -386,8 +388,8 @@ func initPreparedStatements(db *sql.DB) (*PreparedStatements, error) {
 		stmt, err := db.Prepare(query)
 		if err != nil {
 			// Close any already-prepared statements on failure.
-			for j := 0; j < i; j++ {
-				stmts[j].Close()
+			for j := range i {
+				_ = stmts[j].Close()
 			}
 			return nil, fmt.Errorf("prepare statement: %w", err)
 		}

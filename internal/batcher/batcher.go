@@ -9,6 +9,8 @@ package batcher
 
 import (
 	"context"
+	"errors"
+	"log"
 	"sync"
 	"time"
 
@@ -41,7 +43,7 @@ type Batcher struct {
 
 	// Control
 	ctx     context.Context
-	cancel  context.CancelFunc
+	cancel  context.CancelCauseFunc
 	wg      sync.WaitGroup
 	stopped chan struct{}
 }
@@ -105,7 +107,7 @@ func (b *Batcher) Start(ctx context.Context) {
 	if b.newCmd == nil {
 		panic("batcher: Start called before WithCommandFactory")
 	}
-	b.ctx, b.cancel = context.WithCancel(ctx)
+	b.ctx, b.cancel = context.WithCancelCause(ctx)
 	b.wg.Add(1)
 
 	go b.run()
@@ -114,7 +116,7 @@ func (b *Batcher) Start(ctx context.Context) {
 // Stop stops the batcher and waits for it to finish.
 func (b *Batcher) Stop() {
 	if b.cancel != nil {
-		b.cancel()
+		b.cancel(errors.New("batcher stopped"))
 	}
 	<-b.stopped
 }
@@ -135,6 +137,7 @@ func (b *Batcher) run() {
 	for {
 		select {
 		case <-b.ctx.Done():
+			log.Printf("batcher: shutting down: %v", context.Cause(b.ctx))
 			b.flushCurrentBatch()
 			return
 

@@ -122,7 +122,9 @@ func (c *Config) Validate() error {
 		case "PASSIVE", "FULL", "RESTART", "TRUNCATE", "":
 			// valid
 		default:
-			return fmt.Errorf("checkpoint.mode must be one of PASSIVE, FULL, RESTART, TRUNCATE, got %q", c.CheckpointMode)
+			return fmt.Errorf(
+				"checkpoint.mode must be one of PASSIVE, FULL, RESTART, TRUNCATE, got %q",
+				c.CheckpointMode)
 		}
 	}
 
