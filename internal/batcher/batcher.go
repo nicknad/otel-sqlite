@@ -139,7 +139,7 @@ func (b *Batcher) Start(ctx context.Context) {
 	b.ctx, b.cancel = context.WithCancelCause(ctx)
 	b.wg.Add(1)
 
-	//nolint:gosec // G118: batcher uses WithCancelCause context, not Background
+	// #nosec G118 -- batcher uses WithCancelCause context, not Background
 	go b.run()
 }
 
