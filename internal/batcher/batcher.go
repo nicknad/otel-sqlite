@@ -20,6 +20,12 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/storage"
 )
 
+// ErrorNotifier is the interface for notifying about error-level log records.
+// The notify.Worker implements this interface.
+type ErrorNotifier interface {
+	SendRecord(ctx context.Context, record *model.LogRecord) error
+}
+
 // NewWriteBatchCommand is a function type that creates a Command from a LogBatch.
 // This indirection allows the batcher to be completely independent of SQLite.
 // The application entry point injects the real factory; tests inject a mock.
@@ -41,6 +47,10 @@ type Batcher struct {
 	// Command factory — must be set via WithCommandFactory before Start
 	newCmd NewWriteBatchCommand
 
+	// Optional error notifier for severity >= Error
+	errorNotifier          ErrorNotifier
+	errorSeverityThreshold model.Severity
+
 	// Control
 	ctx     context.Context
 	cancel  context.CancelCauseFunc
@@ -59,6 +69,11 @@ type BatcherConfig struct {
 	// Metrics is optional. When non-nil the batcher reports batches
 	// created, batch sizes and queue-depth gauges.
 	Metrics *metrics.Metrics
+
+	// ErrorSeverityThreshold is the minimum severity for which the
+	// error notifier (if set) is called. Defaults to SeverityError.
+	// Set to SeverityInfo to notify on all records during testing.
+	ErrorSeverityThreshold model.Severity
 }
 
 // NewBatcher creates a new Batcher with the given configuration.
@@ -81,14 +96,20 @@ func NewBatcher(ingressQueue ingest.IngressQueue, cmdQueue storage.CommandQueue,
 		flushInterval = defaultBatcherFlushInterval
 	}
 
+	errThreshold := config.ErrorSeverityThreshold
+	if errThreshold == 0 {
+		errThreshold = model.SeverityError
+	}
+
 	return &Batcher{
-		ingressQueue:  ingressQueue,
-		cmdQueue:      cmdQueue,
-		batchSize:     config.BatchSize,
-		flushInterval: flushInterval,
-		currentBatch:  model.NewLogBatch(config.BatchSize),
-		aMetrics:      config.Metrics,
-		stopped:       make(chan struct{}),
+		ingressQueue:           ingressQueue,
+		cmdQueue:               cmdQueue,
+		batchSize:              config.BatchSize,
+		flushInterval:          flushInterval,
+		currentBatch:           model.NewLogBatch(config.BatchSize),
+		aMetrics:               config.Metrics,
+		errorSeverityThreshold: errThreshold,
+		stopped:                make(chan struct{}),
 	}
 }
 
@@ -102,6 +123,14 @@ func (b *Batcher) WithCommandFactory(fn NewWriteBatchCommand) *Batcher {
 	return b
 }
 
+// WithErrorNotifier sets an optional notifier that is called for every
+// log record with SeverityNumber >= model.SeverityError.
+// May be nil to disable error notification.
+func (b *Batcher) WithErrorNotifier(n ErrorNotifier) *Batcher {
+	b.errorNotifier = n
+	return b
+}
+
 // Start starts the batcher goroutine.
 func (b *Batcher) Start(ctx context.Context) {
 	if b.newCmd == nil {
@@ -110,6 +139,7 @@ func (b *Batcher) Start(ctx context.Context) {
 	b.ctx, b.cancel = context.WithCancelCause(ctx)
 	b.wg.Add(1)
 
+	//nolint:gosec // G118: batcher uses WithCancelCause context, not Background
 	go b.run()
 }
 
@@ -158,6 +188,13 @@ func (b *Batcher) run() {
 			// Add all records from the incoming batch
 			for _, record := range batch.Records {
 				b.currentBatch.AddRecord(record)
+
+				// Notify on error-level records.
+				if b.errorNotifier != nil && record.SeverityNumber >= b.errorSeverityThreshold {
+					if err := b.errorNotifier.SendRecord(context.Background(), record); err != nil {
+						log.Printf("batcher: error notifier: %v", err)
+					}
+				}
 			}
 			isFull := b.currentBatch.Size() >= b.batchSize
 			b.mu.Unlock()

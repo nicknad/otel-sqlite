@@ -123,6 +123,9 @@ linters:
       - path: internal/generated/
         linters:
           - all
+      - path: vendor/
+        linters:
+          - all
       - path: check_indexes\.go
         linters:
           - errcheck

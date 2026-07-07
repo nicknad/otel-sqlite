@@ -35,6 +35,15 @@ type Metrics struct {
 	// Resource metrics
 	ActiveResources prometheus.Gauge
 	TotalResources  prometheus.Counter
+
+	// Notification metrics
+	NotifyEventsReceived     prometheus.Counter
+	NotifyEventsMatched      *prometheus.CounterVec
+	NotifyEventsDelivered    *prometheus.CounterVec
+	NotifyEventsFailed       *prometheus.CounterVec
+	NotifyEventsDeadLettered prometheus.Counter
+	NotifyQueueDepth         prometheus.Gauge
+	NotifyRetryQueueDepth    prometheus.Gauge
 }
 
 // NewMetrics creates a new Metrics instance with all metrics registered.
@@ -159,6 +168,56 @@ func NewMetrics() *Metrics {
 			Subsystem: "storage",
 			Name:      "total_resources",
 			Help:      "Total number of unique resources",
+		}),
+
+		// Notification metrics
+		NotifyEventsReceived: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: "otel_collector",
+			Subsystem: "notify",
+			Name:      "events_received_total",
+			Help:      "Total number of notification events received from the batcher",
+		}),
+
+		NotifyEventsMatched: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "otel_collector",
+			Subsystem: "notify",
+			Name:      "events_matched_total",
+			Help:      "Total number of notification events that matched a rule",
+		}, []string{"rule"}),
+
+		NotifyEventsDelivered: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "otel_collector",
+			Subsystem: "notify",
+			Name:      "events_delivered_total",
+			Help:      "Total number of notification events successfully delivered",
+		}, []string{"destination"}),
+
+		NotifyEventsFailed: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "otel_collector",
+			Subsystem: "notify",
+			Name:      "events_failed_total",
+			Help:      "Total number of notification events that failed delivery",
+		}, []string{"destination"}),
+
+		NotifyEventsDeadLettered: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: "otel_collector",
+			Subsystem: "notify",
+			Name:      "events_dead_lettered_total",
+			Help:      "Total number of notification events moved to dead-letter queue",
+		}),
+
+		NotifyQueueDepth: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: "otel_collector",
+			Subsystem: "notify",
+			Name:      "queue_depth",
+			Help:      "Current depth of the notification event queue",
+		}),
+
+		NotifyRetryQueueDepth: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: "otel_collector",
+			Subsystem: "notify",
+			Name:      "retry_queue_depth",
+			Help:      "Current number of events pending retry",
 		}),
 	}
 }
@@ -292,4 +351,60 @@ func (m *Metrics) IncrementTotalResources() {
 		return
 	}
 	m.TotalResources.Inc()
+}
+
+// IncrementNotifyEventsReceived increments the notification events received counter.
+func (m *Metrics) IncrementNotifyEventsReceived() {
+	if m == nil {
+		return
+	}
+	m.NotifyEventsReceived.Inc()
+}
+
+// IncrementNotifyEventsMatched increments the notification events matched counter for a rule.
+func (m *Metrics) IncrementNotifyEventsMatched(rule string) {
+	if m == nil {
+		return
+	}
+	m.NotifyEventsMatched.WithLabelValues(rule).Inc()
+}
+
+// IncrementNotifyEventsDelivered increments the delivered counter for a destination.
+func (m *Metrics) IncrementNotifyEventsDelivered(destination string) {
+	if m == nil {
+		return
+	}
+	m.NotifyEventsDelivered.WithLabelValues(destination).Inc()
+}
+
+// IncrementNotifyEventsFailed increments the failed counter for a destination.
+func (m *Metrics) IncrementNotifyEventsFailed(destination string) {
+	if m == nil {
+		return
+	}
+	m.NotifyEventsFailed.WithLabelValues(destination).Inc()
+}
+
+// IncrementNotifyEventsDeadLettered increments the dead-lettered counter.
+func (m *Metrics) IncrementNotifyEventsDeadLettered() {
+	if m == nil {
+		return
+	}
+	m.NotifyEventsDeadLettered.Inc()
+}
+
+// UpdateNotifyQueueDepth updates the notification queue depth gauge.
+func (m *Metrics) UpdateNotifyQueueDepth(depth int) {
+	if m == nil {
+		return
+	}
+	m.NotifyQueueDepth.Set(float64(depth))
+}
+
+// UpdateNotifyRetryQueueDepth updates the notification retry queue depth gauge.
+func (m *Metrics) UpdateNotifyRetryQueueDepth(depth int) {
+	if m == nil {
+		return
+	}
+	m.NotifyRetryQueueDepth.Set(float64(depth))
 }

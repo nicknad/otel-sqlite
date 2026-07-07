@@ -50,6 +50,35 @@ writer_max_transaction_records: 5000  # Max records per SQLite transaction
 shutdown_timeout: "30s"         # Graceful shutdown timeout
 
 # ---------------------------------------------------------------------------
+# Notification pipeline configuration
+# ---------------------------------------------------------------------------
+# The notification pipeline sends alerts when error-level log records are
+# ingested. It evaluates rules, tracks state (dedup, rate-limit, cooldown,
+# retries), and delivers notifications via pluggable notifiers.
+#
+# notification:
+#   enabled: true
+#   event_queue_depth: 1000
+#   store_path: "notify-state.db"
+#   retry_interval: "30s"
+#   rules:
+#     - name: "errors-to-slack"
+#       match_severity: "ERROR"
+#       cooldown: "5m"
+#       rate_limit: 10
+#       rate_window: "1m"
+#       dedup_window: "5m"
+#       max_retries: 3
+#       retry_backoff: "30s"
+#       destination: "http"
+#     - name: "fatal-to-log"
+#       match_severity: "FATAL"
+#       resource_filter: ".*production.*"
+#       body_filter: "(?i)panic"
+#       cooldown: "1m"
+#       destination: "log"
+
+# ---------------------------------------------------------------------------
 # Maintenance framework configuration
 # ---------------------------------------------------------------------------
 # The maintenance framework schedules periodic database tasks. Each task is
@@ -124,6 +153,12 @@ fts:
 #   CONFIG_FILE             - Path to YAML config file
 #   MAINTENANCE_ENABLED     - Master switch (default: true)
 #   MAINTENANCE_CHECK_INTERVAL - Worker evaluation interval (default: 1h)
+#
+# Notification:
+#   NOTIFICATION_ENABLED              - Enable notification pipeline (default: false)
+#   NOTIFICATION_EVENT_QUEUE_DEPTH    - Notification event queue capacity (default: 1000)
+#   NOTIFICATION_STORE_PATH           - Path to notification state store (default: notify-state.db)
+#   NOTIFICATION_RETRY_INTERVAL       - Retry scan interval (default: 30s)
 #
 # Task-specific (env overrides use Go durations, not "d" suffix):
 #   RETENTION_ENABLED           (default: true)
