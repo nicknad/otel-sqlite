@@ -483,6 +483,7 @@ func (a *Application) initializeNotifications() error {
 		Notifiers:       notifiers,
 		EventQueueDepth: nc.EventQueueDepth,
 		RetryInterval:   nc.RetryInterval,
+		Metrics:         a.metrics,
 	})
 
 	// Wire to batcher.
@@ -493,11 +494,12 @@ func (a *Application) initializeNotifications() error {
 }
 
 // parseSeverity converts a severity string to a model.Severity.
+// Shared between batcher config and rule config parsing.
 func parseSeverity(s string) model.Severity {
 	switch s {
 	case "FATAL":
 		return model.SeverityFatal
-	case "ERROR":
+	case "ERROR", "":
 		return model.SeverityError
 	case "WARN":
 		return model.SeverityWarn
@@ -516,26 +518,13 @@ func parseSeverity(s string) model.Severity {
 func ruleConfigToRule(rc *config.RuleConfig) (*notify.Rule, error) {
 	rule := &notify.Rule{
 		Name:             rc.Name,
+		MatchSeverity:    parseSeverity(rc.MatchSeverity),
 		ResourceFilter:   rc.ResourceFilter,
 		BodyFilter:       rc.BodyFilter,
 		AttributeFilters: rc.AttributeFilters,
 		RateLimit:        rc.RateLimit,
 		MaxRetries:       rc.MaxRetries,
 		Destination:      rc.Destination,
-	}
-
-	// Parse severity.
-	switch rc.MatchSeverity {
-	case "", "ERROR":
-		rule.MatchSeverity = model.SeverityError
-	case "FATAL":
-		rule.MatchSeverity = model.SeverityFatal
-	case "WARN":
-		rule.MatchSeverity = model.SeverityWarn
-	case "INFO":
-		rule.MatchSeverity = model.SeverityInfo
-	default:
-		return nil, fmt.Errorf("unknown severity %q", rc.MatchSeverity)
 	}
 
 	// Parse durations.

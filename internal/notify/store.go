@@ -1,6 +1,10 @@
 package notify
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"strings"
+)
 
 // Store is the persistence layer for notification state.
 // Implementations can use bbolt, RocksDB, Badger, or even SQLite.
@@ -49,6 +53,11 @@ type NotificationState struct {
 	EventDigest     string
 	DeadLettered    bool
 	UpdatedAt       int64 // unix nanos
+
+	// StoredEvent is the original event preserved for retries.
+	// Set on first delivery; used by the retry loop to reconstruct
+	// the full event instead of sending a synthetic key-body.
+	StoredEvent *Event `json:",omitempty"`
 }
 
 // DLQEntry represents an event in the dead-letter queue.
@@ -59,4 +68,34 @@ type DLQEntry struct {
 	RetryCount  int
 	FailedAt    int64 // unix nanos
 	OriginalKey string
+}
+
+// StateKey is a structured key for notification state. It encodes the
+// rule name, resource ID, and event fingerprint.
+type StateKey struct {
+	RuleName    string
+	ResourceID  string
+	Fingerprint string
+}
+
+// Encode returns the string representation of the state key.
+func (k StateKey) Encode() string {
+	return fmt.Sprintf("%s:%s:%s", k.RuleName, k.ResourceID, k.Fingerprint)
+}
+
+// DecodeStateKey parses an encoded state key back into its components.
+func DecodeStateKey(key string) StateKey {
+	first := strings.IndexByte(key, ':')
+	if first < 0 {
+		return StateKey{}
+	}
+	second := strings.IndexByte(key[first+1:], ':')
+	if second < 0 {
+		return StateKey{}
+	}
+	return StateKey{
+		RuleName:    key[:first],
+		ResourceID:  key[first+1 : first+1+second],
+		Fingerprint: key[first+1+second+1:],
+	}
 }

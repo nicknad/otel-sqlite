@@ -80,6 +80,8 @@ type payload struct {
 }
 
 // Send POSTs the event as JSON to the configured URL.
+// Returns a non-retryable error for 4xx responses and retryable errors for
+// 5xx/network failures.
 func (n *HTTPNotifier) Send(ctx context.Context, event *Event) error {
 	p := payload{
 		Severity:     event.Severity.String(),
@@ -127,14 +129,30 @@ func (n *HTTPNotifier) Send(ctx context.Context, event *Event) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Discard body to enable connection reuse.
-	_, _ = io.Copy(io.Discard, resp.Body)
+	// Read a bounded prefix of the response body for error diagnostics.
+	respBody, _ := readBodyPrefix(resp.Body, 512)
+	_, _ = io.Copy(io.Discard, resp.Body) // drain remainder for connection reuse
 
+	if resp.StatusCode >= 500 {
+		err := fmt.Errorf("http %d from %q: %s", resp.StatusCode, n.url, respBody)
+		return err // retryable (5xx)
+	}
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("http %d from %q", resp.StatusCode, n.url)
+		err := fmt.Errorf("http %d from %q: %s", resp.StatusCode, n.url, respBody)
+		return NewNotRetryableError(err) // non-retryable (4xx)
 	}
 
 	return nil
+}
+
+// readBodyPrefix reads up to maxBytes from r and returns them as a string.
+func readBodyPrefix(r io.Reader, maxBytes int) (string, error) {
+	buf := make([]byte, maxBytes)
+	n, err := io.ReadFull(r, buf)
+	if err == io.ErrUnexpectedEOF || err == io.EOF {
+		return string(buf[:n]), nil
+	}
+	return string(buf[:n]), err
 }
 
 // Close closes idle connections.

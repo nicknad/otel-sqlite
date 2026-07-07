@@ -191,7 +191,7 @@ func (b *Batcher) run() {
 
 				// Notify on error-level records.
 				if b.errorNotifier != nil && record.SeverityNumber >= b.errorSeverityThreshold {
-					if err := b.errorNotifier.SendRecord(context.Background(), record); err != nil {
+					if err := b.errorNotifier.SendRecord(b.ctx, record); err != nil {
 						log.Printf("batcher: error notifier: %v", err)
 					}
 				}

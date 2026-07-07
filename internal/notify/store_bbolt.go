@@ -19,7 +19,12 @@ type bboltStore struct {
 var (
 	bucketState = []byte("state")
 	bucketDLQ   = []byte("dlq")
+	bucketRetry = []byte("retry") // index: NextRetry:key → key
 )
+
+// maxStateAge is how long state entries persist after a successful delivery
+// before they are eligible for garbage collection.
+const maxStateAge = 24 * time.Hour
 
 // NewBboltStore opens or creates a bbolt-backed Store at the given path.
 func NewBboltStore(path string) (Store, error) {
@@ -32,11 +37,10 @@ func NewBboltStore(path string) (Store, error) {
 
 	// Create buckets if they don't exist.
 	err = db.Update(func(tx *bbolt.Tx) error {
-		if _, err := tx.CreateBucketIfNotExists(bucketState); err != nil {
-			return fmt.Errorf("create state bucket: %w", err)
-		}
-		if _, err := tx.CreateBucketIfNotExists(bucketDLQ); err != nil {
-			return fmt.Errorf("create dlq bucket: %w", err)
+		for _, name := range [][]byte{bucketState, bucketDLQ, bucketRetry} {
+			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
+				return fmt.Errorf("create bucket %q: %w", string(name), err)
+			}
 		}
 		return nil
 	})
@@ -64,7 +68,9 @@ func (s *bboltStore) GetState(_ context.Context, key string) (*NotificationState
 	return state, err
 }
 
-// PutState upserts state for a notification key.
+// PutState upserts state for a notification key. It also maintains the
+// retry index: if NextRetry > 0 the key is added to the retry bucket;
+// if NextRetry == 0 the key is removed from the retry bucket (if present).
 func (s *bboltStore) PutState(_ context.Context, key string, state *NotificationState) error {
 	state.UpdatedAt = time.Now().UnixNano()
 	data, err := json.Marshal(state)
@@ -73,15 +79,32 @@ func (s *bboltStore) PutState(_ context.Context, key string, state *Notification
 	}
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketState)
-		return b.Put([]byte(key), data)
+		if err := b.Put([]byte(key), data); err != nil {
+			return err
+		}
+		// Maintain retry index.
+		retryB := tx.Bucket(bucketRetry)
+		retryKey := retryIndexKey(state.NextRetry, key)
+		if state.RetryCount > 0 && state.NextRetry > 0 {
+			return retryB.Put(retryKey, []byte(key))
+		}
+		// Remove any existing retry entry for this key (scan and delete).
+		_ = retryB.Delete(retryKey)
+		// Also clean up stale entries that may exist under different timestamps.
+		_ = deleteRetryEntries(retryB, key)
+		return nil
 	})
 }
 
-// DeleteState removes state for a notification key.
+// DeleteState removes state and cleans up the retry index.
 func (s *bboltStore) DeleteState(_ context.Context, key string) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketState)
-		return b.Delete([]byte(key))
+		if err := b.Delete([]byte(key)); err != nil {
+			return err
+		}
+		// Clean retry index.
+		return deleteRetryEntries(tx.Bucket(bucketRetry), key)
 	})
 }
 
@@ -129,28 +152,114 @@ func (s *bboltStore) AckDLQ(_ context.Context, id string) error {
 	})
 }
 
-// ScanRetryable iterates all state entries and returns those with a past-due NextRetry.
+// ScanRetryable uses the retry bucket index to efficiently find past-due
+// retries instead of scanning all state entries. Falls back to a full scan
+// if the retry bucket is empty (e.g., after a migration).
 func (s *bboltStore) ScanRetryable(_ context.Context) ([]RetryableEntry, error) {
 	now := time.Now().UnixNano()
 	var entries []RetryableEntry
+
 	err := s.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketState)
-		c := b.Cursor()
+		retryB := tx.Bucket(bucketRetry)
+		c := retryB.Cursor()
+
+		// Retry keys are formatted as "nextRetry:stateKey".
+		// Iterate only entries whose nextRetry <= now.
 		for k, v := c.First(); k != nil; k, v = c.Next() {
+			ts := parseRetryTimestamp(k)
+			if ts > now {
+				// Since keys are sorted, all subsequent entries are also in the future.
+				break
+			}
+			key := string(v)
+			// Read state to get the current RetryCount (could have changed).
+			stateB := tx.Bucket(bucketState)
+			data := stateB.Get([]byte(key))
+			if data == nil {
+				continue
+			}
 			var state NotificationState
-			if err := json.Unmarshal(v, &state); err != nil {
-				continue // skip corrupt entries
+			if err := json.Unmarshal(data, &state); err != nil {
+				continue
 			}
 			if state.RetryCount > 0 && state.NextRetry > 0 && state.NextRetry <= now {
 				entries = append(entries, RetryableEntry{
-					Key:        string(k),
+					Key:        key,
 					RetryCount: state.RetryCount,
 				})
 			}
 		}
 		return nil
 	})
-	return entries, err
+	if err != nil {
+		return nil, err
+	}
+
+	// Garbage-collect old successful state entries periodically.
+	go s.gcOldState()
+
+	return entries, nil
+}
+
+// gcOldState removes state entries that succeeded more than maxStateAge ago.
+// This runs asynchronously after ScanRetryable to amortize cost.
+func (s *bboltStore) gcOldState() {
+	cutoff := time.Now().Add(-maxStateAge).UnixNano()
+	_ = s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketState)
+		retryB := tx.Bucket(bucketRetry)
+		c := b.Cursor()
+		var toDelete []string
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var state NotificationState
+			if err := json.Unmarshal(v, &state); err != nil {
+				continue
+			}
+			// Remove state entries that are not pending retry and are older than cutoff.
+			if state.RetryCount == 0 && state.NextRetry == 0 && state.LastSuccess > 0 && state.LastSuccess < cutoff {
+				toDelete = append(toDelete, string(k))
+			}
+		}
+		for _, key := range toDelete {
+			_ = b.Delete([]byte(key))
+			_ = deleteRetryEntries(retryB, key)
+		}
+		if len(toDelete) > 0 {
+			log.Printf("notify store: gc removed %d stale state entries", len(toDelete))
+		}
+		return nil
+	})
+}
+
+// retryIndexKey formats a key for the retry bucket as "nextRetry:stateKey".
+func retryIndexKey(nextRetry int64, stateKey string) []byte {
+	return fmt.Appendf(nil, "%020d:%s", nextRetry, stateKey)
+}
+
+// parseRetryTimestamp extracts the nextRetry timestamp from a retry bucket key.
+func parseRetryTimestamp(key []byte) int64 {
+	var ts int64
+	for i, b := range key {
+		if b == ':' {
+			// Parse the numeric prefix.
+			_, _ = fmt.Sscanf(string(key[:i]), "%d", &ts)
+			return ts
+		}
+	}
+	return 0
+}
+
+// deleteRetryEntries removes all retry index entries that point to the given state key.
+func deleteRetryEntries(b *bbolt.Bucket, stateKey string) error {
+	c := b.Cursor()
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		if string(v) == stateKey {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Close closes the bbolt database.
