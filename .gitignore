@@ -62,9 +62,6 @@ config-test.yaml
 # --- Docker ---
 .docker/
 
-# --- Dependency directories ---
-vendor/
-
 # --- Environment / secrets ---
 .env
 .env.local

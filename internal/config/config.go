@@ -25,8 +25,9 @@ type Config struct {
 	BatchQueueCapacity   int `mapstructure:"batch_queue_capacity"`
 
 	// Batcher configuration
-	BatcherBatchSize     int           `mapstructure:"batcher_batch_size"`
-	BatcherFlushInterval time.Duration `mapstructure:"batcher_flush_interval"`
+	BatcherBatchSize              int           `mapstructure:"batcher_batch_size"`
+	BatcherFlushInterval          time.Duration `mapstructure:"batcher_flush_interval"`
+	BatcherErrorSeverityThreshold string        `mapstructure:"batcher_error_severity_threshold"`
 
 	// Writer configuration
 	WriterBatchSize     int           `mapstructure:"writer_batch_size"`
@@ -55,8 +56,63 @@ type Config struct {
 	// Timeouts
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
 
+	// Notification configuration
+	Notification *NotificationConfig `mapstructure:"notification"`
+
 	// Maintenance configuration
 	Maintenance *maintenance.Config `mapstructure:"maintenance"`
+}
+
+// NotificationConfig holds configuration for the notification pipeline.
+type NotificationConfig struct {
+	// Enabled is the master switch.
+	Enabled bool `mapstructure:"enabled"`
+
+	// EventQueueDepth is the buffered channel capacity between batcher and worker.
+	EventQueueDepth int `mapstructure:"event_queue_depth"`
+
+	// StorePath is the file path for the embedded KV store (bbolt).
+	StorePath string `mapstructure:"store_path"`
+
+	// RetryInterval is how often the retry goroutine scans for retryable events.
+	RetryInterval time.Duration `mapstructure:"retry_interval"`
+
+	// Notifiers maps notifier name → config. Built-in names: "log", "http".
+	Notifiers map[string]NotifierConfig `mapstructure:"notifiers"`
+
+	// Rules defines the notification rules.
+	Rules []RuleConfig `mapstructure:"rules"`
+}
+
+// NotifierConfig holds configuration for a single notifier instance.
+type NotifierConfig struct {
+	// Type is the notifier implementation: "log" or "http".
+	Type string `mapstructure:"type"`
+
+	// URL is the webhook URL (for "http" type).
+	URL string `mapstructure:"url"`
+
+	// Timeout is the HTTP client timeout (for "http" type).
+	Timeout time.Duration `mapstructure:"timeout"`
+
+	// AuthHeader is an optional Authorization header value.
+	AuthHeader string `mapstructure:"auth_header"`
+}
+
+// RuleConfig is the YAML-parseable form of a notification rule.
+type RuleConfig struct {
+	Name             string            `mapstructure:"name"`
+	MatchSeverity    string            `mapstructure:"match_severity"`
+	ResourceFilter   string            `mapstructure:"resource_filter"`
+	BodyFilter       string            `mapstructure:"body_filter"`
+	AttributeFilters map[string]string `mapstructure:"attribute_filters"`
+	Cooldown         string            `mapstructure:"cooldown"`
+	RateLimit        int               `mapstructure:"rate_limit"`
+	RateWindow       string            `mapstructure:"rate_window"`
+	DedupWindow      string            `mapstructure:"dedup_window"`
+	MaxRetries       int               `mapstructure:"max_retries"`
+	RetryBackoff     string            `mapstructure:"retry_backoff"`
+	Destination      string            `mapstructure:"destination"`
 }
 
 // DefaultConfig returns a configuration with sensible defaults.
@@ -68,6 +124,7 @@ func DefaultConfig() *Config {
 		BatchQueueCapacity:                1000,
 		BatcherBatchSize:                  250,
 		BatcherFlushInterval:              5 * time.Second,
+		BatcherErrorSeverityThreshold:     "ERROR",
 		WriterBatchSize:                   100,
 		WriterFlushInterval:               5 * time.Second,
 		WriterMaxTransactionRecords:       5000,
@@ -78,6 +135,12 @@ func DefaultConfig() *Config {
 		IngressQueueBackpressureThreshold: 0, // disabled by default; recommends 0.8
 		GoMemoryLimitMB:                   0, // disabled by default; recommends 2048
 		ShutdownTimeout:                   30 * time.Second,
+		Notification: &NotificationConfig{
+			Enabled:         false,
+			EventQueueDepth: 1000,
+			StorePath:       "notify-state.db",
+			RetryInterval:   30 * time.Second,
+		},
 	}
 }
 
@@ -96,6 +159,10 @@ var envVars = []envVar{
 	{Key: "BatchQueueCapacity", Env: "BATCH_QUEUE_CAPACITY", Description: "Maximum batch queue size"},
 	{Key: "BatcherBatchSize", Env: "BATCHER_BATCH_SIZE", Description: "Number of log records per batch (batcher)"},
 	{Key: "BatcherFlushInterval", Env: "BATCHER_FLUSH_INTERVAL", Description: "Maximum time between batch flushes"},
+	{
+		Key: "BatcherErrorSeverityThreshold", Env: "BATCHER_ERROR_SEVERITY_THRESHOLD",
+		Description: "Minimum severity to notify (ERROR, WARN, INFO, etc.)",
+	},
 	{Key: "WriterBatchSize", Env: "WRITER_BATCH_SIZE", Description: "Number of commands per transaction (writer)"},
 	{Key: "WriterFlushInterval", Env: "WRITER_FLUSH_INTERVAL", Description: "Maximum time between transaction flushes"},
 	{
@@ -112,6 +179,19 @@ var envVars = []envVar{
 	{Key: "GoMemoryLimitMB", Env: "GO_MEMORY_LIMIT_MB", Description: "Go runtime memory limit in MB (0 = disabled)"},
 	{Key: "MetricsAddress", Env: "METRICS_ADDRESS", Description: "Prometheus metrics server address"},
 	{Key: "ShutdownTimeout", Env: "SHUTDOWN_TIMEOUT", Description: "Graceful shutdown timeout"},
+	{Key: "NotificationEnabled", Env: "NOTIFICATION_ENABLED", Description: "Enable notification pipeline (true/false)"},
+	{
+		Key: "NotificationEventQueueDepth", Env: "NOTIFICATION_EVENT_QUEUE_DEPTH",
+		Description: "Notification event queue capacity",
+	},
+	{
+		Key: "NotificationStorePath", Env: "NOTIFICATION_STORE_PATH",
+		Description: "Path to notification state store (bbolt)",
+	},
+	{
+		Key: "NotificationRetryInterval", Env: "NOTIFICATION_RETRY_INTERVAL",
+		Description: "Notification retry scan interval",
+	},
 }
 
 // LoadFromEnv overrides config fields with values from environment variables.
@@ -162,6 +242,8 @@ func (c *Config) setField(key, value string) error {
 			return fmt.Errorf("invalid duration %q: %w", value, err)
 		}
 		c.BatcherFlushInterval = d
+	case "BatcherErrorSeverityThreshold":
+		c.BatcherErrorSeverityThreshold = value
 	case "WriterBatchSize":
 		n, err := strconv.Atoi(value)
 		if err != nil {
@@ -218,8 +300,36 @@ func (c *Config) setField(key, value string) error {
 			return fmt.Errorf("invalid duration %q: %w", value, err)
 		}
 		c.ShutdownTimeout = d
+	case "NotificationEnabled":
+		b, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("invalid bool %q: %w", value, err)
+		}
+		c.ensureNotification().Enabled = b
+	case "NotificationEventQueueDepth":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid int %q: %w", value, err)
+		}
+		c.ensureNotification().EventQueueDepth = n
+	case "NotificationStorePath":
+		c.ensureNotification().StorePath = value
+	case "NotificationRetryInterval":
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("invalid duration %q: %w", value, err)
+		}
+		c.ensureNotification().RetryInterval = d
 	}
 	return nil
+}
+
+// ensureNotification returns the Notification config, creating it if nil.
+func (c *Config) ensureNotification() *NotificationConfig {
+	if c.Notification == nil {
+		c.Notification = &NotificationConfig{}
+	}
+	return c.Notification
 }
 
 // Validate checks the configuration for errors.
@@ -241,6 +351,15 @@ func (c *Config) Validate() error {
 	}
 	if c.BatcherFlushInterval <= 0 {
 		return fmt.Errorf("batcher_flush_interval must be positive, got %s", c.BatcherFlushInterval)
+	}
+	if c.BatcherErrorSeverityThreshold != "" {
+		switch c.BatcherErrorSeverityThreshold {
+		case "ERROR", "WARN", "INFO", "DEBUG", "TRACE", "FATAL", "UNSPECIFIED":
+		default:
+			return fmt.Errorf(
+				"batcher_error_severity_threshold must be ERROR,WARN,INFO,DEBUG,TRACE,FATAL,UNSPECIFIED, got %q",
+				c.BatcherErrorSeverityThreshold)
+		}
 	}
 	if c.WriterBatchSize <= 0 {
 		return fmt.Errorf("writer_batch_size must be positive, got %d", c.WriterBatchSize)
@@ -269,6 +388,26 @@ func (c *Config) Validate() error {
 	}
 	if c.ShutdownTimeout <= 0 {
 		return fmt.Errorf("shutdown_timeout must be positive, got %s", c.ShutdownTimeout)
+	}
+	if c.Notification != nil && c.Notification.Enabled {
+		if c.Notification.StorePath == "" {
+			return errors.New("notification.store_path must not be empty when notifications are enabled")
+		}
+		if c.Notification.EventQueueDepth <= 0 {
+			return fmt.Errorf("notification.event_queue_depth must be positive, got %d", c.Notification.EventQueueDepth)
+		}
+		if c.Notification.RetryInterval <= 0 {
+			return fmt.Errorf("notification.retry_interval must be positive, got %s", c.Notification.RetryInterval)
+		}
+		for i := range c.Notification.Rules {
+			rule := &c.Notification.Rules[i]
+			if rule.Name == "" {
+				return fmt.Errorf("notification.rules[%d].name must not be empty", i)
+			}
+			if rule.Destination == "" {
+				return fmt.Errorf("notification.rules[%d].destination must not be empty", i)
+			}
+		}
 	}
 	if c.Maintenance != nil {
 		if err := c.Maintenance.Validate(); err != nil {

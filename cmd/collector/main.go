@@ -27,6 +27,7 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/maintenance/tasks"
 	"codeberg.org/nicknad/otel-sqlite/internal/metrics"
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
+	"codeberg.org/nicknad/otel-sqlite/internal/notify"
 	"codeberg.org/nicknad/otel-sqlite/internal/otlp"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage/sqlite"
@@ -51,6 +52,11 @@ type Application struct {
 	// Maintenance
 	maintenanceWorker  *maintenance.Worker
 	maintenanceMetrics *maintenance.Metrics
+
+	// Notification
+	notifyWorker *notify.Worker
+	notifyStore  notify.Store
+	notifiers    []notify.Notifier
 }
 
 func main() {
@@ -159,9 +165,10 @@ func (a *Application) initialize() error {
 
 	// Create batcher (wraps batches as WriteBatchCommand, sends to cmd queue)
 	a.batcher = batcher.NewBatcher(a.ingressQueue, a.cmdQueue, &batcher.BatcherConfig{
-		BatchSize:     a.config.BatcherBatchSize,
-		FlushInterval: a.config.BatcherFlushInterval,
-		Metrics:       a.metrics,
+		BatchSize:              a.config.BatcherBatchSize,
+		FlushInterval:          a.config.BatcherFlushInterval,
+		Metrics:                a.metrics,
+		ErrorSeverityThreshold: parseSeverity(a.config.BatcherErrorSeverityThreshold),
 	})
 	a.batcher.WithCommandFactory(func(batch *model.LogBatch) storage.Command {
 		return sqlite.NewWriteBatchCommand(batch)
@@ -187,6 +194,13 @@ func (a *Application) initialize() error {
 		return fmt.Errorf("failed to create SQLite writer: %w", err)
 	}
 
+	// Initialize notification pipeline if enabled.
+	if a.config.Notification != nil && a.config.Notification.Enabled {
+		if err := a.initializeNotifications(); err != nil {
+			return fmt.Errorf("failed to initialize notifications: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -210,6 +224,11 @@ func (a *Application) start() error {
 
 	// Start maintenance worker
 	a.startMaintenance()
+
+	// Start notification worker
+	if a.notifyWorker != nil {
+		a.notifyWorker.Start(context.Background())
+	}
 
 	log.Println("OTLP collector started successfully")
 	log.Printf("gRPC server listening on %s", a.config.ListenAddress)
@@ -371,6 +390,17 @@ func (a *Application) cleanup() {
 		a.maintenanceWorker.Stop()
 	}
 
+	// Stop notification worker
+	if a.notifyWorker != nil {
+		a.notifyWorker.Stop()
+	}
+	for _, n := range a.notifiers {
+		_ = n.Close()
+	}
+	if a.notifyStore != nil {
+		_ = a.notifyStore.Close()
+	}
+
 	// Stop SQLite writer
 	if a.writer != nil {
 		a.writer.Stop()
@@ -389,4 +419,154 @@ func (a *Application) cleanup() {
 		log.Printf("shutdown errors: %v", errors.Join(errs...))
 	}
 	log.Println("Shutdown complete")
+}
+
+// initializeNotifications sets up the notification pipeline.
+func (a *Application) initializeNotifications() error {
+	nc := a.config.Notification
+
+	// Open the bbolt store.
+	store, err := notify.NewBboltStore(nc.StorePath)
+	if err != nil {
+		return fmt.Errorf("open notification store: %w", err)
+	}
+	a.notifyStore = store
+
+	// Build rules from config.
+	rules := make([]notify.Rule, 0, len(nc.Rules))
+	for i := range nc.Rules {
+		rule, err := ruleConfigToRule(&nc.Rules[i])
+		if err != nil {
+			return fmt.Errorf("rule %q: %w", nc.Rules[i].Name, err)
+		}
+		rules = append(rules, *rule)
+	}
+
+	// Create rule engine.
+	engine, err := notify.NewRuleEngine(rules)
+	if err != nil {
+		return fmt.Errorf("create rule engine: %w", err)
+	}
+
+	// Create notifiers from config.
+	notifiers := make(map[string]notify.Notifier)
+	for name, ncfg := range nc.Notifiers {
+		var cfg any
+		switch ncfg.Type {
+		case "log":
+			// no config needed
+		case "http":
+			url := ncfg.URL
+			if url == "" {
+				url = "http://localhost:8080/webhook"
+			}
+			cfg = &notify.HTTPNotifierConfig{
+				URL:        url,
+				Timeout:    ncfg.Timeout,
+				AuthHeader: ncfg.AuthHeader,
+			}
+		default:
+			return fmt.Errorf("unknown notifier type %q for %q", ncfg.Type, name)
+		}
+		n, err := notify.NewNotifier(ncfg.Type, cfg)
+		if err != nil {
+			return fmt.Errorf("create notifier %q: %w", name, err)
+		}
+		notifiers[name] = n
+		a.notifiers = append(a.notifiers, n)
+	}
+
+	// Create worker.
+	a.notifyWorker = notify.NewWorker(&notify.WorkerConfig{
+		Store:           store,
+		Engine:          engine,
+		Notifiers:       notifiers,
+		EventQueueDepth: nc.EventQueueDepth,
+		RetryInterval:   nc.RetryInterval,
+	})
+
+	// Wire to batcher.
+	a.batcher.WithErrorNotifier(a.notifyWorker)
+
+	log.Printf("notification pipeline: initialized (%d rules, %d notifiers)", len(rules), len(notifiers))
+	return nil
+}
+
+// parseSeverity converts a severity string to a model.Severity.
+func parseSeverity(s string) model.Severity {
+	switch s {
+	case "FATAL":
+		return model.SeverityFatal
+	case "ERROR":
+		return model.SeverityError
+	case "WARN":
+		return model.SeverityWarn
+	case "INFO":
+		return model.SeverityInfo
+	case "DEBUG":
+		return model.SeverityDebug
+	case "TRACE":
+		return model.SeverityTrace
+	default:
+		return model.SeverityError
+	}
+}
+
+// ruleConfigToRule converts a config.RuleConfig to a notify.Rule.
+func ruleConfigToRule(rc *config.RuleConfig) (*notify.Rule, error) {
+	rule := &notify.Rule{
+		Name:             rc.Name,
+		ResourceFilter:   rc.ResourceFilter,
+		BodyFilter:       rc.BodyFilter,
+		AttributeFilters: rc.AttributeFilters,
+		RateLimit:        rc.RateLimit,
+		MaxRetries:       rc.MaxRetries,
+		Destination:      rc.Destination,
+	}
+
+	// Parse severity.
+	switch rc.MatchSeverity {
+	case "", "ERROR":
+		rule.MatchSeverity = model.SeverityError
+	case "FATAL":
+		rule.MatchSeverity = model.SeverityFatal
+	case "WARN":
+		rule.MatchSeverity = model.SeverityWarn
+	case "INFO":
+		rule.MatchSeverity = model.SeverityInfo
+	default:
+		return nil, fmt.Errorf("unknown severity %q", rc.MatchSeverity)
+	}
+
+	// Parse durations.
+	if rc.Cooldown != "" {
+		d, err := time.ParseDuration(rc.Cooldown)
+		if err != nil {
+			return nil, fmt.Errorf("cooldown: %w", err)
+		}
+		rule.Cooldown = d
+	}
+	if rc.RateWindow != "" {
+		d, err := time.ParseDuration(rc.RateWindow)
+		if err != nil {
+			return nil, fmt.Errorf("rate_window: %w", err)
+		}
+		rule.RateWindow = d
+	}
+	if rc.DedupWindow != "" {
+		d, err := time.ParseDuration(rc.DedupWindow)
+		if err != nil {
+			return nil, fmt.Errorf("dedup_window: %w", err)
+		}
+		rule.DedupWindow = d
+	}
+	if rc.RetryBackoff != "" {
+		d, err := time.ParseDuration(rc.RetryBackoff)
+		if err != nil {
+			return nil, fmt.Errorf("retry_backoff: %w", err)
+		}
+		rule.RetryBackoff = d
+	}
+
+	return rule, nil
 }
