@@ -2,6 +2,8 @@ package notify
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -249,5 +251,122 @@ func TestRuleDefaults(t *testing.T) {
 	}
 	if r.RetryBackoff != 30*time.Second {
 		t.Errorf("RetryBackoff = %v, want 30s", r.RetryBackoff)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for fixes
+// ---------------------------------------------------------------------------
+
+func TestBackoffDuration(t *testing.T) {
+	base := 10 * time.Second
+
+	tests := []struct {
+		attempt int
+		want    int64
+	}{
+		{0, int64(10 * time.Second)},
+		{1, int64(10 * time.Second)},       // 10 * 2^0
+		{2, int64(20 * time.Second)},       // 10 * 2^1
+		{3, int64(40 * time.Second)},       // 10 * 2^2
+		{4, int64(80 * time.Second)},       // 10 * 2^3
+		{12, int64(10*time.Second) * 1024}, // 10 * 2^10 (max cap)
+		{50, int64(10*time.Second) * 1024}, // overflow capped at 2^10
+	}
+
+	for _, tt := range tests {
+		got := backoffDuration(base, tt.attempt)
+		if got != tt.want {
+			t.Errorf("backoffDuration(%v, %d) = %d, want %d", base, tt.attempt, got, tt.want)
+		}
+	}
+}
+
+func TestIsRetryable(t *testing.T) {
+	// Regular error is retryable.
+	if !IsRetryable(errors.New("connection refused")) {
+		t.Error("regular errors should be retryable")
+	}
+
+	// Wrapped non-retryable is not retryable.
+	nr := NewNotRetryableError(errors.New("401 unauthorized"))
+	if IsRetryable(nr) {
+		t.Error("non-retryable errors should not be retryable")
+	}
+
+	// fmt.Errorf wrapping a non-retryable preserves non-retryability.
+	wrapped := fmt.Errorf("send failed: %w", nr)
+	if IsRetryable(wrapped) {
+		t.Error("wrapped non-retryable errors should not be retryable")
+	}
+
+	// nil is retryable (no error to block).
+	if !IsRetryable(nil) {
+		t.Error("nil should be retryable (no error)")
+	}
+}
+
+func TestStateKeyRoundtrip(t *testing.T) {
+	tests := []StateKey{
+		{RuleName: "errors", ResourceID: "res-1", Fingerprint: "abc123"},
+		{RuleName: "panic-rule", ResourceID: "res-2", Fingerprint: "deadbeef"},
+		{RuleName: "r", ResourceID: "", Fingerprint: "f"},
+	}
+
+	for _, sk := range tests {
+		encoded := sk.Encode()
+		decoded := DecodeStateKey(encoded)
+		if decoded != sk {
+			t.Errorf("StateKey roundtrip failed: %+v → %q → %+v", sk, encoded, decoded)
+		}
+	}
+
+	// Malformed keys.
+	if got := DecodeStateKey("no-colons"); got != (StateKey{}) {
+		t.Errorf("malformed key should return zero StateKey, got %+v", got)
+	}
+	if got := DecodeStateKey("one:colon"); got != (StateKey{}) {
+		t.Errorf("one-colon key should return zero StateKey, got %+v", got)
+	}
+}
+
+func TestEventFingerprintCaching(t *testing.T) {
+	event := &Event{
+		Body:       "test error",
+		ResourceID: "res-1",
+		Attributes: []model.Attribute{
+			{Key: "host", Str: "srv1", Kind: model.ValueString},
+		},
+	}
+
+	fp1 := event.Fingerprint()
+	fp2 := event.Fingerprint()
+
+	if fp1 != fp2 {
+		t.Errorf("Fingerprint() not idempotent: %q != %q", fp1, fp2)
+	}
+	if fp1 == "" {
+		t.Error("Fingerprint() should not be empty")
+	}
+
+	// Different body → different fingerprint.
+	event2 := &Event{
+		Body:       "different error",
+		ResourceID: "res-1",
+	}
+	if event2.Fingerprint() == fp1 {
+		t.Error("different events should have different fingerprints")
+	}
+
+	// Same body + same attributes = same fingerprint (deterministic).
+	event3 := &Event{
+		Body:       "test error",
+		ResourceID: "res-1",
+		Attributes: []model.Attribute{
+			{Key: "host", Str: "srv1", Kind: model.ValueString},
+		},
+	}
+	if event3.Fingerprint() != fp1 {
+		t.Error("identical events should have identical fingerprints")
 	}
 }

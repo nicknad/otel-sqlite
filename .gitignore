@@ -83,3 +83,4 @@ test-output/
 
 # --- Go pkg/mod cache (if GOPATH lives in the repo) ---
 .go/
+*.db-journal

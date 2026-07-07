@@ -188,8 +188,12 @@ func (c *WriteBatchCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 			continue
 		}
 
-		if err := insertAttributesRecord(ctx, insertAttr, eventID, record.Attributes); err != nil {
-			log.Printf("error inserting attributes for event %d: %v", eventID, err)
+		if len(record.Attributes) > 0 {
+			for _, attr := range record.Attributes {
+				if err := insertAttributeRow(ctx, insertAttr, eventID, attr); err != nil {
+					log.Printf("error inserting attribute for event %d: %v", eventID, err)
+				}
+			}
 		}
 
 		// Return record to pool after writing (ownership: writer releases records)
@@ -260,50 +264,38 @@ func marshalResourceAttrs(attrs map[string]model.AttributeValue) string {
 	return string(b)
 }
 
-// insertAttributesRecord inserts attribute rows for a log event.
-func insertAttributesRecord(ctx context.Context, stmt *sql.Stmt, eventID int64,
-	attributes []model.Attribute,
-) error {
-	if len(attributes) == 0 {
-		return nil
+// insertAttributeRow inserts a single attribute row using the prepared statement.
+func insertAttributeRow(ctx context.Context, stmt *sql.Stmt, eventID int64, attr model.Attribute) error {
+	strVal, intVal, dblVal, boolVal, bytesVal := attrValues(&attr)
+	_, err := stmt.ExecContext(
+		ctx,
+		eventID,
+		attr.Key,
+		attr.Kind.String(),
+		strVal,
+		intVal,
+		dblVal,
+		boolVal,
+		bytesVal,
+	)
+	return err
+}
+
+// attrValues extracts typed pointers from an attribute for SQL binding.
+func attrValues(attr *model.Attribute) (
+	strVal *string, intVal *int64, dblVal *float64, boolVal *bool, bytesVal []byte,
+) {
+	switch attr.Kind {
+	case model.ValueString:
+		strVal = &attr.Str
+	case model.ValueInt:
+		intVal = &attr.Num
+	case model.ValueDouble:
+		dblVal = &attr.Dbl
+	case model.ValueBool:
+		boolVal = &attr.Flag
+	case model.ValueBytes:
+		bytesVal = attr.Raw
 	}
-
-	for _, attr := range attributes {
-		var (
-			strVal   *string
-			intVal   *int64
-			dblVal   *float64
-			boolVal  *bool
-			bytesVal []byte
-		)
-
-		switch attr.Kind {
-		case model.ValueString:
-			strVal = &attr.Str
-		case model.ValueInt:
-			intVal = &attr.Num
-		case model.ValueDouble:
-			dblVal = &attr.Dbl
-		case model.ValueBool:
-			boolVal = &attr.Flag
-		case model.ValueBytes:
-			bytesVal = attr.Raw
-		}
-
-		_, err := stmt.ExecContext(
-			ctx,
-			eventID,
-			attr.Key,
-			attr.Kind.String(),
-			strVal,
-			intVal,
-			dblVal,
-			boolVal,
-			bytesVal,
-		)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return
 }

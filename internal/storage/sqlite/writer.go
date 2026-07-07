@@ -336,39 +336,104 @@ func (w *Writer) cleanup() {
 	}
 }
 
-// openDatabase opens a SQLite database with appropriate settings.
+// openDatabase opens a SQLite database with performance and durability
+// pragmas tuned for write-heavy log ingestion workloads.
 func openDatabase(path string, walMode bool) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
 
+	// Single connection is correct for a dedicated writer: WAL-mode SQLite
+	// supports one writer concurrently with many readers, but this process
+	// owns the sole writer connection.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
+	// --- Durability & data integrity ---
+
 	// Enable foreign key enforcement. SQLite defaults to OFF; turning it ON
-	// makes declared FK constraints actually reject violations, catching
-	// bugs like orphaned resource references at insert time.
+	// makes declared FK constraints actually reject violations.
 	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to enable foreign keys: %w", err)
 	}
 
+	// Busy timeout: if another connection holds a SHARED lock (e.g., a
+	// long-running read query), wait up to 5s instead of failing immediately
+	// with SQLITE_BUSY.  This is a safety net; under normal operation the
+	// single-writer architecture prevents contention.
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to set busy_timeout: %w", err)
+	}
+
 	if walMode {
-		if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
+		// WAL mode: writes go to the WAL file, readers see a consistent
+		// snapshot.  Crash-safe even with synchronous=NORMAL because the
+		// WAL header is checksummed.
+		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
 		}
 
-		if _, err := db.Exec("PRAGMA synchronous=NORMAL;"); err != nil {
+		// synchronous=NORMAL: the WAL is synced at each checkpoint, but
+		// individual transactions are not synced.  Crash-safe in WAL mode
+		// because the WAL is idempotent on recovery.  Effectively as durable
+		// as FULL for WAL databases at significantly higher throughput.
+		if _, err := db.Exec("PRAGMA synchronous=NORMAL"); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("failed to set synchronous mode: %w", err)
 		}
 
-		if _, err := db.Exec("PRAGMA wal_autocheckpoint=1000;"); err != nil {
+		// wal_autocheckpoint: trigger a checkpoint after every 1000 pages
+		// (4 MB with default 4 KB pages, 8 MB with 8 KB pages) written to
+		// the WAL.  Prevents the WAL from growing without bound while keeping
+		// checkpoint pauses short.
+		if _, err := db.Exec("PRAGMA wal_autocheckpoint=1000"); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("failed to set autocheckpoint: %w", err)
 		}
+
+		// journal_size_limit caps the WAL file at 64 MB.  If the WAL
+		// reaches this size before wal_autocheckpoint fires, SQLite will
+		// force a checkpoint to reclaim disk space.  This is a safety
+		// net for workloads with very large individual transactions.
+		if _, err := db.Exec("PRAGMA journal_size_limit = 67108864"); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("failed to set journal_size_limit: %w", err)
+		}
+	}
+
+	// --- Performance tuning ---
+
+	// cache_size: increase the in-memory page cache from the default 2 MB
+	// (~500 pages) to 64 MB (~16000 pages at 4 KB).  A larger cache reduces
+	// B-tree page reads from disk, especially important for the resource
+	// lookup path (INSERT OR IGNORE still reads the index).
+	// Negative value means kibibytes: -65536 = 64 MB.
+	if _, err := db.Exec("PRAGMA cache_size = -65536"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to set cache_size: %w", err)
+	}
+
+	// mmap_size: enable memory-mapped I/O for the database file.  Instead
+	// of read() syscalls, SQLite accesses pages directly in the process
+	// address space via the kernel's page cache.  This eliminates user/kernel
+	// copies and reduces CPU overhead.  256 MB is large enough for most
+	// deployments without pressuring virtual address space.
+	if _, err := db.Exec("PRAGMA mmap_size = 268435456"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to set mmap_size: %w", err)
+	}
+
+	// temp_store = MEMORY: force temporary tables, indices, and sorting
+	// buffers into memory instead of spilling to a temporary file on disk.
+	// This is safe because temp objects are small and short-lived in this
+	// workload (no large analytical queries).
+	if _, err := db.Exec("PRAGMA temp_store = MEMORY"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to set temp_store: %w", err)
 	}
 
 	if err := db.Ping(); err != nil {

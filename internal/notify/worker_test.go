@@ -316,3 +316,252 @@ func (n *noMatchEngine) Evaluate(_ context.Context, _ *Event) (*Rule, string, bo
 	return nil, "", false
 }
 func (n *noMatchEngine) Rules() []Rule { return nil }
+
+// ---------------------------------------------------------------------------
+// Regression tests for fixes
+// ---------------------------------------------------------------------------
+
+func TestWorker_StoredEventOnRetry(t *testing.T) {
+	// The retry loop must send the original StoredEvent body, not the key string.
+	store := newMockStore()
+	notifier := &mockNotifier{failOn: 1} // always fails on first attempt
+	engine := &mockRuleEngine{
+		rule: Rule{
+			Name:         "stored-rule",
+			MaxRetries:   3,
+			RetryBackoff: 10 * time.Millisecond,
+			Destination:  "mock",
+		},
+		key: "stored-rule:res1:fp1",
+	}
+
+	originalEvent := &Event{
+		Severity:   17,
+		Body:       "real error message",
+		ResourceID: "res1",
+	}
+
+	// Pre-populate state with StoredEvent and retry due now.
+	store.PutState(context.Background(), "stored-rule:res1:fp1", &NotificationState{
+		RetryCount:  1,
+		NextRetry:   time.Now().UnixNano() - int64(time.Second),
+		StoredEvent: originalEvent,
+	})
+
+	w := NewWorker(&WorkerConfig{
+		Store:           store,
+		Engine:          engine,
+		Notifiers:       map[string]Notifier{"mock": notifier},
+		EventQueueDepth: 10,
+		RetryInterval:   50 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+
+	time.Sleep(200 * time.Millisecond)
+	w.Stop()
+
+	// The notifier should have received the original event body, not the key.
+	sent := notifier.Sent()
+	if len(sent) == 0 {
+		t.Fatal("expected at least 1 send attempt")
+	}
+	lastEvent := sent[len(sent)-1]
+	if lastEvent.Body != "real error message" {
+		t.Errorf("retry body = %q, want %q (should use StoredEvent, not key string)",
+			lastEvent.Body, "real error message")
+	}
+	if lastEvent.ResourceID != "res1" {
+		t.Errorf("retry resource_id = %q, want %q", lastEvent.ResourceID, "res1")
+	}
+}
+
+func TestWorker_NonRetryableGoesStraightToDLQ(t *testing.T) {
+	// 4xx errors should go directly to DLQ without retrying.
+	store := newMockStore()
+	notifier := &nonRetryableNotifier{}
+	engine := &mockRuleEngine{
+		rule: Rule{
+			Name:         "nr-rule",
+			MaxRetries:   3,
+			RetryBackoff: 10 * time.Millisecond,
+			Destination:  "mock",
+			Cooldown:     0,
+		},
+		key: "nr-rule:res1:fp1",
+	}
+
+	w := NewWorker(&WorkerConfig{
+		Store:           store,
+		Engine:          engine,
+		Notifiers:       map[string]Notifier{"mock": notifier},
+		EventQueueDepth: 10,
+		RetryInterval:   500 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+
+	event := &Event{Severity: 17, Body: "unauthorized", ResourceID: "res1"}
+	w.Send(context.Background(), event)
+	time.Sleep(200 * time.Millisecond)
+	w.Stop()
+
+	// Should be in DLQ immediately (no retries).
+	dlq, _ := store.ListDLQ(context.Background())
+	if len(dlq) != 1 {
+		t.Fatalf("expected 1 DLQ entry, got %d", len(dlq))
+	}
+	// State should be deleted (not pending retry).
+	_, err := store.GetState(context.Background(), "nr-rule:res1:fp1")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("state should be deleted after non-retryable, got err=%v", err)
+	}
+}
+
+func TestWorker_QueueDrainOnShutdown(t *testing.T) {
+	// Events already buffered in the channel must be processed during Stop().
+	store := newMockStore()
+	notifier := &mockNotifier{}
+	engine := &mockRuleEngine{
+		rule: Rule{
+			Name:        "drain-rule",
+			Cooldown:    0,
+			MaxRetries:  1,
+			Destination: "mock",
+		},
+		key: "drain-rule:res1:fp1",
+	}
+
+	w := NewWorker(&WorkerConfig{
+		Store:           store,
+		Engine:          engine,
+		Notifiers:       map[string]Notifier{"mock": notifier},
+		EventQueueDepth: 100,
+		RetryInterval:   10 * time.Second,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	w.Start(ctx)
+
+	// Enqueue several events, then immediately stop.
+	for i := 0; i < 5; i++ {
+		w.Send(context.Background(), &Event{Severity: 17, Body: "msg", ResourceID: "res1"})
+	}
+	cancel()
+	w.Stop() // should drain and process all 5
+
+	sent := notifier.Sent()
+	if len(sent) != 5 {
+		t.Errorf("expected 5 events drained and delivered, got %d", len(sent))
+	}
+}
+
+func TestWorker_CheckCooldown(t *testing.T) {
+	w := &Worker{}
+
+	// Past cooldown.
+	if !w.checkCooldown(&NotificationState{CooldownUntil: 0}, 100) {
+		t.Error("cooldownUntil=0 should pass")
+	}
+	if !w.checkCooldown(&NotificationState{CooldownUntil: 50}, 100) {
+		t.Error("cooldownUntil=50, now=100 should pass")
+	}
+
+	// Active cooldown.
+	if w.checkCooldown(&NotificationState{CooldownUntil: 200}, 100) {
+		t.Error("cooldownUntil=200, now=100 should block")
+	}
+}
+
+func TestWorker_CheckDedup(t *testing.T) {
+	w := &Worker{}
+	rule := &Rule{DedupWindow: 1 * time.Second}
+
+	// No previous event.
+	event := &Event{Body: "error"}
+	state := &NotificationState{LastAttempt: 0, EventDigest: ""}
+	now := int64(time.Second)
+	if !w.checkDedup(state, rule, event, now) {
+		t.Error("first event should pass dedup")
+	}
+	if state.EventDigest == "" {
+		t.Error("EventDigest should be set after check")
+	}
+
+	// Same fingerprint within window → blocked.
+	event2 := &Event{Body: "error"} // same body → same fingerprint
+	state2 := &NotificationState{
+		LastAttempt: now,
+		EventDigest: event.Fingerprint(),
+	}
+	now2 := now + int64(500*time.Millisecond) // within 1s window
+	if w.checkDedup(state2, rule, event2, now2) {
+		t.Error("duplicate within window should be blocked")
+	}
+
+	// Same fingerprint outside window → passes.
+	now3 := now + int64(2*time.Second) // outside 1s window
+	if !w.checkDedup(state2, rule, event2, now3) {
+		t.Error("duplicate outside window should pass")
+	}
+
+	// No dedup window → always passes.
+	ruleNoDedup := &Rule{DedupWindow: 0}
+	state3 := &NotificationState{LastAttempt: now, EventDigest: event.Fingerprint()}
+	if !w.checkDedup(state3, ruleNoDedup, event, now+1) {
+		t.Error("dedup window=0 should always pass")
+	}
+}
+
+func TestWorker_CheckRateLimit(t *testing.T) {
+	w := &Worker{}
+	rule := &Rule{RateLimit: 3, RateWindow: 1 * time.Second}
+
+	// Below limit.
+	state := &NotificationState{
+		ErrorRateBucket: []int64{100, 200},
+	}
+	if !w.checkRateLimit(state, rule, 300) {
+		t.Error("2 events in window should pass rate limit of 3")
+	}
+
+	// At limit.
+	state2 := &NotificationState{
+		ErrorRateBucket: []int64{100, 200, 300},
+	}
+	if w.checkRateLimit(state2, rule, 400) {
+		t.Error("3 events at limit of 3 should block")
+	}
+
+	// Expired bucket entries don't count.
+	base := time.Now().UnixNano()
+	state4 := &NotificationState{
+		ErrorRateBucket: []int64{base - int64(2*time.Second)}, // 2s ago, outside 1s window
+	}
+	if !w.checkRateLimit(state4, rule, base) {
+		t.Error("expired bucket entries should not count against limit")
+	}
+	// The prune should have removed the old entry.
+	if len(state4.ErrorRateBucket) != 1 || state4.ErrorRateBucket[0] != base {
+		t.Error("bucket should contain only current timestamp after prune")
+	}
+
+	// No rate limit → always passes.
+	ruleNoLimit := &Rule{RateLimit: 0}
+	if !w.checkRateLimit(&NotificationState{}, ruleNoLimit, 100) {
+		t.Error("rate limit=0 should always pass")
+	}
+}
+
+// nonRetryableNotifier always returns a non-retryable error.
+type nonRetryableNotifier struct{}
+
+func (n *nonRetryableNotifier) Send(_ context.Context, _ *Event) error {
+	return NewNotRetryableError(errors.New("401 unauthorized"))
+}
+func (n *nonRetryableNotifier) Name() string { return "mock" }
+func (n *nonRetryableNotifier) Close() error { return nil }
