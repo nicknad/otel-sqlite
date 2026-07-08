@@ -48,177 +48,133 @@ type Metrics struct {
 
 // NewMetrics creates a new Metrics instance with all metrics registered.
 func NewMetrics() *Metrics {
+	// ── Ingestion ────────────────────────────────────────────────────
+	logsReceived := promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "ingest", Name: "logs_received_total",
+		Help: "Total number of log records received",
+	})
+	ingressQueueDepth := promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "otel_collector", Subsystem: "ingest", Name: "ingress_queue_depth",
+		Help: "Current depth of the ingress queue",
+	})
+	batchQueueDepth := promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "otel_collector", Subsystem: "ingest", Name: "batch_queue_depth",
+		Help: "Current depth of the batch queue",
+	})
+	backpressureRejections := promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "ingest", Name: "backpressure_rejections_total",
+		Help: "Total number of requests rejected due to backpressure",
+	})
+
+	// ── Batcher ──────────────────────────────────────────────────────
+	batchesCreated := promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "batcher", Name: "batches_created_total",
+		Help: "Total number of batches created",
+	})
+	batchSize := promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "otel_collector", Subsystem: "batcher", Name: "batch_size",
+		Help:    "Size of batches (number of log records)",
+		Buckets: prometheus.ExponentialBuckets(1, 2, 10),
+	})
+
+	// ── Storage ──────────────────────────────────────────────────────
+	logsWritten := promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "storage", Name: "logs_written_total",
+		Help: "Total number of log records written to storage",
+	})
+	batchesWritten := promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "storage", Name: "batches_written_total",
+		Help: "Total number of batches written to storage",
+	})
+	writeLatency := promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "otel_collector", Subsystem: "storage", Name: "write_latency_seconds",
+		Help: "Latency of write operations in seconds", Buckets: prometheus.DefBuckets,
+	})
+	writeErrors := promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "storage", Name: "write_errors_total",
+		Help: "Total number of write errors",
+	})
+	activeResources := promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "otel_collector", Subsystem: "storage", Name: "active_resources",
+		Help: "Number of active resources",
+	})
+	totalResources := promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "storage", Name: "total_resources",
+		Help: "Total number of unique resources",
+	})
+
+	// ── Command execution ────────────────────────────────────────────
+	commandQueueDepth := promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "otel_collector", Subsystem: "command", Name: "queue_depth",
+		Help: "Current depth of the command queue",
+	})
+	commandExecutionDuration := promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "otel_collector", Subsystem: "command", Name: "execution_duration_seconds",
+		Help: "Duration of command execution batches in seconds", Buckets: prometheus.DefBuckets,
+	})
+	commandsExecutedTotal := promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "command", Name: "executed_total",
+		Help: "Total number of commands executed",
+	})
+	commandFailuresTotal := promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "command", Name: "failures_total",
+		Help: "Total number of command execution failures",
+	})
+
+	// ── Notification ────────────────────────────────────────────────
+	notifyEventsReceived := promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "notify", Name: "events_received_total",
+		Help: "Total number of notification events received from the batcher",
+	})
+	notifyEventsMatched := promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "notify", Name: "events_matched_total",
+		Help: "Total number of notification events that matched a rule",
+	}, []string{"rule"})
+	notifyEventsDelivered := promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "notify", Name: "events_delivered_total",
+		Help: "Total number of notification events successfully delivered",
+	}, []string{"destination"})
+	notifyEventsFailed := promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "notify", Name: "events_failed_total",
+		Help: "Total number of notification events that failed delivery",
+	}, []string{"destination"})
+	notifyEventsDeadLettered := promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "notify", Name: "events_dead_lettered_total",
+		Help: "Total number of notification events moved to dead-letter queue",
+	})
+	notifyQueueDepth := promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "otel_collector", Subsystem: "notify", Name: "queue_depth",
+		Help: "Current depth of the notification event queue",
+	})
+	notifyRetryQueueDepth := promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "otel_collector", Subsystem: "notify", Name: "retry_queue_depth",
+		Help: "Current number of events pending retry",
+	})
+
 	return &Metrics{
-		// Ingestion metrics
-		LogsReceived: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: "otel_collector",
-			Subsystem: "ingest",
-			Name:      "logs_received_total",
-			Help:      "Total number of log records received",
-		}),
-
-		LogsWritten: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: "otel_collector",
-			Subsystem: "storage",
-			Name:      "logs_written_total",
-			Help:      "Total number of log records written to storage",
-		}),
-
-		IngressQueueDepth: promauto.NewGauge(prometheus.GaugeOpts{
-			Namespace: "otel_collector",
-			Subsystem: "ingest",
-			Name:      "ingress_queue_depth",
-			Help:      "Current depth of the ingress queue",
-		}),
-
-		BatchQueueDepth: promauto.NewGauge(prometheus.GaugeOpts{
-			Namespace: "otel_collector",
-			Subsystem: "ingest",
-			Name:      "batch_queue_depth",
-			Help:      "Current depth of the batch queue",
-		}),
-
-		// Batch metrics
-		BatchesCreated: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: "otel_collector",
-			Subsystem: "batcher",
-			Name:      "batches_created_total",
-			Help:      "Total number of batches created",
-		}),
-
-		BatchesWritten: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: "otel_collector",
-			Subsystem: "storage",
-			Name:      "batches_written_total",
-			Help:      "Total number of batches written to storage",
-		}),
-
-		BatchSize: promauto.NewHistogram(prometheus.HistogramOpts{
-			Namespace: "otel_collector",
-			Subsystem: "batcher",
-			Name:      "batch_size",
-			Help:      "Size of batches (number of log records)",
-			Buckets:   prometheus.ExponentialBuckets(1, 2, 10),
-		}),
-
-		// Storage metrics
-		WriteLatency: promauto.NewHistogram(prometheus.HistogramOpts{
-			Namespace: "otel_collector",
-			Subsystem: "storage",
-			Name:      "write_latency_seconds",
-			Help:      "Latency of write operations in seconds",
-			Buckets:   prometheus.DefBuckets,
-		}),
-
-		WriteErrors: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: "otel_collector",
-			Subsystem: "storage",
-			Name:      "write_errors_total",
-			Help:      "Total number of write errors",
-		}),
-
-		// Command execution metrics
-		CommandQueueDepth: promauto.NewGauge(prometheus.GaugeOpts{
-			Namespace: "otel_collector",
-			Subsystem: "command",
-			Name:      "queue_depth",
-			Help:      "Current depth of the command queue",
-		}),
-
-		CommandExecutionDuration: promauto.NewHistogram(prometheus.HistogramOpts{
-			Namespace: "otel_collector",
-			Subsystem: "command",
-			Name:      "execution_duration_seconds",
-			Help:      "Duration of command execution batches in seconds",
-			Buckets:   prometheus.DefBuckets,
-		}),
-
-		CommandsExecutedTotal: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: "otel_collector",
-			Subsystem: "command",
-			Name:      "executed_total",
-			Help:      "Total number of commands executed",
-		}),
-
-		CommandFailuresTotal: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: "otel_collector",
-			Subsystem: "command",
-			Name:      "failures_total",
-			Help:      "Total number of command execution failures",
-		}),
-
-		// Backpressure metrics
-		BackpressureRejections: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: "otel_collector",
-			Subsystem: "ingest",
-			Name:      "backpressure_rejections_total",
-			Help:      "Total number of requests rejected due to backpressure",
-		}),
-
-		// Resource metrics
-		ActiveResources: promauto.NewGauge(prometheus.GaugeOpts{
-			Namespace: "otel_collector",
-			Subsystem: "storage",
-			Name:      "active_resources",
-			Help:      "Number of active resources",
-		}),
-
-		TotalResources: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: "otel_collector",
-			Subsystem: "storage",
-			Name:      "total_resources",
-			Help:      "Total number of unique resources",
-		}),
-
-		// Notification metrics
-		NotifyEventsReceived: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: "otel_collector",
-			Subsystem: "notify",
-			Name:      "events_received_total",
-			Help:      "Total number of notification events received from the batcher",
-		}),
-
-		NotifyEventsMatched: promauto.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "otel_collector",
-			Subsystem: "notify",
-			Name:      "events_matched_total",
-			Help:      "Total number of notification events that matched a rule",
-		}, []string{"rule"}),
-
-		NotifyEventsDelivered: promauto.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "otel_collector",
-			Subsystem: "notify",
-			Name:      "events_delivered_total",
-			Help:      "Total number of notification events successfully delivered",
-		}, []string{"destination"}),
-
-		NotifyEventsFailed: promauto.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "otel_collector",
-			Subsystem: "notify",
-			Name:      "events_failed_total",
-			Help:      "Total number of notification events that failed delivery",
-		}, []string{"destination"}),
-
-		NotifyEventsDeadLettered: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: "otel_collector",
-			Subsystem: "notify",
-			Name:      "events_dead_lettered_total",
-			Help:      "Total number of notification events moved to dead-letter queue",
-		}),
-
-		NotifyQueueDepth: promauto.NewGauge(prometheus.GaugeOpts{
-			Namespace: "otel_collector",
-			Subsystem: "notify",
-			Name:      "queue_depth",
-			Help:      "Current depth of the notification event queue",
-		}),
-
-		NotifyRetryQueueDepth: promauto.NewGauge(prometheus.GaugeOpts{
-			Namespace: "otel_collector",
-			Subsystem: "notify",
-			Name:      "retry_queue_depth",
-			Help:      "Current number of events pending retry",
-		}),
+		LogsReceived:             logsReceived,
+		LogsWritten:              logsWritten,
+		IngressQueueDepth:        ingressQueueDepth,
+		BatchQueueDepth:          batchQueueDepth,
+		BatchesCreated:           batchesCreated,
+		BatchesWritten:           batchesWritten,
+		BatchSize:                batchSize,
+		WriteLatency:             writeLatency,
+		WriteErrors:              writeErrors,
+		CommandQueueDepth:        commandQueueDepth,
+		CommandExecutionDuration: commandExecutionDuration,
+		CommandsExecutedTotal:    commandsExecutedTotal,
+		CommandFailuresTotal:     commandFailuresTotal,
+		BackpressureRejections:   backpressureRejections,
+		ActiveResources:          activeResources,
+		TotalResources:           totalResources,
+		NotifyEventsReceived:     notifyEventsReceived,
+		NotifyEventsMatched:      notifyEventsMatched,
+		NotifyEventsDelivered:    notifyEventsDelivered,
+		NotifyEventsFailed:       notifyEventsFailed,
+		NotifyEventsDeadLettered: notifyEventsDeadLettered,
+		NotifyQueueDepth:         notifyQueueDepth,
+		NotifyRetryQueueDepth:    notifyRetryQueueDepth,
 	}
 }
 

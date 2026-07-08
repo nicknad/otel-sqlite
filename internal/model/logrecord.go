@@ -70,22 +70,20 @@ const (
 	ValueBytes
 )
 
+var valueTypeStrings = map[ValueType]string{
+	ValueString: "string",
+	ValueInt:    "int",
+	ValueDouble: "double",
+	ValueBool:   "bool",
+	ValueBytes:  "bytes",
+}
+
 // String returns the string representation of the value type.
 func (t ValueType) String() string {
-	switch t {
-	case ValueString:
-		return "string"
-	case ValueInt:
-		return "int"
-	case ValueDouble:
-		return "double"
-	case ValueBool:
-		return "bool"
-	case ValueBytes:
-		return "bytes"
-	default:
-		return "null"
+	if s, ok := valueTypeStrings[t]; ok {
+		return s
 	}
+	return "null"
 }
 
 // Attribute represents a key-value pair stored inline (no pointer indirection).

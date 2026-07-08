@@ -226,116 +226,105 @@ func (c *Config) LoadFromEnv() (int, error) {
 	return count, nil
 }
 
+// envBinding describes one environment-variable → config-field mapping.
+type envBinding struct {
+	key   string
+	parse func(string) (any, error)
+	apply func(*Config, any)
+}
+
+var envBindings = []envBinding{
+	// Strings
+	{key: "ListenAddress", parse: parseString, apply: func(c *Config, v any) { c.ListenAddress = v.(string) }},
+	{key: "SQLitePath", parse: parseString, apply: func(c *Config, v any) { c.SQLitePath = v.(string) }},
+	{key: "MetricsAddress", parse: parseString, apply: func(c *Config, v any) { c.MetricsAddress = v.(string) }},
+	{
+		key: "BatcherErrorSeverityThreshold", parse: parseString,
+		apply: func(c *Config, v any) { c.BatcherErrorSeverityThreshold = v.(string) },
+	},
+
+	// Ints
+	{key: "IngressQueueCapacity", parse: parseInt, apply: func(c *Config, v any) { c.IngressQueueCapacity = v.(int) }},
+	{key: "BatchQueueCapacity", parse: parseInt, apply: func(c *Config, v any) { c.BatchQueueCapacity = v.(int) }},
+	{key: "BatcherBatchSize", parse: parseInt, apply: func(c *Config, v any) { c.BatcherBatchSize = v.(int) }},
+	{key: "WriterBatchSize", parse: parseInt, apply: func(c *Config, v any) { c.WriterBatchSize = v.(int) }},
+	{
+		key: "WriterMaxTransactionRecords", parse: parseInt,
+		apply: func(c *Config, v any) { c.WriterMaxTransactionRecords = v.(int) },
+	},
+	{key: "GrpcMaxRecvMsgSize", parse: parseInt, apply: func(c *Config, v any) { c.GrpcMaxRecvMsgSize = v.(int) }},
+	{key: "GrpcMaxSendMsgSize", parse: parseInt, apply: func(c *Config, v any) { c.GrpcMaxSendMsgSize = v.(int) }},
+	{
+		key: "GrpcMaxConcurrentStreams", parse: parseInt,
+		apply: func(c *Config, v any) { c.GrpcMaxConcurrentStreams = v.(int) },
+	},
+	{key: "GoMemoryLimitMB", parse: parseInt, apply: func(c *Config, v any) { c.GoMemoryLimitMB = v.(int) }},
+
+	// Durations
+	{
+		key: "BatcherFlushInterval", parse: parseDuration,
+		apply: func(c *Config, v any) { c.BatcherFlushInterval = v.(time.Duration) },
+	},
+	{
+		key: "WriterFlushInterval", parse: parseDuration,
+		apply: func(c *Config, v any) { c.WriterFlushInterval = v.(time.Duration) },
+	},
+	{
+		key: "ShutdownTimeout", parse: parseDuration,
+		apply: func(c *Config, v any) { c.ShutdownTimeout = v.(time.Duration) },
+	},
+
+	// Float
+	{
+		key: "IngressQueueBackpressureThreshold", parse: parseFloat,
+		apply: func(c *Config, v any) { c.IngressQueueBackpressureThreshold = v.(float64) },
+	},
+
+	// Notification
+	{
+		key: "NotificationEnabled", parse: parseBool,
+		apply: func(c *Config, v any) { c.ensureNotification().Enabled = v.(bool) },
+	},
+	{
+		key: "NotificationEventQueueDepth", parse: parseInt,
+		apply: func(c *Config, v any) { c.ensureNotification().EventQueueDepth = v.(int) },
+	},
+	{
+		key: "NotificationStorePath", parse: parseString,
+		apply: func(c *Config, v any) { c.ensureNotification().StorePath = v.(string) },
+	},
+	{
+		key: "NotificationRetryInterval", parse: parseDuration,
+		apply: func(c *Config, v any) { c.ensureNotification().RetryInterval = v.(time.Duration) },
+	},
+}
+
+// Parse helpers.
+func parseString(s string) (any, error)   { return s, nil }
+func parseInt(s string) (any, error)      { return strconv.Atoi(s) }
+func parseFloat(s string) (any, error)    { return strconv.ParseFloat(s, 64) }
+func parseBool(s string) (any, error)     { return strconv.ParseBool(s) }
+func parseDuration(s string) (any, error) { return time.ParseDuration(s) }
+
+var bindingIndex = func() map[string]envBinding {
+	m := make(map[string]envBinding, len(envBindings))
+	for _, b := range envBindings {
+		m[b.key] = b
+	}
+	return m
+}()
+
 // setField sets a config field by name from a string value.
 func (c *Config) setField(key, value string) error {
-	switch key {
-	case "ListenAddress":
-		c.ListenAddress = value
-	case "SQLitePath":
-		c.SQLitePath = value
-	case "IngressQueueCapacity":
-		n, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid int %q: %w", value, err)
-		}
-		c.IngressQueueCapacity = n
-	case "BatchQueueCapacity":
-		n, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid int %q: %w", value, err)
-		}
-		c.BatchQueueCapacity = n
-	case "BatcherBatchSize":
-		n, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid int %q: %w", value, err)
-		}
-		c.BatcherBatchSize = n
-	case "BatcherFlushInterval":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("invalid duration %q: %w", value, err)
-		}
-		c.BatcherFlushInterval = d
-	case "BatcherErrorSeverityThreshold":
-		c.BatcherErrorSeverityThreshold = value
-	case "WriterBatchSize":
-		n, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid int %q: %w", value, err)
-		}
-		c.WriterBatchSize = n
-	case "WriterFlushInterval":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("invalid duration %q: %w", value, err)
-		}
-		c.WriterFlushInterval = d
-	case "WriterMaxTransactionRecords":
-		n, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid int %q: %w", value, err)
-		}
-		c.WriterMaxTransactionRecords = n
-	case "GrpcMaxRecvMsgSize":
-		n, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid int %q: %w", value, err)
-		}
-		c.GrpcMaxRecvMsgSize = n
-	case "GrpcMaxSendMsgSize":
-		n, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid int %q: %w", value, err)
-		}
-		c.GrpcMaxSendMsgSize = n
-	case "GrpcMaxConcurrentStreams":
-		n, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid int %q: %w", value, err)
-		}
-		c.GrpcMaxConcurrentStreams = n
-	case "IngressQueueBackpressureThreshold":
-		f, err := strconv.ParseFloat(value, 64)
-		if err != nil {
-			return fmt.Errorf("invalid float %q: %w", value, err)
-		}
-		c.IngressQueueBackpressureThreshold = f
-	case "GoMemoryLimitMB":
-		n, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid int %q: %w", value, err)
-		}
-		c.GoMemoryLimitMB = n
-	case "MetricsAddress":
-		c.MetricsAddress = value
-	case "ShutdownTimeout":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("invalid duration %q: %w", value, err)
-		}
-		c.ShutdownTimeout = d
-	case "NotificationEnabled":
-		b, err := strconv.ParseBool(value)
-		if err != nil {
-			return fmt.Errorf("invalid bool %q: %w", value, err)
-		}
-		c.ensureNotification().Enabled = b
-	case "NotificationEventQueueDepth":
-		n, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid int %q: %w", value, err)
-		}
-		c.ensureNotification().EventQueueDepth = n
-	case "NotificationStorePath":
-		c.ensureNotification().StorePath = value
-	case "NotificationRetryInterval":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("invalid duration %q: %w", value, err)
-		}
-		c.ensureNotification().RetryInterval = d
+	b, ok := bindingIndex[key]
+	if !ok {
+		return nil // unknown key → no-op (backward compatible)
 	}
+	parsed, err := b.parse(value)
+	if err != nil {
+		return fmt.Errorf("invalid value %q for %s: %w", value, key, err)
+	}
+	b.apply(c, parsed)
 	return nil
 }
 
