@@ -10,7 +10,10 @@ A high-performance OpenTelemetry log collector that receives OTLP logs over gRPC
 - **Prometheus Metrics**: Comprehensive observability with built-in metrics for ingestion, batching, commands, storage, and maintenance
 - **Backpressure**: Graceful handling of load spikes without data loss at every pipeline stage
 - **Batch-Level Ingress**: Batches sent through the ingress queue instead of individual records — 250× fewer channel operations
+- **Production-Tuned SQLite**: WAL mode, 64MB page cache, 256MB mmap I/O, temp_store=MEMORY, journal size limit
 - **OTLP Type Isolation**: Protobuf types confined to the transport layer; internal packages depend only on domain models
+- **Notification Pipeline**: Rule-based alerting with dedup, rate-limiting, cooldown, retries, and dead-letter queue
+- **Pluggable Notifiers**: HTTP webhook and log-based notifiers; add your own via the `Notifier` interface
 - **YAML Configuration**: Optional config file support via `CONFIG_FILE` environment variable
 
 ## Architecture
@@ -38,7 +41,14 @@ Command Queue (bounded, FIFO, channel-based Command objects)
 SQLite Writer (single goroutine, executes Command.Execute within transactions,
     │          returns records to pool after write)
     ▼
-SQLite Database (WAL mode, prepared statements, minimized indexes)
+SQLite Database (WAL mode, 64MB cache, 256MB mmap, prepared statements, minimized indexes)
+    │
+    ▼ (optional, if notification.enabled)
+Notification Worker (rule engine → state store → notifier)
+    │
+    ├── HTTP Webhook Notifier (POST JSON)
+    ├── Log Notifier (log.Printf)
+    └── Dead-Letter Queue (bbolt, persistent)
 ```
 
 ### Maintenance Framework
@@ -132,6 +142,7 @@ Or directly:
 | `BATCH_QUEUE_CAPACITY` | `1000` | Maximum command queue size |
 | `BATCHER_BATCH_SIZE` | `250` | Number of log records per batch (batcher) |
 | `BATCHER_FLUSH_INTERVAL` | `5s` | Maximum time between batch flushes |
+| `BATCHER_ERROR_SEVERITY_THRESHOLD` | `ERROR` | Minimum severity to forward to notification worker |
 | `WRITER_BATCH_SIZE` | `100` | Number of commands per transaction (writer) |
 | `WRITER_FLUSH_INTERVAL` | `5s` | Maximum time between transaction flushes |
 | `WRITER_MAX_TRANSACTION_RECORDS` | `5000` | Maximum records per SQLite transaction |
@@ -151,6 +162,10 @@ Or directly:
 | `OPTIMIZE_INTERVAL` | `24h` | How often to run optimize |
 | `VACUUM_ENABLED` | `false` | Enable VACUUM (requires exclusive lock) |
 | `VACUUM_INTERVAL` | `168h` (7d) | How often to vacuum |
+| `NOTIFICATION_ENABLED` | `false` | Enable notification pipeline |
+| `NOTIFICATION_EVENT_QUEUE_DEPTH` | `1000` | Notification event queue capacity |
+| `NOTIFICATION_STORE_PATH` | `notify-state.db` | Path to notification state store (bbolt) |
+| `NOTIFICATION_RETRY_INTERVAL` | `30s` | Retry scan interval |
 
 ### YAML Configuration File
 
@@ -205,6 +220,63 @@ func main() {
 }
 ```
 
+
+### Notification Pipeline
+
+The collector includes an optional notification pipeline that sends alerts when error-level log records are ingested.
+
+**Pipeline flow:**
+```
+Batcher (severity >= threshold)
+  → Notification Worker (event queue, non-blocking)
+    → Rule Engine (first-match-wins, regex filters on resource/body/attributes)
+      → State Store (bbolt: cooldown, dedup, rate-limit, retry tracking)
+        → Notifier (HTTP webhook or log)
+          → Retry Loop (exponential backoff, max 3 retries)
+            → Dead-Letter Queue (persistent, after max retries or 4xx errors)
+```
+
+**Features:**
+- **Rule-based matching**: filter by severity, resource ID (regex), body (regex), attributes
+- **Deduplication**: suppress identical events within a configurable window (SHA-256 digest)
+- **Rate limiting**: sliding window counter per rule (N events per M seconds)
+- **Cooldown**: minimum interval between notifications for the same event key
+- **Retry with backoff**: exponential backoff (base × 2^attempt), capped at 2^10
+- **Dead-letter queue**: persistent storage for events that exhausted retries or received 4xx responses
+- **Graceful shutdown**: drains buffered events before stopping
+- **Metrics**: events received, matched, delivered, failed, dead-lettered; queue depth
+
+**Configuration example** (`config.yaml`):
+```yaml
+notification:
+  enabled: true
+  event_queue_depth: 1000
+  store_path: "notify-state.db"
+  retry_interval: "30s"
+  notifiers:
+    slack:
+      type: "http"
+      url: "https://hooks.slack.com/services/..."
+      timeout: "10s"
+    dev:
+      type: "log"
+  rules:
+    - name: "production-errors"
+      match_severity: "ERROR"
+      resource_filter: ".*production.*"
+      cooldown: "5m"
+      rate_limit: 10
+      rate_window: "1m"
+      dedup_window: "5m"
+      max_retries: 3
+      retry_backoff: "30s"
+      destination: "slack"
+    - name: "all-fatals"
+      match_severity: "FATAL"
+      destination: "dev"
+```
+
+**HTTP notifier**: sends JSON POST requests with the event payload. Non-retryable errors (4xx) go straight to DLQ; retryable errors (5xx, network) follow the retry backoff.
 
 ### Load Testing
 
@@ -264,6 +336,16 @@ The collector exposes Prometheus metrics on `METRICS_ADDRESS` (default `:9090`).
 - `otel_collector_maintenance_duration_seconds` — Task execution duration (labeled by task)
 - `otel_collector_maintenance_last_run_timestamp` — Last successful run time (labeled by task)
 
+#### Notification Metrics
+
+- `otel_collector_notify_events_received_total` — Total notification events received
+- `otel_collector_notify_events_matched_total` — Events that matched a rule (labeled by rule)
+- `otel_collector_notify_events_delivered_total` — Events successfully delivered (labeled by destination)
+- `otel_collector_notify_events_failed_total` — Events that failed delivery (labeled by destination)
+- `otel_collector_notify_events_dead_lettered_total` — Events moved to dead-letter queue
+- `otel_collector_notify_queue_depth` — Current notification event queue depth
+- `otel_collector_notify_retry_queue_depth` — Current retry queue depth
+
 ### Health Checks
 
 - **gRPC Health Check**: Available at the gRPC endpoint
@@ -292,6 +374,24 @@ The collector exposes Prometheus metrics on `METRICS_ADDRESS` (default `:9090`).
 - Foreign keys for referential integrity
 - Indexes on: `timestamp_ns` (time-range queries), `resource_id` (resource filtering), `event_id` on attributes
 - Unused indexes removed (migration 004): `severity_number`, `trace_id`, `severity_text`, `body`, `event_name`, composite `(resource_id, timestamp_ns)`, composite `(trace_id, timestamp_ns)`, and all attribute value indexes — write performance is prioritized over read performance on non-critical query paths
+
+### SQLite Performance Tuning
+
+The writer applies these pragmas at startup for production-grade durability and performance:
+
+| Pragma | Value | Purpose |
+|--------|-------|---------|
+| `journal_mode` | WAL | Crash-safe writes without blocking readers |
+| `synchronous` | NORMAL | Safe in WAL mode; avoids per-transaction fsync |
+| `cache_size` | -65536 (64 MB) | Large page cache for B-tree efficiency on established databases |
+| `mmap_size` | 268435456 (256 MB) | Zero-copy page access via memory-mapped I/O |
+| `temp_store` | MEMORY | Force temp tables/indexes into RAM |
+| `journal_size_limit` | 67108864 (64 MB) | Cap WAL file growth; force checkpoint if exceeded |
+| `wal_autocheckpoint` | 1000 pages | Auto-checkpoint after ~4-8 MB written |
+| `busy_timeout` | 5000 ms | Retry on lock contention instead of immediate failure |
+| `foreign_keys` | ON | Enforce referential integrity at insert time |
+
+These settings are most impactful on large, established databases where B-tree depth is significant. On fresh databases with fast NVMe storage, the WAL absorbs write latency — the B-tree optimizations primarily benefit read queries, maintenance operations, and sustained write throughput over time.
 
 ### Migrations
 
