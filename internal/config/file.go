@@ -64,9 +64,6 @@ type FileRuleConfig struct {
 	BodyFilter       string            `yaml:"body_filter"`
 	AttributeFilters map[string]string `yaml:"attribute_filters"`
 	Cooldown         string            `yaml:"cooldown"`
-	RateLimit        int               `yaml:"rate_limit"`
-	RateWindow       string            `yaml:"rate_window"`
-	DedupWindow      string            `yaml:"dedup_window"`
 	MaxRetries       int               `yaml:"max_retries"`
 	RetryBackoff     string            `yaml:"retry_backoff"`
 	Destination      string            `yaml:"destination"`
@@ -241,7 +238,6 @@ func (c *Config) loadNotificationConfig(fc *FileConfig) error {
 			ResourceFilter:   fr.ResourceFilter,
 			BodyFilter:       fr.BodyFilter,
 			AttributeFilters: fr.AttributeFilters,
-			RateLimit:        fr.RateLimit,
 			MaxRetries:       fr.MaxRetries,
 			Destination:      fr.Destination,
 			AlertThreshold:   fr.AlertThreshold,
@@ -250,8 +246,6 @@ func (c *Config) loadNotificationConfig(fc *FileConfig) error {
 		// Parse each rule duration field with the shared helper.
 		setters := map[string]func(string){
 			"cooldown":             func(v string) { rc.Cooldown = v },
-			"rate_window":          func(v string) { rc.RateWindow = v },
-			"dedup_window":         func(v string) { rc.DedupWindow = v },
 			"retry_backoff":        func(v string) { rc.RetryBackoff = v },
 			"alert_window":         func(v string) { rc.AlertWindow = v },
 			"alert_resolve_window": func(v string) { rc.AlertResolveWindow = v },
@@ -290,8 +284,6 @@ type ruleDurationField struct {
 
 var ruleDurationFields = map[string]ruleDurationField{
 	"cooldown":             {"cooldown", func(fr *FileRuleConfig) string { return fr.Cooldown }},
-	"rate_window":          {"rate_window", func(fr *FileRuleConfig) string { return fr.RateWindow }},
-	"dedup_window":         {"dedup_window", func(fr *FileRuleConfig) string { return fr.DedupWindow }},
 	"retry_backoff":        {"retry_backoff", func(fr *FileRuleConfig) string { return fr.RetryBackoff }},
 	"alert_window":         {"alert_window", func(fr *FileRuleConfig) string { return fr.AlertWindow }},
 	"alert_resolve_window": {"alert_resolve_window", func(fr *FileRuleConfig) string { return fr.AlertResolveWindow }},

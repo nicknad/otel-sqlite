@@ -115,9 +115,6 @@ type RuleConfig struct {
 	BodyFilter       string            `mapstructure:"body_filter"`
 	AttributeFilters map[string]string `mapstructure:"attribute_filters"`
 	Cooldown         string            `mapstructure:"cooldown"`
-	RateLimit        int               `mapstructure:"rate_limit"`
-	RateWindow       string            `mapstructure:"rate_window"`
-	DedupWindow      string            `mapstructure:"dedup_window"`
 	MaxRetries       int               `mapstructure:"max_retries"`
 	RetryBackoff     string            `mapstructure:"retry_backoff"`
 	Destination      string            `mapstructure:"destination"`
@@ -206,6 +203,14 @@ var envVars = []envVar{
 	{
 		Key: "NotificationRetryInterval", Env: "NOTIFICATION_RETRY_INTERVAL",
 		Description: "Notification retry scan interval",
+	},
+	{
+		Key: "NotificationAlertStorePath", Env: "NOTIFICATION_ALERT_STORE_PATH",
+		Description: "Path to alert state store (bbolt)",
+	},
+	{
+		Key: "NotificationGCInterval", Env: "NOTIFICATION_GC_INTERVAL",
+		Description: "Resolved alert GC interval",
 	},
 }
 
@@ -296,6 +301,14 @@ var envBindings = []envBinding{
 	{
 		key: "NotificationRetryInterval", parse: parseDuration,
 		apply: func(c *Config, v any) { c.ensureNotification().RetryInterval = v.(time.Duration) },
+	},
+	{
+		key: "NotificationAlertStorePath", parse: parseString,
+		apply: func(c *Config, v any) { c.ensureNotification().AlertStorePath = v.(string) },
+	},
+	{
+		key: "NotificationGCInterval", parse: parseDuration,
+		apply: func(c *Config, v any) { c.ensureNotification().GCInterval = v.(time.Duration) },
 	},
 }
 

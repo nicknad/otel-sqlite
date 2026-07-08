@@ -537,7 +537,6 @@ func ruleConfigToRule(rc *config.RuleConfig) (*rules.Rule, error) {
 		ResourceFilter:   rc.ResourceFilter,
 		BodyFilter:       rc.BodyFilter,
 		AttributeFilters: rc.AttributeFilters,
-		RateLimit:        rc.RateLimit,
 		MaxRetries:       rc.MaxRetries,
 		Destination:      rc.Destination,
 		AlertThreshold:   rc.AlertThreshold,
@@ -550,20 +549,6 @@ func ruleConfigToRule(rc *config.RuleConfig) (*rules.Rule, error) {
 			return nil, fmt.Errorf("cooldown: %w", err)
 		}
 		rule.Cooldown = d
-	}
-	if rc.RateWindow != "" {
-		d, err := time.ParseDuration(rc.RateWindow)
-		if err != nil {
-			return nil, fmt.Errorf("rate_window: %w", err)
-		}
-		rule.RateWindow = d
-	}
-	if rc.DedupWindow != "" {
-		d, err := time.ParseDuration(rc.DedupWindow)
-		if err != nil {
-			return nil, fmt.Errorf("dedup_window: %w", err)
-		}
-		rule.DedupWindow = d
 	}
 	if rc.RetryBackoff != "" {
 		d, err := time.ParseDuration(rc.RetryBackoff)
