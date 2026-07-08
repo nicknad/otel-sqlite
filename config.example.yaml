@@ -56,27 +56,46 @@ shutdown_timeout: "30s"         # Graceful shutdown timeout
 # ingested. It evaluates rules, tracks state (dedup, rate-limit, cooldown,
 # retries), and delivers notifications via pluggable notifiers.
 #
+# Rules are evaluated in order; the first matching rule wins.
+# Each rule maps to a destination, which references a notifier by name.
+#
+# Built-in notifier types:
+#   "log"  — writes to the application log (development/testing)
+#   "http" — POSTs JSON to a configurable URL with optional auth header
+#
+# State (retry count, cooldown, dedup digest, rate-limit bucket) is
+# persisted in a bbolt embedded KV store at store_path.
+#
 # notification:
 #   enabled: true
 #   event_queue_depth: 1000
 #   store_path: "notify-state.db"
 #   retry_interval: "30s"
+#   notifiers:
+#     slack:
+#       type: "http"
+#       url: "https://hooks.slack.com/services/..."
+#       timeout: "10s"
+#       auth_header: ""
+#     dev:
+#       type: "log"
 #   rules:
-#     - name: "errors-to-slack"
+#     - name: "production-errors"
 #       match_severity: "ERROR"
+#       resource_filter: ".*production.*"
 #       cooldown: "5m"
 #       rate_limit: 10
 #       rate_window: "1m"
 #       dedup_window: "5m"
 #       max_retries: 3
 #       retry_backoff: "30s"
-#       destination: "http"
+#       destination: "slack"
 #     - name: "fatal-to-log"
 #       match_severity: "FATAL"
 #       resource_filter: ".*production.*"
 #       body_filter: "(?i)panic"
 #       cooldown: "1m"
-#       destination: "log"
+#       destination: "dev"
 
 # ---------------------------------------------------------------------------
 # Maintenance framework configuration

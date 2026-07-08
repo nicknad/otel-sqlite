@@ -1,5 +1,18 @@
 # Notification Queue & Rule Engine — `internal/notify`
 
+> **Status: ✅ Implemented** (commit `d57f7b5`). See `README.md` for usage docs.
+>
+> Key implementation changes from this spec:
+> - State store uses a **retry bucket index** for O(1) scans instead of full table scans
+> - State entries are **GC'd after 24h** of successful delivery (no unbounded growth)
+> - The **original Event is stored in state** for retries (the retry loop reconstructs the full event instead of sending a key-string body)
+> - HTTP notifier distinguishes **4xx (non-retryable → DLQ) from 5xx (retryable)** responses
+> - Worker **drains the event queue on shutdown** (no silent event loss)
+> - All notification **Prometheus metrics are wired**
+> - Worker is split into composable helper methods (`checkCooldown`, `checkDedup`, `checkRateLimit`, `deliver`, `handleNonRetryable`, `handleDeadLetter`)
+> - Fingerprint is **lazily cached** on the Event struct
+> - `StateKey` struct replaces fragile colon-delimited string parsing
+
 ## Context
 
 You are extending the OTLP-SQLite collector (Go). The existing pipeline is:
