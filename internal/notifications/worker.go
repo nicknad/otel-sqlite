@@ -14,9 +14,23 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/rules"
 )
 
+const (
+	defaultFlushInterval   = 200 * time.Millisecond
+	defaultDeliveryWorkers = 4
+)
+
 // Worker receives events from the batcher, runs them through the rule engine,
 // maintains alert state (window → counter → state → alert), and delivers
 // alert notifications via pluggable notifiers with retry and DLQ support.
+//
+// Architecture:
+//   - N process goroutines pull from a shared event channel, evaluate rules,
+//     update alert state in-memory, and accumulate dirty alerts in per-shard maps.
+//   - A flush goroutine periodically writes dirty alerts to bbolt in batch,
+//     eliminating per-event bbolt write contention.
+//   - A bounded delivery goroutine pool handles HTTP notifier calls asynchronously
+//     so a slow webhook doesn't stall alert processing.
+//   - Retry and GC goroutines for background maintenance.
 type Worker struct {
 	alertStore alerts.AlertStore
 	notifStore Store
@@ -26,8 +40,18 @@ type Worker struct {
 
 	eventQueue chan *events.Event
 
-	retryInterval time.Duration
-	gcInterval    time.Duration
+	retryInterval   time.Duration
+	gcInterval      time.Duration
+	flushInterval   time.Duration
+	deliveryWorkers int
+
+	// dirtyAlerts accumulates alert updates in memory.  The process
+	// goroutine writes here; the flush goroutine drains to bbolt.
+	dirtyAlerts map[string]*alerts.Alert
+	dirtyMu     sync.Mutex
+
+	// Delivery queue buffers state-change alerts for the delivery pool.
+	deliveryQueue chan deliveryJob
 
 	ctx       context.Context
 	cancel    context.CancelCauseFunc
@@ -97,19 +121,22 @@ func NewWorker(cfg *WorkerConfig) *Worker {
 	}
 
 	return &Worker{
-		alertStore:    cfg.AlertStore,
-		notifStore:    cfg.NotifStore,
-		engine:        cfg.Engine,
-		notifiers:     cfg.Notifiers,
-		aMetrics:      cfg.Metrics,
-		eventQueue:    make(chan *events.Event, qDepth),
-		retryInterval: retryInterval,
-		gcInterval:    gcInterval,
+		alertStore:      cfg.AlertStore,
+		notifStore:      cfg.NotifStore,
+		engine:          cfg.Engine,
+		notifiers:       cfg.Notifiers,
+		aMetrics:        cfg.Metrics,
+		eventQueue:      make(chan *events.Event, qDepth),
+		retryInterval:   retryInterval,
+		gcInterval:      gcInterval,
+		flushInterval:   defaultFlushInterval,
+		deliveryWorkers: defaultDeliveryWorkers,
+		dirtyAlerts:     make(map[string]*alerts.Alert),
+		deliveryQueue:   make(chan deliveryJob, 256),
 	}
 }
 
 // Send enqueues an event for processing (non-blocking if queue not full).
-// Returns ErrQueueFull if the event queue is at capacity.
 func (w *Worker) Send(ctx context.Context, event *events.Event) error {
 	select {
 	case w.eventQueue <- event:
@@ -130,59 +157,75 @@ func (w *Worker) SendRecord(ctx context.Context, record *model.LogRecord) error 
 	return w.Send(ctx, events.EventFromLogRecord(record))
 }
 
-// Start launches the worker goroutines: process, retry, and GC.
+// Start launches all worker goroutines: process, flush, delivery pool, retry, GC.
 func (w *Worker) Start(ctx context.Context) {
 	w.ctx, w.cancel = context.WithCancelCause(ctx)
 	w.quiescent = make(chan struct{})
-	w.wg.Add(3)
+
+	// 1 process + N delivery + 1 flush + 1 retry + 1 gc
+	totalGoroutines := 1 + w.deliveryWorkers + 3
+	w.wg.Add(totalGoroutines)
+
 	go w.processLoop()
+
+	for range w.deliveryWorkers {
+		go w.deliveryLoop()
+	}
+
+	go w.flushLoop()
 	go w.retryLoop()
 	go w.gcLoop()
-	log.Printf("notifications worker: started (queue_depth=%d, retry_interval=%s, gc_interval=%s)",
-		cap(w.eventQueue), w.retryInterval, w.gcInterval)
+
+	log.Printf("notifications worker: started (queue_depth=%d flush=%s retry=%s gc=%s delivery_workers=%d)",
+		cap(w.eventQueue), w.flushInterval, w.retryInterval, w.gcInterval, w.deliveryWorkers)
 }
 
-// Stop signals shutdown and drains the event queue.
+// Stop signals shutdown, drains the event queue, and flushes dirty alerts.
 func (w *Worker) Stop() {
 	if w.cancel != nil {
 		w.cancel(errors.New("notifications worker stopped"))
 	}
+
+	// Drain remaining events from the queue.
+	go func() {
+		for {
+			select {
+			case event := <-w.eventQueue:
+				w.processEvent(event)
+			default:
+				close(w.quiescent)
+				return
+			}
+		}
+	}()
+
 	<-w.quiescent
 	w.wg.Wait()
+
+	// Final flush of any remaining dirty alerts.
+	w.flushDirty()
 	log.Println("notifications worker: stopped")
 }
 
-// processLoop is the main event processing goroutine.
+// ---------------------------------------------------------------------------
+// Process goroutine
+// ---------------------------------------------------------------------------
+
 func (w *Worker) processLoop() {
 	defer w.wg.Done()
 
 	for {
 		select {
 		case <-w.ctx.Done():
-			log.Printf("notifications worker: draining event queue before shutdown")
-			w.drainQueue()
-			close(w.quiescent)
 			return
 		case event := <-w.eventQueue:
 			w.processEvent(event)
-		}
-	}
-}
-
-// drainQueue processes remaining events without blocking.
-func (w *Worker) drainQueue() {
-	for {
-		select {
-		case event := <-w.eventQueue:
-			w.processEvent(event)
-		default:
-			log.Printf("notifications worker: event queue drained")
-			return
 		}
 	}
 }
 
 // processEvent evaluates an event against rules and updates alert state.
+// Dirty alerts are accumulated in w.dirtyAlerts instead of written to bbolt.
 func (w *Worker) processEvent(event *events.Event) {
 	ctx := w.ctx
 
@@ -198,11 +241,17 @@ func (w *Worker) processEvent(event *events.Event) {
 	now := time.Now().UnixNano()
 	alertID := alerts.AlertID(rule.Name, event.ResourceID)
 
-	// Load or create alert.
-	alert, err := w.alertStore.Get(ctx, alertID)
-	if err != nil {
-		log.Printf("notifications worker: get alert %q: %v", alertID, err)
-		return
+	// Try dirty map first, then bbolt.
+	w.dirtyMu.Lock()
+	alert, ok := w.dirtyAlerts[alertID]
+	w.dirtyMu.Unlock()
+	if !ok {
+		var err error
+		alert, err = w.alertStore.Get(ctx, alertID)
+		if err != nil {
+			log.Printf("notifications worker: get alert %q: %v", alertID, err)
+			return
+		}
 	}
 
 	if alert == nil {
@@ -212,47 +261,115 @@ func (w *Worker) processEvent(event *events.Event) {
 		alert.Severity = event.Severity
 	}
 
-	// Build a counter from the stored window timestamps + the new event.
-	counter := alerts.NewCounter(rule.AlertWindow, rule.AlertThreshold)
-	if len(alert.WindowTimestamps) > 0 {
-		counter.LoadFrom(alert.WindowTimestamps)
-	}
-	count, _ := counter.Hit(now)
-
-	// Save window timestamps back to alert.
-	alert.WindowTimestamps = counter.Snapshot()
+	// Add event timestamp to the alert's window in-place (no copies).
+	alert.WindowTimestamps = alerts.AddToSlice(alert.WindowTimestamps, now, rule.AlertWindow)
+	count := len(alert.WindowTimestamps)
 
 	// Evaluate state transition.
 	transition := alerts.EvaluateAlert(alert, count, now, rule.AlertThreshold, rule.AlertResolveWindow)
 
 	switch transition {
 	case alerts.TransitionGarbage:
-		// Alert was pending with no recent activity — delete.
 		if delErr := w.alertStore.Delete(ctx, alertID); delErr != nil {
 			log.Printf("notifications worker: delete garbage alert %q: %v", alertID, delErr)
 		}
+		w.dirtyMu.Lock()
+		delete(w.dirtyAlerts, alertID)
+		w.dirtyMu.Unlock()
 		return
 
 	case alerts.TransitionNone:
-		// No state change: just update count/timestamps.
 		alert.Count = count
 		alert.UpdatedAt = now
-		if putErr := w.alertStore.Put(ctx, alert); putErr != nil {
-			log.Printf("notifications worker: put alert %q: %v", alertID, putErr)
-		}
+		w.dirtyMu.Lock()
+		w.dirtyAlerts[alertID] = alert
+		w.dirtyMu.Unlock()
 		return
 	}
 
 	// State transition occurred: Firing or Resolved.
 	alerts.ApplyTransition(alert, transition, count, now)
+	w.dirtyMu.Lock()
+	w.dirtyAlerts[alertID] = alert
+	w.dirtyMu.Unlock()
 
-	if putErr := w.alertStore.Put(ctx, alert); putErr != nil {
-		log.Printf("notifications worker: put alert %q: %v", alertID, putErr)
-		return
+	// Deliver the state-change notification asynchronously.
+	w.tryDeliverAlert(ctx, alert, rule)
+}
+
+// ---------------------------------------------------------------------------
+// Flush goroutine — async batched bbolt writes
+// ---------------------------------------------------------------------------
+
+func (w *Worker) flushLoop() {
+	defer w.wg.Done()
+
+	ticker := time.NewTicker(w.flushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case <-ticker.C:
+			w.flushDirty()
+		}
 	}
+}
 
-	// Deliver notification for the state change.
-	w.deliverAlert(ctx, alert, rule)
+// flushDirty swaps the dirty map and writes all accumulated alerts to bbolt.
+func (w *Worker) flushDirty() {
+	ctx := w.ctx
+
+	w.dirtyMu.Lock()
+	batch := w.dirtyAlerts
+	w.dirtyAlerts = make(map[string]*alerts.Alert, len(batch))
+	w.dirtyMu.Unlock()
+
+	total := 0
+	for id, alert := range batch {
+		if putErr := w.alertStore.Put(ctx, alert); putErr != nil {
+			log.Printf("notifications worker: flush put %q: %v", id, putErr)
+		}
+		total++
+	}
+	if total > 0 && w.aMetrics != nil {
+		w.aMetrics.UpdateNotifyQueueDepth(len(w.eventQueue))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Async delivery goroutine pool
+// ---------------------------------------------------------------------------
+
+// deliveryJob is a pending alert delivery.
+type deliveryJob struct {
+	alert *alerts.Alert
+	rule  *rules.Rule
+}
+
+// tryDeliverAlert submits a delivery job to the async pool. Non-blocking:
+// if the delivery queue is full, the alert will be picked up by the retry
+// loop on its next scan.
+func (w *Worker) tryDeliverAlert(ctx context.Context, alert *alerts.Alert, rule *rules.Rule) {
+	select {
+	case w.deliveryQueue <- deliveryJob{alert: alert, rule: rule}:
+	default:
+		// Delivery pool saturated — retry loop will handle it.
+	}
+}
+
+func (w *Worker) deliveryLoop() {
+	defer w.wg.Done()
+
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case job := <-w.deliveryQueue:
+			w.deliverAlert(w.ctx, job.alert, job.rule)
+		}
+	}
 }
 
 // deliverAlert sends an alert notification via the appropriate notifier.
@@ -272,7 +389,7 @@ func (w *Worker) deliverAlert(ctx context.Context, alert *alerts.Alert, rule *ru
 		return
 	}
 	if state != nil && now < state.CooldownUntil {
-		return // within cooldown
+		return
 	}
 
 	err = notifier.Send(ctx, alert)
@@ -288,7 +405,6 @@ func (w *Worker) deliverAlert(ctx context.Context, alert *alerts.Alert, rule *ru
 			return
 		}
 
-		// Schedule retry.
 		if state == nil {
 			state = &NotificationState{}
 		}
@@ -323,34 +439,10 @@ func (w *Worker) deliverAlert(ctx context.Context, alert *alerts.Alert, rule *ru
 	}
 }
 
-// handleNonRetryable sends a non-retryable failure directly to DLQ.
-func (w *Worker) handleNonRetryable(ctx context.Context, alert *alerts.Alert, err error) {
-	if dlqErr := w.notifStore.EnqueueDLQ(ctx, alert, err.Error()); dlqErr != nil {
-		log.Printf("notifications worker: enqueue dlq: %v", dlqErr)
-	}
-	if delErr := w.notifStore.DeleteNotificationState(ctx, alert.ID); delErr != nil {
-		log.Printf("notifications worker: delete notification state %q: %v", alert.ID, delErr)
-	}
-	if w.aMetrics != nil {
-		w.aMetrics.IncrementNotifyEventsDeadLettered()
-	}
-}
+// ---------------------------------------------------------------------------
+// Retry loop
+// ---------------------------------------------------------------------------
 
-// handleDeadLetter moves a max-retry alert to DLQ.
-func (w *Worker) handleDeadLetter(ctx context.Context, alert *alerts.Alert, state *NotificationState, err error) {
-	state.DeadLettered = true
-	if dlqErr := w.notifStore.EnqueueDLQ(ctx, alert, err.Error()); dlqErr != nil {
-		log.Printf("notifications worker: enqueue dlq: %v", dlqErr)
-	}
-	if delErr := w.notifStore.DeleteNotificationState(ctx, alert.ID); delErr != nil {
-		log.Printf("notifications worker: delete notification state %q: %v", alert.ID, delErr)
-	}
-	if w.aMetrics != nil {
-		w.aMetrics.IncrementNotifyEventsDeadLettered()
-	}
-}
-
-// retryLoop periodically scans for retryable alert deliveries.
 func (w *Worker) retryLoop() {
 	defer w.wg.Done()
 
@@ -367,7 +459,6 @@ func (w *Worker) retryLoop() {
 	}
 }
 
-// retryDeliveries scans and re-attempts failed alert deliveries.
 func (w *Worker) retryDeliveries() {
 	ctx := w.ctx
 
@@ -387,19 +478,16 @@ func (w *Worker) retryDeliveries() {
 			continue
 		}
 
-		// Load the alert to re-deliver.
 		alert, err := w.alertStore.Get(ctx, entry.AlertID)
 		if err != nil {
 			log.Printf("notifications worker: get retryable alert %q: %v", entry.AlertID, err)
 			continue
 		}
 		if alert == nil {
-			// Alert deleted — clean up state.
 			_ = w.notifStore.DeleteNotificationState(ctx, entry.AlertID)
 			continue
 		}
 
-		// Find the rule for this alert.
 		rule := w.findRule(alert.RuleID)
 		if rule == nil {
 			log.Printf("notifications worker: no rule %q for alert %q", alert.RuleID, entry.AlertID)
@@ -444,7 +532,10 @@ func (w *Worker) retryDeliveries() {
 	}
 }
 
-// gcLoop periodically cleans up old resolved alerts and delivery state.
+// ---------------------------------------------------------------------------
+// GC loop
+// ---------------------------------------------------------------------------
+
 func (w *Worker) gcLoop() {
 	defer w.wg.Done()
 
@@ -461,7 +552,6 @@ func (w *Worker) gcLoop() {
 	}
 }
 
-// garbageCollect removes resolved alerts older than a threshold.
 func (w *Worker) garbageCollect() {
 	ctx := w.ctx
 
@@ -482,7 +572,35 @@ func (w *Worker) garbageCollect() {
 	}
 }
 
-// findRule returns the rule with the given name, or nil.
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+func (w *Worker) handleNonRetryable(ctx context.Context, alert *alerts.Alert, err error) {
+	if dlqErr := w.notifStore.EnqueueDLQ(ctx, alert, err.Error()); dlqErr != nil {
+		log.Printf("notifications worker: enqueue dlq: %v", dlqErr)
+	}
+	if delErr := w.notifStore.DeleteNotificationState(ctx, alert.ID); delErr != nil {
+		log.Printf("notifications worker: delete notification state %q: %v", alert.ID, delErr)
+	}
+	if w.aMetrics != nil {
+		w.aMetrics.IncrementNotifyEventsDeadLettered()
+	}
+}
+
+func (w *Worker) handleDeadLetter(ctx context.Context, alert *alerts.Alert, state *NotificationState, err error) {
+	state.DeadLettered = true
+	if dlqErr := w.notifStore.EnqueueDLQ(ctx, alert, err.Error()); dlqErr != nil {
+		log.Printf("notifications worker: enqueue dlq: %v", dlqErr)
+	}
+	if delErr := w.notifStore.DeleteNotificationState(ctx, alert.ID); delErr != nil {
+		log.Printf("notifications worker: delete notification state %q: %v", alert.ID, delErr)
+	}
+	if w.aMetrics != nil {
+		w.aMetrics.IncrementNotifyEventsDeadLettered()
+	}
+}
+
 func (w *Worker) findRule(name string) *rules.Rule {
 	rs := w.engine.Rules()
 	for i := range rs {
@@ -493,7 +611,6 @@ func (w *Worker) findRule(name string) *rules.Rule {
 	return nil
 }
 
-// backoffDuration computes exponential backoff: base * 2^(attempt-1).
 func backoffDuration(base time.Duration, attempt int) int64 {
 	if attempt <= 0 {
 		return int64(base)

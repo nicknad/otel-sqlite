@@ -21,10 +21,14 @@ import (
 )
 
 // ErrorNotifier is the interface for notifying about error-level log records.
-// The notify.Worker implements this interface.
+// The notifications.Worker implements this interface.
 type ErrorNotifier interface {
 	SendRecord(ctx context.Context, record *model.LogRecord) error
 }
+
+// suppressLogUntil is used to rate-limit error-notifier failure logs.
+// Writes are only from the single batcher goroutine, so no mutex needed.
+var suppressLogUntil time.Time
 
 // NewWriteBatchCommand is a function type that creates a Command from a LogBatch.
 // This indirection allows the batcher to be completely independent of SQLite.
@@ -192,7 +196,10 @@ func (b *Batcher) run() {
 				// Notify on error-level records.
 				if b.errorNotifier != nil && record.SeverityNumber >= b.errorSeverityThreshold {
 					if err := b.errorNotifier.SendRecord(b.ctx, record); err != nil {
-						log.Printf("batcher: error notifier: %v", err)
+						if time.Now().After(suppressLogUntil) {
+							log.Printf("batcher: error notifier: %v (suppressing for 10s)", err)
+							suppressLogUntil = time.Now().Add(10 * time.Second)
+						}
 					}
 				}
 			}

@@ -137,7 +137,7 @@ func TestE2E_AlertPipeline_Delivery(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 
-	// Wait for delivery.
+	// Wait for async delivery + flush to complete.
 	deadline := time.Now().Add(3 * time.Second)
 	for recv.count() < 1 && time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
@@ -146,6 +146,9 @@ func TestE2E_AlertPipeline_Delivery(t *testing.T) {
 	if recv.count() != 1 {
 		t.Fatalf("received %d notifications, want 1", recv.count())
 	}
+
+	// Wait for the async flush to bbolt (200ms default flush interval).
+	time.Sleep(400 * time.Millisecond)
 
 	// Verify the alert was persisted.
 	alertID := alerts.AlertID("e2e-errors", "host-1")
@@ -306,9 +309,11 @@ func TestE2E_NoMatchingRule(t *testing.T) {
 
 	// Send ERROR event — should not match FATAL rule.
 	w.Send(ctx, &events.Event{Severity: model.SeverityError, Body: "err", ResourceID: "r1", Timestamp: time.Now().UnixNano()})
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	w.Stop()
 
+	// Allow flush to complete.
+	time.Sleep(100 * time.Millisecond)
 	all, _ := alertStore.ListAll(ctx)
 	if len(all) != 0 {
 		t.Errorf("expected 0 alerts, got %d", len(all))
