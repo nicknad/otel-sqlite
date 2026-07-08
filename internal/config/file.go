@@ -38,14 +38,18 @@ type FileConfig struct {
 
 // FileNotificationConfig mirrors the notification section in YAML.
 type FileNotificationConfig struct {
-	Enabled         bool                          `yaml:"enabled"`
-	EventQueueDepth int                           `yaml:"event_queue_depth"`
-	StorePath       string                        `yaml:"store_path"`
-	AlertStorePath  string                        `yaml:"alert_store_path"`
-	RetryInterval   string                        `yaml:"retry_interval"`
-	GCInterval      string                        `yaml:"gc_interval"`
-	Notifiers       map[string]FileNotifierConfig `yaml:"notifiers"`
-	Rules           []FileRuleConfig              `yaml:"rules"`
+	Enabled                 bool                          `yaml:"enabled"`
+	EventQueueDepth         int                           `yaml:"event_queue_depth"`
+	StorePath               string                        `yaml:"store_path"`
+	AlertStorePath          string                        `yaml:"alert_store_path"`
+	RetryInterval           string                        `yaml:"retry_interval"`
+	GCInterval              string                        `yaml:"gc_interval"`
+	AlertIdleTTL            string                        `yaml:"alert_idle_ttl"`
+	DLQRetention            string                        `yaml:"dlq_retention"`
+	BboltCompactionEnabled  *bool                         `yaml:"bbolt_compaction_enabled"`
+	BboltCompactionInterval string                        `yaml:"bbolt_compaction_interval"`
+	Notifiers               map[string]FileNotifierConfig `yaml:"notifiers"`
+	Rules                   []FileRuleConfig              `yaml:"rules"`
 }
 
 // FileNotifierConfig mirrors a notifier config in YAML.
@@ -207,6 +211,30 @@ func (c *Config) loadNotificationConfig(fc *FileConfig) error {
 			return fmt.Errorf("notification.gc_interval: %w", err)
 		}
 		nc.GCInterval = d
+	}
+	if fc.Notification.AlertIdleTTL != "" {
+		d, err := parseDurationExt(fc.Notification.AlertIdleTTL)
+		if err != nil {
+			return fmt.Errorf("notification.alert_idle_ttl: %w", err)
+		}
+		nc.AlertIdleTTL = d
+	}
+	if fc.Notification.DLQRetention != "" {
+		d, err := parseDurationExt(fc.Notification.DLQRetention)
+		if err != nil {
+			return fmt.Errorf("notification.dlq_retention: %w", err)
+		}
+		nc.DLQRetention = d
+	}
+	if fc.Notification.BboltCompactionEnabled != nil {
+		nc.BboltCompactionEnabled = *fc.Notification.BboltCompactionEnabled
+	}
+	if fc.Notification.BboltCompactionInterval != "" {
+		d, err := parseDurationExt(fc.Notification.BboltCompactionInterval)
+		if err != nil {
+			return fmt.Errorf("notification.bbolt_compaction_interval: %w", err)
+		}
+		nc.BboltCompactionInterval = d
 	}
 
 	// Load notifier configs.

@@ -45,6 +45,12 @@ type Worker struct {
 	flushInterval   time.Duration
 	deliveryWorkers int
 
+	alertIdleTTL            time.Duration
+	dlqRetention            time.Duration
+	bboltCompactionEnabled  bool
+	bboltCompactionInterval time.Duration
+	lastCompaction          time.Time
+
 	// dirtyAlerts accumulates alert updates in memory.  The process
 	// goroutine writes here; the flush goroutine drains to bbolt.
 	dirtyAlerts map[string]*alerts.Alert
@@ -85,6 +91,24 @@ type WorkerConfig struct {
 	// Defaults to 5m if <= 0.
 	GCInterval time.Duration
 
+	// AlertIdleTTL is how long Pending/Firing alerts can remain idle (no
+	// matching events) before being garbage-collected. Prevents unbounded
+	// growth from ephemeral resources that emit one error then disappear.
+	// Defaults to 24h if <= 0.
+	AlertIdleTTL time.Duration
+
+	// DLQRetention is how long dead-letter queue entries are retained before
+	// being purged. Defaults to 30 days if <= 0.
+	DLQRetention time.Duration
+
+	// BboltCompactionEnabled enables periodic compaction of the bbolt stores.
+	// Defaults to false.
+	BboltCompactionEnabled bool
+
+	// BboltCompactionInterval is how often to compact the bbolt stores.
+	// Defaults to 24h if enabled and <= 0.
+	BboltCompactionInterval time.Duration
+
 	// Metrics is an optional metrics collector.
 	Metrics *metrics.Metrics
 }
@@ -119,20 +143,36 @@ func NewWorker(cfg *WorkerConfig) *Worker {
 	if gcInterval <= 0 {
 		gcInterval = 5 * time.Minute
 	}
+	alertIdleTTL := cfg.AlertIdleTTL
+	if alertIdleTTL <= 0 {
+		alertIdleTTL = 24 * time.Hour
+	}
+	dlqRetention := cfg.DLQRetention
+	if dlqRetention <= 0 {
+		dlqRetention = 30 * 24 * time.Hour
+	}
+	compactionInterval := cfg.BboltCompactionInterval
+	if compactionInterval <= 0 {
+		compactionInterval = 24 * time.Hour
+	}
 
 	return &Worker{
-		alertStore:      cfg.AlertStore,
-		notifStore:      cfg.NotifStore,
-		engine:          cfg.Engine,
-		notifiers:       cfg.Notifiers,
-		aMetrics:        cfg.Metrics,
-		eventQueue:      make(chan *events.Event, qDepth),
-		retryInterval:   retryInterval,
-		gcInterval:      gcInterval,
-		flushInterval:   defaultFlushInterval,
-		deliveryWorkers: defaultDeliveryWorkers,
-		dirtyAlerts:     make(map[string]*alerts.Alert),
-		deliveryQueue:   make(chan deliveryJob, 256),
+		alertStore:              cfg.AlertStore,
+		notifStore:              cfg.NotifStore,
+		engine:                  cfg.Engine,
+		notifiers:               cfg.Notifiers,
+		aMetrics:                cfg.Metrics,
+		eventQueue:              make(chan *events.Event, qDepth),
+		retryInterval:           retryInterval,
+		gcInterval:              gcInterval,
+		alertIdleTTL:            alertIdleTTL,
+		dlqRetention:            dlqRetention,
+		bboltCompactionEnabled:  cfg.BboltCompactionEnabled,
+		bboltCompactionInterval: compactionInterval,
+		flushInterval:           defaultFlushInterval,
+		deliveryWorkers:         defaultDeliveryWorkers,
+		dirtyAlerts:             make(map[string]*alerts.Alert),
+		deliveryQueue:           make(chan deliveryJob, 256),
 	}
 }
 
@@ -487,21 +527,62 @@ func (w *Worker) gcLoop() {
 func (w *Worker) garbageCollect() {
 	ctx := w.ctx
 
+	// 1. Evict resolved alerts older than 24h.
 	resolvedAlerts, err := w.alertStore.ListByStatus(ctx, alerts.AlertResolved)
 	if err != nil {
 		log.Printf("notifications worker: list resolved alerts: %v", err)
-		return
-	}
-
-	cutoff := time.Now().Add(-24 * time.Hour).UnixNano()
-	for _, alert := range resolvedAlerts {
-		if alert.UpdatedAt < cutoff {
-			if delErr := w.alertStore.Delete(ctx, alert.ID); delErr != nil {
-				log.Printf("notifications worker: delete resolved alert %q: %v", alert.ID, delErr)
+	} else {
+		cutoff := time.Now().Add(-24 * time.Hour).UnixNano()
+		for _, alert := range resolvedAlerts {
+			if alert.UpdatedAt < cutoff {
+				if delErr := w.alertStore.Delete(ctx, alert.ID); delErr != nil {
+					log.Printf("notifications worker: delete resolved alert %q: %v", alert.ID, delErr)
+				}
+				_ = w.notifStore.DeleteNotificationState(ctx, alert.ID)
 			}
-			_ = w.notifStore.DeleteNotificationState(ctx, alert.ID)
 		}
 	}
+
+	// 2. Evict idle Pending/Firing alerts that haven't seen an event
+	//    within the configured alert idle TTL.
+	deletedIdle, err := w.alertStore.DeleteIdleAlerts(ctx, w.alertIdleTTL, w.notifStore)
+	if err != nil {
+		log.Printf("notifications worker: delete idle alerts: %v", err)
+	} else if deletedIdle > 0 {
+		log.Printf("notifications worker: gc evicted %d idle alerts", deletedIdle)
+	}
+
+	// 3. Purge aged DLQ entries.
+	deletedDLQ, err := w.notifStore.PurgeDLQ(ctx, w.dlqRetention)
+	if err != nil {
+		log.Printf("notifications worker: purge dlq: %v", err)
+	} else if deletedDLQ > 0 {
+		log.Printf("notifications worker: gc purged %d DLQ entries", deletedDLQ)
+	}
+
+	// 4. Periodic bbolt compaction (reclaims freed pages to OS).
+	if w.bboltCompactionEnabled {
+		now := time.Now()
+		if now.Sub(w.lastCompaction) >= w.bboltCompactionInterval {
+			w.compactStores(ctx)
+			w.lastCompaction = now
+		}
+	}
+}
+
+// compactStores compacts both the alert store and notification state store.
+func (w *Worker) compactStores(ctx context.Context) {
+	log.Println("notifications worker: starting bbolt compaction")
+
+	if err := w.alertStore.Compact(ctx); err != nil {
+		log.Printf("notifications worker: compact alert store: %v", err)
+	}
+
+	if err := w.notifStore.Compact(ctx); err != nil {
+		log.Printf("notifications worker: compact notif store: %v", err)
+	}
+
+	log.Println("notifications worker: bbolt compaction complete")
 }
 
 // ---------------------------------------------------------------------------

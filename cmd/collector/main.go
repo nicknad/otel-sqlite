@@ -491,14 +491,18 @@ func (a *Application) initializeNotifications() error {
 
 	// Create worker.
 	a.notifyWorker = notifications.NewWorker(&notifications.WorkerConfig{
-		AlertStore:      alertStore,
-		NotifStore:      notifStore,
-		Engine:          engine,
-		Notifiers:       notifierMap,
-		EventQueueDepth: nc.EventQueueDepth,
-		RetryInterval:   nc.RetryInterval,
-		GCInterval:      nc.GCInterval,
-		Metrics:         a.metrics,
+		AlertStore:              alertStore,
+		NotifStore:              notifStore,
+		Engine:                  engine,
+		Notifiers:               notifierMap,
+		EventQueueDepth:         nc.EventQueueDepth,
+		RetryInterval:           nc.RetryInterval,
+		GCInterval:              nc.GCInterval,
+		AlertIdleTTL:            nc.AlertIdleTTL,
+		DLQRetention:            nc.DLQRetention,
+		BboltCompactionEnabled:  nc.BboltCompactionEnabled,
+		BboltCompactionInterval: nc.BboltCompactionInterval,
+		Metrics:                 a.metrics,
 	})
 
 	// Wire to batcher.

@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"codeberg.org/nicknad/otel-sqlite/internal/alerts"
@@ -14,8 +17,13 @@ import (
 
 // bboltStore implements Store using bbolt.
 type bboltStore struct {
-	db *bbolt.DB
+	db   *bbolt.DB
+	path string
+	mu   sync.Mutex
 }
+
+// dlqSeq provides a monotonic counter to prevent DLQ ID collisions.
+var dlqSeq atomic.Int64
 
 // bucket names
 var (
@@ -50,7 +58,7 @@ func NewBboltStore(path string) (Store, error) {
 	}
 
 	log.Printf("notifications store: bbolt opened at %q", path)
-	return &bboltStore{db: db}, nil
+	return &bboltStore{db: db, path: path}, nil
 }
 
 // GetNotificationState retrieves state for an alert.
@@ -249,6 +257,113 @@ func deleteRetryEntries(b *bbolt.Bucket, alertID string) error {
 	return nil
 }
 
+// PurgeDLQ removes DLQ entries older than maxAge. Returns the number of entries deleted.
+func (s *bboltStore) PurgeDLQ(_ context.Context, maxAge time.Duration) (int, error) {
+	cutoff := time.Now().Add(-maxAge).UnixNano()
+	var deleted int
+
+	err := s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketNotifDLQ)
+		c := b.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var entry DLQEntry
+			if err := json.Unmarshal(v, &entry); err != nil {
+				continue
+			}
+			if entry.FailedAt < cutoff {
+				if err := c.Delete(); err != nil {
+					return fmt.Errorf("delete dlq entry %q: %w", string(k), err)
+				}
+				deleted++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return deleted, err
+	}
+
+	if deleted > 0 {
+		log.Printf("notifications store: purged %d DLQ entries older than %s", deleted, maxAge)
+	}
+	return deleted, nil
+}
+
+// Compact rewrites the bbolt database into a compacted file and atomically
+// replaces the original. Safe to call while the store is serving reads/writes.
+func (s *bboltStore) Compact(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tmpPath := s.path + ".compact"
+
+	dstDB, err := bbolt.Open(tmpPath, 0o600, &bbolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		return fmt.Errorf("open compact dest: %w", err)
+	}
+
+	err = bbolt.Compact(dstDB, s.db, 0)
+	closeErr := dstDB.Close()
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("compact: %w", err)
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close compact dest: %w", closeErr)
+	}
+
+	prevPath := s.path + ".prev"
+	prevDB := s.db
+
+	if err := prevDB.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close original db: %w", err)
+	}
+
+	if err := os.Rename(s.path, prevPath); err != nil {
+		s.reopen(prevDB, s.path)
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("backup original: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		_ = os.Rename(prevPath, s.path)
+		s.reopen(prevDB, s.path)
+		return fmt.Errorf("install compacted db: %w", err)
+	}
+
+	_ = os.Remove(prevPath)
+
+	newDB, err := bbolt.Open(s.path, 0o600, &bbolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		return fmt.Errorf("reopen compacted db: %w", err)
+	}
+
+	err = newDB.Update(func(tx *bbolt.Tx) error {
+		for _, name := range [][]byte{bucketNotifState, bucketNotifDLQ, bucketNotifRetry} {
+			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
+				return fmt.Errorf("create bucket %q: %w", string(name), err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		_ = newDB.Close()
+		return err
+	}
+
+	s.db = newDB
+	log.Printf("notifications store: compacted %s", s.path)
+	return nil
+}
+
+func (s *bboltStore) reopen(fallback *bbolt.DB, path string) {
+	if fallback != nil {
+		s.db, _ = bbolt.Open(path, 0o600, &bbolt.Options{Timeout: 1 * time.Second})
+	}
+}
+
 // Close closes the bbolt database.
 func (s *bboltStore) Close() error {
 	log.Println("notifications store: closing bbolt")
@@ -257,5 +372,5 @@ func (s *bboltStore) Close() error {
 
 // newDLQID generates a unique ID for a DLQ entry.
 func newDLQID() string {
-	return fmt.Sprintf("dlq_%d", time.Now().UnixNano())
+	return fmt.Sprintf("dlq_%d_%d", time.Now().UnixNano(), dlqSeq.Add(1))
 }

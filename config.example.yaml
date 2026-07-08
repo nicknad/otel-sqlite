@@ -80,6 +80,10 @@ shutdown_timeout: "30s"         # Graceful shutdown timeout
 #   alert_store_path: "alert-state.db"
 #   retry_interval: "30s"
 #   gc_interval: "5m"
+#   alert_idle_ttl: "24h"            # Max idle time for Pending/Firing alerts before GC eviction
+#   dlq_retention: "720h"            # Max age of DLQ entries before purge (720h = 30d)
+#   bbolt_compaction_enabled: false   # Enable periodic bbolt compaction
+#   bbolt_compaction_interval: "24h"  # Interval between bbolt compactions
 #   notifiers:
 #     slack:
 #       type: "http"
@@ -190,6 +194,10 @@ fts:
 #   NOTIFICATION_ALERT_STORE_PATH     - Path to alert state store (default: alert-state.db)
 #   NOTIFICATION_RETRY_INTERVAL       - Retry scan interval (default: 30s)
 #   NOTIFICATION_GC_INTERVAL          - Resolved alert GC interval (default: 5m)
+#   NOTIFICATION_ALERT_IDLE_TTL       - Max idle time for Pending/Firing alerts before GC eviction (default: 24h)
+#   NOTIFICATION_DLQ_RETENTION        - Max age of DLQ entries before purge (default: 720h)
+#   NOTIFICATION_BBOLT_COMPACTION_ENABLED  - Enable periodic bbolt compaction (default: false)
+#   NOTIFICATION_BBOLT_COMPACTION_INTERVAL - Interval between bbolt compactions (default: 24h)
 #
 # Task-specific (env overrides use Go durations, not "d" suffix):
 #   RETENTION_ENABLED           (default: true)
