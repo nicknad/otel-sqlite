@@ -93,9 +93,6 @@ shutdown_timeout: "30s"         # Graceful shutdown timeout
 #       match_severity: "ERROR"
 #       resource_filter: ".*production.*"
 #       cooldown: "5m"
-#       rate_limit: 10
-#       rate_window: "1m"
-#       dedup_window: "5m"
 #       max_retries: 3
 #       retry_backoff: "30s"
 #       alert_window: "5m"

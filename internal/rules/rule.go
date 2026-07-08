@@ -21,9 +21,6 @@ type Rule struct {
 	BodyFilter       string
 	AttributeFilters map[string]string
 	Cooldown         time.Duration
-	RateLimit        int
-	RateWindow       time.Duration
-	DedupWindow      time.Duration
 	MaxRetries       int
 	RetryBackoff     time.Duration
 	Destination      string
