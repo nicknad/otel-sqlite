@@ -85,6 +85,22 @@ type NotificationConfig struct {
 	// GCInterval is how often the worker garbage-collects resolved alerts.
 	GCInterval time.Duration `mapstructure:"gc_interval"`
 
+	// AlertIdleTTL is how long Pending/Firing alerts can remain idle (no
+	// matching events) before being garbage-collected. Prevents unbounded
+	// growth from ephemeral resources. Defaults to 24h.
+	AlertIdleTTL time.Duration `mapstructure:"alert_idle_ttl"`
+
+	// DLQRetention is how long dead-letter queue entries are retained before
+	// being purged. Defaults to 30 days.
+	DLQRetention time.Duration `mapstructure:"dlq_retention"`
+
+	// BboltCompactionEnabled enables periodic compaction of the bbolt stores.
+	BboltCompactionEnabled bool `mapstructure:"bbolt_compaction_enabled"`
+
+	// BboltCompactionInterval is how often to compact the bbolt stores.
+	// Defaults to 24h if enabled.
+	BboltCompactionInterval time.Duration `mapstructure:"bbolt_compaction_interval"`
+
 	// Notifiers maps notifier name → config. Built-in names: "log", "http".
 	Notifiers map[string]NotifierConfig `mapstructure:"notifiers"`
 
@@ -146,12 +162,16 @@ func DefaultConfig() *Config {
 		GoMemoryLimitMB:                   0, // disabled by default; recommends 2048
 		ShutdownTimeout:                   30 * time.Second,
 		Notification: &NotificationConfig{
-			Enabled:         false,
-			EventQueueDepth: 1000,
-			StorePath:       "notify-state.db",
-			AlertStorePath:  "alert-state.db",
-			RetryInterval:   30 * time.Second,
-			GCInterval:      5 * time.Minute,
+			Enabled:                 false,
+			EventQueueDepth:         1000,
+			StorePath:               "notify-state.db",
+			AlertStorePath:          "alert-state.db",
+			RetryInterval:           30 * time.Second,
+			GCInterval:              5 * time.Minute,
+			AlertIdleTTL:            24 * time.Hour,
+			DLQRetention:            30 * 24 * time.Hour,
+			BboltCompactionEnabled:  false,
+			BboltCompactionInterval: 24 * time.Hour,
 		},
 	}
 }
@@ -211,6 +231,22 @@ var envVars = []envVar{
 	{
 		Key: "NotificationGCInterval", Env: "NOTIFICATION_GC_INTERVAL",
 		Description: "Resolved alert GC interval",
+	},
+	{
+		Key: "NotificationAlertIdleTTL", Env: "NOTIFICATION_ALERT_IDLE_TTL",
+		Description: "Max idle time for Pending/Firing alerts before GC eviction",
+	},
+	{
+		Key: "NotificationDLQRetention", Env: "NOTIFICATION_DLQ_RETENTION",
+		Description: "Max age of DLQ entries before purge",
+	},
+	{
+		Key: "NotificationBboltCompactionEnabled", Env: "NOTIFICATION_BBOLT_COMPACTION_ENABLED",
+		Description: "Enable periodic bbolt compaction (true/false)",
+	},
+	{
+		Key: "NotificationBboltCompactionInterval", Env: "NOTIFICATION_BBOLT_COMPACTION_INTERVAL",
+		Description: "Interval between bbolt compactions",
 	},
 }
 
@@ -310,6 +346,22 @@ var envBindings = []envBinding{
 		key: "NotificationGCInterval", parse: parseDuration,
 		apply: func(c *Config, v any) { c.ensureNotification().GCInterval = v.(time.Duration) },
 	},
+	{
+		key: "NotificationAlertIdleTTL", parse: parseDuration,
+		apply: func(c *Config, v any) { c.ensureNotification().AlertIdleTTL = v.(time.Duration) },
+	},
+	{
+		key: "NotificationDLQRetention", parse: parseDuration,
+		apply: func(c *Config, v any) { c.ensureNotification().DLQRetention = v.(time.Duration) },
+	},
+	{
+		key: "NotificationBboltCompactionEnabled", parse: parseBool,
+		apply: func(c *Config, v any) { c.ensureNotification().BboltCompactionEnabled = v.(bool) },
+	},
+	{
+		key: "NotificationBboltCompactionInterval", parse: parseDuration,
+		apply: func(c *Config, v any) { c.ensureNotification().BboltCompactionInterval = v.(time.Duration) },
+	},
 }
 
 // Parse helpers.
@@ -375,7 +427,8 @@ func (c *Config) Validate() error {
 		default:
 			return fmt.Errorf(
 				"batcher_error_severity_threshold must be ERROR,WARN,INFO,DEBUG,TRACE,FATAL,UNSPECIFIED, got %q",
-				c.BatcherErrorSeverityThreshold)
+				c.BatcherErrorSeverityThreshold,
+			)
 		}
 	}
 	if c.WriterBatchSize <= 0 {
@@ -421,6 +474,18 @@ func (c *Config) Validate() error {
 		}
 		if c.Notification.GCInterval <= 0 {
 			return fmt.Errorf("notification.gc_interval must be positive, got %s", c.Notification.GCInterval)
+		}
+		if c.Notification.AlertIdleTTL <= 0 {
+			return fmt.Errorf("notification.alert_idle_ttl must be positive, got %s", c.Notification.AlertIdleTTL)
+		}
+		if c.Notification.DLQRetention <= 0 {
+			return fmt.Errorf("notification.dlq_retention must be positive, got %s", c.Notification.DLQRetention)
+		}
+		if c.Notification.BboltCompactionEnabled && c.Notification.BboltCompactionInterval <= 0 {
+			return fmt.Errorf(
+				"notification.bbolt_compaction_interval must be positive when compaction is enabled, got %s",
+				c.Notification.BboltCompactionInterval,
+			)
 		}
 		for i := range c.Notification.Rules {
 			rule := &c.Notification.Rules[i]

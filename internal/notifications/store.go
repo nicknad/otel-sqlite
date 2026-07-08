@@ -3,6 +3,7 @@ package notifications
 import (
 	"context"
 	"strings"
+	"time"
 
 	"codeberg.org/nicknad/otel-sqlite/internal/alerts"
 )
@@ -33,6 +34,13 @@ type Store interface {
 
 	// Close cleans up store resources.
 	Close() error
+
+	// PurgeDLQ removes DLQ entries older than maxAge. Returns the number of entries deleted.
+	PurgeDLQ(ctx context.Context, maxAge time.Duration) (int, error)
+
+	// Compact rewrites the bbolt database into a smaller file after bulk
+	// deletions. Safe to call while the store is serving reads/writes.
+	Compact(ctx context.Context) error
 }
 
 // RetryableEntry pairs an alert ID with its retry count for scanning.

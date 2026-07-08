@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -15,6 +16,8 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/events"
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
 	"codeberg.org/nicknad/otel-sqlite/internal/rules"
+
+	"go.etcd.io/bbolt"
 )
 
 // ---------------------------------------------------------------------------
@@ -392,3 +395,146 @@ func (n *alwaysFailNotifier) Name() string { return "fail" }
 func (n *alwaysFailNotifier) Close() error { return nil }
 
 var errAlwaysFail = NewNotRetryableError(fmt.Errorf("always fails"))
+
+// ---------------------------------------------------------------------------
+// DLQ retention test
+// ---------------------------------------------------------------------------
+
+func TestDLQ_PurgeDLQ_RemovesOldEntries(t *testing.T) {
+	notifStore, err := NewBboltStore(filepath.Join(t.TempDir(), "e2e-dlq-purge.db"))
+	if err != nil {
+		t.Fatalf("NewBboltStore: %v", err)
+	}
+	defer notifStore.Close()
+
+	ctx := context.Background()
+
+	// Enqueue a stale DLQ entry.
+	staleAlert := alerts.NewAlert("r1", "res-stale", 0, 0)
+	staleEntry := &DLQEntry{
+		ID:       "dlq_stale",
+		Alert:    staleAlert,
+		FailedAt: time.Now().Add(-48 * time.Hour).UnixNano(),
+	}
+	err = putDLQEntry(notifStore, staleEntry)
+	if err != nil {
+		t.Fatalf("put stale dlq: %v", err)
+	}
+
+	// Enqueue a recent DLQ entry.
+	recentAlert := alerts.NewAlert("r2", "res-recent", 0, 0)
+	recentEntry := &DLQEntry{
+		ID:       "dlq_recent",
+		Alert:    recentAlert,
+		FailedAt: time.Now().Add(-1 * time.Hour).UnixNano(),
+	}
+	err = putDLQEntry(notifStore, recentEntry)
+	if err != nil {
+		t.Fatalf("put recent dlq: %v", err)
+	}
+
+	// Purge entries older than 24h.
+	deleted, err := notifStore.PurgeDLQ(ctx, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("PurgeDLQ: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1", deleted)
+	}
+
+	// Verify only the stale entry was removed.
+	entries, _ := notifStore.ListDLQ(ctx)
+	if len(entries) != 1 {
+		t.Fatalf("remaining DLQ entries = %d, want 1", len(entries))
+	}
+	if entries[0].ID != "dlq_recent" {
+		t.Errorf("expected dlq_recent, got %s", entries[0].ID)
+	}
+}
+
+// putDLQEntry writes a raw DLQ entry directly via bbolt.
+func putDLQEntry(store Store, entry *DLQEntry) error {
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	// Access the underlying bbolt store via type assertion.
+	bs, ok := store.(*bboltStore)
+	if !ok {
+		return fmt.Errorf("store is not *bboltStore")
+	}
+	return bs.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketNotifDLQ)
+		return b.Put([]byte(entry.ID), data)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// bbolt compaction test
+// ---------------------------------------------------------------------------
+
+func TestBboltCompact_ReducesFileSize(t *testing.T) {
+	alertPath := filepath.Join(t.TempDir(), "compact-alerts.db")
+	store, err := alerts.NewBboltAlertStore(alertPath)
+	if err != nil {
+		t.Fatalf("NewBboltAlertStore: %v", err)
+	}
+
+	ctx := context.Background()
+	now := time.Now().UnixNano()
+
+	// Insert many alerts with large window timestamps to bloat the file.
+	for i := 0; i < 100; i++ {
+		a := alerts.NewAlert("rule", fmt.Sprintf("res-%d", i), 0, now)
+		a.Status = alerts.AlertFiring
+		// Each alert gets 100 timestamp entries.
+		for j := 0; j < 100; j++ {
+			a.WindowTimestamps = append(a.WindowTimestamps, now+int64(j))
+		}
+		if err := store.Put(ctx, a); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	// Measure size before deletions.
+	infoBefore, _ := os.Stat(alertPath)
+	sizeBefore := infoBefore.Size()
+
+	// Delete 90% of alerts.
+	for i := 0; i < 90; i++ {
+		id := alerts.AlertID("rule", fmt.Sprintf("res-%d", i))
+		if err := store.Delete(ctx, id); err != nil {
+			t.Fatalf("Delete %d: %v", i, err)
+		}
+	}
+
+	// File size should be roughly the same (freed pages not reclaimed).
+	infoAfterDelete, _ := os.Stat(alertPath)
+	sizeAfterDelete := infoAfterDelete.Size()
+	t.Logf("size before=%d after delete=%d", sizeBefore, sizeAfterDelete)
+
+	// Compact.
+	if err := store.Compact(ctx); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	// File should be smaller after compaction.
+	infoAfterCompact, _ := os.Stat(alertPath)
+	sizeAfterCompact := infoAfterCompact.Size()
+	t.Logf("size after compact=%d", sizeAfterCompact)
+
+	if sizeAfterCompact >= sizeAfterDelete {
+		t.Errorf("size after compact (%d) should be < after delete (%d)", sizeAfterCompact, sizeAfterDelete)
+	}
+
+	// Verify remaining alerts are still accessible.
+	for i := 90; i < 100; i++ {
+		id := alerts.AlertID("rule", fmt.Sprintf("res-%d", i))
+		a, _ := store.Get(ctx, id)
+		if a == nil {
+			t.Errorf("alert %d missing after compaction", i)
+		}
+	}
+
+	store.Close()
+}
