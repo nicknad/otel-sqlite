@@ -20,6 +20,7 @@ import (
 	_ "google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/keepalive"
 
+	"codeberg.org/nicknad/otel-sqlite/internal/alerts"
 	"codeberg.org/nicknad/otel-sqlite/internal/batcher"
 	"codeberg.org/nicknad/otel-sqlite/internal/config"
 	"codeberg.org/nicknad/otel-sqlite/internal/ingest"
@@ -27,8 +28,9 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/maintenance/tasks"
 	"codeberg.org/nicknad/otel-sqlite/internal/metrics"
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
-	"codeberg.org/nicknad/otel-sqlite/internal/notify"
+	"codeberg.org/nicknad/otel-sqlite/internal/notifications"
 	"codeberg.org/nicknad/otel-sqlite/internal/otlp"
+	"codeberg.org/nicknad/otel-sqlite/internal/rules"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage/sqlite"
 )
@@ -54,9 +56,10 @@ type Application struct {
 	maintenanceMetrics *maintenance.Metrics
 
 	// Notification
-	notifyWorker *notify.Worker
-	notifyStore  notify.Store
-	notifiers    []notify.Notifier
+	notifyWorker *notifications.Worker
+	notifStore   notifications.Store
+	alertStore   alerts.AlertStore
+	notifiers    []notifications.Notifier
 }
 
 func main() {
@@ -397,8 +400,11 @@ func (a *Application) cleanup() {
 	for _, n := range a.notifiers {
 		_ = n.Close()
 	}
-	if a.notifyStore != nil {
-		_ = a.notifyStore.Close()
+	if a.notifStore != nil {
+		_ = a.notifStore.Close()
+	}
+	if a.alertStore != nil {
+		_ = a.alertStore.Close()
 	}
 
 	// Stop SQLite writer
@@ -421,35 +427,42 @@ func (a *Application) cleanup() {
 	log.Println("Shutdown complete")
 }
 
-// initializeNotifications sets up the notification pipeline.
+// initializeNotifications sets up the notification and alerting pipeline.
 func (a *Application) initializeNotifications() error {
 	nc := a.config.Notification
 
-	// Open the bbolt store.
-	store, err := notify.NewBboltStore(nc.StorePath)
+	// Open the notification delivery state store (retry/DLQ).
+	notifStore, err := notifications.NewBboltStore(nc.StorePath)
 	if err != nil {
 		return fmt.Errorf("open notification store: %w", err)
 	}
-	a.notifyStore = store
+	a.notifStore = notifStore
+
+	// Open the alert state store.
+	alertStore, err := alerts.NewBboltAlertStore(nc.AlertStorePath)
+	if err != nil {
+		return fmt.Errorf("open alert store: %w", err)
+	}
+	a.alertStore = alertStore
 
 	// Build rules from config.
-	rules := make([]notify.Rule, 0, len(nc.Rules))
+	ruleList := make([]rules.Rule, 0, len(nc.Rules))
 	for i := range nc.Rules {
 		rule, err := ruleConfigToRule(&nc.Rules[i])
 		if err != nil {
 			return fmt.Errorf("rule %q: %w", nc.Rules[i].Name, err)
 		}
-		rules = append(rules, *rule)
+		ruleList = append(ruleList, *rule)
 	}
 
 	// Create rule engine.
-	engine, err := notify.NewRuleEngine(rules)
+	engine, err := rules.NewRuleEngine(ruleList)
 	if err != nil {
 		return fmt.Errorf("create rule engine: %w", err)
 	}
 
 	// Create notifiers from config.
-	notifiers := make(map[string]notify.Notifier)
+	notifierMap := make(map[string]notifications.Notifier)
 	for name, ncfg := range nc.Notifiers {
 		var cfg any
 		switch ncfg.Type {
@@ -460,7 +473,7 @@ func (a *Application) initializeNotifications() error {
 			if url == "" {
 				url = "http://localhost:8080/webhook"
 			}
-			cfg = &notify.HTTPNotifierConfig{
+			cfg = &notifications.HTTPNotifierConfig{
 				URL:        url,
 				Timeout:    ncfg.Timeout,
 				AuthHeader: ncfg.AuthHeader,
@@ -468,28 +481,30 @@ func (a *Application) initializeNotifications() error {
 		default:
 			return fmt.Errorf("unknown notifier type %q for %q", ncfg.Type, name)
 		}
-		n, err := notify.NewNotifier(ncfg.Type, cfg)
+		n, err := notifications.NewNotifier(ncfg.Type, cfg)
 		if err != nil {
 			return fmt.Errorf("create notifier %q: %w", name, err)
 		}
-		notifiers[name] = n
+		notifierMap[name] = n
 		a.notifiers = append(a.notifiers, n)
 	}
 
 	// Create worker.
-	a.notifyWorker = notify.NewWorker(&notify.WorkerConfig{
-		Store:           store,
+	a.notifyWorker = notifications.NewWorker(&notifications.WorkerConfig{
+		AlertStore:      alertStore,
+		NotifStore:      notifStore,
 		Engine:          engine,
-		Notifiers:       notifiers,
+		Notifiers:       notifierMap,
 		EventQueueDepth: nc.EventQueueDepth,
 		RetryInterval:   nc.RetryInterval,
+		GCInterval:      nc.GCInterval,
 		Metrics:         a.metrics,
 	})
 
 	// Wire to batcher.
 	a.batcher.WithErrorNotifier(a.notifyWorker)
 
-	log.Printf("notification pipeline: initialized (%d rules, %d notifiers)", len(rules), len(notifiers))
+	log.Printf("notification pipeline: initialized (%d rules, %d notifiers)", len(ruleList), len(notifierMap))
 	return nil
 }
 
@@ -514,9 +529,9 @@ func parseSeverity(s string) model.Severity {
 	}
 }
 
-// ruleConfigToRule converts a config.RuleConfig to a notify.Rule.
-func ruleConfigToRule(rc *config.RuleConfig) (*notify.Rule, error) {
-	rule := &notify.Rule{
+// ruleConfigToRule converts a config.RuleConfig to a rules.Rule.
+func ruleConfigToRule(rc *config.RuleConfig) (*rules.Rule, error) {
+	rule := &rules.Rule{
 		Name:             rc.Name,
 		MatchSeverity:    parseSeverity(rc.MatchSeverity),
 		ResourceFilter:   rc.ResourceFilter,
@@ -525,6 +540,7 @@ func ruleConfigToRule(rc *config.RuleConfig) (*notify.Rule, error) {
 		RateLimit:        rc.RateLimit,
 		MaxRetries:       rc.MaxRetries,
 		Destination:      rc.Destination,
+		AlertThreshold:   rc.AlertThreshold,
 	}
 
 	// Parse durations.
@@ -555,6 +571,20 @@ func ruleConfigToRule(rc *config.RuleConfig) (*notify.Rule, error) {
 			return nil, fmt.Errorf("retry_backoff: %w", err)
 		}
 		rule.RetryBackoff = d
+	}
+	if rc.AlertWindow != "" {
+		d, err := time.ParseDuration(rc.AlertWindow)
+		if err != nil {
+			return nil, fmt.Errorf("alert_window: %w", err)
+		}
+		rule.AlertWindow = d
+	}
+	if rc.AlertResolveWindow != "" {
+		d, err := time.ParseDuration(rc.AlertResolveWindow)
+		if err != nil {
+			return nil, fmt.Errorf("alert_resolve_window: %w", err)
+		}
+		rule.AlertResolveWindow = d
 	}
 
 	return rule, nil

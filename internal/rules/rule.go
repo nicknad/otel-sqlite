@@ -1,17 +1,15 @@
-package notify
+// Package rules defines notification rules and a rule-matching engine.
+package rules
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"regexp"
-	"sort"
 	"strconv"
-	"strings"
 	"time"
 
+	"codeberg.org/nicknad/otel-sqlite/internal/events"
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
 )
 
@@ -29,6 +27,18 @@ type Rule struct {
 	MaxRetries       int
 	RetryBackoff     time.Duration
 	Destination      string
+
+	// Alert-specific fields.
+	// AlertWindow is the sliding window for counting matched events.
+	AlertWindow time.Duration
+
+	// AlertThreshold is the number of events within AlertWindow required
+	// to transition the alert to Firing state.
+	AlertThreshold int
+
+	// AlertResolveWindow is the duration of silence (no matched events)
+	// after which a Firing alert auto-resolves.
+	AlertResolveWindow time.Duration
 
 	// compiled regexps (populated on creation)
 	resourceRegex *regexp.Regexp
@@ -71,11 +81,20 @@ func (r *Rule) setDefaults() {
 	if r.RetryBackoff <= 0 {
 		r.RetryBackoff = 30 * time.Second
 	}
+	if r.AlertWindow <= 0 {
+		r.AlertWindow = 5 * time.Minute
+	}
+	if r.AlertThreshold <= 0 {
+		r.AlertThreshold = 1 // fire on first match by default
+	}
+	if r.AlertResolveWindow <= 0 {
+		r.AlertResolveWindow = 15 * time.Minute
+	}
 }
 
 // RuleEngine evaluates events against a set of rules.
 type RuleEngine interface {
-	Evaluate(ctx context.Context, event *Event) (rule *Rule, key string, matched bool)
+	Evaluate(ctx context.Context, event *events.Event) (rule *Rule, matched bool)
 	Rules() []Rule
 }
 
@@ -93,20 +112,19 @@ func NewRuleEngine(rules []Rule) (*DefaultRuleEngine, error) {
 			return nil, err
 		}
 	}
-	log.Printf("notify rule engine: %d rules configured", len(rules))
+	log.Printf("rule engine: %d rules configured", len(rules))
 	return &DefaultRuleEngine{rules: rules}, nil
 }
 
 // Evaluate checks all rules against the event. Returns the first matching rule.
-func (e *DefaultRuleEngine) Evaluate(_ context.Context, event *Event) (*Rule, string, bool) {
+func (e *DefaultRuleEngine) Evaluate(_ context.Context, event *events.Event) (*Rule, bool) {
 	for i := range e.rules {
 		rule := &e.rules[i]
 		if e.matchRule(rule, event) {
-			key := e.buildKey(rule, event)
-			return rule, key, true
+			return rule, true
 		}
 	}
-	return nil, "", false
+	return nil, false
 }
 
 // Rules returns the configured rules.
@@ -115,7 +133,7 @@ func (e *DefaultRuleEngine) Rules() []Rule {
 }
 
 // matchRule checks if an event matches a rule.
-func (e *DefaultRuleEngine) matchRule(rule *Rule, event *Event) bool {
+func (e *DefaultRuleEngine) matchRule(rule *Rule, event *events.Event) bool {
 	// Severity threshold.
 	if event.Severity < rule.MatchSeverity {
 		return false
@@ -149,35 +167,6 @@ func (e *DefaultRuleEngine) matchAttribute(attrs []model.Attribute, key string, 
 		}
 	}
 	return false
-}
-
-// buildKey creates a composite state key from rule name + resource ID + fingerprint.
-func (e *DefaultRuleEngine) buildKey(rule *Rule, event *Event) string {
-	fingerprint := eventFingerprint(event)
-	return fmt.Sprintf("%s:%s:%s", rule.Name, event.ResourceID, fingerprint)
-}
-
-// eventFingerprint returns a short hash of event body + sorted attributes.
-func eventFingerprint(event *Event) string {
-	var sb strings.Builder
-	sb.WriteString(event.Body)
-
-	// Sort attributes by key for deterministic hashing.
-	type kv struct{ k, v string }
-	var pairs []kv
-	for _, attr := range event.Attributes {
-		pairs = append(pairs, kv{attr.Key, attrValueString(&attr)})
-	}
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].k < pairs[j].k })
-	for _, p := range pairs {
-		sb.WriteString(p.k)
-		sb.WriteString("=")
-		sb.WriteString(p.v)
-		sb.WriteString(";")
-	}
-
-	hash := sha256.Sum256([]byte(sb.String()))
-	return hex.EncodeToString(hash[:8])
 }
 
 // attrValueString returns the string representation of an attribute value.
