@@ -115,7 +115,22 @@ The OTLP SQLite Collector is a high-performance log collector that receives Open
   - Perform mapping logic
   - Begin/commit/rollback transactions from within commands
 
-### 7. Metrics (`internal/metrics/`)
+### 7. Notification Pipeline (`internal/notify/`)
+- **Owns**: Rule engine, state store, notifier implementations, worker goroutines
+- **Responsibilities**:
+  - Receive error-level events from the batcher via non-blocking channel
+  - Evaluate rules (severity threshold, regex filters on resource/body/attributes)
+  - Track notification state in embedded bbolt KV store (cooldown, dedup digest, rate-limit bucket, retry count)
+  - Deliver notifications via pluggable notifiers (HTTP webhook, log)
+  - Retry failed deliveries with exponential backoff (capped at 2^10)
+  - Move exhausted or non-retryable events to dead-letter queue
+  - Drain event queue on graceful shutdown
+- **Must NOT**:
+  - Block the batcher hot path (non-blocking send, returns ErrQueueFull when full)
+  - Leak OTLP or SQLite types
+  - Depend on specific notifier implementations
+
+### 8. Metrics (`internal/metrics/`)
 - **Owns**: Prometheus metrics collection
 - **Responsibilities**:
   - Define and expose application metrics
@@ -159,16 +174,16 @@ The rest of the system depends only on this interface.
 |---------|---------|
 | `WriteBatchCommand` | Write a LogBatch to SQLite |
 
-### Future Commands (not yet implemented)
+### Implemented Commands
 
-| Command | Purpose |
-|---------|---------|
-| `PurgeLogs` | Delete logs older than a retention threshold |
-| `CheckpointWAL` | Force WAL checkpoint |
-| `OptimizeDatabase` | Run PRAGMA optimize |
-| `VacuumDatabase` | Reclaim storage space |
-| `ArchiveLogs` | Move old logs to archival storage |
-| `ReindexDatabase` | Rebuild database indexes |
+| Command | Interface | Purpose |
+|---------|-----------|---------|
+| `WriteBatchCommand` | `Command` | Write a LogBatch to SQLite (hot path) |
+| `PurgeLogsCommand` | `Command` | Delete logs older than retention threshold |
+| `CheckpointCommand` | `NonTransactionalCommand` | Force WAL checkpoint (runs outside transaction) |
+| `OptimizeCommand` | `NonTransactionalCommand` | Run PRAGMA optimize (runs outside transaction) |
+| `VacuumCommand` | `NonTransactionalCommand` | Rebuild database file to reclaim space |
+| `RebuildFTSCommand` | `Command` | Drop and recreate contentless FTS5 index |
 
 ## Queue Flow and Backpressure
 
@@ -243,7 +258,7 @@ It does NOT own command construction.
 ### Performance Optimizations
 
 - **WAL Mode**: Enables concurrent reads while writing
-- **Prepared Statements**: Reduces SQL parsing overhead
+- **Prepared Statements**: Reduces SQL parsing overhead; single compilation at startup, reused via `tx.Stmt()` per transaction
 - **Batched Transactions**: Reduces commit overhead
 - **Single Connection**: Avoids connection pool overhead for write-heavy workload
 - **Object Pooling**: `LogRecord` objects are reused via `sync.Pool` — zero allocations in the hot path
@@ -251,6 +266,11 @@ It does NOT own command construction.
 - **Inline Attributes**: `[]Attribute` slice replaces `map[string]AttributeValue` — eliminates map overhead
 - **Batch-Level Ingress**: Batches flow through the ingress queue instead of individual records, reducing channel operations from N per batch to 1
 - **Minimized Indexes**: Unused indexes removed (migration 004) to reduce write overhead by ~33%
+- **Large Page Cache**: 64 MB page cache (`cache_size=-65536`) for B-tree efficiency on established databases
+- **Memory-Mapped I/O**: 256 MB mmap (`mmap_size=268435456`) for zero-copy page access
+- **In-Memory Temp Store**: `temp_store=MEMORY` avoids temporary file I/O for sorts and indices
+- **WAL Size Cap**: `journal_size_limit=64MB` prevents runaway WAL growth
+- **Lock Retry**: `busy_timeout=5000ms` avoids spurious failures during maintenance operations
 
 ## OTLP Boundary
 
@@ -301,6 +321,7 @@ It does NOT own command construction.
 - **Commands**: Command queue depth, execution duration, executed/failure totals
 - **Storage**: Logs written, write latency, write errors
 - **Resources**: Active resources, total resources
+- **Notification**: Events received, matched (by rule), delivered (by destination), failed (by destination), dead-lettered, queue depth, retry queue depth
 
 All command metrics are labelled by command type for granular observability.
 
@@ -332,10 +353,15 @@ All command metrics are labelled by command type for granular observability.
 - `BATCH_QUEUE_CAPACITY`: Maximum command queue size
 - `BATCHER_BATCH_SIZE`: Number of records per batcher batch
 - `BATCHER_FLUSH_INTERVAL`: Maximum time between batcher flushes
+- `BATCHER_ERROR_SEVERITY_THRESHOLD`: Minimum severity forwarded to notification worker
 - `WRITER_BATCH_SIZE`: Number of commands per writer transaction
 - `WRITER_FLUSH_INTERVAL`: Maximum time between writer flushes
 - `WRITER_MAX_TRANSACTION_RECORDS`: Maximum records per SQLite transaction
 - `METRICS_ADDRESS`: Prometheus metrics server address
+- `NOTIFICATION_ENABLED`: Enable notification pipeline (default: false)
+- `NOTIFICATION_EVENT_QUEUE_DEPTH`: Notification event queue capacity
+- `NOTIFICATION_STORE_PATH`: Path to notification state store (bbolt)
+- `NOTIFICATION_RETRY_INTERVAL`: Retry scan interval
 
 ### Configuration File
 
@@ -361,13 +387,58 @@ See `config.example.yaml` for YAML configuration format.
 - Include error details in responses
 - Handle cancellation gracefully
 
+## Notification Pipeline
+
+### Architecture
+
+The notification pipeline is an optional subsystem that sends alerts when error-level log records are ingested. It sits as a sidecar to the main ingestion path, receiving events from the batcher via a non-blocking buffered channel.
+
+```
+Batcher (severity >= threshold)
+  → Notification Worker (event queue, non-blocking)
+    → Rule Engine (first-match-wins, regex filters)
+      → State Store (bbolt: cooldown, dedup, rate-limit, retries)
+        → Notifier (HTTP webhook or log)
+          → Dead-Letter Queue (after max retries or 4xx)
+```
+
+### Rule Evaluation
+
+Rules are evaluated in order; the first matching rule wins. Each rule can filter on:
+- **Severity threshold**: minimum severity to trigger (ERROR, FATAL, etc.)
+- **Resource filter**: regex on resource ID (e.g., `.*production.*`)
+- **Body filter**: regex on log body (e.g., `(?i)panic`)
+- **Attribute filters**: regex on attribute values (e.g., `service.name: payment`)
+
+### State Tracking
+
+Per-event state is persisted in an embedded bbolt KV store with a retry index for efficient scanning:
+- **Cooldown**: minimum interval between notifications for the same event key
+- **Deduplication**: SHA-256 digest of body + sorted attributes; suppressed within configurable window
+- **Rate limiting**: sliding window counter (N events per M seconds)
+- **Retries**: exponential backoff (base × 2^attempt), capped at 2^10, max 3 retries by default
+- **Dead-letter queue**: persistent storage for exhausted or non-retryable events
+
+### Garbage Collection
+
+State entries that succeeded more than 24 hours ago are GC'd asynchronously after `ScanRetryable` runs. This prevents unbounded state growth while keeping recent state available for cooldown/dedup.
+
+### Non-Retryable Errors
+
+HTTP 4xx responses (401, 403, 404) are treated as non-retryable and sent directly to the dead-letter queue. HTTP 5xx and network errors follow the standard retry backoff. Notifier implementations can mark errors as non-retryable by wrapping them with `NewNotRetryableError()`.
+
 ## Extensibility
 
 Adding a new maintenance command requires:
-1. Implement the `Command` interface
+1. Implement the `Command` or `NonTransactionalCommand` interface
 2. The SQLite Writer needs no changes
 3. The command queue needs no changes
 4. Submit the command via `CommandExecutor.Submit()`
+
+Adding a new notifier requires:
+1. Implement the `Notifier` interface (`Send`, `Name`, `Close`)
+2. Register it in `notify.NewNotifier()` factory
+3. Add config parsing in `cmd/collector/main.go`
 
 This is the key benefit of the command architecture: the execution path is generic and extensible without modifying the queue or the writer.
 
