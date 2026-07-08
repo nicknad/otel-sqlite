@@ -41,7 +41,9 @@ type FileNotificationConfig struct {
 	Enabled         bool                          `yaml:"enabled"`
 	EventQueueDepth int                           `yaml:"event_queue_depth"`
 	StorePath       string                        `yaml:"store_path"`
+	AlertStorePath  string                        `yaml:"alert_store_path"`
 	RetryInterval   string                        `yaml:"retry_interval"`
+	GCInterval      string                        `yaml:"gc_interval"`
 	Notifiers       map[string]FileNotifierConfig `yaml:"notifiers"`
 	Rules           []FileRuleConfig              `yaml:"rules"`
 }
@@ -68,6 +70,11 @@ type FileRuleConfig struct {
 	MaxRetries       int               `yaml:"max_retries"`
 	RetryBackoff     string            `yaml:"retry_backoff"`
 	Destination      string            `yaml:"destination"`
+
+	// Alert-specific fields.
+	AlertWindow        string `yaml:"alert_window"`
+	AlertThreshold     int    `yaml:"alert_threshold"`
+	AlertResolveWindow string `yaml:"alert_resolve_window"`
 }
 
 // LoadFile loads configuration from a YAML file.
@@ -179,12 +186,22 @@ func (c *Config) LoadFile(path string) error {
 		if fc.Notification.StorePath != "" {
 			nc.StorePath = fc.Notification.StorePath
 		}
+		if fc.Notification.AlertStorePath != "" {
+			nc.AlertStorePath = fc.Notification.AlertStorePath
+		}
 		if fc.Notification.RetryInterval != "" {
 			d, err := parseDurationExt(fc.Notification.RetryInterval)
 			if err != nil {
 				return fmt.Errorf("notification.retry_interval: %w", err)
 			}
 			nc.RetryInterval = d
+		}
+		if fc.Notification.GCInterval != "" {
+			d, err := parseDurationExt(fc.Notification.GCInterval)
+			if err != nil {
+				return fmt.Errorf("notification.gc_interval: %w", err)
+			}
+			nc.GCInterval = d
 		}
 
 		// Load notifier configs.
@@ -218,6 +235,7 @@ func (c *Config) LoadFile(path string) error {
 				RateLimit:        fr.RateLimit,
 				MaxRetries:       fr.MaxRetries,
 				Destination:      fr.Destination,
+				AlertThreshold:   fr.AlertThreshold,
 			}
 			if fr.Cooldown != "" {
 				d, err := parseDurationExt(fr.Cooldown)
@@ -246,6 +264,20 @@ func (c *Config) LoadFile(path string) error {
 					return fmt.Errorf("notification.rules[%s].retry_backoff: %w", fr.Name, err)
 				}
 				rc.RetryBackoff = d.String()
+			}
+			if fr.AlertWindow != "" {
+				d, err := parseDurationExt(fr.AlertWindow)
+				if err != nil {
+					return fmt.Errorf("notification.rules[%s].alert_window: %w", fr.Name, err)
+				}
+				rc.AlertWindow = d.String()
+			}
+			if fr.AlertResolveWindow != "" {
+				d, err := parseDurationExt(fr.AlertResolveWindow)
+				if err != nil {
+					return fmt.Errorf("notification.rules[%s].alert_resolve_window: %w", fr.Name, err)
+				}
+				rc.AlertResolveWindow = d.String()
 			}
 			nc.Rules = append(nc.Rules, rc)
 		}

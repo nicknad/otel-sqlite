@@ -1,4 +1,4 @@
-package notify
+package notifications
 
 import (
 	"context"
@@ -7,24 +7,25 @@ import (
 	"log"
 	"time"
 
+	"codeberg.org/nicknad/otel-sqlite/internal/alerts"
+
 	"go.etcd.io/bbolt"
 )
 
-// bboltStore implements Store using bbolt (pure Go embedded KV store).
+// bboltStore implements Store using bbolt.
 type bboltStore struct {
 	db *bbolt.DB
 }
 
 // bucket names
 var (
-	bucketState = []byte("state")
-	bucketDLQ   = []byte("dlq")
-	bucketRetry = []byte("retry") // index: NextRetry:key → key
+	bucketNotifState = []byte("notif_state")
+	bucketNotifDLQ   = []byte("notif_dlq")
+	bucketNotifRetry = []byte("notif_retry") // index: NextRetry:alertID → alertID
 )
 
-// maxStateAge is how long state entries persist after a successful delivery
-// before they are eligible for garbage collection.
-const maxStateAge = 24 * time.Hour
+// maxNotificationStateAge is how long delivery state persists after success.
+const maxNotificationStateAge = 24 * time.Hour
 
 // NewBboltStore opens or creates a bbolt-backed Store at the given path.
 func NewBboltStore(path string) (Store, error) {
@@ -35,9 +36,8 @@ func NewBboltStore(path string) (Store, error) {
 		return nil, fmt.Errorf("bbolt open %q: %w", path, err)
 	}
 
-	// Create buckets if they don't exist.
 	err = db.Update(func(tx *bbolt.Tx) error {
-		for _, name := range [][]byte{bucketState, bucketDLQ, bucketRetry} {
+		for _, name := range [][]byte{bucketNotifState, bucketNotifDLQ, bucketNotifRetry} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return fmt.Errorf("create bucket %q: %w", string(name), err)
 			}
@@ -49,15 +49,16 @@ func NewBboltStore(path string) (Store, error) {
 		return nil, err
 	}
 
-	log.Printf("notify store: bbolt opened at %q", path)
+	log.Printf("notifications store: bbolt opened at %q", path)
 	return &bboltStore{db: db}, nil
 }
 
-// GetState retrieves state for a notification key.
-func (s *bboltStore) GetState(_ context.Context, key string) (*NotificationState, error) {
+// GetNotificationState retrieves state for an alert.
+func (s *bboltStore) GetNotificationState(_ context.Context, alertID string) (*NotificationState, error) {
+	key := NotificationKey(alertID)
 	var state *NotificationState
 	err := s.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketState)
+		b := tx.Bucket(bucketNotifState)
 		data := b.Get([]byte(key))
 		if data == nil {
 			return ErrNotFound
@@ -68,51 +69,48 @@ func (s *bboltStore) GetState(_ context.Context, key string) (*NotificationState
 	return state, err
 }
 
-// PutState upserts state for a notification key. It also maintains the
-// retry index: if NextRetry > 0 the key is added to the retry bucket;
-// if NextRetry == 0 the key is removed from the retry bucket (if present).
-func (s *bboltStore) PutState(_ context.Context, key string, state *NotificationState) error {
+// PutNotificationState upserts delivery state.
+func (s *bboltStore) PutNotificationState(_ context.Context, alertID string, state *NotificationState) error {
+	key := NotificationKey(alertID)
 	state.UpdatedAt = time.Now().UnixNano()
 	data, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}
 	return s.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketState)
+		b := tx.Bucket(bucketNotifState)
 		if err := b.Put([]byte(key), data); err != nil {
 			return err
 		}
 		// Maintain retry index.
-		retryB := tx.Bucket(bucketRetry)
-		retryKey := retryIndexKey(state.NextRetry, key)
+		retryB := tx.Bucket(bucketNotifRetry)
+		retryKey := retryIndexKey(state.NextRetry, alertID)
 		if state.RetryCount > 0 && state.NextRetry > 0 {
-			return retryB.Put(retryKey, []byte(key))
+			return retryB.Put(retryKey, []byte(alertID))
 		}
-		// Remove any existing retry entry for this key (scan and delete).
 		_ = retryB.Delete(retryKey)
-		// Also clean up stale entries that may exist under different timestamps.
-		_ = deleteRetryEntries(retryB, key)
+		_ = deleteRetryEntries(retryB, alertID)
 		return nil
 	})
 }
 
-// DeleteState removes state and cleans up the retry index.
-func (s *bboltStore) DeleteState(_ context.Context, key string) error {
+// DeleteNotificationState removes delivery state.
+func (s *bboltStore) DeleteNotificationState(_ context.Context, alertID string) error {
+	key := NotificationKey(alertID)
 	return s.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketState)
+		b := tx.Bucket(bucketNotifState)
 		if err := b.Delete([]byte(key)); err != nil {
 			return err
 		}
-		// Clean retry index.
-		return deleteRetryEntries(tx.Bucket(bucketRetry), key)
+		return deleteRetryEntries(tx.Bucket(bucketNotifRetry), alertID)
 	})
 }
 
-// EnqueueDLQ moves an event to the dead-letter queue.
-func (s *bboltStore) EnqueueDLQ(_ context.Context, event *Event, reason string) error {
+// EnqueueDLQ moves an alert to the dead-letter queue.
+func (s *bboltStore) EnqueueDLQ(_ context.Context, alert *alerts.Alert, reason string) error {
 	entry := &DLQEntry{
 		ID:         newDLQID(),
-		Event:      event,
+		Alert:      alert,
 		FailReason: reason,
 		FailedAt:   time.Now().UnixNano(),
 	}
@@ -121,16 +119,16 @@ func (s *bboltStore) EnqueueDLQ(_ context.Context, event *Event, reason string) 
 		return fmt.Errorf("marshal dlq entry: %w", err)
 	}
 	return s.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketDLQ)
+		b := tx.Bucket(bucketNotifDLQ)
 		return b.Put([]byte(entry.ID), data)
 	})
 }
 
-// ListDLQ returns all events in the dead-letter queue.
+// ListDLQ returns all entries in the dead-letter queue.
 func (s *bboltStore) ListDLQ(_ context.Context) ([]*DLQEntry, error) {
 	var entries []*DLQEntry
 	err := s.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketDLQ)
+		b := tx.Bucket(bucketNotifDLQ)
 		c := b.Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			var entry DLQEntry
@@ -147,34 +145,28 @@ func (s *bboltStore) ListDLQ(_ context.Context) ([]*DLQEntry, error) {
 // AckDLQ removes a DLQ entry.
 func (s *bboltStore) AckDLQ(_ context.Context, id string) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketDLQ)
+		b := tx.Bucket(bucketNotifDLQ)
 		return b.Delete([]byte(id))
 	})
 }
 
-// ScanRetryable uses the retry bucket index to efficiently find past-due
-// retries instead of scanning all state entries. Falls back to a full scan
-// if the retry bucket is empty (e.g., after a migration).
+// ScanRetryable finds alerts due for retry.
 func (s *bboltStore) ScanRetryable(_ context.Context) ([]RetryableEntry, error) {
 	now := time.Now().UnixNano()
 	var entries []RetryableEntry
 
 	err := s.db.View(func(tx *bbolt.Tx) error {
-		retryB := tx.Bucket(bucketRetry)
+		retryB := tx.Bucket(bucketNotifRetry)
 		c := retryB.Cursor()
 
-		// Retry keys are formatted as "nextRetry:stateKey".
-		// Iterate only entries whose nextRetry <= now.
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			ts := parseRetryTimestamp(k)
 			if ts > now {
-				// Since keys are sorted, all subsequent entries are also in the future.
 				break
 			}
-			key := string(v)
-			// Read state to get the current RetryCount (could have changed).
-			stateB := tx.Bucket(bucketState)
-			data := stateB.Get([]byte(key))
+			alertID := string(v)
+			stateB := tx.Bucket(bucketNotifState)
+			data := stateB.Get([]byte(NotificationKey(alertID)))
 			if data == nil {
 				continue
 			}
@@ -184,7 +176,7 @@ func (s *bboltStore) ScanRetryable(_ context.Context) ([]RetryableEntry, error) 
 			}
 			if state.RetryCount > 0 && state.NextRetry > 0 && state.NextRetry <= now {
 				entries = append(entries, RetryableEntry{
-					Key:        key,
+					AlertID:    alertID,
 					RetryCount: state.RetryCount,
 				})
 			}
@@ -195,19 +187,16 @@ func (s *bboltStore) ScanRetryable(_ context.Context) ([]RetryableEntry, error) 
 		return nil, err
 	}
 
-	// Garbage-collect old successful state entries periodically.
 	go s.gcOldState()
-
 	return entries, nil
 }
 
-// gcOldState removes state entries that succeeded more than maxStateAge ago.
-// This runs asynchronously after ScanRetryable to amortize cost.
+// gcOldState removes successful delivery state entries older than the cutoff.
 func (s *bboltStore) gcOldState() {
-	cutoff := time.Now().Add(-maxStateAge).UnixNano()
+	cutoff := time.Now().Add(-maxNotificationStateAge).UnixNano()
 	_ = s.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketState)
-		retryB := tx.Bucket(bucketRetry)
+		b := tx.Bucket(bucketNotifState)
+		retryB := tx.Bucket(bucketNotifRetry)
 		c := b.Cursor()
 		var toDelete []string
 		for k, v := c.First(); k != nil; k, v = c.Next() {
@@ -215,25 +204,24 @@ func (s *bboltStore) gcOldState() {
 			if err := json.Unmarshal(v, &state); err != nil {
 				continue
 			}
-			// Remove state entries that are not pending retry and are older than cutoff.
 			if state.RetryCount == 0 && state.NextRetry == 0 && state.LastSuccess > 0 && state.LastSuccess < cutoff {
 				toDelete = append(toDelete, string(k))
 			}
 		}
 		for _, key := range toDelete {
 			_ = b.Delete([]byte(key))
-			_ = deleteRetryEntries(retryB, key)
+			_ = deleteRetryEntries(retryB, DecodeNotificationKey(key))
 		}
 		if len(toDelete) > 0 {
-			log.Printf("notify store: gc removed %d stale state entries", len(toDelete))
+			log.Printf("notifications store: gc removed %d stale state entries", len(toDelete))
 		}
 		return nil
 	})
 }
 
-// retryIndexKey formats a key for the retry bucket as "nextRetry:stateKey".
-func retryIndexKey(nextRetry int64, stateKey string) []byte {
-	return fmt.Appendf(nil, "%020d:%s", nextRetry, stateKey)
+// retryIndexKey formats a key for the retry bucket.
+func retryIndexKey(nextRetry int64, alertID string) []byte {
+	return fmt.Appendf(nil, "%020d:%s", nextRetry, alertID)
 }
 
 // parseRetryTimestamp extracts the nextRetry timestamp from a retry bucket key.
@@ -241,7 +229,6 @@ func parseRetryTimestamp(key []byte) int64 {
 	var ts int64
 	for i, b := range key {
 		if b == ':' {
-			// Parse the numeric prefix.
 			_, _ = fmt.Sscanf(string(key[:i]), "%d", &ts)
 			return ts
 		}
@@ -249,11 +236,11 @@ func parseRetryTimestamp(key []byte) int64 {
 	return 0
 }
 
-// deleteRetryEntries removes all retry index entries that point to the given state key.
-func deleteRetryEntries(b *bbolt.Bucket, stateKey string) error {
+// deleteRetryEntries removes all retry index entries that point to the given alert ID.
+func deleteRetryEntries(b *bbolt.Bucket, alertID string) error {
 	c := b.Cursor()
 	for k, v := c.First(); k != nil; k, v = c.Next() {
-		if string(v) == stateKey {
+		if string(v) == alertID {
 			if err := b.Delete(k); err != nil {
 				return err
 			}
@@ -264,7 +251,7 @@ func deleteRetryEntries(b *bbolt.Bucket, stateKey string) error {
 
 // Close closes the bbolt database.
 func (s *bboltStore) Close() error {
-	log.Println("notify store: closing bbolt")
+	log.Println("notifications store: closing bbolt")
 	return s.db.Close()
 }
 

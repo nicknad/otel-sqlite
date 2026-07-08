@@ -71,11 +71,19 @@ type NotificationConfig struct {
 	// EventQueueDepth is the buffered channel capacity between batcher and worker.
 	EventQueueDepth int `mapstructure:"event_queue_depth"`
 
-	// StorePath is the file path for the embedded KV store (bbolt).
+	// StorePath is the file path for the embedded KV store (bbolt) used for
+	// notification delivery state and DLQ.
 	StorePath string `mapstructure:"store_path"`
+
+	// AlertStorePath is the file path for the alert state store (bbolt).
+	// Defaults to "alert-state.db" if empty.
+	AlertStorePath string `mapstructure:"alert_store_path"`
 
 	// RetryInterval is how often the retry goroutine scans for retryable events.
 	RetryInterval time.Duration `mapstructure:"retry_interval"`
+
+	// GCInterval is how often the worker garbage-collects resolved alerts.
+	GCInterval time.Duration `mapstructure:"gc_interval"`
 
 	// Notifiers maps notifier name → config. Built-in names: "log", "http".
 	Notifiers map[string]NotifierConfig `mapstructure:"notifiers"`
@@ -113,6 +121,11 @@ type RuleConfig struct {
 	MaxRetries       int               `mapstructure:"max_retries"`
 	RetryBackoff     string            `mapstructure:"retry_backoff"`
 	Destination      string            `mapstructure:"destination"`
+
+	// Alert-specific fields.
+	AlertWindow        string `mapstructure:"alert_window"`
+	AlertThreshold     int    `mapstructure:"alert_threshold"`
+	AlertResolveWindow string `mapstructure:"alert_resolve_window"`
 }
 
 // DefaultConfig returns a configuration with sensible defaults.
@@ -139,7 +152,9 @@ func DefaultConfig() *Config {
 			Enabled:         false,
 			EventQueueDepth: 1000,
 			StorePath:       "notify-state.db",
+			AlertStorePath:  "alert-state.db",
 			RetryInterval:   30 * time.Second,
+			GCInterval:      5 * time.Minute,
 		},
 	}
 }
@@ -393,11 +408,17 @@ func (c *Config) Validate() error {
 		if c.Notification.StorePath == "" {
 			return errors.New("notification.store_path must not be empty when notifications are enabled")
 		}
+		if c.Notification.AlertStorePath == "" {
+			return errors.New("notification.alert_store_path must not be empty when notifications are enabled")
+		}
 		if c.Notification.EventQueueDepth <= 0 {
 			return fmt.Errorf("notification.event_queue_depth must be positive, got %d", c.Notification.EventQueueDepth)
 		}
 		if c.Notification.RetryInterval <= 0 {
 			return fmt.Errorf("notification.retry_interval must be positive, got %s", c.Notification.RetryInterval)
+		}
+		if c.Notification.GCInterval <= 0 {
+			return fmt.Errorf("notification.gc_interval must be positive, got %s", c.Notification.GCInterval)
 		}
 		for i := range c.Notification.Rules {
 			rule := &c.Notification.Rules[i]

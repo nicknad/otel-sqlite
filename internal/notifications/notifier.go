@@ -1,16 +1,18 @@
-package notify
+package notifications
 
 import (
 	"context"
 	"fmt"
+
+	"codeberg.org/nicknad/otel-sqlite/internal/alerts"
 )
 
-// Notifier sends a notification to an external system.
+// Notifier sends an alert notification to an external system.
 // Implementations must be safe for concurrent use.
 type Notifier interface {
-	// Send delivers the event. Returns nil on success, error on failure.
+	// Send delivers the alert. Returns nil on success, error on failure.
 	// The caller decides retry logic.
-	Send(ctx context.Context, event *Event) error
+	Send(ctx context.Context, alert *alerts.Alert) error
 
 	// Name returns a unique name for this notifier (matches Rule.Destination).
 	Name() string
@@ -32,10 +34,10 @@ func NewNotifier(name string, config any) (Notifier, error) {
 	case "http":
 		cfg, ok := config.(*HTTPNotifierConfig)
 		if !ok {
-			return nil, fmt.Errorf("notify: http notifier requires *HTTPNotifierConfig, got %T", config)
+			return nil, fmt.Errorf("notifications: http notifier requires *HTTPNotifierConfig, got %T", config)
 		}
 		return NewHTTPNotifier(cfg), nil
 	default:
-		return nil, fmt.Errorf("notify: unknown notifier %q", name)
+		return nil, fmt.Errorf("notifications: unknown notifier %q", name)
 	}
 }

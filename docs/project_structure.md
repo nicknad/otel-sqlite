@@ -48,20 +48,32 @@ otel-sqlite/
 │   │   ├── resource.go     # Resource struct with deterministic ID hashing
 │   │   └── value.go        # AttributeValue (union type for resource attributes)
 │   │
-│   ├── notify/             # Notification pipeline (optional alerting subsystem)
-│   │   ├── types.go        # Event, EventFromLogRecord, IsRetryable, sentinel errors
-│   │   ├── store.go        # Store interface, NotificationState, DLQEntry, StateKey
+│   ├── events/             # Event model for the notification pipeline
+│   │   ├── event.go        # Event struct, Fingerprint, EventFromLogRecord
+│   │   └── event_test.go
+│   │
+│   ├── rules/              # Notification rule matching engine
+│   │   ├── rule.go         # Rule (with alert_window/threshold/resolve_window), RuleEngine
+│   │   └── rule_test.go
+│   │
+│   ├── alerts/             # Alert state machine (window → counter → state → alert)
+│   │   ├── alert.go        # Alert struct, AlertStatus enum, AlertID, NewAlert
+│   │   ├── window.go       # Sliding time window with LoadFrom/Snapshot
+│   │   ├── counter.go      # Counter wraps Window + threshold check
+│   │   ├── state.go        # EvaluateAlert state machine, ApplyTransition
+│   │   ├── store.go        # AlertStore interface (Get, Put, Delete, ListByStatus, ListAll)
+│   │   ├── store_bbolt.go  # bbolt-backed AlertStore
+│   │   └── *_test.go       # Unit tests for all components
+│   │
+│   ├── notifications/      # Notification delivery + retry + DLQ
+│   │   ├── types.go        # IsRetryable, NewNotRetryableError, sentinel errors
+│   │   ├── store.go        # Store interface, NotificationState, DLQEntry
 │   │   ├── store_bbolt.go  # bbolt implementation with retry bucket index + GC
-│   │   ├── rule.go         # Rule, RuleEngine interface, DefaultRuleEngine, eventFingerprint
-│   │   ├── notifier.go     # Notifier interface + NewNotifier factory
+│   │   ├── notifier.go     # Notifier interface (receives *alerts.Alert) + NewNotifier factory
 │   │   ├── notifier_http.go    # HTTP webhook notifier (4xx→non-retryable, 5xx→retryable)
 │   │   ├── notifier_log.go     # Log notifier (log.Printf, dev/testing)
-│   │   ├── worker.go       # Worker: goroutines, queue drain, helpers (checkCooldown, etc.)
-│   │   ├── worker_test.go      # Unit tests with mocks
-│   │   ├── rule_test.go         # Rule engine tests + regression tests
-│   │   ├── store_bbolt_test.go  # bbolt CRUD + retry scanning tests
-│   │   ├── notifier_http_test.go # HTTP notifier tests with httptest
-│   │   └── e2e_test.go          # End-to-end: worker → HTTP notifier → webhook receiver
+│   │   ├── worker.go       # Worker: goroutines (process, retry, GC), alert pipeline integration
+│   │   └── e2e_test.go     # End-to-end: Event → Rule → Alert → Notifier
 │   │
 │   ├── otlp/               # OTLP gRPC transport layer (protobuf boundary)
 │   │   ├── server.go       # gRPC service implementation
@@ -110,7 +122,10 @@ otel-sqlite/
 ```
 cmd/collector → internal/config
               → internal/batcher
-              → internal/notify
+              → internal/events
+              → internal/rules
+              → internal/alerts
+              → internal/notifications
               → internal/otlp
               → internal/storage
               → internal/storage/sqlite
@@ -126,8 +141,18 @@ internal/batcher → internal/ingest
                  → internal/model
                  → internal/metrics
 
-internal/notify → internal/model         (no protobuf, no SQLite)
-                → internal/metrics
+internal/notifications → internal/events
+                       → internal/rules
+                       → internal/alerts
+                       → internal/model   (no protobuf, no SQLite)
+                       → internal/metrics
+
+internal/rules → internal/events
+               → internal/model
+
+internal/alerts → internal/model
+
+internal/events → internal/model
 
 internal/storage/sqlite → internal/storage
                         → internal/model
@@ -147,7 +172,9 @@ internal/maintenance → internal/storage  (CommandSubmitter interface only)
 
 4. **Non-blocking notification**: The notification pipeline is a sidecar — the batcher's hot path does a non-blocking channel send. If the queue is full, events are dropped with a counter increment. The notification path never blocks ingestion.
 
-5. **bbolt for notification state**: Pure-Go embedded KV store with no CGo dependency. Retry index bucket enables O(retryable) scanning instead of O(all state). Async GC after 24h caps growth.
+5. **Alert state machine**: Each rule×resource pair creates one Alert with a lifecycle (pending → firing → resolved). Events are counted within sliding time windows per rule. Thresholds determine when alerts fire; silence windows determine when they resolve. Alert and delivery state are persisted in separate bbolt stores.
+
+6. **bbolt for state**: Pure-Go embedded KV store with no CGo dependency. Retry index bucket enables O(retryable) scanning. Resolved alerts and stale delivery state are GC'd asynchronously after 24h.
 
 6. **Prepared statements via tx.Stmt()**: Insert SQL is compiled once at startup, then bound to each transaction. Multi-row batch INSERT was benchmarked but proved slower — per-row with prepared statements is optimal for this workload.
 

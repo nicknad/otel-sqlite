@@ -115,15 +115,20 @@ The OTLP SQLite Collector is a high-performance log collector that receives Open
   - Perform mapping logic
   - Begin/commit/rollback transactions from within commands
 
-### 7. Notification Pipeline (`internal/notify/`)
-- **Owns**: Rule engine, state store, notifier implementations, worker goroutines
+### 7. Notification Pipeline (`internal/notifications/`, `internal/rules/`, `internal/alerts/`, `internal/events/`)
+- **Owns**: Event model, rule engine, alert state machine, notifier implementations, worker goroutines
 - **Responsibilities**:
   - Receive error-level events from the batcher via non-blocking channel
   - Evaluate rules (severity threshold, regex filters on resource/body/attributes)
-  - Track notification state in embedded bbolt KV store (cooldown, dedup digest, rate-limit bucket, retry count)
-  - Deliver notifications via pluggable notifiers (HTTP webhook, log)
+  - Maintain alert state per rule×resource pair (pending → firing → resolved)
+  - Count events within configurable sliding time windows per rule
+  - Fire alerts when count exceeds threshold; auto-resolve after silence window
+  - Persist alert state in bbolt KV store (`alert-state.db`)
+  - Track notification delivery state (cooldown, retries) in bbolt (`notify-state.db`)
+  - Deliver alert notifications via pluggable notifiers (HTTP webhook, log)
   - Retry failed deliveries with exponential backoff (capped at 2^10)
-  - Move exhausted or non-retryable events to dead-letter queue
+  - Move exhausted or non-retryable deliveries to dead-letter queue
+  - Garbage-collect resolved alerts older than 24h
   - Drain event queue on graceful shutdown
 - **Must NOT**:
   - Block the batcher hot path (non-blocking send, returns ErrQueueFull when full)
@@ -360,8 +365,10 @@ All command metrics are labelled by command type for granular observability.
 - `METRICS_ADDRESS`: Prometheus metrics server address
 - `NOTIFICATION_ENABLED`: Enable notification pipeline (default: false)
 - `NOTIFICATION_EVENT_QUEUE_DEPTH`: Notification event queue capacity
-- `NOTIFICATION_STORE_PATH`: Path to notification state store (bbolt)
+- `NOTIFICATION_STORE_PATH`: Path to notification delivery state store (bbolt)
+- `NOTIFICATION_ALERT_STORE_PATH`: Path to alert state store (bbolt)
 - `NOTIFICATION_RETRY_INTERVAL`: Retry scan interval
+- `NOTIFICATION_GC_INTERVAL`: Resolved alert GC interval
 
 ### Configuration File
 
@@ -397,35 +404,54 @@ The notification pipeline is an optional subsystem that sends alerts when error-
 Batcher (severity >= threshold)
   → Notification Worker (event queue, non-blocking)
     → Rule Engine (first-match-wins, regex filters)
-      → State Store (bbolt: cooldown, dedup, rate-limit, retries)
-        → Notifier (HTTP webhook or log)
+      → Alert Pipeline:
+          Time Window (sliding window: count events within alert_window)
+          → Counter (count >= alert_threshold?)
+          → State Machine (pending → firing → resolved)
+          → Alert Store (bbolt: persisted per rule×resource)
+        → Notifier (HTTP webhook or log, sends Alert JSON)
           → Dead-Letter Queue (after max retries or 4xx)
 ```
 
-### Rule Evaluation
+### Package Layout
 
-Rules are evaluated in order; the first matching rule wins. Each rule can filter on:
-- **Severity threshold**: minimum severity to trigger (ERROR, FATAL, etc.)
-- **Resource filter**: regex on resource ID (e.g., `.*production.*`)
-- **Body filter**: regex on log body (e.g., `(?i)panic`)
-- **Attribute filters**: regex on attribute values (e.g., `service.name: payment`)
+| Package | Purpose |
+|---------|---------|
+| `internal/events/` | Event type, fingerprinting, LogRecord conversion |
+| `internal/rules/` | Rule definition, regex matching engine |
+| `internal/alerts/` | Alert struct, sliding window, counter, state machine, AlertStore |
+| `internal/notifications/` | Notifier interface, HTTP/log implementations, delivery state, retry/DLQ, worker |
 
-### State Tracking
+### Alert Pipeline
 
-Per-event state is persisted in an embedded bbolt KV store with a retry index for efficient scanning:
-- **Cooldown**: minimum interval between notifications for the same event key
-- **Deduplication**: SHA-256 digest of body + sorted attributes; suppressed within configurable window
-- **Rate limiting**: sliding window counter (N events per M seconds)
-- **Retries**: exponential backoff (base × 2^attempt), capped at 2^10, max 3 retries by default
-- **Dead-letter queue**: persistent storage for exhausted or non-retryable events
+Each event goes through the pipeline:
+1. **Rule evaluation**: Check severity, resource, body, and attribute filters
+2. **Time window**: Add event timestamp to a sliding window (configurable per rule via `alert_window`)
+3. **Counter**: Count events currently in the window; check against `alert_threshold`
+4. **State machine**: Determine next alert state
+   - **Pending**: counting but below threshold. Stale pending alerts (above window, no recent hits) are garbage-collected.
+   - **Firing**: threshold exceeded. Notification sent on transition. Subsequent events increment count but don't re-notify.
+   - **Resolved**: was firing, now below threshold for `alert_resolve_window`. Resolution notification sent.
+5. **Alert persistence**: Alert object (ID, rule, resource, status, severity, count, timestamps, window) stored in bbolt
+6. **Notification delivery**: Alert JSON delivered via configured notifier with retry backoff
 
-### Garbage Collection
+### Alert Model
 
-State entries that succeeded more than 24 hours ago are GC'd asynchronously after `ScanRetryable` runs. This prevents unbounded state growth while keeping recent state available for cooldown/dedup.
+Each rule×resource pair creates one `Alert` with a composite ID (`ruleID:resourceID`). Multiple distinct error messages from the same resource under the same rule aggregate into a single alert. The alert carries the current count, status, severity, and timing metadata.
+
+### Delivery State
+
+Notification delivery state (cooldown, retry count, next retry time) is tracked separately from alert state in a dedicated bbolt store. A retry index bucket enables O(retryable) scanning. Delivery state is garbage-collected after 24h of successful delivery.
 
 ### Non-Retryable Errors
 
 HTTP 4xx responses (401, 403, 404) are treated as non-retryable and sent directly to the dead-letter queue. HTTP 5xx and network errors follow the standard retry backoff. Notifier implementations can mark errors as non-retryable by wrapping them with `NewNotRetryableError()`.
+
+### Garbage Collection
+
+- **Resolved alerts**: Deleted after 24h via the GC goroutine (configurable `gc_interval`)
+- **Delivery state**: Successful state entries older than 24h are GC'd asynchronously
+- **Stale pending alerts**: Pending alerts with no recent hits beyond `alert_resolve_window` are deleted on next evaluation
 
 ## Extensibility
 
@@ -436,8 +462,8 @@ Adding a new maintenance command requires:
 4. Submit the command via `CommandExecutor.Submit()`
 
 Adding a new notifier requires:
-1. Implement the `Notifier` interface (`Send`, `Name`, `Close`)
-2. Register it in `notify.NewNotifier()` factory
+1. Implement the `Notifier` interface (`Send`, `Name`, `Close`) — `Send` receives an `*alerts.Alert`
+2. Register it in `notifications.NewNotifier()` factory
 3. Add config parsing in `cmd/collector/main.go`
 
 This is the key benefit of the command architecture: the execution path is generic and extensible without modifying the queue or the writer.

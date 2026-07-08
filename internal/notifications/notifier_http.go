@@ -1,4 +1,4 @@
-package notify
+package notifications
 
 import (
 	"bytes"
@@ -9,6 +9,8 @@ import (
 	"maps"
 	"net/http"
 	"time"
+
+	"codeberg.org/nicknad/otel-sqlite/internal/alerts"
 )
 
 // HTTPNotifierConfig configures the HTTP webhook notifier.
@@ -27,7 +29,7 @@ type HTTPNotifierConfig struct {
 	CustomHeaders map[string]string
 }
 
-// HTTPNotifier sends notifications via HTTP POST (webhook).
+// HTTPNotifier sends alert notifications via HTTP POST (webhook).
 type HTTPNotifier struct {
 	url     string
 	client  *http.Client
@@ -65,48 +67,31 @@ func (n *HTTPNotifier) Name() string {
 	return "http"
 }
 
-// payload is the JSON structure sent to the webhook.
-type payload struct {
-	Severity     string            `json:"severity"`
-	SeverityText string            `json:"severity_text,omitempty"`
-	Body         string            `json:"body"`
-	ResourceID   string            `json:"resource_id,omitempty"`
-	Timestamp    int64             `json:"timestamp"`
-	TraceID      string            `json:"trace_id,omitempty"`
-	SpanID       string            `json:"span_id,omitempty"`
-	Attributes   map[string]string `json:"attributes,omitempty"`
-	ScopeName    string            `json:"scope_name,omitempty"`
-	ScopeVersion string            `json:"scope_version,omitempty"`
+// alertPayload is the JSON structure sent to the webhook.
+type alertPayload struct {
+	ID          string `json:"id"`
+	RuleID      string `json:"rule_id"`
+	ResourceID  string `json:"resource_id"`
+	Status      string `json:"status"`
+	Severity    string `json:"severity"`
+	OpenedAt    int64  `json:"opened_at"`
+	UpdatedAt   int64  `json:"updated_at"`
+	LastMatched int64  `json:"last_matched"`
+	Count       int    `json:"count"`
 }
 
-// Send POSTs the event as JSON to the configured URL.
-// Returns a non-retryable error for 4xx responses and retryable errors for
-// 5xx/network failures.
-func (n *HTTPNotifier) Send(ctx context.Context, event *Event) error {
-	p := payload{
-		Severity:     event.Severity.String(),
-		SeverityText: event.SeverityText,
-		Body:         event.Body,
-		ResourceID:   event.ResourceID,
-		Timestamp:    event.Timestamp,
-		ScopeName:    event.ScopeName,
-		ScopeVersion: event.ScopeVersion,
-	}
-
-	// Format trace/span IDs as hex strings.
-	if event.TraceID != [16]byte{} {
-		p.TraceID = fmt.Sprintf("%032x", event.TraceID)
-	}
-	if event.SpanID != [8]byte{} {
-		p.SpanID = fmt.Sprintf("%016x", event.SpanID)
-	}
-
-	// Flatten attributes to a simple map.
-	if len(event.Attributes) > 0 {
-		p.Attributes = make(map[string]string, len(event.Attributes))
-		for _, attr := range event.Attributes {
-			p.Attributes[attr.Key] = attrValueString(&attr)
-		}
+// Send POSTs the alert as JSON to the configured URL.
+func (n *HTTPNotifier) Send(ctx context.Context, alert *alerts.Alert) error {
+	p := alertPayload{
+		ID:          alert.ID,
+		RuleID:      alert.RuleID,
+		ResourceID:  alert.ResourceID,
+		Status:      alert.Status.String(),
+		Severity:    alert.Severity.String(),
+		OpenedAt:    alert.OpenedAt,
+		UpdatedAt:   alert.UpdatedAt,
+		LastMatched: alert.LastMatched,
+		Count:       alert.Count,
 	}
 
 	body, err := json.Marshal(p)
@@ -129,9 +114,8 @@ func (n *HTTPNotifier) Send(ctx context.Context, event *Event) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Read a bounded prefix of the response body for error diagnostics.
 	respBody, _ := readBodyPrefix(resp.Body, 512)
-	_, _ = io.Copy(io.Discard, resp.Body) // drain remainder for connection reuse
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode >= 500 {
 		err := fmt.Errorf("http %d from %q: %s", resp.StatusCode, n.url, respBody)

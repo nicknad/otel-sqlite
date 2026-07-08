@@ -12,7 +12,7 @@ A high-performance OpenTelemetry log collector that receives OTLP logs over gRPC
 - **Batch-Level Ingress**: Batches sent through the ingress queue instead of individual records — 250× fewer channel operations
 - **Production-Tuned SQLite**: WAL mode, 64MB page cache, 256MB mmap I/O, temp_store=MEMORY, journal size limit
 - **OTLP Type Isolation**: Protobuf types confined to the transport layer; internal packages depend only on domain models
-- **Notification Pipeline**: Rule-based alerting with dedup, rate-limiting, cooldown, retries, and dead-letter queue
+- **Notification Pipeline**: Rule-based alerting with sliding-window aggregation, threshold counting, alert state machine (pending→firing→resolved), and dead-letter queue
 - **Pluggable Notifiers**: HTTP webhook and log-based notifiers; add your own via the `Notifier` interface
 - **YAML Configuration**: Optional config file support via `CONFIG_FILE` environment variable
 
@@ -44,9 +44,13 @@ SQLite Writer (single goroutine, executes Command.Execute within transactions,
 SQLite Database (WAL mode, 64MB cache, 256MB mmap, prepared statements, minimized indexes)
     │
     ▼ (optional, if notification.enabled)
-Notification Worker (rule engine → state store → notifier)
+Notification Worker
     │
-    ├── HTTP Webhook Notifier (POST JSON)
+    ├── Rule Engine (severity threshold, regex filters)
+    ├── Alert Pipeline (ERROR → time window → counter → state → alert)
+    ├── Alert Store (bbolt: pending/firing/resolved per rule×resource)
+    ├── Notification State Store (bbolt: cooldown, retry tracking, DLQ)
+    ├── HTTP Webhook Notifier (POSTs Alert JSON)
     ├── Log Notifier (log.Printf)
     └── Dead-Letter Queue (bbolt, persistent)
 ```
@@ -164,8 +168,10 @@ Or directly:
 | `VACUUM_INTERVAL` | `168h` (7d) | How often to vacuum |
 | `NOTIFICATION_ENABLED` | `false` | Enable notification pipeline |
 | `NOTIFICATION_EVENT_QUEUE_DEPTH` | `1000` | Notification event queue capacity |
-| `NOTIFICATION_STORE_PATH` | `notify-state.db` | Path to notification state store (bbolt) |
+| `NOTIFICATION_STORE_PATH` | `notify-state.db` | Path to notification delivery state store (bbolt) |
+| `NOTIFICATION_ALERT_STORE_PATH` | `alert-state.db` | Path to alert state store (bbolt) |
 | `NOTIFICATION_RETRY_INTERVAL` | `30s` | Retry scan interval |
+| `NOTIFICATION_GC_INTERVAL` | `5m` | Resolved alert garbage-collection interval |
 
 ### YAML Configuration File
 
@@ -225,24 +231,32 @@ func main() {
 
 The collector includes an optional notification pipeline that sends alerts when error-level log records are ingested.
 
-**Pipeline flow:**
+**Alert pipeline flow:**
 ```
-Batcher (severity >= threshold)
-  → Notification Worker (event queue, non-blocking)
-    → Rule Engine (first-match-wins, regex filters on resource/body/attributes)
-      → State Store (bbolt: cooldown, dedup, rate-limit, retry tracking)
-        → Notifier (HTTP webhook or log)
-          → Retry Loop (exponential backoff, max 3 retries)
-            → Dead-Letter Queue (persistent, after max retries or 4xx errors)
+ERROR event
+  → Time Window (sliding window per rule: count events within alert_window)
+    → Counter (threshold check: count >= alert_threshold?)
+      → State Machine (pending → firing → resolved)
+        → Alert (persisted per rule×resource pair)
+          → Notifier (HTTP webhook or log)
+            → Retry Loop (exponential backoff) → Dead-Letter Queue
 ```
+
+**Alert state machine:**
+- **Pending**: events are being counted but haven't reached the threshold yet
+- **Firing**: threshold exceeded — notifications are delivered
+- **Resolved**: silence for `alert_resolve_window` — a resolution notification is sent
+
+Each rule×resource pair creates one Alert. Multiple error messages from the same resource under the same rule count toward a single alert.
 
 **Features:**
 - **Rule-based matching**: filter by severity, resource ID (regex), body (regex), attributes
-- **Deduplication**: suppress identical events within a configurable window (SHA-256 digest)
-- **Rate limiting**: sliding window counter per rule (N events per M seconds)
-- **Cooldown**: minimum interval between notifications for the same event key
+- **Sliding-window aggregation**: count events within a configurable time window per rule
+- **Threshold-based alerting**: fire when count reaches `alert_threshold`; resolve after `alert_resolve_window` of silence
+- **Cooldown**: minimum interval between notifications for the same alert
 - **Retry with backoff**: exponential backoff (base × 2^attempt), capped at 2^10
-- **Dead-letter queue**: persistent storage for events that exhausted retries or received 4xx responses
+- **Dead-letter queue**: persistent storage for deliveries that exhausted retries or received 4xx responses
+- **Garbage collection**: resolved alerts older than 24h are automatically cleaned up
 - **Graceful shutdown**: drains buffered events before stopping
 - **Metrics**: events received, matched, delivered, failed, dead-lettered; queue depth
 
@@ -251,8 +265,10 @@ Batcher (severity >= threshold)
 notification:
   enabled: true
   event_queue_depth: 1000
-  store_path: "notify-state.db"
+  store_path: "notify-state.db"     # delivery state (cooldown, retries, DLQ)
+  alert_store_path: "alert-state.db" # alert state (pending/firing/resolved)
   retry_interval: "30s"
+  gc_interval: "5m"
   notifiers:
     slack:
       type: "http"
@@ -265,18 +281,19 @@ notification:
       match_severity: "ERROR"
       resource_filter: ".*production.*"
       cooldown: "5m"
-      rate_limit: 10
-      rate_window: "1m"
-      dedup_window: "5m"
       max_retries: 3
       retry_backoff: "30s"
+      alert_window: "5m"           # count events within 5-minute windows
+      alert_threshold: 3           # fire after 3 events in one window
+      alert_resolve_window: "15m"  # auto-resolve after 15m of silence
       destination: "slack"
     - name: "all-fatals"
       match_severity: "FATAL"
+      alert_threshold: 1          # fire immediately on first Fatal
       destination: "dev"
 ```
 
-**HTTP notifier**: sends JSON POST requests with the event payload. Non-retryable errors (4xx) go straight to DLQ; retryable errors (5xx, network) follow the retry backoff.
+**HTTP notifier**: sends JSON POST requests with the alert payload (id, rule_id, resource_id, status, severity, opened_at, updated_at, last_matched, count). Non-retryable errors (4xx) go straight to DLQ; retryable errors (5xx, network) follow the retry backoff.
 
 ### Load Testing
 
@@ -338,11 +355,11 @@ The collector exposes Prometheus metrics on `METRICS_ADDRESS` (default `:9090`).
 
 #### Notification Metrics
 
-- `otel_collector_notify_events_received_total` — Total notification events received
+- `otel_collector_notify_events_received_total` — Total events received by the notification worker
 - `otel_collector_notify_events_matched_total` — Events that matched a rule (labeled by rule)
-- `otel_collector_notify_events_delivered_total` — Events successfully delivered (labeled by destination)
-- `otel_collector_notify_events_failed_total` — Events that failed delivery (labeled by destination)
-- `otel_collector_notify_events_dead_lettered_total` — Events moved to dead-letter queue
+- `otel_collector_notify_events_delivered_total` — Alert notifications successfully delivered (labeled by destination)
+- `otel_collector_notify_events_failed_total` — Alert notifications that failed delivery (labeled by destination)
+- `otel_collector_notify_events_dead_lettered_total` — Alerts moved to dead-letter queue
 - `otel_collector_notify_queue_depth` — Current notification event queue depth
 - `otel_collector_notify_retry_queue_depth` — Current retry queue depth
 
