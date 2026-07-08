@@ -17,20 +17,20 @@ func TestDefaultConfig(t *testing.T) {
 	if c.IngressQueueCapacity != 10000 {
 		t.Errorf("expected 10000, got %d", c.IngressQueueCapacity)
 	}
-	if c.BatchQueueCapacity != 1000 {
-		t.Errorf("expected 1000, got %d", c.BatchQueueCapacity)
+	if c.BatchQueueCapacity != 5000 {
+		t.Errorf("expected 5000, got %d", c.BatchQueueCapacity)
 	}
 	if c.BatcherBatchSize != 250 {
 		t.Errorf("expected 250, got %d", c.BatcherBatchSize)
 	}
-	if c.BatcherFlushInterval != 5*time.Second {
-		t.Errorf("expected 5s, got %s", c.BatcherFlushInterval)
+	if c.BatcherFlushInterval != 1*time.Second {
+		t.Errorf("expected 1s, got %s", c.BatcherFlushInterval)
 	}
 	if c.WriterBatchSize != 100 {
 		t.Errorf("expected 100, got %d", c.WriterBatchSize)
 	}
-	if c.WriterFlushInterval != 5*time.Second {
-		t.Errorf("expected 5s, got %s", c.WriterFlushInterval)
+	if c.WriterFlushInterval != 1*time.Second {
+		t.Errorf("expected 1s, got %s", c.WriterFlushInterval)
 	}
 	if c.MetricsAddress != ":9090" {
 		t.Errorf("expected :9090, got %q", c.MetricsAddress)

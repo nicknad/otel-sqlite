@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"strconv"
+	"sync"
 
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
 
@@ -15,6 +16,11 @@ import (
 	logsV1 "codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/logs/v1"
 	resourceV1 "codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/resource/v1"
 )
+
+// resourceIDCache avoids repeated SHA-256 hashing for the same
+// (service.name, host.name, schema_url) tuple.  Resource count in
+// production is typically in the dozens, so hit rate is near 100%.
+var resourceIDCache sync.Map
 
 // Mapper converts OTLP protobuf types to internal domain models.
 type Mapper struct{}
@@ -88,25 +94,34 @@ func (m *Mapper) mapResource(resource *resourceV1.Resource, schemaURL string) *m
 
 // computeResourceID returns a stable identifier for a resource based on the
 // subset of attributes that identify it (service.name, host.name) plus the
-// schema URL. Other attributes (e.g. version) are intentionally excluded so
-// that logically-equal resources collapse to a single row.
+// schema URL. Results are cached in a sync.Map since resource count in
+// production is small and stable.
 func computeResourceID(attrs map[string]model.AttributeValue, schemaURL string) string {
-	var idParts [3]string
+	// Build a cache key from the identifying fields.
+	svc := ""
+	host := ""
 	if v, ok := attrs["service.name"]; ok && v.StringValue != nil {
-		idParts[0] = *v.StringValue
+		svc = *v.StringValue
 	}
 	if v, ok := attrs["host.name"]; ok && v.StringValue != nil {
-		idParts[1] = *v.StringValue
+		host = *v.StringValue
 	}
-	idParts[2] = schemaURL
+	cacheKey := svc + "\x00" + host + "\x00" + schemaURL
+
+	if id, ok := resourceIDCache.Load(cacheKey); ok {
+		return id.(string)
+	}
 
 	h := sha256.New()
-	h.Write([]byte(idParts[0]))
+	h.Write([]byte(svc))
 	h.Write([]byte{0})
-	h.Write([]byte(idParts[1]))
+	h.Write([]byte(host))
 	h.Write([]byte{0})
-	h.Write([]byte(idParts[2]))
-	return "res-" + hex.EncodeToString(h.Sum(nil)[:16])
+	h.Write([]byte(schemaURL))
+	id := "res-" + hex.EncodeToString(h.Sum(nil)[:16])
+
+	resourceIDCache.Store(cacheKey, id)
+	return id
 }
 
 // mapScopeLogs converts ScopeLogs and adds records to the batch.
