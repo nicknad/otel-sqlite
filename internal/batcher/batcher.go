@@ -192,16 +192,7 @@ func (b *Batcher) run() {
 			// Add all records from the incoming batch
 			for _, record := range batch.Records {
 				b.currentBatch.AddRecord(record)
-
-				// Notify on error-level records.
-				if b.errorNotifier != nil && record.SeverityNumber >= b.errorSeverityThreshold {
-					if err := b.errorNotifier.SendRecord(b.ctx, record); err != nil {
-						if time.Now().After(suppressLogUntil) {
-							log.Printf("batcher: error notifier: %v (suppressing for 10s)", err)
-							suppressLogUntil = time.Now().Add(10 * time.Second)
-						}
-					}
-				}
+				b.maybeNotify(record)
 			}
 			isFull := b.currentBatch.Size() >= b.batchSize
 			b.mu.Unlock()
@@ -237,6 +228,20 @@ func (b *Batcher) flushCurrentBatch() {
 
 	// Start a new batch
 	b.currentBatch = model.NewLogBatch(b.batchSize)
+}
+
+// maybeNotify sends a log record to the error notifier if its severity
+// meets or exceeds the configured threshold.
+func (b *Batcher) maybeNotify(record *model.LogRecord) {
+	if b.errorNotifier == nil || record.SeverityNumber < b.errorSeverityThreshold {
+		return
+	}
+	if err := b.errorNotifier.SendRecord(b.ctx, record); err != nil {
+		if time.Now().After(suppressLogUntil) {
+			log.Printf("batcher: error notifier: %v (suppressing for 10s)", err)
+			suppressLogUntil = time.Now().Add(10 * time.Second)
+		}
+	}
 }
 
 // Flush forces the current batch to be flushed.

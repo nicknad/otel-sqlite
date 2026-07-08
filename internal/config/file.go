@@ -91,12 +91,34 @@ func (c *Config) LoadFile(path string) error {
 		return fmt.Errorf("parse config file %q: %w", path, err)
 	}
 
-	// Apply simple string fields.
+	if err := c.loadCoreConfig(&fc); err != nil {
+		return err
+	}
+	return c.loadNotificationConfig(&fc)
+}
+
+// loadCoreConfig applies top-level scalar fields from a FileConfig.
+func (c *Config) loadCoreConfig(fc *FileConfig) error {
+	// String fields.
 	if fc.ListenAddress != "" {
 		c.ListenAddress = fc.ListenAddress
 	}
 	if fc.SQLitePath != "" {
 		c.SQLitePath = fc.SQLitePath
+	}
+	if fc.MetricsAddress != "" {
+		c.MetricsAddress = fc.MetricsAddress
+	}
+	if fc.BatcherErrorSeverityThreshold != "" {
+		c.BatcherErrorSeverityThreshold = fc.BatcherErrorSeverityThreshold
+	}
+
+	// Int fields (only if non-zero to distinguish "unset" from "set to 0").
+	if fc.IngressQueueCapacity != 0 {
+		c.IngressQueueCapacity = fc.IngressQueueCapacity
+	}
+	if fc.BatchQueueCapacity != 0 {
+		c.BatchQueueCapacity = fc.BatchQueueCapacity
 	}
 	if fc.GrpcMaxRecvMsgSize != 0 {
 		c.GrpcMaxRecvMsgSize = fc.GrpcMaxRecvMsgSize
@@ -113,20 +135,8 @@ func (c *Config) LoadFile(path string) error {
 	if fc.GoMemoryLimitMB != 0 {
 		c.GoMemoryLimitMB = fc.GoMemoryLimitMB
 	}
-	if fc.MetricsAddress != "" {
-		c.MetricsAddress = fc.MetricsAddress
-	}
 
-	// Apply int fields (only if non-zero to distinguish "unset" from "set to 0").
-	if fc.IngressQueueCapacity != 0 {
-		c.IngressQueueCapacity = fc.IngressQueueCapacity
-	}
-	if fc.BatchQueueCapacity != 0 {
-		c.BatchQueueCapacity = fc.BatchQueueCapacity
-	}
-
-	// Apply batcher/writer batch sizes. Legacy BatchSize applies to both
-	// if the specific fields are not set.
+	// Legacy BatchSize falls back to both batcher/writer if specific fields unset.
 	if fc.BatcherBatchSize != 0 {
 		c.BatcherBatchSize = fc.BatcherBatchSize
 	} else if fc.BatchSize != 0 {
@@ -138,151 +148,171 @@ func (c *Config) LoadFile(path string) error {
 		c.WriterBatchSize = fc.BatchSize
 	}
 
-	// Parse duration fields.
-	if fc.BatcherFlushInterval != "" {
-		d, err := parseDurationExt(fc.BatcherFlushInterval)
-		if err != nil {
-			return fmt.Errorf("batcher_flush_interval: %w", err)
-		}
-		c.BatcherFlushInterval = d
-	} else if fc.FlushInterval != "" {
-		d, err := parseDurationExt(fc.FlushInterval)
-		if err != nil {
-			return fmt.Errorf("flush_interval: %w", err)
-		}
-		c.BatcherFlushInterval = d
+	// Duration fields.
+	var err error
+	err = parseOptionalDuration(
+		fc.BatcherFlushInterval, &c.BatcherFlushInterval, "batcher_flush_interval",
+	)
+	if err != nil {
+		return err
 	}
-	if fc.BatcherErrorSeverityThreshold != "" {
-		c.BatcherErrorSeverityThreshold = fc.BatcherErrorSeverityThreshold
+	if fc.BatcherFlushInterval == "" {
+		err = parseOptionalDuration(fc.FlushInterval, &c.BatcherFlushInterval, "flush_interval")
+		if err != nil {
+			return err
+		}
 	}
-	if fc.WriterFlushInterval != "" {
-		d, err := parseDurationExt(fc.WriterFlushInterval)
-		if err != nil {
-			return fmt.Errorf("writer_flush_interval: %w", err)
-		}
-		c.WriterFlushInterval = d
-	} else if fc.FlushInterval != "" {
-		d, err := parseDurationExt(fc.FlushInterval)
-		if err != nil {
-			return fmt.Errorf("flush_interval: %w", err)
-		}
-		c.WriterFlushInterval = d
+	err = parseOptionalDuration(
+		fc.WriterFlushInterval, &c.WriterFlushInterval, "writer_flush_interval",
+	)
+	if err != nil {
+		return err
 	}
-	if fc.ShutdownTimeout != "" {
-		d, err := parseDurationExt(fc.ShutdownTimeout)
+	if fc.WriterFlushInterval == "" {
+		err = parseOptionalDuration(fc.FlushInterval, &c.WriterFlushInterval, "flush_interval")
 		if err != nil {
-			return fmt.Errorf("shutdown_timeout: %w", err)
+			return err
 		}
-		c.ShutdownTimeout = d
+	}
+	return parseOptionalDuration(fc.ShutdownTimeout, &c.ShutdownTimeout, "shutdown_timeout")
+}
+
+// loadNotificationConfig applies the notification section from a FileConfig.
+func (c *Config) loadNotificationConfig(fc *FileConfig) error {
+	if fc.Notification == nil {
+		return nil
 	}
 
-	// Apply notification config.
-	if fc.Notification != nil {
-		nc := c.ensureNotification()
-		nc.Enabled = fc.Notification.Enabled
-		if fc.Notification.EventQueueDepth > 0 {
-			nc.EventQueueDepth = fc.Notification.EventQueueDepth
+	nc := c.ensureNotification()
+	nc.Enabled = fc.Notification.Enabled
+
+	if fc.Notification.EventQueueDepth > 0 {
+		nc.EventQueueDepth = fc.Notification.EventQueueDepth
+	}
+	if fc.Notification.StorePath != "" {
+		nc.StorePath = fc.Notification.StorePath
+	}
+	if fc.Notification.AlertStorePath != "" {
+		nc.AlertStorePath = fc.Notification.AlertStorePath
+	}
+
+	// Parse notification-level durations.
+	if fc.Notification.RetryInterval != "" {
+		d, err := parseDurationExt(fc.Notification.RetryInterval)
+		if err != nil {
+			return fmt.Errorf("notification.retry_interval: %w", err)
 		}
-		if fc.Notification.StorePath != "" {
-			nc.StorePath = fc.Notification.StorePath
+		nc.RetryInterval = d
+	}
+	if fc.Notification.GCInterval != "" {
+		d, err := parseDurationExt(fc.Notification.GCInterval)
+		if err != nil {
+			return fmt.Errorf("notification.gc_interval: %w", err)
 		}
-		if fc.Notification.AlertStorePath != "" {
-			nc.AlertStorePath = fc.Notification.AlertStorePath
+		nc.GCInterval = d
+	}
+
+	// Load notifier configs.
+	if nc.Notifiers == nil {
+		nc.Notifiers = make(map[string]NotifierConfig)
+	}
+	for name, fn := range fc.Notification.Notifiers {
+		ncfg := NotifierConfig{
+			Type:       fn.Type,
+			URL:        fn.URL,
+			AuthHeader: fn.AuthHeader,
 		}
-		if fc.Notification.RetryInterval != "" {
-			d, err := parseDurationExt(fc.Notification.RetryInterval)
+		if fn.Timeout != "" {
+			d, err := parseDurationExt(fn.Timeout)
 			if err != nil {
-				return fmt.Errorf("notification.retry_interval: %w", err)
+				return fmt.Errorf("notification.notifiers[%s].timeout: %w", name, err)
 			}
-			nc.RetryInterval = d
+			ncfg.Timeout = d
 		}
-		if fc.Notification.GCInterval != "" {
-			d, err := parseDurationExt(fc.Notification.GCInterval)
-			if err != nil {
-				return fmt.Errorf("notification.gc_interval: %w", err)
-			}
-			nc.GCInterval = d
-		}
-
-		// Load notifier configs.
-		if nc.Notifiers == nil {
-			nc.Notifiers = make(map[string]NotifierConfig)
-		}
-		for name, fn := range fc.Notification.Notifiers {
-			ncfg := NotifierConfig{
-				Type:       fn.Type,
-				URL:        fn.URL,
-				AuthHeader: fn.AuthHeader,
-			}
-			if fn.Timeout != "" {
-				d, err := parseDurationExt(fn.Timeout)
-				if err != nil {
-					return fmt.Errorf("notification.notifiers[%s].timeout: %w", name, err)
-				}
-				ncfg.Timeout = d
-			}
-			nc.Notifiers[name] = ncfg
-		}
-
-		for i := range fc.Notification.Rules {
-			fr := &fc.Notification.Rules[i]
-			rc := RuleConfig{
-				Name:             fr.Name,
-				MatchSeverity:    fr.MatchSeverity,
-				ResourceFilter:   fr.ResourceFilter,
-				BodyFilter:       fr.BodyFilter,
-				AttributeFilters: fr.AttributeFilters,
-				RateLimit:        fr.RateLimit,
-				MaxRetries:       fr.MaxRetries,
-				Destination:      fr.Destination,
-				AlertThreshold:   fr.AlertThreshold,
-			}
-			if fr.Cooldown != "" {
-				d, err := parseDurationExt(fr.Cooldown)
-				if err != nil {
-					return fmt.Errorf("notification.rules[%s].cooldown: %w", fr.Name, err)
-				}
-				rc.Cooldown = d.String()
-			}
-			if fr.RateWindow != "" {
-				d, err := parseDurationExt(fr.RateWindow)
-				if err != nil {
-					return fmt.Errorf("notification.rules[%s].rate_window: %w", fr.Name, err)
-				}
-				rc.RateWindow = d.String()
-			}
-			if fr.DedupWindow != "" {
-				d, err := parseDurationExt(fr.DedupWindow)
-				if err != nil {
-					return fmt.Errorf("notification.rules[%s].dedup_window: %w", fr.Name, err)
-				}
-				rc.DedupWindow = d.String()
-			}
-			if fr.RetryBackoff != "" {
-				d, err := parseDurationExt(fr.RetryBackoff)
-				if err != nil {
-					return fmt.Errorf("notification.rules[%s].retry_backoff: %w", fr.Name, err)
-				}
-				rc.RetryBackoff = d.String()
-			}
-			if fr.AlertWindow != "" {
-				d, err := parseDurationExt(fr.AlertWindow)
-				if err != nil {
-					return fmt.Errorf("notification.rules[%s].alert_window: %w", fr.Name, err)
-				}
-				rc.AlertWindow = d.String()
-			}
-			if fr.AlertResolveWindow != "" {
-				d, err := parseDurationExt(fr.AlertResolveWindow)
-				if err != nil {
-					return fmt.Errorf("notification.rules[%s].alert_resolve_window: %w", fr.Name, err)
-				}
-				rc.AlertResolveWindow = d.String()
-			}
-			nc.Rules = append(nc.Rules, rc)
-		}
+		nc.Notifiers[name] = ncfg
 	}
 
+	// Load rules.
+	for i := range fc.Notification.Rules {
+		fr := &fc.Notification.Rules[i]
+		rc := RuleConfig{
+			Name:             fr.Name,
+			MatchSeverity:    fr.MatchSeverity,
+			ResourceFilter:   fr.ResourceFilter,
+			BodyFilter:       fr.BodyFilter,
+			AttributeFilters: fr.AttributeFilters,
+			RateLimit:        fr.RateLimit,
+			MaxRetries:       fr.MaxRetries,
+			Destination:      fr.Destination,
+			AlertThreshold:   fr.AlertThreshold,
+		}
+
+		// Parse each rule duration field with the shared helper.
+		setters := map[string]func(string){
+			"cooldown":             func(v string) { rc.Cooldown = v },
+			"rate_window":          func(v string) { rc.RateWindow = v },
+			"dedup_window":         func(v string) { rc.DedupWindow = v },
+			"retry_backoff":        func(v string) { rc.RetryBackoff = v },
+			"alert_window":         func(v string) { rc.AlertWindow = v },
+			"alert_resolve_window": func(v string) { rc.AlertResolveWindow = v },
+		}
+		for field, setter := range setters {
+			if err := parseRuleDurationField(fr, field, setter); err != nil {
+				return err
+			}
+		}
+
+		nc.Rules = append(nc.Rules, rc)
+	}
+
+	return nil
+}
+
+// parseOptionalDuration parses s as an extended duration and writes it to *target.
+// If s is empty the target is left unchanged. Returns an error on invalid input.
+func parseOptionalDuration(s string, target *time.Duration, name string) error {
+	if s == "" {
+		return nil
+	}
+	d, err := parseDurationExt(s)
+	if err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	*target = d
+	return nil
+}
+
+// ruleDurationField maps a logical field name to the getter that reads it from FileRuleConfig.
+type ruleDurationField struct {
+	name string
+	get  func(*FileRuleConfig) string
+}
+
+var ruleDurationFields = map[string]ruleDurationField{
+	"cooldown":             {"cooldown", func(fr *FileRuleConfig) string { return fr.Cooldown }},
+	"rate_window":          {"rate_window", func(fr *FileRuleConfig) string { return fr.RateWindow }},
+	"dedup_window":         {"dedup_window", func(fr *FileRuleConfig) string { return fr.DedupWindow }},
+	"retry_backoff":        {"retry_backoff", func(fr *FileRuleConfig) string { return fr.RetryBackoff }},
+	"alert_window":         {"alert_window", func(fr *FileRuleConfig) string { return fr.AlertWindow }},
+	"alert_resolve_window": {"alert_resolve_window", func(fr *FileRuleConfig) string { return fr.AlertResolveWindow }},
+}
+
+// parseRuleDurationField reads a duration string from a FileRuleConfig field,
+// parses it, and calls setter with the result. A no-op when the field is empty.
+func parseRuleDurationField(fr *FileRuleConfig, field string, setter func(string)) error {
+	rf, ok := ruleDurationFields[field]
+	if !ok {
+		return nil
+	}
+	s := rf.get(fr)
+	if s == "" {
+		return nil
+	}
+	d, err := parseDurationExt(s)
+	if err != nil {
+		return fmt.Errorf("notification.rules[%s].%s: %w", fr.Name, rf.name, err)
+	}
+	setter(d.String())
 	return nil
 }
 

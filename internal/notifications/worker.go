@@ -392,51 +392,7 @@ func (w *Worker) deliverAlert(ctx context.Context, alert *alerts.Alert, rule *ru
 		return
 	}
 
-	err = notifier.Send(ctx, alert)
-	if err != nil {
-		log.Printf("notifications worker: send alert %q to %q failed: %v", alert.ID, rule.Destination, err)
-
-		if w.aMetrics != nil {
-			w.aMetrics.IncrementNotifyEventsFailed(rule.Destination)
-		}
-
-		if !IsRetryable(err) {
-			w.handleNonRetryable(ctx, alert, err)
-			return
-		}
-
-		if state == nil {
-			state = &NotificationState{}
-		}
-		state.RetryCount++
-		state.LastAttempt = now
-		state.NextRetry = now + backoffDuration(rule.RetryBackoff, state.RetryCount)
-
-		if state.RetryCount >= rule.MaxRetries {
-			w.handleDeadLetter(ctx, alert, state, err)
-			return
-		}
-
-		if putErr := w.notifStore.PutNotificationState(ctx, alert.ID, state); putErr != nil {
-			log.Printf("notifications worker: put notification state %q: %v", alert.ID, putErr)
-		}
-	} else {
-		if w.aMetrics != nil {
-			w.aMetrics.IncrementNotifyEventsDelivered(rule.Destination)
-		}
-
-		if state == nil {
-			state = &NotificationState{}
-		}
-		state.LastSuccess = now
-		state.CooldownUntil = now + int64(rule.Cooldown)
-		state.RetryCount = 0
-		state.NextRetry = 0
-
-		if putErr := w.notifStore.PutNotificationState(ctx, alert.ID, state); putErr != nil {
-			log.Printf("notifications worker: put notification state %q: %v", alert.ID, putErr)
-		}
-	}
+	w.deliverOnce(ctx, alert, notifier, rule, state, now)
 }
 
 // ---------------------------------------------------------------------------
@@ -501,34 +457,10 @@ func (w *Worker) retryDeliveries() {
 		}
 
 		now := time.Now().UnixNano()
-		state.LastAttempt = now
-
-		err = notifier.Send(ctx, alert)
-		if err != nil {
-			log.Printf("notifications worker: retry %q failed: %v", entry.AlertID, err)
-
-			if !IsRetryable(err) {
-				w.handleNonRetryable(ctx, alert, err)
-				continue
-			}
-
-			state.RetryCount++
-			state.NextRetry = now + backoffDuration(rule.RetryBackoff, state.RetryCount)
-
-			if state.RetryCount >= rule.MaxRetries {
-				w.handleDeadLetter(ctx, alert, state, err)
-				continue
-			}
-		} else {
-			state.LastSuccess = now
-			state.CooldownUntil = now + int64(rule.Cooldown)
-			state.RetryCount = 0
-			state.NextRetry = 0
+		if state != nil {
+			state.LastAttempt = now
 		}
-
-		if putErr := w.notifStore.PutNotificationState(ctx, entry.AlertID, state); putErr != nil {
-			log.Printf("notifications worker: put retry state %q: %v", entry.AlertID, putErr)
-		}
+		w.deliverOnce(ctx, alert, notifier, rule, state, now)
 	}
 }
 
@@ -575,6 +507,56 @@ func (w *Worker) garbageCollect() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// deliverOnce calls notifier.Send and handles retry scheduling / DLQ.
+// state may be nil; it is initialized on demand.
+func (w *Worker) deliverOnce(
+	ctx context.Context,
+	alert *alerts.Alert,
+	notifier Notifier,
+	rule *rules.Rule,
+	state *NotificationState,
+	now int64,
+) {
+	err := notifier.Send(ctx, alert)
+	if err != nil {
+		log.Printf("notifications worker: send alert %q to %q failed: %v", alert.ID, rule.Destination, err)
+
+		if w.aMetrics != nil {
+			w.aMetrics.IncrementNotifyEventsFailed(rule.Destination)
+		}
+		if !IsRetryable(err) {
+			w.handleNonRetryable(ctx, alert, err)
+			return
+		}
+		if state == nil {
+			state = &NotificationState{}
+		}
+		state.LastAttempt = now
+		state.RetryCount++
+		state.NextRetry = now + backoffDuration(rule.RetryBackoff, state.RetryCount)
+
+		if state.RetryCount >= rule.MaxRetries {
+			w.handleDeadLetter(ctx, alert, state, err)
+			return
+		}
+	} else {
+		if w.aMetrics != nil {
+			w.aMetrics.IncrementNotifyEventsDelivered(rule.Destination)
+		}
+		if state == nil {
+			state = &NotificationState{}
+		}
+		state.LastSuccess = now
+		state.CooldownUntil = now + int64(rule.Cooldown)
+		state.RetryCount = 0
+		state.NextRetry = 0
+	}
+
+	if putErr := w.notifStore.PutNotificationState(ctx, alert.ID, state); putErr != nil {
+		log.Printf("notifications worker: put notification state %q: %v", alert.ID, putErr)
+	}
+}
 
 func (w *Worker) handleNonRetryable(ctx context.Context, alert *alerts.Alert, err error) {
 	if dlqErr := w.notifStore.EnqueueDLQ(ctx, alert, err.Error()); dlqErr != nil {
