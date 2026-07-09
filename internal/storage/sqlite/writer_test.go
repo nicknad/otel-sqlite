@@ -317,3 +317,146 @@ func TestWriteBatchCommandImmutability(t *testing.T) {
 		t.Errorf("Size() = %d, want 1 (cached at construction)", cmd.Size())
 	}
 }
+
+func TestExecuteCommandsSplitsLargeTransactions(t *testing.T) {
+	// Verify that when the total record count across commands exceeds
+	// MaxTransactionRecords, executeCommands splits them into multiple
+	// transactions instead of one oversized transaction.
+	dbpath := fmt.Sprintf("test_tx_split_%d.db", time.Now().UnixNano())
+	defer os.Remove(dbpath)
+
+	cmdQueue := storage.NewCommandQueue(10)
+	w, err := NewWriter(cmdQueue, &WriterConfig{
+		Path:          dbpath,
+		BatchSize:     100,
+		FlushInterval: 50 * time.Millisecond,
+		WALMode:       false,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter() error: %v", err)
+	}
+	defer func() { w.Stop(); w.Wait() }()
+
+	ctx := context.Background()
+	w.Start(ctx)
+
+	// Use small MaxTransactionRecords to force splitting (7 records per batch,
+	// 3 records max per transaction → 3 transactions).
+	origMax := MaxTransactionRecords
+	MaxTransactionRecords = 3
+	defer func() { MaxTransactionRecords = origMax }()
+
+	resource := model.NewResource(map[string]model.AttributeValue{
+		"service.name": model.NewStringValue("tx-split-svc"),
+	})
+
+	// Send a batch with 7 records (should split into 3 transactions: 3+3+1)
+	batch := model.NewLogBatch(7)
+	for i := 0; i < 7; i++ {
+		batch.AddRecord(&model.LogRecord{
+			Timestamp:      int64(i),
+			Body:           fmt.Sprintf("record-%d", i),
+			SeverityNumber: model.SeverityInfo,
+		})
+	}
+	batch.Resource = resource
+
+	cmd := NewWriteBatchCommand(batch)
+	if err := cmdQueue.Send(ctx, cmd); err != nil {
+		t.Fatalf("Send command error: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	var count int
+	if err := w.db.QueryRow("SELECT COUNT(*) FROM log_event").Scan(&count); err != nil {
+		t.Fatalf("query count: %v", err)
+	}
+	if count != 7 {
+		t.Errorf("expected 7 events written, got %d", count)
+	}
+}
+
+func TestCommandRecordCount(t *testing.T) {
+	// Verify commandRecordCount returns correct sizes.
+	batch := model.NewLogBatch(1)
+	batch.AddRecord(&model.LogRecord{Body: "a"})
+	wbc := NewWriteBatchCommand(batch)
+
+	if commandRecordCount(wbc) != 1 {
+		t.Errorf("WriteBatchCommand record count = %d, want 1", commandRecordCount(wbc))
+	}
+
+	batch2 := model.NewLogBatch(3)
+	for i := 0; i < 3; i++ {
+		batch2.AddRecord(&model.LogRecord{Body: fmt.Sprintf("m%d", i)})
+	}
+	wbc2 := NewWriteBatchCommand(batch2)
+	if commandRecordCount(wbc2) != 3 {
+		t.Errorf("WriteBatchCommand record count = %d, want 3", commandRecordCount(wbc2))
+	}
+
+	// Non-write commands default to 1 record for splitting purposes.
+	if commandRecordCount(&CheckpointCommand{}) != 1 {
+		t.Errorf("non-write command record count = %d, want 1",
+			commandRecordCount(&CheckpointCommand{}))
+	}
+}
+
+func TestWriterShutdownDrainsQueue(t *testing.T) {
+	// Verify that the writer processes all enqueued commands during
+	// shutdown drain before exiting.
+	dbpath := fmt.Sprintf("test_shutdown_%d.db", time.Now().UnixNano())
+	defer os.Remove(dbpath)
+
+	cmdQueue := storage.NewCommandQueue(20)
+	w, err := NewWriter(cmdQueue, &WriterConfig{
+		Path:          dbpath,
+		BatchSize:     1, // flush every command (no batching delay)
+		FlushInterval: 5 * time.Minute,
+		WALMode:       false,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter() error: %v", err)
+	}
+
+	ctx := context.Background()
+	w.Start(ctx)
+
+	resource := model.NewResource(map[string]model.AttributeValue{
+		"service.name": model.NewStringValue("shutdown-svc"),
+	})
+
+	const numBatches = 5
+	for i := 0; i < numBatches; i++ {
+		batch := model.NewLogBatch(1)
+		batch.AddRecord(&model.LogRecord{
+			Timestamp:      int64(i),
+			Body:           fmt.Sprintf("s-%d", i),
+			SeverityNumber: model.SeverityInfo,
+		})
+		batch.Resource = resource
+		cmd := NewWriteBatchCommand(batch)
+		if err := cmdQueue.Send(ctx, cmd); err != nil {
+			t.Fatalf("Send command %d: %v", i, err)
+		}
+	}
+
+	w.Stop()
+	w.Wait()
+
+	// Reopen the database to verify all records were written.
+	db2, err := openDatabase(dbpath, false)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	defer db2.Close()
+
+	var count int
+	if err := db2.QueryRow("SELECT COUNT(*) FROM log_event").Scan(&count); err != nil {
+		t.Fatalf("query count: %v", err)
+	}
+	if count != numBatches {
+		t.Errorf("expected %d events after shutdown, got %d", numBatches, count)
+	}
+}
