@@ -90,6 +90,10 @@ type NotificationConfig struct {
 	// growth from ephemeral resources. Defaults to 24h.
 	AlertIdleTTL time.Duration `mapstructure:"alert_idle_ttl"`
 
+	// ResolvedAlertRetention is how long Resolved alerts are retained before
+	// being garbage-collected. Defaults to 24h.
+	ResolvedAlertRetention time.Duration `mapstructure:"resolved_alert_retention"`
+
 	// DLQRetention is how long dead-letter queue entries are retained before
 	// being purged. Defaults to 30 days.
 	DLQRetention time.Duration `mapstructure:"dlq_retention"`
@@ -169,6 +173,7 @@ func DefaultConfig() *Config {
 			RetryInterval:           30 * time.Second,
 			GCInterval:              5 * time.Minute,
 			AlertIdleTTL:            24 * time.Hour,
+			ResolvedAlertRetention:  24 * time.Hour,
 			DLQRetention:            30 * 24 * time.Hour,
 			BboltCompactionEnabled:  false,
 			BboltCompactionInterval: 24 * time.Hour,
@@ -176,190 +181,124 @@ func DefaultConfig() *Config {
 	}
 }
 
-// envVar holds the mapping from a config field to its environment variable name.
-type envVar struct {
-	Key         string
-	Env         string
-	Description string
-}
-
-// envVars lists all configurable fields and their environment variable names.
-var envVars = []envVar{
-	{Key: "ListenAddress", Env: "LISTEN_ADDRESS", Description: "gRPC server listen address"},
-	{Key: "SQLitePath", Env: "SQLITE_PATH", Description: "Path to SQLite database file"},
-	{Key: "IngressQueueCapacity", Env: "INGRESS_QUEUE_CAPACITY", Description: "Maximum ingress queue size"},
-	{Key: "BatchQueueCapacity", Env: "BATCH_QUEUE_CAPACITY", Description: "Maximum batch queue size"},
-	{Key: "BatcherBatchSize", Env: "BATCHER_BATCH_SIZE", Description: "Number of log records per batch (batcher)"},
-	{Key: "BatcherFlushInterval", Env: "BATCHER_FLUSH_INTERVAL", Description: "Maximum time between batch flushes"},
-	{
-		Key: "BatcherErrorSeverityThreshold", Env: "BATCHER_ERROR_SEVERITY_THRESHOLD",
-		Description: "Minimum severity to notify (ERROR, WARN, INFO, etc.)",
-	},
-	{Key: "WriterBatchSize", Env: "WRITER_BATCH_SIZE", Description: "Number of commands per transaction (writer)"},
-	{Key: "WriterFlushInterval", Env: "WRITER_FLUSH_INTERVAL", Description: "Maximum time between transaction flushes"},
-	{
-		Key: "WriterMaxTransactionRecords", Env: "WRITER_MAX_TRANSACTION_RECORDS",
-		Description: "Maximum records per SQLite transaction",
-	},
-	{Key: "GrpcMaxRecvMsgSize", Env: "GRPC_MAX_RECV_MSG_SIZE", Description: "Max gRPC receive message size in bytes"},
-	{Key: "GrpcMaxSendMsgSize", Env: "GRPC_MAX_SEND_MSG_SIZE", Description: "Max gRPC send message size in bytes"},
-	{Key: "GrpcMaxConcurrentStreams", Env: "GRPC_MAX_CONCURRENT_STREAMS", Description: "Max concurrent gRPC streams"},
-	{
-		Key: "IngressQueueBackpressureThreshold", Env: "INGRESS_QUEUE_BACKPRESSURE_THRESHOLD",
-		Description: "Ingress queue fullness fraction (0.0–1.0) to trigger early rejection",
-	},
-	{Key: "GoMemoryLimitMB", Env: "GO_MEMORY_LIMIT_MB", Description: "Go runtime memory limit in MB (0 = disabled)"},
-	{Key: "MetricsAddress", Env: "METRICS_ADDRESS", Description: "Prometheus metrics server address"},
-	{Key: "ShutdownTimeout", Env: "SHUTDOWN_TIMEOUT", Description: "Graceful shutdown timeout"},
-	{Key: "NotificationEnabled", Env: "NOTIFICATION_ENABLED", Description: "Enable notification pipeline (true/false)"},
-	{
-		Key: "NotificationEventQueueDepth", Env: "NOTIFICATION_EVENT_QUEUE_DEPTH",
-		Description: "Notification event queue capacity",
-	},
-	{
-		Key: "NotificationStorePath", Env: "NOTIFICATION_STORE_PATH",
-		Description: "Path to notification state store (bbolt)",
-	},
-	{
-		Key: "NotificationRetryInterval", Env: "NOTIFICATION_RETRY_INTERVAL",
-		Description: "Notification retry scan interval",
-	},
-	{
-		Key: "NotificationAlertStorePath", Env: "NOTIFICATION_ALERT_STORE_PATH",
-		Description: "Path to alert state store (bbolt)",
-	},
-	{
-		Key: "NotificationGCInterval", Env: "NOTIFICATION_GC_INTERVAL",
-		Description: "Resolved alert GC interval",
-	},
-	{
-		Key: "NotificationAlertIdleTTL", Env: "NOTIFICATION_ALERT_IDLE_TTL",
-		Description: "Max idle time for Pending/Firing alerts before GC eviction",
-	},
-	{
-		Key: "NotificationDLQRetention", Env: "NOTIFICATION_DLQ_RETENTION",
-		Description: "Max age of DLQ entries before purge",
-	},
-	{
-		Key: "NotificationBboltCompactionEnabled", Env: "NOTIFICATION_BBOLT_COMPACTION_ENABLED",
-		Description: "Enable periodic bbolt compaction (true/false)",
-	},
-	{
-		Key: "NotificationBboltCompactionInterval", Env: "NOTIFICATION_BBOLT_COMPACTION_INTERVAL",
-		Description: "Interval between bbolt compactions",
-	},
-}
-
-// LoadFromEnv overrides config fields with values from environment variables.
-// Returns the number of overrides applied and any parse errors encountered.
-func (c *Config) LoadFromEnv() (int, error) {
-	var count int
-	for _, ev := range envVars {
-		val, ok := os.LookupEnv(ev.Env)
-		if !ok {
-			continue
-		}
-		if err := c.setField(ev.Key, val); err != nil {
-			return count, fmt.Errorf("env %s: %w", ev.Env, err)
-		}
-		count++
-	}
-	return count, nil
-}
-
 // envBinding describes one environment-variable → config-field mapping.
 type envBinding struct {
-	key   string
+	env   string
 	parse func(string) (any, error)
 	apply func(*Config, any)
 }
 
 var envBindings = []envBinding{
 	// Strings
-	{key: "ListenAddress", parse: parseString, apply: func(c *Config, v any) { c.ListenAddress = v.(string) }},
-	{key: "SQLitePath", parse: parseString, apply: func(c *Config, v any) { c.SQLitePath = v.(string) }},
-	{key: "MetricsAddress", parse: parseString, apply: func(c *Config, v any) { c.MetricsAddress = v.(string) }},
+	{env: "LISTEN_ADDRESS", parse: parseString, apply: func(c *Config, v any) { c.ListenAddress = v.(string) }},
+	{env: "SQLITE_PATH", parse: parseString, apply: func(c *Config, v any) { c.SQLitePath = v.(string) }},
+	{env: "METRICS_ADDRESS", parse: parseString, apply: func(c *Config, v any) { c.MetricsAddress = v.(string) }},
 	{
-		key: "BatcherErrorSeverityThreshold", parse: parseString,
+		env: "BATCHER_ERROR_SEVERITY_THRESHOLD", parse: parseString,
 		apply: func(c *Config, v any) { c.BatcherErrorSeverityThreshold = v.(string) },
 	},
 
 	// Ints
-	{key: "IngressQueueCapacity", parse: parseInt, apply: func(c *Config, v any) { c.IngressQueueCapacity = v.(int) }},
-	{key: "BatchQueueCapacity", parse: parseInt, apply: func(c *Config, v any) { c.BatchQueueCapacity = v.(int) }},
-	{key: "BatcherBatchSize", parse: parseInt, apply: func(c *Config, v any) { c.BatcherBatchSize = v.(int) }},
-	{key: "WriterBatchSize", parse: parseInt, apply: func(c *Config, v any) { c.WriterBatchSize = v.(int) }},
 	{
-		key: "WriterMaxTransactionRecords", parse: parseInt,
+		env: "INGRESS_QUEUE_CAPACITY", parse: parseInt,
+		apply: func(c *Config, v any) { c.IngressQueueCapacity = v.(int) },
+	},
+	{
+		env: "BATCH_QUEUE_CAPACITY", parse: parseInt,
+		apply: func(c *Config, v any) { c.BatchQueueCapacity = v.(int) },
+	},
+	{
+		env: "BATCHER_BATCH_SIZE", parse: parseInt,
+		apply: func(c *Config, v any) { c.BatcherBatchSize = v.(int) },
+	},
+	{
+		env: "WRITER_BATCH_SIZE", parse: parseInt,
+		apply: func(c *Config, v any) { c.WriterBatchSize = v.(int) },
+	},
+	{
+		env: "WRITER_MAX_TRANSACTION_RECORDS", parse: parseInt,
 		apply: func(c *Config, v any) { c.WriterMaxTransactionRecords = v.(int) },
 	},
-	{key: "GrpcMaxRecvMsgSize", parse: parseInt, apply: func(c *Config, v any) { c.GrpcMaxRecvMsgSize = v.(int) }},
-	{key: "GrpcMaxSendMsgSize", parse: parseInt, apply: func(c *Config, v any) { c.GrpcMaxSendMsgSize = v.(int) }},
 	{
-		key: "GrpcMaxConcurrentStreams", parse: parseInt,
+		env: "GRPC_MAX_RECV_MSG_SIZE", parse: parseInt,
+		apply: func(c *Config, v any) { c.GrpcMaxRecvMsgSize = v.(int) },
+	},
+	{
+		env: "GRPC_MAX_SEND_MSG_SIZE", parse: parseInt,
+		apply: func(c *Config, v any) { c.GrpcMaxSendMsgSize = v.(int) },
+	},
+	{
+		env: "GRPC_MAX_CONCURRENT_STREAMS", parse: parseInt,
 		apply: func(c *Config, v any) { c.GrpcMaxConcurrentStreams = v.(int) },
 	},
-	{key: "GoMemoryLimitMB", parse: parseInt, apply: func(c *Config, v any) { c.GoMemoryLimitMB = v.(int) }},
+	{
+		env: "GO_MEMORY_LIMIT_MB", parse: parseInt,
+		apply: func(c *Config, v any) { c.GoMemoryLimitMB = v.(int) },
+	},
 
 	// Durations
 	{
-		key: "BatcherFlushInterval", parse: parseDuration,
+		env: "BATCHER_FLUSH_INTERVAL", parse: parseDuration,
 		apply: func(c *Config, v any) { c.BatcherFlushInterval = v.(time.Duration) },
 	},
 	{
-		key: "WriterFlushInterval", parse: parseDuration,
+		env: "WRITER_FLUSH_INTERVAL", parse: parseDuration,
 		apply: func(c *Config, v any) { c.WriterFlushInterval = v.(time.Duration) },
 	},
 	{
-		key: "ShutdownTimeout", parse: parseDuration,
+		env: "SHUTDOWN_TIMEOUT", parse: parseDuration,
 		apply: func(c *Config, v any) { c.ShutdownTimeout = v.(time.Duration) },
 	},
 
 	// Float
 	{
-		key: "IngressQueueBackpressureThreshold", parse: parseFloat,
+		env: "INGRESS_QUEUE_BACKPRESSURE_THRESHOLD", parse: parseFloat,
 		apply: func(c *Config, v any) { c.IngressQueueBackpressureThreshold = v.(float64) },
 	},
 
 	// Notification
 	{
-		key: "NotificationEnabled", parse: parseBool,
+		env: "NOTIFICATION_ENABLED", parse: parseBool,
 		apply: func(c *Config, v any) { c.ensureNotification().Enabled = v.(bool) },
 	},
 	{
-		key: "NotificationEventQueueDepth", parse: parseInt,
+		env: "NOTIFICATION_EVENT_QUEUE_DEPTH", parse: parseInt,
 		apply: func(c *Config, v any) { c.ensureNotification().EventQueueDepth = v.(int) },
 	},
 	{
-		key: "NotificationStorePath", parse: parseString,
+		env: "NOTIFICATION_STORE_PATH", parse: parseString,
 		apply: func(c *Config, v any) { c.ensureNotification().StorePath = v.(string) },
 	},
 	{
-		key: "NotificationRetryInterval", parse: parseDuration,
+		env: "NOTIFICATION_RETRY_INTERVAL", parse: parseDuration,
 		apply: func(c *Config, v any) { c.ensureNotification().RetryInterval = v.(time.Duration) },
 	},
 	{
-		key: "NotificationAlertStorePath", parse: parseString,
+		env: "NOTIFICATION_ALERT_STORE_PATH", parse: parseString,
 		apply: func(c *Config, v any) { c.ensureNotification().AlertStorePath = v.(string) },
 	},
 	{
-		key: "NotificationGCInterval", parse: parseDuration,
+		env: "NOTIFICATION_GC_INTERVAL", parse: parseDuration,
 		apply: func(c *Config, v any) { c.ensureNotification().GCInterval = v.(time.Duration) },
 	},
 	{
-		key: "NotificationAlertIdleTTL", parse: parseDuration,
+		env: "NOTIFICATION_ALERT_IDLE_TTL", parse: parseDuration,
 		apply: func(c *Config, v any) { c.ensureNotification().AlertIdleTTL = v.(time.Duration) },
 	},
 	{
-		key: "NotificationDLQRetention", parse: parseDuration,
+		env: "NOTIFICATION_RESOLVED_ALERT_RETENTION", parse: parseDuration,
+		apply: func(c *Config, v any) { c.ensureNotification().ResolvedAlertRetention = v.(time.Duration) },
+	},
+	{
+		env: "NOTIFICATION_DLQ_RETENTION", parse: parseDuration,
 		apply: func(c *Config, v any) { c.ensureNotification().DLQRetention = v.(time.Duration) },
 	},
 	{
-		key: "NotificationBboltCompactionEnabled", parse: parseBool,
+		env: "NOTIFICATION_BBOLT_COMPACTION_ENABLED", parse: parseBool,
 		apply: func(c *Config, v any) { c.ensureNotification().BboltCompactionEnabled = v.(bool) },
 	},
 	{
-		key: "NotificationBboltCompactionInterval", parse: parseDuration,
+		env: "NOTIFICATION_BBOLT_COMPACTION_INTERVAL", parse: parseDuration,
 		apply: func(c *Config, v any) { c.ensureNotification().BboltCompactionInterval = v.(time.Duration) },
 	},
 }
@@ -371,26 +310,23 @@ func parseFloat(s string) (any, error)    { return strconv.ParseFloat(s, 64) }
 func parseBool(s string) (any, error)     { return strconv.ParseBool(s) }
 func parseDuration(s string) (any, error) { return time.ParseDuration(s) }
 
-var bindingIndex = func() map[string]envBinding {
-	m := make(map[string]envBinding, len(envBindings))
+// LoadFromEnv overrides config fields with values from environment variables.
+// Returns the number of overrides applied and any parse errors encountered.
+func (c *Config) LoadFromEnv() (int, error) {
+	var count int
 	for _, b := range envBindings {
-		m[b.key] = b
+		val, ok := os.LookupEnv(b.env)
+		if !ok {
+			continue
+		}
+		parsed, err := b.parse(val)
+		if err != nil {
+			return count, fmt.Errorf("env %s: %w", b.env, err)
+		}
+		b.apply(c, parsed)
+		count++
 	}
-	return m
-}()
-
-// setField sets a config field by name from a string value.
-func (c *Config) setField(key, value string) error {
-	b, ok := bindingIndex[key]
-	if !ok {
-		return nil // unknown key → no-op (backward compatible)
-	}
-	parsed, err := b.parse(value)
-	if err != nil {
-		return fmt.Errorf("invalid value %q for %s: %w", value, key, err)
-	}
-	b.apply(c, parsed)
-	return nil
+	return count, nil
 }
 
 // ensureNotification returns the Notification config, creating it if nil.
@@ -477,6 +413,12 @@ func (c *Config) Validate() error {
 		}
 		if c.Notification.AlertIdleTTL <= 0 {
 			return fmt.Errorf("notification.alert_idle_ttl must be positive, got %s", c.Notification.AlertIdleTTL)
+		}
+		if c.Notification.ResolvedAlertRetention <= 0 {
+			return fmt.Errorf(
+				"notification.resolved_alert_retention must be positive, got %s",
+				c.Notification.ResolvedAlertRetention,
+			)
 		}
 		if c.Notification.DLQRetention <= 0 {
 			return fmt.Errorf("notification.dlq_retention must be positive, got %s", c.Notification.DLQRetention)
