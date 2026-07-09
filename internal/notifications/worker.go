@@ -46,6 +46,7 @@ type Worker struct {
 	deliveryWorkers int
 
 	alertIdleTTL            time.Duration
+	resolvedAlertRetention  time.Duration
 	dlqRetention            time.Duration
 	bboltCompactionEnabled  bool
 	bboltCompactionInterval time.Duration
@@ -59,10 +60,9 @@ type Worker struct {
 	// Delivery queue buffers state-change alerts for the delivery pool.
 	deliveryQueue chan deliveryJob
 
-	ctx       context.Context
-	cancel    context.CancelCauseFunc
-	wg        sync.WaitGroup
-	quiescent chan struct{}
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	wg     sync.WaitGroup
 }
 
 // WorkerConfig holds configuration for the notification Worker.
@@ -96,6 +96,10 @@ type WorkerConfig struct {
 	// growth from ephemeral resources that emit one error then disappear.
 	// Defaults to 24h if <= 0.
 	AlertIdleTTL time.Duration
+
+	// ResolvedAlertRetention is how long Resolved alerts are retained before
+	// being garbage-collected. Defaults to 24h if <= 0.
+	ResolvedAlertRetention time.Duration
 
 	// DLQRetention is how long dead-letter queue entries are retained before
 	// being purged. Defaults to 30 days if <= 0.
@@ -147,6 +151,10 @@ func NewWorker(cfg *WorkerConfig) *Worker {
 	if alertIdleTTL <= 0 {
 		alertIdleTTL = 24 * time.Hour
 	}
+	resolvedAlertRetention := cfg.ResolvedAlertRetention
+	if resolvedAlertRetention <= 0 {
+		resolvedAlertRetention = 24 * time.Hour
+	}
 	dlqRetention := cfg.DLQRetention
 	if dlqRetention <= 0 {
 		dlqRetention = 30 * 24 * time.Hour
@@ -166,6 +174,7 @@ func NewWorker(cfg *WorkerConfig) *Worker {
 		retryInterval:           retryInterval,
 		gcInterval:              gcInterval,
 		alertIdleTTL:            alertIdleTTL,
+		resolvedAlertRetention:  resolvedAlertRetention,
 		dlqRetention:            dlqRetention,
 		bboltCompactionEnabled:  cfg.BboltCompactionEnabled,
 		bboltCompactionInterval: compactionInterval,
@@ -200,7 +209,6 @@ func (w *Worker) SendRecord(ctx context.Context, record *model.LogRecord) error 
 // Start launches all worker goroutines: process, flush, delivery pool, retry, GC.
 func (w *Worker) Start(ctx context.Context) {
 	w.ctx, w.cancel = context.WithCancelCause(ctx)
-	w.quiescent = make(chan struct{})
 
 	// 1 process + N delivery + 1 flush + 1 retry + 1 gc
 	totalGoroutines := 1 + w.deliveryWorkers + 3
@@ -226,23 +234,15 @@ func (w *Worker) Stop() {
 		w.cancel(errors.New("notifications worker stopped"))
 	}
 
-	// Drain remaining events from the queue.
-	go func() {
-		for {
-			select {
-			case event := <-w.eventQueue:
-				w.processEvent(event)
-			default:
-				close(w.quiescent)
-				return
-			}
-		}
-	}()
+	// Close the event queue to unblock processLoop. By this point the
+	// batcher has already stopped so no new Send calls will arrive.
+	// processLoop drains remaining events and calls wg.Done.
+	close(w.eventQueue)
 
-	<-w.quiescent
+	// Wait for all goroutines (process, flush, delivery, retry, gc).
 	w.wg.Wait()
 
-	// Final flush of any remaining dirty alerts.
+	// Final flush of any remaining dirty alerts (safe: no goroutines remain).
 	w.flushDirty()
 	log.Println("notifications worker: stopped")
 }
@@ -254,11 +254,8 @@ func (w *Worker) Stop() {
 func (w *Worker) processLoop() {
 	defer w.wg.Done()
 
-	for {
-		select {
-		case <-w.ctx.Done():
-			return
-		case event := <-w.eventQueue:
+	for event := range w.eventQueue {
+		if event != nil {
 			w.processEvent(event)
 		}
 	}
@@ -527,12 +524,12 @@ func (w *Worker) gcLoop() {
 func (w *Worker) garbageCollect() {
 	ctx := w.ctx
 
-	// 1. Evict resolved alerts older than 24h.
+	// 1. Evict resolved alerts older than the configured retention.
 	resolvedAlerts, err := w.alertStore.ListByStatus(ctx, alerts.AlertResolved)
 	if err != nil {
 		log.Printf("notifications worker: list resolved alerts: %v", err)
 	} else {
-		cutoff := time.Now().Add(-24 * time.Hour).UnixNano()
+		cutoff := time.Now().Add(-w.resolvedAlertRetention).UnixNano()
 		for _, alert := range resolvedAlerts {
 			if alert.UpdatedAt < cutoff {
 				if delErr := w.alertStore.Delete(ctx, alert.ID); delErr != nil {
