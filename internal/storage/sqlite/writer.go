@@ -168,8 +168,10 @@ func (w *Writer) run() {
 	for {
 		select {
 		case <-w.ctx.Done():
+			// Shutdown: drain remaining commands from the channel
+			// before executing one last time.
 			log.Printf("sqlite writer: shutting down: %v", context.Cause(w.ctx))
-			w.executeCommands(cmdCollection)
+			w.drainAndExecute(cmdCollection)
 			return
 
 		case <-flushTicker.C:
@@ -180,6 +182,7 @@ func (w *Writer) run() {
 
 		case cmd, ok := <-w.cmdQueue.Chan():
 			if !ok {
+				// Queue closed — execute what we have and exit.
 				w.executeCommands(cmdCollection)
 				return
 			}
@@ -188,6 +191,21 @@ func (w *Writer) run() {
 				w.executeCommands(cmdCollection)
 				cmdCollection = cmdCollection[:0]
 			}
+		}
+	}
+}
+
+// drainAndExecute drains any remaining commands from the command queue
+// (non-blocking) and executes them. Used during shutdown to avoid losing
+// commands that were enqueued before the ctx was canceled.
+func (w *Writer) drainAndExecute(cmds []storage.Command) {
+	for {
+		select {
+		case cmd := <-w.cmdQueue.Chan():
+			cmds = append(cmds, cmd)
+		default:
+			w.executeCommands(cmds)
+			return
 		}
 	}
 }
@@ -244,10 +262,16 @@ func commandRecordCount(cmd storage.Command) int {
 // If the batch contains exactly one command that implements storage.NonTransactionalCommand,
 // it is executed directly on the database connection without a transaction wrapper.
 func (w *Writer) executeTransaction(commands []storage.Command) {
+	// Use context.Background() for SQL operations so that in-flight
+	// commands complete even during shutdown. The writer controls its
+	// own lifecycle via the run loop; it drains pending commands after
+	// the context is canceled.
+	dbCtx := context.Background()
+
 	// Non-transactional commands (e.g., VACUUM) run outside a transaction.
 	if len(commands) == 1 {
 		if ntCmd, ok := commands[0].(storage.NonTransactionalCommand); ok {
-			if err := ntCmd.ExecuteNonTransactional(w.ctx, w.db); err != nil {
+			if err := ntCmd.ExecuteNonTransactional(dbCtx, w.db); err != nil {
 				log.Printf("non-transactional command %T failed: %v", commands[0], err)
 				if w.aMetrics != nil {
 					w.aMetrics.IncrementWriteErrors()
@@ -281,7 +305,7 @@ func (w *Writer) executeTransaction(commands []storage.Command) {
 
 	executed := 0
 	for _, cmd := range commands {
-		if err := cmd.Execute(w.ctx, tx); err != nil {
+		if err := cmd.Execute(dbCtx, tx); err != nil {
 			log.Printf("command %T failed: %v", cmd, err)
 			w.aMetrics.IncrementWriteErrors()
 			// Rollback the entire transaction on command failure.
