@@ -106,12 +106,14 @@ func main() {
 }
 
 // loadConfig loads configuration with defaults overridden by environment variables
-// and an optional YAML config file.
+// and an optional YAML config file. The config file is read once; both the main
+// config and the maintenance sub-config are extracted from the same parse.
 func loadConfig() (*config.Config, error) {
 	cfg := config.DefaultConfig()
 
 	// Load optional YAML config file.
-	if configPath := os.Getenv("CONFIG_FILE"); configPath != "" {
+	configPath := os.Getenv("CONFIG_FILE")
+	if configPath != "" {
 		log.Printf("Loading config file from CONFIG_FILE")
 		if err := cfg.LoadFile(configPath); err != nil {
 			return nil, fmt.Errorf("failed to load config file: %w", err)
@@ -123,26 +125,40 @@ func loadConfig() (*config.Config, error) {
 		return nil, fmt.Errorf("failed to load config from environment: %w", err)
 	}
 
-	// Load maintenance config (merged with defaults and env overrides).
+	// Load maintenance config. Use defaults first, then read from the same
+	// config file (already read above) if available, then apply env overrides.
 	maintCfg := maintenance.DefaultConfig()
-
-	// Load maintenance config from file if available.
-	if configPath := os.Getenv("CONFIG_FILE"); configPath != "" {
+	if configPath != "" {
 		if err := maintCfg.LoadFile(configPath); err != nil {
 			return nil, fmt.Errorf("failed to load maintenance config from file: %w", err)
 		}
 	}
-
-	// Environment variables override file values for maintenance too.
 	if _, err := maintCfg.LoadFromEnv(); err != nil {
 		return nil, fmt.Errorf("failed to load maintenance config from environment: %w", err)
 	}
 	cfg.Maintenance = maintCfg
 
-	// Writer tuning
-	if v := os.Getenv("WRITER_MAX_TRANSACTION_RECORDS"); v != "" {
+	// Apply legacy BATCH_SIZE / FLUSH_INTERVAL env vars (deprecated;
+	// prefer BATCHER_BATCH_SIZE / BATCHER_FLUSH_INTERVAL).  Only fall back
+	// when the specific vars weren't set.
+	if v := os.Getenv("BATCH_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.WriterMaxTransactionRecords = n
+			if cfg.BatcherBatchSize == 0 {
+				cfg.BatcherBatchSize = n
+			}
+			if cfg.WriterBatchSize == 0 {
+				cfg.WriterBatchSize = n
+			}
+		}
+	}
+	if v := os.Getenv("FLUSH_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			if cfg.BatcherFlushInterval == 0 {
+				cfg.BatcherFlushInterval = d
+			}
+			if cfg.WriterFlushInterval == 0 {
+				cfg.WriterFlushInterval = d
+			}
 		}
 	}
 
@@ -499,6 +515,7 @@ func (a *Application) initializeNotifications() error {
 		RetryInterval:           nc.RetryInterval,
 		GCInterval:              nc.GCInterval,
 		AlertIdleTTL:            nc.AlertIdleTTL,
+		ResolvedAlertRetention:  nc.ResolvedAlertRetention,
 		DLQRetention:            nc.DLQRetention,
 		BboltCompactionEnabled:  nc.BboltCompactionEnabled,
 		BboltCompactionInterval: nc.BboltCompactionInterval,
