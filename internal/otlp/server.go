@@ -4,8 +4,6 @@ package otlp
 
 import (
 	"context"
-	"log"
-	"net"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -97,25 +95,4 @@ func (s *Server) Export(ctx context.Context, request *logsV1.ExportLogsServiceRe
 // RegisterServer registers the OTLP server with a gRPC server.
 func RegisterServer(grpcServer *grpc.Server, server *Server) {
 	logsV1.RegisterLogsServiceServer(grpcServer, server)
-}
-
-// StartGRPCServer starts a gRPC server with the OTLP service.
-// Optional gRPC server options (e.g. grpc.MaxRecvMsgSize) can be passed.
-func StartGRPCServer(address string, server *Server, opts ...grpc.ServerOption) (*grpc.Server, error) {
-	lis, err := net.Listen("tcp", address)
-	if err != nil {
-		return nil, err
-	}
-
-	grpcServer := grpc.NewServer(opts...)
-	RegisterServer(grpcServer, server)
-
-	go func() {
-		log.Printf("Starting gRPC server on %s", address)
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Printf("gRPC server stopped: %v", err)
-		}
-	}()
-
-	return grpcServer, nil
 }
