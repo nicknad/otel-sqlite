@@ -131,7 +131,23 @@ func main() {
 	}
 
 	if *metrics != "" {
-		after := scrapeMetrics(*metrics)
+		// Poll until the pipeline catches up: written count approaches
+		// received count. Times out after 30s.
+		var after metricsSnapshot
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			after = scrapeMetrics(*metrics)
+			recv, _ := diff(after.logsReceived, baseline.logsReceived)
+			writ, _ := diff(after.logsWritten, baseline.logsWritten)
+			if recv > 0 && writ >= recv { // all received records written
+				break
+			}
+			if time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
+
 		fmt.Println()
 		fmt.Println("----------- Prometheus counters -----------")
 		fmt.Printf("logs_received_total:           %s -> %s (delta %s)\n",
@@ -142,16 +158,26 @@ func main() {
 			baseline.batchesWritten, after.batchesWritten, subCounters(after.batchesWritten, baseline.batchesWritten))
 		fmt.Printf("write_errors_total:            %s -> %s (delta %s)\n",
 			baseline.writeErrors, after.writeErrors, subCounters(after.writeErrors, baseline.writeErrors))
-		if after.logsReceived != "" && baseline.logsReceived != "" {
-			if d, err := diff(after.logsReceived, baseline.logsReceived); err == nil {
-				fmt.Printf("Confirmed received (metrics):  %d (%.2f/s)\n",
-					d, float64(d)/elapsed.Seconds())
-			}
-		}
-		if after.logsWritten != "" && baseline.logsWritten != "" {
-			if d, err := diff(after.logsWritten, baseline.logsWritten); err == nil {
-				fmt.Printf("Confirmed written (metrics):   %d (%.2f/s)  <-- PROCESS rate\n",
-					d, float64(d)/elapsed.Seconds())
+
+		if after.logsWritten != "" && after.logsReceived != "" {
+			if writ, err := diff(after.logsWritten, baseline.logsWritten); err == nil {
+				recv, _ := diff(after.logsReceived, baseline.logsReceived)
+				if writ > 0 {
+					recPerSec := float64(writ) / elapsed.Seconds()
+					fmt.Printf("\nConfirmed process rate:        %d records (%.2f rec/s)\n", writ, recPerSec)
+				}
+				// Compare received (collector side) vs written to check
+				// for data loss.  Use received rather than client-side
+				// sent count because the pipeline queue holds in-flight
+				// records that have been received but not yet written.
+				if recv > 0 && writ < recv {
+					gap := recv - writ
+					pct := float64(gap) / float64(recv) * 100
+					if pct > 5.0 {
+						log.Printf("\n*** WARNING: possible data loss: received=%d written=%d gap=%d (%.1f%%)\n",
+							recv, writ, gap, pct)
+					}
+				}
 			}
 		}
 	}
@@ -369,12 +395,14 @@ func percent(n, d uint64) float64 {
 }
 
 func diff(a, b string) (int64, error) {
-	ai, errA := strconv.ParseInt(a, 10, 64)
-	bi, errB := strconv.ParseInt(b, 10, 64)
+	// Prometheus may format large counters with scientific notation
+	// (e.g. "2.283e+06"), so parse as float64 then convert.
+	af, errA := strconv.ParseFloat(a, 64)
+	bf, errB := strconv.ParseFloat(b, 64)
 	if errA != nil || errB != nil {
 		return 0, fmt.Errorf("parse")
 	}
-	return ai - bi, nil
+	return int64(af - bf), nil
 }
 
 func subCounters(a, b string) string {
