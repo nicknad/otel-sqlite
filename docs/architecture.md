@@ -128,7 +128,9 @@ The OTLP SQLite Collector is a high-performance log collector that receives Open
   - Deliver alert notifications via pluggable notifiers (HTTP webhook, log)
   - Retry failed deliveries with exponential backoff (capped at 2^10)
   - Move exhausted or non-retryable deliveries to dead-letter queue
-  - Garbage-collect resolved alerts older than 24h
+  - Garbage-collect resolved alerts older than the configurable `resolved_alert_retention` (default 24h)
+- Evict idle Pending/Firing alerts after `alert_idle_ttl`
+- Compact bbolt stores periodically (when enabled)
   - Drain event queue on graceful shutdown
 - **Must NOT**:
   - Block the batcher hot path (non-blocking send, returns ErrQueueFull when full)
@@ -368,7 +370,11 @@ All command metrics are labelled by command type for granular observability.
 - `NOTIFICATION_STORE_PATH`: Path to notification delivery state store (bbolt)
 - `NOTIFICATION_ALERT_STORE_PATH`: Path to alert state store (bbolt)
 - `NOTIFICATION_RETRY_INTERVAL`: Retry scan interval
-- `NOTIFICATION_GC_INTERVAL`: Resolved alert GC interval
+- `NOTIFICATION_ALERT_IDLE_TTL`: Max idle time for Pending/Firing alerts before GC eviction
+- `NOTIFICATION_RESOLVED_ALERT_RETENTION`: How long Resolved alerts are retained before GC
+- `NOTIFICATION_DLQ_RETENTION`: Max age of DLQ entries before purge
+- `NOTIFICATION_BBOLT_COMPACTION_ENABLED`: Enable periodic bbolt compaction
+- `NOTIFICATION_BBOLT_COMPACTION_INTERVAL`: Interval between bbolt compactions
 
 ### Configuration File
 
@@ -449,9 +455,11 @@ HTTP 4xx responses (401, 403, 404) are treated as non-retryable and sent directl
 
 ### Garbage Collection
 
-- **Resolved alerts**: Deleted after 24h via the GC goroutine (configurable `gc_interval`)
-- **Delivery state**: Successful state entries older than 24h are GC'd asynchronously
-- **Stale pending alerts**: Pending alerts with no recent hits beyond `alert_resolve_window` are deleted on next evaluation
+**Garbage Collection**:
+- **Resolved alerts**: Deleted after `resolved_alert_retention` (default 24h) via the GC goroutine.
+- **Idle pending/firing alerts**: Evicted after `alert_idle_ttl` of inactivity.
+- **DLQ entries**: Purged after `dlq_retention` (default 30d).
+- **Bbolt compaction**: Optionally compact bbolt stores to reclaim freed pages to the OS.
 
 ## Extensibility
 

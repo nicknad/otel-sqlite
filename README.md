@@ -172,6 +172,11 @@ Or directly:
 | `NOTIFICATION_ALERT_STORE_PATH` | `alert-state.db` | Path to alert state store (bbolt) |
 | `NOTIFICATION_RETRY_INTERVAL` | `30s` | Retry scan interval |
 | `NOTIFICATION_GC_INTERVAL` | `5m` | Resolved alert garbage-collection interval |
+| `NOTIFICATION_ALERT_IDLE_TTL` | `24h` | Max idle time for Pending/Firing alerts before GC eviction |
+| `NOTIFICATION_RESOLVED_ALERT_RETENTION` | `24h` | How long Resolved alerts are retained before GC |
+| `NOTIFICATION_DLQ_RETENTION` | `720h` (30d) | Max age of DLQ entries before purge |
+| `NOTIFICATION_BBOLT_COMPACTION_ENABLED` | `false` | Enable periodic bbolt compaction |
+| `NOTIFICATION_BBOLT_COMPACTION_INTERVAL` | `24h` | Interval between bbolt compactions |
 
 ### YAML Configuration File
 
@@ -256,7 +261,7 @@ Each rule×resource pair creates one Alert. Multiple error messages from the sam
 - **Cooldown**: minimum interval between notifications for the same alert
 - **Retry with backoff**: exponential backoff (base × 2^attempt), capped at 2^10
 - **Dead-letter queue**: persistent storage for deliveries that exhausted retries or received 4xx responses
-- **Garbage collection**: resolved alerts older than 24h are automatically cleaned up
+- **Garbage collection**: resolved alerts older than `resolved_alert_retention` (default 24h) are automatically cleaned up; idle Pending/Firing alerts evicted after `alert_idle_ttl`
 - **Graceful shutdown**: drains buffered events before stopping
 - **Metrics**: events received, matched, delivered, failed, dead-lettered; queue depth
 
@@ -269,6 +274,9 @@ notification:
   alert_store_path: "alert-state.db" # alert state (pending/firing/resolved)
   retry_interval: "30s"
   gc_interval: "5m"
+  alert_idle_ttl: "24h"           # evict idle Pending/Firing alerts after this
+  resolved_alert_retention: "24h"  # remove Resolved alerts after this
+  dlq_retention: "720h"            # purge dead-letter entries after this
   notifiers:
     slack:
       type: "http"
