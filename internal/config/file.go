@@ -26,6 +26,7 @@ type FileConfig struct {
 	FlushInterval                     string  `yaml:"flush_interval"`
 	GrpcMaxRecvMsgSize                int     `yaml:"grpc_max_recv_msg_size"`
 	GrpcMaxSendMsgSize                int     `yaml:"grpc_max_send_msg_size"`
+	WriterMaxTransactionRecords       int     `yaml:"writer_max_transaction_records"`
 	GrpcMaxConcurrentStreams          int     `yaml:"grpc_max_concurrent_streams"`
 	IngressQueueBackpressureThreshold float64 `yaml:"ingress_queue_backpressure_threshold"`
 	GoMemoryLimitMB                   int     `yaml:"go_memory_limit_mb"`
@@ -45,6 +46,7 @@ type FileNotificationConfig struct {
 	RetryInterval           string                        `yaml:"retry_interval"`
 	GCInterval              string                        `yaml:"gc_interval"`
 	AlertIdleTTL            string                        `yaml:"alert_idle_ttl"`
+	ResolvedAlertRetention  string                        `yaml:"resolved_alert_retention"`
 	DLQRetention            string                        `yaml:"dlq_retention"`
 	BboltCompactionEnabled  *bool                         `yaml:"bbolt_compaction_enabled"`
 	BboltCompactionInterval string                        `yaml:"bbolt_compaction_interval"`
@@ -136,6 +138,9 @@ func (c *Config) loadCoreConfig(fc *FileConfig) error {
 	if fc.GoMemoryLimitMB != 0 {
 		c.GoMemoryLimitMB = fc.GoMemoryLimitMB
 	}
+	if fc.WriterMaxTransactionRecords != 0 {
+		c.WriterMaxTransactionRecords = fc.WriterMaxTransactionRecords
+	}
 
 	// Legacy BatchSize falls back to both batcher/writer if specific fields unset.
 	if fc.BatcherBatchSize != 0 {
@@ -218,6 +223,13 @@ func (c *Config) loadNotificationConfig(fc *FileConfig) error {
 			return fmt.Errorf("notification.alert_idle_ttl: %w", err)
 		}
 		nc.AlertIdleTTL = d
+	}
+	if fc.Notification.ResolvedAlertRetention != "" {
+		d, err := parseDurationExt(fc.Notification.ResolvedAlertRetention)
+		if err != nil {
+			return fmt.Errorf("notification.resolved_alert_retention: %w", err)
+		}
+		nc.ResolvedAlertRetention = d
 	}
 	if fc.Notification.DLQRetention != "" {
 		d, err := parseDurationExt(fc.Notification.DLQRetention)
