@@ -223,8 +223,8 @@ Additional rules:
   key and duplicate key), marks 001–004 applied, and runs `RunMigrations`.
 - [x] Assert the backfilled JSON values, duplicate-key rule, empty case `{}`,
   absence of `log_attr`, migration version 005, and `logs.attributes_json`.
-- [ ] Assert a failed backfill rolls back the schema/data change and can be
-  retried, if the migration hook has an injectable invalid-value path.
+- [x] Assert a failed backfill rolls back the schema/data change and can be
+  retried, using an invalid legacy value type.
 - [x] Keep the existing FTS rebuild test and add an assertion that migration
   005 does not drop or repopulate `logs_fts` unexpectedly.
 
@@ -288,7 +288,7 @@ Additional rules:
 - [x] Update `sql_syntax_test.go` DDL expectations: `log_attr` must be absent;
   surviving indexes are the timestamp/resource indexes plus the resource
   service-name index as appropriate. Remove direct EAV insert/delete cases.
-- [ ] Update batcher integration assertions to read event JSON where relevant.
+- [x] Update batcher integration assertions to read event JSON where relevant.
 - [ ] Update all SQLite benchmarks to measure the new event statement and add
   a focused marshal benchmark. Remove benchmark assumptions that count one
   attribute insert per attribute.
@@ -366,7 +366,7 @@ Additional rules:
 
 - [x] Run `CGO_ENABLED=1 go test -tags fts5 ./...` and
   `CGO_ENABLED=1 go test -race -tags fts5 ./...` with CGO enabled.
-- [ ] Run the migration tests against: fresh DB, a legacy DB with attributes,
+- [x] Run the migration tests against: fresh DB, a legacy DB with attributes,
   an empty legacy DB, an already-migrated DB, and a DB reopened after migration.
 - [x] Run FTS rebuild/search, retention, vacuum, checkpoint, resource dedup,
   foreign-key, shutdown-drain, and batcher integration tests.
