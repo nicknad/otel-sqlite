@@ -145,11 +145,13 @@ Or directly:
 | `INGRESS_QUEUE_CAPACITY` | `10000` | Maximum ingress queue size |
 | `BATCH_QUEUE_CAPACITY` | `1000` | Maximum command queue size |
 | `BATCHER_BATCH_SIZE` | `250` | Number of log records per batch (batcher) |
-| `BATCHER_FLUSH_INTERVAL` | `5s` | Maximum time between batch flushes |
+| `BATCHER_FLUSH_INTERVAL` | `1s` | Maximum time between batch flushes |
 | `BATCHER_ERROR_SEVERITY_THRESHOLD` | `ERROR` | Minimum severity to forward to notification worker |
-| `WRITER_BATCH_SIZE` | `100` | Number of commands per transaction (writer) |
-| `WRITER_FLUSH_INTERVAL` | `5s` | Maximum time between transaction flushes |
+| `WRITER_BATCH_SIZE` | `100` | Number of **commands** collected per writer transaction (not records) |
+| `WRITER_FLUSH_INTERVAL` | `1s` | Maximum time between transaction flushes |
 | `WRITER_MAX_TRANSACTION_RECORDS` | `5000` | Maximum records per SQLite transaction |
+| `BATCH_SIZE` | — | **Deprecated.** If set and the specific `*_BATCH_SIZE` vars are unset, applies to both batcher and writer sizes |
+| `FLUSH_INTERVAL` | — | **Deprecated.** If set and the specific `*_FLUSH_INTERVAL` vars are unset, applies to both flush intervals |
 | `METRICS_ADDRESS` | `:9090` | Prometheus metrics server address |
 | `SHUTDOWN_TIMEOUT` | `30s` | Graceful shutdown timeout |
 | `CONFIG_FILE` | — | Path to YAML configuration file |
@@ -405,34 +407,39 @@ These settings are most impactful on large, established databases where B-tree d
 
 ### Measured Rewrite Results
 
-Measurements were taken with the same container load-test configuration:
-32 clients, 150 records/request, four attributes/record, eight resources, and
-one request/second/client for 60 seconds.
+**Density** (capped keep-up workload, same before/after):
+32 clients × 150 records × 1 req/s/client for 60s ≈ 4.72k rec/s client budget.
+This profile only proves the pipeline keeps up; it is **not** the process
+ceiling.
 
 | Measurement | Before rewrite | After inline JSON + native SQLite |
 |---|---:|---:|
-| Ingest rate | 4,720.20 records/sec | 4,720.21 records/sec |
+| Ingest rate (capped) | 4,720.20 records/sec | 4,720.21 records/sec |
 | Persisted events | 283,200 | 283,200 |
 | Database bytes/event | 437.37 | 309.64 |
 | Attribute storage | `log_attr` table and index | Inline `log_event.attributes_json` |
 
-The sustained workload was rate-capped at approximately 4.72k records/sec, so
-it does not establish the maximum native-driver throughput. Overall database
-storage was reduced by approximately 29.2% (1.41x denser).
+Overall database storage fell ~29.2% (1.41× denser). A synthetic insert
+microbenchmark on the inline-JSON schema showed the native driver ~2.7–3.35×
+faster than modernc.
 
-A synthetic 100-event-per-operation benchmark using the inline-JSON schema
-showed the native driver was approximately 2.7–3.35x faster than modernc,
-depending on the insert pattern:
+**Process ceiling** must be measured with the uncapped profiles:
 
-| Benchmark | modernc | native `go-sqlite3` | Speedup |
-|---|---:|---:|---:|
-| Individual inserts | 3.075 ms/op | 0.994 ms/op | 3.09x |
-| Batch insert | 3.587 ms/op | 1.203 ms/op | 2.98x |
-| Prepared batch insert | 3.362 ms/op | 1.004 ms/op | 3.35x |
-| Fewer indexes | 1.876 ms/op | 0.687 ms/op | 2.73x |
+```bash
+make loadtest-up
+make loadtest-process          # profile B: process ceiling
+make loadtest-burst-drain      # profile C: burst + drain
+make loadtest-keepup           # profile A: capped keep-up regression
+make loadtest-down
+```
 
-See [`docs/loadtest-baseline.md`](docs/loadtest-baseline.md) for commands,
-workload details, and limitations of these measurements.
+See [`docs/loadtest-baseline.md`](docs/loadtest-baseline.md) for the full
+measurement matrix, host writer-bench numbers, and current baselines.
+
+**Env precedence:** specific vars (`BATCHER_BATCH_SIZE`, `WRITER_BATCH_SIZE`,
+`BATCHER_FLUSH_INTERVAL`, `WRITER_FLUSH_INTERVAL`) always win. Deprecated
+`BATCH_SIZE` / `FLUSH_INTERVAL` fill only the sides whose specific var is
+unset. Defaults are never treated as "already configured" for that check.
 
 ## License
 

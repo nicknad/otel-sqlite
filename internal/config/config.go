@@ -312,6 +312,10 @@ func parseDuration(s string) (any, error) { return time.ParseDuration(s) }
 
 // LoadFromEnv overrides config fields with values from environment variables.
 // Returns the number of overrides applied and any parse errors encountered.
+//
+// After applying named bindings it also honors the deprecated BATCH_SIZE and
+// FLUSH_INTERVAL variables when the corresponding specific variables were not
+// set. See ApplyLegacyEnv for precedence rules.
 func (c *Config) LoadFromEnv() (int, error) {
 	var count int
 	for _, b := range envBindings {
@@ -326,6 +330,71 @@ func (c *Config) LoadFromEnv() (int, error) {
 		b.apply(c, parsed)
 		count++
 	}
+	legacy, err := c.ApplyLegacyEnv()
+	if err != nil {
+		return count, err
+	}
+	return count + legacy, nil
+}
+
+// ApplyLegacyEnv applies the deprecated BATCH_SIZE and FLUSH_INTERVAL
+// environment variables.
+//
+// Precedence:
+//  1. BATCHER_BATCH_SIZE / WRITER_BATCH_SIZE win when set.
+//  2. Else BATCH_SIZE, when set to a positive int, fills whichever of the
+//     batcher/writer sizes did not have a specific env var.
+//  3. BATCHER_FLUSH_INTERVAL / WRITER_FLUSH_INTERVAL win when set.
+//  4. Else FLUSH_INTERVAL fills whichever flush interval lacked a specific
+//     env var.
+//
+// The check is "was the specific env var present", not "is the field still
+// zero". DefaultConfig always populates non-zero defaults, so a zero-value
+// check would silently ignore legacy env vars (the historical loadtest bug).
+func (c *Config) ApplyLegacyEnv() (int, error) {
+	var count int
+
+	if v := os.Getenv("BATCH_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return count, fmt.Errorf("env BATCH_SIZE: %w", err)
+		}
+		if n <= 0 {
+			return count, fmt.Errorf("env BATCH_SIZE: must be positive, got %d", n)
+		}
+		applied := false
+		if _, ok := os.LookupEnv("BATCHER_BATCH_SIZE"); !ok {
+			c.BatcherBatchSize = n
+			applied = true
+		}
+		if _, ok := os.LookupEnv("WRITER_BATCH_SIZE"); !ok {
+			c.WriterBatchSize = n
+			applied = true
+		}
+		if applied {
+			count++
+		}
+	}
+
+	if v := os.Getenv("FLUSH_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return count, fmt.Errorf("env FLUSH_INTERVAL: %w", err)
+		}
+		applied := false
+		if _, ok := os.LookupEnv("BATCHER_FLUSH_INTERVAL"); !ok {
+			c.BatcherFlushInterval = d
+			applied = true
+		}
+		if _, ok := os.LookupEnv("WRITER_FLUSH_INTERVAL"); !ok {
+			c.WriterFlushInterval = d
+			applied = true
+		}
+		if applied {
+			count++
+		}
+	}
+
 	return count, nil
 }
 

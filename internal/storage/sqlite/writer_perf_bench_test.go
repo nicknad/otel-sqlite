@@ -404,18 +404,24 @@ func BenchmarkWriter_E2E_Pipeline(b *testing.B) {
 		totalRecords += benchBatchSize
 	}
 
-	// Wait for queue to drain.
-	for cmdQueue.Len() > 0 {
-		time.Sleep(10 * time.Millisecond)
+	// Wait until every submitted record is durable, not just until the
+	// channel looks empty (the writer may still be inside a transaction).
+	deadline := time.Now().Add(30 * time.Second)
+	var count int
+	for {
+		if err := w.db.QueryRow("SELECT COUNT(*) FROM log_event").Scan(&count); err != nil {
+			b.Fatal(err)
+		}
+		if count >= totalRecords && cmdQueue.Len() == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			b.Fatalf("drain timeout: stored %d/%d queue_len=%d", count, totalRecords, cmdQueue.Len())
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	time.Sleep(50 * time.Millisecond) // give writer one last tick
 
 	b.StopTimer()
-
-	var count int
-	if err := w.db.QueryRow("SELECT COUNT(*) FROM log_event").Scan(&count); err != nil {
-		b.Fatal(err)
-	}
 
 	b.ReportMetric(float64(totalRecords)/b.Elapsed().Seconds(), "records/s")
 	b.ReportMetric(float64(count), "total_stored")

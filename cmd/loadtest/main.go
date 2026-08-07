@@ -45,10 +45,17 @@ func main() {
 	rpsPerClient := flag.Int("rps-per-client", 0, "max requests/second per client (0 = uncapped)")
 	attrsPerRecord := flag.Int("attrs", 4, "attributes per log record")
 	resourceCount := flag.Int("resources", 8, "number of distinct resources (services) simulated across all clients")
+	drainTimeout := flag.Duration(
+		"drain-timeout", 2*time.Minute,
+		"how long to wait after clients stop for logs_written_total to catch logs_received_total (0 disables)",
+	)
 	flag.Parse()
 
 	if *clients <= 0 || *records <= 0 || *duration <= 0 {
 		log.Fatal("clients, records and duration must be positive")
+	}
+	if *drainTimeout < 0 {
+		log.Fatal("drain-timeout must be >= 0")
 	}
 
 	// Shared gRPC connection (HTTP/2 multiplexes concurrent streams).
@@ -107,14 +114,11 @@ func main() {
 		}(i)
 	}
 	wg.Wait()
-	elapsed := time.Since(start)
-
-	// Give the pipeline a moment to drain before the final scrape.
-	time.Sleep(3 * time.Second)
+	clientElapsed := time.Since(start)
 
 	fmt.Println()
 	fmt.Println("================ LOAD TEST RESULTS ================")
-	fmt.Printf("Duration (client active):       %s\n", elapsed.Round(time.Millisecond))
+	fmt.Printf("Duration (client active):       %s\n", clientElapsed.Round(time.Millisecond))
 	fmt.Printf("Mock API clients:              %d\n", *clients)
 	fmt.Printf("Records per request:          %d\n", *records)
 	totalReq := totalRequests.Load()
@@ -124,28 +128,40 @@ func main() {
 	fmt.Printf("Records sent:                  %d\n", totalRec)
 	fmt.Printf("Export errors:                 %d (%.2f%% of requests)\n",
 		totalErr, percent(totalErr, totalReq))
-	fmt.Printf("Ingest rate (records):         %.2f rec/s\n", float64(totalRec)/elapsed.Seconds())
-	fmt.Printf("Ingest rate (requests):        %.2f req/s\n", float64(totalReq)/elapsed.Seconds())
+	fmt.Printf("Ingest rate (records):         %.2f rec/s\n", float64(totalRec)/clientElapsed.Seconds())
+	fmt.Printf("Ingest rate (requests):        %.2f req/s\n", float64(totalReq)/clientElapsed.Seconds())
 	if totalErrorBytes.Load() > 0 {
 		fmt.Printf("Error bytes (gRPC msg):        %d\n", totalErrorBytes.Load())
 	}
 
 	if *metrics != "" {
-		// Poll until the pipeline catches up: written count approaches
-		// received count. Times out after 30s.
-		var after metricsSnapshot
-		deadline := time.Now().Add(30 * time.Second)
-		for {
-			after = scrapeMetrics(*metrics)
-			recv, _ := diff(after.logsReceived, baseline.logsReceived)
-			writ, _ := diff(after.logsWritten, baseline.logsWritten)
-			if recv > 0 && writ >= recv { // all received records written
-				break
+		// Snapshot immediately after clients stop: process rate during the
+		// active window uses this delta / clientElapsed (not drain time).
+		activeEnd := scrapeMetrics(*metrics)
+
+		var (
+			after     = activeEnd
+			drainTook time.Duration
+			drained   bool
+		)
+		if *drainTimeout > 0 {
+			drainStart := time.Now()
+			deadline := drainStart.Add(*drainTimeout)
+			for {
+				after = scrapeMetrics(*metrics)
+				recv, _ := diff(after.logsReceived, baseline.logsReceived)
+				writ, _ := diff(after.logsWritten, baseline.logsWritten)
+				if recv > 0 && writ >= recv {
+					drained = true
+					drainTook = time.Since(drainStart)
+					break
+				}
+				if time.Now().After(deadline) {
+					drainTook = time.Since(drainStart)
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
 			}
-			if time.Now().After(deadline) {
-				break
-			}
-			time.Sleep(1 * time.Second)
 		}
 
 		fmt.Println()
@@ -160,22 +176,31 @@ func main() {
 			baseline.writeErrors, after.writeErrors, subCounters(after.writeErrors, baseline.writeErrors))
 
 		if after.logsWritten != "" && after.logsReceived != "" {
-			if writ, err := diff(after.logsWritten, baseline.logsWritten); err == nil {
-				recv, _ := diff(after.logsReceived, baseline.logsReceived)
-				if writ > 0 {
-					recPerSec := float64(writ) / elapsed.Seconds()
-					fmt.Printf("\nConfirmed process rate:        %d records (%.2f rec/s)\n", writ, recPerSec)
+			writFinal, errW := diff(after.logsWritten, baseline.logsWritten)
+			recvFinal, errR := diff(after.logsReceived, baseline.logsReceived)
+			writActive, _ := diff(activeEnd.logsWritten, baseline.logsWritten)
+			if errW == nil && writFinal > 0 {
+				// Process rate during the client-active window (the ceiling).
+				activeRate := float64(writActive) / clientElapsed.Seconds()
+				fmt.Printf("\nProcess rate (client window):  %d written / %s = %.2f rec/s\n",
+					writActive, clientElapsed.Round(time.Millisecond), activeRate)
+				fmt.Printf("Confirmed written (final):     %d records\n", writFinal)
+			}
+			if errR == nil && errW == nil && recvFinal > 0 {
+				if *drainTimeout > 0 {
+					status := "incomplete"
+					if drained {
+						status = "complete"
+					}
+					fmt.Printf("Drain after clients stopped:  %s (%s, timeout %s)\n",
+						drainTook.Round(time.Millisecond), status, *drainTimeout)
 				}
-				// Compare received (collector side) vs written to check
-				// for data loss.  Use received rather than client-side
-				// sent count because the pipeline queue holds in-flight
-				// records that have been received but not yet written.
-				if recv > 0 && writ < recv {
-					gap := recv - writ
-					pct := float64(gap) / float64(recv) * 100
+				if writFinal < recvFinal {
+					gap := recvFinal - writFinal
+					pct := float64(gap) / float64(recvFinal) * 100
 					if pct > 5.0 {
 						log.Printf("\n*** WARNING: possible data loss: received=%d written=%d gap=%d (%.1f%%)\n",
-							recv, writ, gap, pct)
+							recvFinal, writFinal, gap, pct)
 					}
 				}
 			}

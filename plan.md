@@ -1,445 +1,458 @@
-# Rewrite plan: inline event attributes and native SQLite
+# Rewrite plan: unlock and raise real write throughput
 
-## Purpose and starting point
+## Why the previous plan looked like a no-op on write rate
 
-This plan is the implementation checklist for replacing the event-attribute EAV
-writes with one JSON value on `log_event`, then switching the SQL driver to
-`github.com/mattn/go-sqlite3`.
+The inline-attributes + native-driver work **did what it claimed for density and
+driver microbenchmarks**, but the post-rewrite load number was measured with a
+**rate-capped** workload that cannot show a write-path improvement.
 
-The repository was inspected before writing this plan. The important facts are:
+### What actually landed (and is fine)
 
-- `go test ./...` currently passes before the CGO cutover. After the native
-  driver is enabled, use `CGO_ENABLED=1 go test -tags fts5 ./...` because
-  go-sqlite3 requires the `fts5` build tag for the existing FTS schema.
-- The writer is already single-consumer/single-connection and uses prepared
-  statements in `internal/storage/sqlite`.
-- `log_event` currently has no `attributes_json`; `log_attr` is still created by
-  migrations 001 and the embedded bootstrap SQL.
-- `internal/storage/sqlite/write_batch_command.go` currently inserts one event
-  and then one `log_attr` row per attribute. Resource attributes already use the
-  existing verbose JSON representation and are not part of this rewrite.
-- Migration SQL is duplicated: `migrations/*.sql` is the human/audit copy and
-  `internal/storage/sqlite/migrator.go` contains the SQL actually executed.
-  Keep those copies synchronized.
-- Migration 003 owns the current `logs` view and the contentless `logs_fts`
-  table. FTS is rebuilt by maintenance; it is not trigger-maintained anymore.
-- `observed_timestamp_ns` is currently `NOT NULL`; do not bind `NULL` to it
-  without a table-rebuild migration. `severity_text` is already nullable.
-- The current Docker build explicitly uses `CGO_ENABLED=0`. There is no CI
-  configuration in the repository; the Makefile and Dockerfile are the local
-  build/test contract.
-- `go.sum` already contains a `go-sqlite3` checksum, but it is not a direct
-  dependency in `go.mod` and the vendored tree currently contains modernc,
-  not go-sqlite3.
+| Result | Evidence |
+|---|---|
+| One event insert per record; no `log_attr` on the write path | `write_batch_command.go` |
+| Density ~1.41× (437 → 310 logical bytes/event) | `docs/loadtest-baseline.md` post-rewrite capture |
+| Native driver ~3× faster than modernc on insert microbench | same doc, `BenchmarkWriterInsert` |
+| Direct writer throughput on this machine | **~45–100k rec/s** empty DB, **~18–20k rec/s** on 500k-row DB (`BenchmarkWriter_*`) |
+| Full queue+writer E2E (short run, empty DB) | **~110k rec/s** (`BenchmarkWriter_E2E_Pipeline`) |
 
-### Scope locked for this rewrite
+### Why “write rate is the same” is the wrong conclusion
+
+1. **The sustained loadtest is capped at ~4.72k rec/s.**
+   Command used pre/post:
+
+   ```bash
+   make loadtest-run LOADTEST_CLIENTS=32 LOADTEST_RECORDS=150 \
+                     LOADTEST_DURATION=60s LOADTEST_RPS=1
+   ```
+
+   That is `32 × 1 req/s × 150 records = 4,800 rec/s` client budget.
+   Matching 4,720 → 4,720 only proves the pipeline still keeps up under the
+   cap. It does **not** measure the process ceiling.
+
+2. **Docs incorrectly promoted the cap to a ceiling.**
+   `docs/loadtest-baseline.md` still says “SQLite persistence is the hard
+   ceiling at ~4,700 records/sec”. That sentence is wrong given:
+   - historical uncapped runs in `loadtest-results/` already showed
+     **~6–9k written rec/s** on modernc;
+   - current native-driver writer benches show **tens of thousands** rec/s.
+
+3. **Loadtest compose tuning is silently ignored (real bug).**
+   `docker-compose.loadtest.yml` sets:
+
+   ```yaml
+   BATCH_SIZE=500
+   FLUSH_INTERVAL=1s
+   ```
+
+   but `cmd/collector/main.go` only applies legacy `BATCH_SIZE` /
+   `FLUSH_INTERVAL` when the specific fields are **already zero**:
+
+   ```go
+   if cfg.BatcherBatchSize == 0 { cfg.BatcherBatchSize = n }
+   if cfg.WriterBatchSize == 0  { cfg.WriterBatchSize  = n }
+   ```
+
+   `DefaultConfig()` always sets non-zero defaults (`BatcherBatchSize=250`,
+   `WriterBatchSize=100`, flush intervals `1s`), so the compose values never
+   stick. Effective loadtest config today:
+
+   | Setting | Compose intent | Actual |
+   |---|---:|---:|
+   | Batcher batch size | 500 | **250** |
+   | Writer commands/tx | 500 | **100** |
+   | Flush intervals | 1s | 1s (default already 1s) |
+   | Ingress / batch queue | 200k / 20k | applied (named env vars work) |
+
+4. **EAV removal was never going to move a capped 4.7k number.**
+   At 4.7k the machine is idle relative to the writer. Saving four attribute
+   inserts per row only shows up once ingest ≥ previous process ceiling.
+
+### Bottom line
+
+Do **not** re-do the schema/driver rewrite. Treat it as done. The next plan is:
+
+1. Fix measurement and config so process rate is real.
+2. Establish an uncapped process baseline on the current code.
+3. Attack the remaining write-path costs in priority order.
+4. Only then claim a throughput win.
+
+---
+
+## Scope locked for this plan
 
 In scope:
 
-1. Add `log_event.attributes_json` with a compact JSON-object encoding.
-2. Migrate existing `log_attr` rows into that column and remove `log_attr` from
-   the final schema.
-3. Make event writes one event insert per record, with no attribute inserts.
-4. Remove the attribute delete path from retention.
-5. Drop redundant severity text values where safe; preserve custom text.
-6. Switch every runtime/test/tool SQL open to the native CGO driver.
-7. Preserve resource deduplication, WAL/pragmas, single-writer behavior, the
-   `logs` view contract, FTS maintenance, purge behavior, and queue behavior.
+1. Fix legacy env handling and loadtest compose env names.
+2. Replace the capped “sustained = ceiling” narrative with a correct
+   measurement matrix (capped keep-up, uncapped process, burst/drain).
+3. Raise single-writer SQLite process throughput on the existing schema
+   (inline JSON, native driver, WAL, one writer).
+4. Keep density gains; do not reintroduce EAV.
 
-Explicitly out of scope:
+Out of scope (unless a later plan reopens them):
 
-- Turso, multi-writer/sharded storage, or a query API redesign.
-- Attribute-key SQL indexes or a return to EAV. Future filtering can use
-  `json_extract`/expression indexes for a small number of deliberately chosen
-  keys.
-- Resource JSON compaction, integer resource IDs, scope tables, body
-  compression, or changing the resource attribute wire format.
-- Making `observed_timestamp_ns` nullable. It is a separate schema-rebuild
-  decision and the expected space saving is small.
-- Replacing contentless FTS or adding attributes to FTS.
+- Multi-DB sharding / multiple writer processes.
+- Query API redesign, attribute expression indexes, FTS redesign.
+- Making `observed_timestamp_ns` nullable.
+- Resource JSON compaction / integer resource IDs (optional later phase only
+  if profiling says resource insert is hot).
+- Turso or non-SQLite backends.
 
 ---
 
-## Locked data-format decisions
+## Current write-path cost model (post-rewrite)
 
-### Event attributes
+Per persisted record today:
 
-Store a single JSON object in `log_event.attributes_json`:
+| Step | Cost class | Notes |
+|---|---|---|
+| gRPC + map + ingress queue | usually cheap vs SQLite | burst ingest already ≥278k rec/s |
+| Batcher merge → `WriteBatchCommand` | cheap | size currently 250 (compose 500 ignored) |
+| Writer collects up to `WriterBatchSize` **commands** | config | 100 commands × 250 rec = 25k rec before split |
+| `MaxTransactionRecords=5000` splits txs | config | caps each SQLite tx |
+| `BEGIN` | once/tx | fine |
+| `INSERT OR IGNORE log_resource` | once/batch | PK + service_name index lookup |
+| `marshalEventAttrs` | **once/record** | `map[string]any` + `json.Marshal` + `string(bytes)` alloc |
+| `INSERT log_event` (15 binds) | **once/record** | PK AUTOINCREMENT + 2 secondary indexes + FK check |
+| `COMMIT` | once/tx | WAL + synchronous=NORMAL |
 
-```json
-{"http.method":"GET","http.status_code":500,"ok":true,"payload":{"$b":"AQI="}}
+Remaining indexes touched on every event insert:
+
+- `log_event` INTEGER PRIMARY KEY AUTOINCREMENT (`sqlite_sequence`)
+- `idx_log_event_timestamp`
+- `idx_log_event_resource_id`
+- FK parent lookup on `log_resource(id)` while `PRAGMA foreign_keys=ON`
+
+Driver/schema wins already taken: no `log_attr`, no attr indexes, native CGO.
+
+---
+
+## Phase 0 — Fix measurement and config (do this first)
+
+### 0.1 Legacy env bug
+
+- [x] Change legacy handling so `BATCH_SIZE` / `FLUSH_INTERVAL` apply when the
+  **named** env vars were not set, not when the field is zero after
+  `DefaultConfig()`. Implemented as `config.ApplyLegacyEnv` (called from
+  `LoadFromEnv`); collector main no longer duplicates the logic.
+  - Prefer `BATCHER_BATCH_SIZE` / `WRITER_BATCH_SIZE` when present.
+  - Else if `BATCH_SIZE` present, fill whichever sides lack a specific var.
+  - Same pattern for flush intervals.
+  - Unit tests cover BATCH_SIZE alone, precedence, and loadtest-style env.
+- [x] Update `docker-compose.loadtest.yml` to use the explicit names:
+
+  ```yaml
+  BATCHER_BATCH_SIZE=500
+  WRITER_BATCH_SIZE=50
+  BATCHER_FLUSH_INTERVAL=1s
+  WRITER_FLUSH_INTERVAL=1s
+  WRITER_MAX_TRANSACTION_RECORDS=10000
+  ```
+
+- [x] Log effective batcher/writer sizes and flush intervals once at startup.
+- [x] Update README env table: mark `BATCH_SIZE` / `FLUSH_INTERVAL` deprecated
+  but working; document the precedence rules.
+
+### 0.2 Measurement matrix (replace the false ceiling)
+
+Stop using the capped run as the process baseline. Record three profiles:
+
+| Profile | Purpose | Suggested command |
+|---|---|---|
+| **A. Keep-up (capped)** | Prove no backlog at a chosen rate | current 4.72k command (regression only) |
+| **B. Process ceiling (uncapped, short)** | Max sustained written rec/s while queues non-empty | `CLIENTS=8 RECORDS=250 DURATION=30s RPS=0` (matches historical `loadtest-results`) |
+| **C. Burst + drain** | Intake ceiling + time-to-drain after client stops | `CLIENTS=32 RECORDS=1000 DURATION=30s RPS=0`, then watch `logs_written_total` until flat |
+
+For B and C always report from Prometheus deltas, not client send rate:
+
+- `otel_collector_storage_logs_written_total` → **process rate**
+- `otel_collector_storage_logs_received_total` → ingest rate
+- batch/ingress queue depths during the run
+- export error %
+- final `COUNT(*)` and density report after stop + checkpoint
+
+- [x] Add Make targets: `loadtest-keepup`, `loadtest-process`,
+  `loadtest-burst-drain`.
+- [x] Extend `cmd/loadtest` with `-drain-timeout`; print process rate over the
+  client window and drain seconds until written ≥ received.
+- [x] Re-run A/B on current HEAD after the env fix; append results to
+  `docs/loadtest-baseline.md` as **“post-fix uncapped baseline”**
+  (process ceiling **~58.3k written rec/s**).
+- [x] Strike or rewrite the “hard ceiling at ~4,700” language in
+  `docs/loadtest-baseline.md` and README. Keep 4.7k only as the historical
+  capped keep-up number.
+
+### 0.3 Local absolute baseline (no Docker required)
+
+- [x] Document the writer bench commands and host numbers in
+  `docs/loadtest-baseline.md`.
+
+  ```bash
+  CGO_ENABLED=1 go test -tags fts5 ./internal/storage/sqlite -run '^$' \
+    -bench 'BenchmarkWriter_' -benchtime=3s -count=3
+  ```
+
+  Observed on AMD Ryzen 5 4500U (single sample):
+
+  | Bench | Approx rec/s |
+  |---|---:|
+  | `BenchmarkWriter_OptimizedPragmas` (fresh DB, 250-rec tx, 5 attrs) | ~45k |
+  | `BenchmarkWriter_LargeDB_Optimized` (after 500k prefill) | ~19–20k |
+  | `BenchmarkWriter_E2E_Pipeline` (queue + writer) | ~100k+ short-run |
+
+- [x] Fix `BenchmarkWriter_E2E_Pipeline` drain wait: wait until
+  `COUNT(*)` catches `totalRecords` and the command queue is empty.
+
+### Phase 0 exit criteria
+
+- [x] Legacy `BATCH_SIZE` actually changes runtime batch sizes (test-covered).
+- [x] Loadtest compose uses explicit env names; startup logs print them.
+- [x] Docs no longer call 4.7k the process ceiling.
+- [x] Profile B number recorded on current code — **~58.3k written rec/s**
+  is the baseline later phases must beat.
+
+---
+
+## Phase 1 — Confirm where time goes (before changing SQL)
+
+Do not guess. Spend one short profiling pass on profile B.
+
+- [ ] Run collector under `perf` or `go test -cpuprofile` on the writer bench
+  and on a 30s uncapped loadtest.
+- [ ] Attribute time at least into:
+  1. SQLite / go-sqlite3 (`sqlite3_step`, page ops)
+  2. `marshalEventAttrs` / `encoding/json`
+  3. Go `database/sql` bind + `tx.Stmt` overhead
+  4. batcher / channel / GC
+- [ ] Optional: SQLite progress handler or a test-only statement counter to
+  prove statement mix is `1 resource + N events` per batch (finish the open
+  Phase-4 item from the previous plan).
+- [ ] Write a short “hot spots” subsection into `docs/loadtest-baseline.md`.
+
+Expected order of dominance (hypothesis to confirm):
+
+1. SQLite row insert + secondary index maintenance + AUTOINCREMENT
+2. JSON marshal allocs per record
+3. `database/sql` per-Exec overhead
+4. Everything else
+
+### Phase 1 exit criteria
+
+- [ ] Profile captured; Phase 2 order adjusted if the hypothesis is wrong.
+
+---
+
+## Phase 2 — High-confidence throughput wins (no schema rewrite)
+
+Implement in this order. Each step gets its own before/after profile B number.
+
+### 2.1 Config defaults that match the write path we already have
+
+The schema change made larger transactions cheaper (1 insert/row). Defaults
+still look like the EAV era.
+
+- [ ] Raise loadtest (and consider production defaults) roughly to:
+  - `BatcherBatchSize`: 500–1000
+  - `WriterBatchSize`: 20–50 **commands** (remember this is commands, not rows)
+  - `WriterMaxTransactionRecords`: 10_000–20_000
+- [ ] Document that `WriterBatchSize` is “commands per transaction collection”,
+  not records. Consider renaming in config comments to avoid future confusion.
+- [ ] Re-run profile B. Expect a measurable bump from amortization alone if
+  the legacy bug was hiding the intended 500 size.
+
+### 2.2 Cut per-record JSON overhead
+
+`marshalEventAttrs` currently:
+
+```go
+values := make(map[string]any, len(attrs))
+// ... fill ...
+encoded, err := json.Marshal(values)
+return string(encoded), nil
 ```
 
-Encoding rules:
+That is at least one map, one `[]byte`, and one string per record.
 
-| Internal kind | JSON representation |
-|---|---|
-| `ValueString` | JSON string |
-| `ValueInt` | JSON integer number (`int64`) |
-| `ValueDouble` | JSON number |
-| `ValueBool` | JSON boolean |
-| `ValueBytes` | `{"$b":"<standard-base64>"}` |
-| `ValueNull` | JSON `null` |
-| no attributes | `{}` |
+- [ ] Add `BenchmarkMarshalEventAttrs` and a pooled encoder path.
+- [ ] Prefer a small hand-rolled JSON object writer for the common case
+  (flat string/int/float/bool/null/bytes keys) **or** `json.Encoder` into a
+  `bytes.Buffer` from `sync.Pool`, reusing the buffer.
+- [ ] Keep deterministic key order only if tests require it; if order is only
+  for tests, sort in tests or accept encoder order and stop paying for
+  `map` sort semantics on the hot path. (`encoding/json` map key sort is
+  convenient but not free.)
+- [ ] Avoid `string(encoded)` copy when binding: bind `[]byte` if the driver
+  accepts BLOB/TEXT interchangeably for this column, or keep one immutable
+  `[]byte` field without dual representation.
+- [ ] Preserve encoding rules from the previous plan (bytes wrapper, reject
+  non-finite doubles, `{}` for empty, last-write-wins keys).
 
-Additional rules:
+### 2.3 Reduce SQLite work per row
 
-- Use the existing `[]model.Attribute` representation; do not add a map to the
-  hot-path model.
-- Use `encoding/json` on a `map[string]any` (Go's JSON encoder sorts string map
-  keys, making tests and migration output deterministic).
-- Duplicate keys are last-write-wins, matching the order of the input attribute
-  slice and the legacy rows' `id` order.
-- Invalid legacy `value_type` values fail migration rather than silently
-  dropping data.
-- Non-finite doubles cannot be JSON numbers. Reject them as a write error and
-  cover that behavior with a unit test; do not silently turn them into strings.
-- Bytes use an explicit wrapper so they cannot be confused with ordinary JSON
-  strings. The wrapper is reserved by this storage format.
-- Keep resource `attributes_json` unchanged for this rewrite. Its current
-  verbose shape is covered by existing E2E tests.
+- [ ] **FK checks:** measure profile B with `PRAGMA foreign_keys=OFF` on the
+  writer connection only (readers/maintenance can keep ON if opened
+  separately). Integrity is already implied by insert order + single writer.
+  If gain is real, gate it behind config defaulting to OFF for the writer
+  and document the invariant. Keep a test that the writer still never
+  inserts an event before its resource row in the same tx.
+- [ ] **AUTOINCREMENT tax:** evaluate dropping `AUTOINCREMENT` (keep
+  `INTEGER PRIMARY KEY`) in a new migration 006 so rowids can be recycled
+  and `sqlite_sequence` is not updated every insert. Only if nothing
+  external depends on monotonic never-reuse IDs (FTS rebuild uses rowid;
+  confirm).
+- [ ] **Indexes:** keep `idx_log_event_timestamp` (purge) and
+  `idx_log_event_resource_id` (orphan resource cleanup) unless purge/orphan
+  SQL is rewritten to not need them. Do not re-add dropped search indexes.
+- [ ] **`INSERT OR IGNORE` resource every batch:** cache seen resource IDs in
+  the writer process (bounded LRU / map) and skip the SQL when the ID was
+  inserted successfully earlier in this process lifetime. Fall back to SQL
+  on miss. This removes a PK probe per batch under steady service sets.
 
-### Schema and migration policy
+### 2.4 Reduce `database/sql` per-row overhead
 
-- Do not edit migrations 001–004. Existing database directories need those
-  versions to remain historical and replayable.
-- Add migration 005. A fresh database may create `log_attr` transiently while
-  replaying the immutable 001–004 history, but after all migrations the final
-  schema must not contain it.
-- Apply migration 005 transactionally: add the column, backfill, update the
-  view, remove attribute indexes/table, and record version 005 atomically.
-- Make the migration safe for both a legacy database with rows and a fresh
-  database with no rows.
+- [ ] Keep prepared statements (already done).
+- [ ] Avoid re-wrapping with `tx.Stmt` costs where possible; confirm go-sqlite3
+  + `database/sql` behavior and whether executing the parent `*sql.Stmt`
+  inside the tx is viable for this driver (only if correct under concurrent
+  rules; we have one connection so it may be).
+- [ ] Experiment with multi-row `INSERT INTO log_event ... VALUES (...), (...), ...`
+  for chunks of 50–100 rows inside the existing command. One statement
+  exec per chunk vs per row. Must still honor max variable count
+  (SQLite default 999 → ~60 rows × 15 binds). Feature-flag or bench both.
+- [ ] Ensure bind types avoid extra conversions (prefer `int64`, `[]byte`,
+  `string` consistently).
 
-### Native SQLite driver
+### 2.5 WAL / checkpoint interaction under sustained write
 
-- Driver import: `_ "github.com/mattn/go-sqlite3"`.
-- Driver name: `sqlite3` at every `sql.Open` call.
-- Use the driver's default bundled SQLite build; do not add `-tags libsqlite3`
-  or require a system SQLite development library unless that choice is made
-  explicitly later.
-- Keep the existing explicit PRAGMAs and `SetMaxOpenConns(1)`. Do not replace
-  tested behavior with undocumented DSN-only pragmas.
-- CGO is a build prerequisite. The Docker builder must use `CGO_ENABLED=1`
-  and `build-base`; verify the resulting Alpine binary's runtime libraries
-  rather than assuming it is static.
+- [ ] During profile B, watch WAL file size and checkpoint frequency.
+- [ ] Tune `wal_autocheckpoint` upward for loadtest (e.g. 10000 pages) so
+  checkpoints do not interrupt every few MB if profiles show stalls.
+- [ ] Keep production defaults conservative; document loadtest-only overrides.
 
----
+### Phase 2 exit criteria
 
-## Phase 0 — Baseline and inventory
-
-### Checklist
-
-- [x] Confirm a clean baseline with `go test ./...`; record the command, Go
-  version, OS/container image, and commit in the change notes.
-- [x] Reproduce the existing sustained load profile from
-  `docs/loadtest-baseline.md` and record process records/sec, ingest records/sec,
-  queue depth, errors, elapsed time, database size, page count, page size, and
-  `COUNT(*)` for `log_event` and `log_attr`.
-- [ ] Capture a burst/drain run as well as the flat sustained run. Do not use a
-  burst-only number as the SQLite throughput baseline.
-- [x] Before changing the schema, checkpoint/close the database and collect
-  `PRAGMA page_count`, `PRAGMA page_size`, `PRAGMA freelist_count`, and table
-  sizes from `dbstat` when available. Record whether WAL/shm files are included.
-- [x] Add `scripts/db_density_report.go` (or an equivalent checked-in script)
-  that accepts a database path and reports the above values, table/index
-  `dbstat` bytes, event count, attribute count, and bytes/event. It must be
-  usable both before and after the rewrite; update only its driver import during
-  the driver phase.
-- [x] Inventory every runtime, test, benchmark, and script reference with:
-  `rg -n 'modernc.org/sqlite|sql.Open\("sqlite"|log_attr|attributes_json' --glob '!vendor/**' .`
-- [x] Treat historical migration references to `log_attr` as intentional. The
-  final runtime code, final schema assertions, writer SQL, purge SQL, and
-  current docs must not depend on it.
-
-### Exit criteria
-
-- [x] Baseline is reproducible from a checked-in command and its numbers are
-  recorded in `docs/loadtest-baseline.md` or a new clearly labeled pre-rewrite
-  section.
-- [x] The inventory lists at least: writer, migrator, write command, purge
-  command, all SQLite tests/benchmarks, batcher integration test,
-  `scripts/check_indexes.go`, Dockerfile, Makefile, README, architecture docs,
-  and the vendor/module files.
+- [ ] Profile B process rate improved vs Phase 0 baseline; each substep’s
+  delta recorded (even if a step is a wash and reverted).
+- [ ] `CGO_ENABLED=1 go test -tags fts5 ./...` green.
+- [ ] Density not regressed beyond noise (still no `log_attr`).
 
 ---
 
-## Phase 1 — Migration 005 and schema contract
+## Phase 3 — Optional schema/format wins (only if Phase 2 plateaus)
 
-### 1. Define the migration
+Pursue only the items profiling still blames.
 
-- [x] Add `migrations/005_inline_event_attributes.sql` with the canonical DDL
-  for adding `attributes_json TEXT NOT NULL DEFAULT '{}'` to `log_event`.
-- [x] Add the matching `migration005SQL` to `migrator.go` and add version 005 to
-  `allMigrations()`.
-- [x] Refactor migration application so each migration runs in a transaction
-  and its `schema_migrations` row is inserted in that same transaction. Preserve
-  current behavior for 001–004 while making failure/retry safe.
-- [x] Give migration 005 a Go hook because typed EAV values cannot be safely
-  aggregated by a simple SQLite expression. The hook must run in one transaction
-  and in this order:
-  1. inspect `PRAGMA table_info(log_event)` and execute `migration005SQL` only
-     when the new column is absent;
-  2. read legacy rows ordered by `event_id, id`, group by event;
-  3. encode and update `log_event.attributes_json`;
-  4. drop all legacy attribute indexes and `log_attr` if it exists;
-  5. drop and recreate `logs` with an explicit column list including
-     `attributes_json`;
-  6. insert the version-005 tracking row and commit the same transaction.
-- [x] Define `migration005SQL` and the checked-in 005 SQL file as the guarded
-  column-add DDL contract. The Go hook owns the conditional execution,
-  backfill, table removal, and view recreation; this avoids an `ALTER TABLE`
-  duplicate-column failure on a retry while keeping the two SQL copies clear.
-- [x] Detect whether `log_attr` exists before querying it. A fresh final schema
-  and a legacy schema with no attribute table must both migrate successfully.
-### 2. Backfill implementation
+### 3.1 Migration 006 candidates (pick by evidence)
 
-- [x] Read `event_id, id, key, value_type, string_value, int_value,
-  double_value, bool_value, bytes_value` with nullable scan types.
-- [x] Convert each legacy row using the locked encoding rules. Bind one prepared
-  update statement and flush each completed event; do not build a whole large
-  database in memory.
-- [x] Preserve empty byte slices, null values, integer range, booleans, and
-  special characters. Use standard base64 for bytes.
-- [x] Use deterministic duplicate-key behavior (last row by legacy `id`).
-- [x] Drop `idx_log_attr_event_id`, `idx_log_attr_key`, all legacy value indexes,
-  and any other `idx_log_attr_*` indexes with `IF EXISTS` before dropping the
-  table. Do not drop event timestamp/resource indexes used by purge.
-- [x] Recreate the `logs` view explicitly; preserve every existing column and
-  append/name `attributes_json` without using `le.*`. Keep FTS as the existing
-  separate `logs_fts` object.
-- [x] Keep `migrations/005_inline_event_attributes.sql` and the embedded SQL
-  comments clear about the Go backfill hook; the file must not imply that a
-  typed EAV backfill happens in SQL alone. The file is the auditable DDL
-  contract, while `RunMigrations` is the only supported complete application
-  path.
+- [ ] Remove `AUTOINCREMENT` if Phase 2.3 showed gain and FTS/purge OK.
+- [ ] Nullable `observed_timestamp_ns` with bind `NULL` when equal to
+  `timestamp_ns` or zero — small space win, minor bind win; only with a
+  real table rebuild.
+- [ ] WITHOUT ROWID is **not** a fit (`id` is the rowid integer PK). Skip.
 
-### 3. Migration tests
+### 3.2 Payload slimming (CPU + pages)
 
-- [x] Add a fresh-database test asserting `RunMigrations` is idempotent and the
-  final `sqlite_master` has no `log_attr` table or `idx_log_attr_*` indexes.
-- [x] Add a legacy-database test that creates the 001–004 shape, inserts one
-  event with string/int/double/bool/bytes/null attributes (including a special
-  key and duplicate key), marks 001–004 applied, and runs `RunMigrations`.
-- [x] Assert the backfilled JSON values, duplicate-key rule, empty case `{}`,
-  absence of `log_attr`, migration version 005, and `logs.attributes_json`.
-- [x] Assert a failed backfill rolls back the schema/data change and can be
-  retried, using an invalid legacy value type.
-- [x] Keep the existing FTS rebuild test and add an assertion that migration
-  005 does not drop or repopulate `logs_fts` unexpectedly.
+- [ ] Resource attributes: still verbose `AttributeValue` JSON. Compact them
+  with the same rules as event attrs if resource insert/update CPU or
+  page churn shows up (usually secondary).
+- [ ] Consider storing `attributes_json` as raw TEXT from a known-safe encoder
+  without intermediate `map[string]any`.
 
-### Exit criteria
+### 3.3 Out of scope unless product requires it
 
-- [x] Both fresh and pre-existing databases migrate successfully.
-- [x] Final schema has one event row per event, no attribute table/indexes, and a
-  queryable `logs.attributes_json` column.
-- [x] `go test ./internal/storage/sqlite ./internal/batcher` passes before any
-  driver change is made.
+- Sharded DB per tenant/resource.
+- Async durability (`synchronous=OFF`) — only as an explicit dangerous knob
+  for bulk import tools, never default.
+- Dropping timestamp index without a purge redesign.
+
+### Phase 3 exit criteria
+
+- [ ] Any migration has fresh+legacy tests, docs, and density+throughput pair.
 
 ---
 
-## Phase 2 — Inline write path and retention
+## Phase 4 — Validation and documentation
 
-### 1. Write SQL and prepared statements
+### 4.1 Functional
 
-- [x] Add `attributes_json` to `sqlInsertEvent` and its values list.
-- [x] Remove `sqlInsertAttr`, `InsertAttr`, `insertAttributeRow`, and
-  `attrValues` from the production write path.
-- [x] Reduce `PreparedStatements` and `preparedStatementsSQL` to resource/event
-  statements only; update close/error cleanup and all tests that inspect them.
-- [x] Implement `marshalEventAttrs(attrs []model.Attribute) (string, error)` in
-  the SQLite storage package. Marshal once per record before the event insert.
-- [x] Bind `{}` for nil/empty attributes. Bind the compact scalar values and
-  bytes wrapper exactly as specified above.
-- [x] Decide and test command error ownership: if JSON encoding or event insert
-  fails, return an error that causes the writer transaction to roll back and
-  return every record to its pool exactly once. Do not log-and-continue while
-  silently losing a record.
+- [ ] Full test suite with CGO + `fts5`.
+- [ ] Migration tests if 006 added.
+- [ ] E2E, purge, FTS rebuild, resource dedup, shutdown drain.
 
-### 2. Safe row slimming
+### 4.2 Performance acceptance
 
-- [x] Add a small helper for the stored severity text: bind `NULL` when
-  `SeverityText == ""` or exactly equals `record.SeverityNumber.String()`;
-  retain non-empty custom OTLP text.
-- [x] Add tests for standard severity, unspecified severity, custom text, and
-  empty text. Confirm `severity_text` remains nullable in the existing schema.
-- [x] Continue binding `observed_timestamp_ns` as an integer, including zero;
-  do not bind `NULL` because migration 001 declares it `NOT NULL`.
-- [x] Leave flags, dropped-attribute count, scope, IDs, body, and resource ID
-  semantics unchanged. Do not remove columns based only on an unmeasured guess.
+Record in `docs/loadtest-baseline.md`:
 
-### 3. Retention and query-side checks
+| Metric | Phase 0 uncapped baseline | Final |
+|---|---:|---:|
+| Process rec/s (profile B) | TBD | TBD |
+| Keep-up at 4.72k (profile A) | pass | pass |
+| Drain time after burst (profile C) | TBD | TBD |
+| Logical bytes/event | ~310 | ≥ prior (no major regression) |
+| Writer bench fresh / large DB | ~45k / ~20k | higher or explained |
 
-- [x] Remove the `DELETE FROM log_attr` statement and its error path from
-  `PurgeLogsCommand`. Delete expired `log_event` rows and rely on the declared
-  event/resource relationship plus the existing orphan-resource cleanup.
-- [x] Keep the purge batching/iteration limit and timestamp index behavior.
-- [x] Rewrite purge SQL syntax tests so they insert attributes in
-  `attributes_json`, never into `log_attr`.
-- [x] Confirm deleting events does not leave FTS behavior/regression issues;
-  `logs_fts` is rebuilt by the existing maintenance command, not incrementally.
+No fixed multiple required (no “must hit 2×”). Accept based on measured
+deltas and absence of correctness regressions.
 
-### 4. Write-path tests and benchmarks
+### 4.3 Docs to fix
 
-- [x] Update `writer_test.go` to query and unmarshal `log_event.attributes_json`
-  for all supported scalar kinds and `{}` for empty attributes.
-- [x] Update `e2e_test.go` to assert event attribute keys/values in JSON. Keep
-  the existing resource-attribute assertions in their current verbose format.
-- [x] Update `sql_syntax_test.go` DDL expectations: `log_attr` must be absent;
-  surviving indexes are the timestamp/resource indexes plus the resource
-  service-name index as appropriate. Remove direct EAV insert/delete cases.
-- [x] Update batcher integration assertions to read event JSON where relevant.
-- [ ] Update all SQLite benchmarks to measure the new event statement and add
-  a focused marshal benchmark. Remove benchmark assumptions that count one
-  attribute insert per attribute.
-- [x] Add table tests for key escaping, Unicode, quotes, all scalar types,
-  empty attributes, duplicate keys, and invalid non-finite doubles.
-
-### Exit criteria
-
-- [x] The production path executes one event insert per record and no
-  `log_attr` SQL exists outside intentional historical migration/backfill tests.
-- [x] Attribute round-trip tests pass, purge tests pass, and
-  `go test ./internal/storage/sqlite ./internal/batcher ./internal/otlp` passes.
-- [x] A modernc-backed Phase 2 benchmark is captured so the schema change can
-  be compared independently from the driver change.
-
----
-
-## Phase 3 — Native `go-sqlite3` cutover
-
-### Checklist
-
-- [x] Add `github.com/mattn/go-sqlite3` as a direct `go.mod` dependency.
-- [x] Replace the writer's modernc blank import with go-sqlite3 and change
-  `sql.Open("sqlite", ...)` to `sql.Open("sqlite3", ...)`.
-- [x] Update every test/benchmark/tool call site found by the inventory,
-  including `writer_bench_test.go`, `writer_perf_bench_test.go`,
-  `writer_pool_bench_test.go` if applicable, `batcher_test.go`, `e2e_test.go`,
-  and `scripts/check_indexes.go`.
-- [x] Remove modernc from direct/transitive module requirements with
-  `go mod tidy`; run `go mod vendor` so `vendor/` and `vendor/modules.txt`
-  contain go-sqlite3 and no modernc package.
-- [x] Re-run `rg` and ensure modernc is absent from active Go code, tests, tools,
-  `go.mod`, `go.sum`, and `vendor/modules.txt`. Historical plan/load-result
-  text may be retained only if it is explicitly labeled historical.
-- [x] Keep `SetMaxOpenConns(1)` and `SetMaxIdleConns(1)` and all existing
-  foreign-key, WAL, busy-timeout, cache, mmap, temp-store, checkpoint, and
-  journal-size pragmas.
-- [x] Add/retain an `openDatabase` test checking `journal_mode`, foreign keys,
-  and the key performance pragmas under the native driver.
-- [x] Verify `LastInsertId`, BLOB scan/bind behavior, error behavior, FTS5,
-  `VACUUM`, and `PRAGMA wal_checkpoint` under go-sqlite3. Do not assume
-  modernc and native driver error strings are identical in assertions.
-- [x] Run `CGO_ENABLED=1 go test -tags fts5 ./...` and the equivalent race
-  suite through `make test`. A deliberate `CGO_ENABLED=0` build is expected to
-  fail; document that as a prerequisite rather than retaining a second driver.
-
-### Docker and developer build
-
-- [x] In `Dockerfile`, install `build-base` in the builder, set/use
-  `CGO_ENABLED=1`, and build the collector with the existing target and `fts5`.
-- [x] Keep the runtime Alpine image compatible with the generated binary;
-  inspect `ldd /usr/local/bin/otel-collector` (or the equivalent image command)
-  and add only the required runtime libraries. The default bundled driver does
-  not require `sqlite-dev` in the runtime image.
-- [x] Update `Makefile` targets/comments so build, test, and loadtest use CGO
-  intentionally, including the required `fts5` tag. Do not add a fake static
-  CGO claim.
-- [x] Update README build/development instructions with GCC/build-base
-  prerequisites for local Linux/macOS builds and the cross-compilation caveat.
-- [x] Rebuild `docker-compose.loadtest.yml` and verify the collector starts,
-  creates its database, passes health checks, and accepts OTLP traffic.
-
-### Exit criteria
-
-- [x] No active modernc import, module, vendor entry, or `sqlite` driver-name
-  call site remains.
-- [x] The native-driver test suite and Docker health check pass.
-- [x] The single-writer architecture and observed pragmas are unchanged.
-
----
-
-## Phase 4 — Validation, density, and documentation
-
-### Functional validation
-
-- [x] Run `CGO_ENABLED=1 go test -tags fts5 ./...` and
-  `CGO_ENABLED=1 go test -race -tags fts5 ./...` with CGO enabled.
-- [x] Run the migration tests against: fresh DB, a legacy DB with attributes,
-  an empty legacy DB, an already-migrated DB, and a DB reopened after migration.
-- [x] Run FTS rebuild/search, retention, vacuum, checkpoint, resource dedup,
-  foreign-key, shutdown-drain, and batcher integration tests.
-- [x] Inspect `sqlite_master` after a real ingestion run. Assert final tables,
-  indexes, view columns, and absence of `log_attr`.
-- [ ] Use a SQLite trace or a controlled test/statement counter where practical
-  to verify no per-attribute insert is issued. Source inspection alone is not
-  the only proof for this success criterion.
-
-### Performance and storage validation
-
-- [x] Generate a fixed synthetic workload (same number of events, same four
-  scalar attributes, same resources, same batch/queue settings) before and
-  after. Stop/checkpoint both databases before measuring file/page totals.
-- [x] Run the sustained profile and record process rate, ingest rate, queue
-  depth, errors, elapsed time, database bytes/event, and table/index bytes.
-- [ ] Run the burst profile and record drain time separately from intake rate.
-- [x] Compare Phase 2 (old driver/new schema) and Phase 3 (native driver/new
-  schema) where the environment permits. Do not attribute a schema gain to
-  CGO or a driver gain to removed EAV rows.
-- [x] Treat the existing ~4.7k records/sec sustained figure as a baseline, not
-  a guaranteed target. Report the measured result and investigate regressions.
-- [ ] Run `VACUUM` only as a separately labeled post-migration size check;
-  distinguish logical freed pages from file size reclaimed by VACUUM.
-
-### Documentation
-
-- [x] Update `docs/architecture.md`: final schema has compact event
-  `attributes_json`, no `log_attr`, migration 005 compatibility/backfill,
-  native CGO SQLite, and the unchanged single-writer/FTS model.
-- [x] Update `README.md`: remove `log_attr` from the current schema description,
-  document the JSON encoding and the lost direct EAV SQL contract, and document
-  CGO/native-driver build prerequisites.
-- [x] Update `docs/project_structure.md` migration list and storage notes.
-- [x] Update `docs/loadtest-baseline.md` with the exact pre/post commands and
-  results; retain the old baseline as historical context rather than silently
-  overwriting it.
-- [x] Add an operations note that migration 005 removes the EAV table and that
-  a VACUUM may be needed to shrink an existing file after the migration.
-- [x] Document the compatibility impact: external readers that query
-  `log_attr` must migrate to `log_event.attributes_json`; this is an on-disk
-  migration, not a query API redesign.
+- [ ] `docs/loadtest-baseline.md` — remove false 4.7k ceiling; add matrix.
+- [ ] `README.md` — env precedence; performance section.
+- [ ] `docs/architecture.md` — writer batching semantics; FK/pragma choices.
+- [ ] `plan.md` (this file) — check boxes as work completes.
+- [ ] Leave previous rewrite history intact as “Phase −1 completed work”.
 
 ### Final acceptance checklist
 
-- [x] `CGO_ENABLED=1 go test -tags fts5 ./...` passes with CGO enabled.
-- [x] Fresh and legacy migrations pass and leave no `log_attr` table/index.
-- [x] All event attribute kinds round-trip through JSON, including bytes and
-  null; resource attributes remain intact.
-- [x] `logs.attributes_json` is available by name and FTS rebuild/search still
-  works.
-- [x] Purge removes expired events without any EAV delete statement and cleans
-  orphaned resources.
-- [x] Docker loadtest image builds/runs with the native driver.
-- [x] Density and throughput measurements are recorded with their workload and
-  environment; the 1.41x density result and unchanged capped throughput are
-  documented rather than treated as an unexplained regression.
-- [x] `git diff --check`, `go vet -tags fts5 ./...`, and the repository linter pass.
+- [ ] Uncapped process baseline published for pre-Phase-2 HEAD.
+- [ ] Config bug fixed and tested.
+- [ ] At least one Phase 2 change lands with a measured process-rate gain,
+  **or** profiling proves SQLite page write rate is saturated and further
+  single-process gains need Phase 3/sharding.
+- [ ] Capped keep-up still green.
+- [ ] Density still without `log_attr`.
+- [ ] CI/local: `CGO_ENABLED=1 go test -tags fts5 ./...`.
 
 ---
 
 ## Recommended commit order
 
-Use small commits so failures are attributable:
+1. **fix(config):** honor `BATCH_SIZE` / `FLUSH_INTERVAL` correctly; explicit
+   loadtest env names; startup log of effective sizes.
+2. **docs(loadtest):** measurement matrix; retract 4.7k ceiling; record
+   uncapped baseline on current code.
+3. **test(bench):** fix E2E bench drain; add marshal bench.
+4. **perf(json):** pooled / specialized `marshalEventAttrs`.
+5. **perf(writer):** resource ID cache; optional FK off on writer; tx sizing.
+6. **perf(sql):** multi-row insert experiment (keep or revert from benches).
+7. **perf(pragma):** wal_autocheckpoint / loadtest-only overrides.
+8. **feat(migrate006):** only if AUTOINCREMENT/nullable observed_ts justified.
+9. **docs:** final numbers and ops notes.
 
-1. **Baseline/instrumentation:** density report and recorded pre-rewrite run.
-2. **Migration 005:** transactional backfill, final schema/view, migration tests.
-3. **Inline writes:** event JSON encoder, prepared statements, purge, tests and
-   modernc-backed comparison benchmark.
-4. **Driver cutover:** go-sqlite3 imports/names, module/vendor cleanup, native
-   driver tests.
-5. **Build/docs/validation:** Docker/Makefile/README/architecture/loadtest
-   updates and final measurements.
+---
 
-Start with the unchecked Phase 0 items. Do not begin the CGO cutover until the
-fresh/legacy migration tests and the Phase 2 schema benchmark are green.
+## Completed work this plan builds on (do not redo)
+
+Previous plan (inline attributes + native driver) is **done**:
+
+- Migration 005, compact `attributes_json`, `log_attr` removed from final schema
+- Writer one-insert-per-event path
+- `go-sqlite3` + CGO Docker/Makefile
+- Density 1.41× on the capped workload
+- Driver microbench ~3× vs modernc
+
+That work improved **cost per record** and **storage**. It was never given a
+chance to show **records/sec** because the only published comparison was
+rate-capped at 4.72k and the loadtest batch-size env was not applied.
+
+---
+
+## Immediate next actions (start here)
+
+1. Fix the legacy env bug + loadtest compose env names.
+2. Run profile B uncapped; write the number down as the real baseline.
+3. Profile once; then execute Phase 2.1 → 2.2 → 2.3 in order.
+
+Do not open another schema-rewrite discussion until step 2 is on paper.
+)

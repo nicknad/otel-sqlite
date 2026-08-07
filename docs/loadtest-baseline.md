@@ -123,20 +123,100 @@ CGO_ENABLED=1 go test -tags fts5 ./internal/storage/sqlite -run '^$' \\
   -bench 'BenchmarkWriter(Insert|WithFewerIndexes)$' -benchtime=3s -count=1
 ```
 
-This demonstrates a driver-level improvement in the synthetic benchmark, while
-production throughput remains capped by the tested sustained workload.
+This demonstrates a driver-level improvement in the synthetic benchmark. The
+capped 4.72k keep-up workload does **not** bound production throughput.
 
-### Interpretation
+### Interpretation (corrected)
 
 - **Ingest intake ceiling** is high: the gRPC server + bounded ingress queue
   absorb **≥278k records/sec** in bursts; the backpressure design lets the
   pipeline hold millions of records in queues.
-- **SQLite persistence is the hard ceiling at ~4,700 records/sec** sustained.
-  Once the ingest rate exceeds this, the batch queue grows without bound and
-  writes fall behind (the burst committed ~250k rows per transaction at
-  **~16–22s commit latency**).
-- Sustained (rows in ≈ rows out, flat queue) is achievable only at rates
-  ≤ ~4.7k rec/s under the current schema/PRAGMA settings.
+- **The 4.72k figure is a client rate cap, not a process ceiling.** The
+  sustained profile uses `32 × 150 × 1 req/s ≈ 4.8k rec/s` client budget.
+  Matching 4.72k before and after the rewrite only proves keep-up under that
+  budget. Historical uncapped runs already wrote ~6–9k rec/s on modernc;
+  native-driver writer benches on this host reach tens of thousands of rec/s.
+- **Real process ceiling** must be read from `logs_written_total` under an
+  uncapped profile (see Measurement Matrix below), never from a capped run.
+
+### Config bug found during throughput investigation
+
+`docker-compose.loadtest.yml` historically set `BATCH_SIZE=500` /
+`FLUSH_INTERVAL=1s`, but the collector only applied those legacy vars when the
+corresponding config fields were still zero. `DefaultConfig()` always sets
+non-zero defaults, so the compose values were silently ignored and the
+loadtest ran with `BatcherBatchSize=250` and `WriterBatchSize=100`.
+
+Fixed: `config.ApplyLegacyEnv` keys off whether the **specific env var was
+present**, and the loadtest compose now uses explicit
+`BATCHER_BATCH_SIZE` / `WRITER_BATCH_SIZE` / flush / `WRITER_MAX_TRANSACTION_RECORDS`
+names. Startup logs print the effective pipeline sizes.
+
+## Measurement Matrix
+
+Use these three profiles. Process rate always comes from Prometheus
+`otel_collector_storage_logs_written_total` deltas, not client send rate.
+
+| Profile | Make target | Purpose |
+|---|---|---|
+| **A. Keep-up (capped)** | `make loadtest-keepup` | Regression: no backlog at ~4.72k rec/s |
+| **B. Process ceiling** | `make loadtest-process` | Max written rec/s while queues are fed |
+| **C. Burst + drain** | `make loadtest-burst-drain` | Intake ceiling + time-to-drain after clients stop |
+
+```bash
+make loadtest-up
+make loadtest-keepup
+make loadtest-process
+make loadtest-burst-drain
+make loadtest-down
+```
+
+`cmd/loadtest` accepts `-drain-timeout` (default 2m). After clients stop it
+prints:
+
+- **Process rate (client window)** = written-during-client-window / client duration
+- **Drain after clients stopped** = time until `written >= received` (or timeout)
+
+### Host writer microbenchmarks (native driver, post-rewrite)
+
+Recorded on AMD Ryzen 5 4500U during the throughput investigation. Re-run after
+each perf change:
+
+```bash
+CGO_ENABLED=1 go test -tags fts5 ./internal/storage/sqlite -run '^$' \
+  -bench 'BenchmarkWriter_' -benchtime=3s -count=3
+```
+
+| Benchmark | Approx rec/s (single sample) |
+|---|---:|
+| `BenchmarkWriter_OptimizedPragmas` (fresh DB, 250-rec tx, 5 attrs) | ~45k |
+| `BenchmarkWriter_LargeDB_Optimized` (after 500k prefill) | ~19–20k |
+| `BenchmarkWriter_E2E_Pipeline` (queue + writer, fixed drain) | ~100k+ short-run |
+
+### Post-fix uncapped baseline (Phase 0 of throughput plan)
+
+Captured 2026-08-07 on AMD Ryzen 5 4500U after the legacy-env fix and explicit
+loadtest compose sizes (`batcher=500`, `writer_commands=50`,
+`max_tx_records=10000`). Startup log confirmed:
+`pipeline config: ... batcher_batch_size=500 ... writer_batch_size=50 ...`.
+
+| Profile | Process rec/s (client window) | Ingest rec/s | Export errors | Drain | Notes |
+|---|---:|---:|---:|---:|---|
+| A keep-up | kept up (final written = 283200) | 4,720.19 | 0% | 507ms complete | flat; not a ceiling |
+| **B process** | **58,298.67** | 257,210.81 | 0.06% | 1m7.9s complete | **baseline to beat** |
+| C burst+drain | (same shape as B at higher fan-in; re-run when comparing) | ≥278k historical | — | — | use `make loadtest-burst-drain` |
+
+Profile B detail (`make loadtest-process`):
+
+- 8 clients × 250 records/req, 30s, uncapped
+- Client sent 7,716,500 records; collector received/wrote 7,717,250
+- Written during client window: 1,749,000 → **58,298.67 rec/s process**
+- Full drain after clients stopped: 67.9s (complete within 2m timeout)
+- `write_errors_total` delta 0 (one pre-existing counter from startup checkpoint race)
+
+This replaces any reading of ~4.7k as the process ceiling. Phase 2+ changes
+must beat **~58k written rec/s** on the same profile B command, or explain a
+regression with profiling.
 
 ## Optimizations Identified and Applied
 
@@ -162,43 +242,31 @@ production throughput remains capped by the tested sustained workload.
      `protoc-gen-go@v1.36.11` / `protoc-gen-go-grpc@v1.5.1`, removed inline
      `EXPOSE` comments, and chowned the data dir to the `otel` user.
 
-## Further Optimization Opportunities (not implemented)
+## Further Optimization Opportunities
 
-- **Process ceiling (~4.7k rec/s) is the real bottleneck**, dominated by
-  SQLite: 5 inserts/record plus the `log_attr(key)` and `log_event(body)`
-  indexes. Levers (each trades durability/space for speed):
-  - `PRAGMA synchronous=OFF` (or `EXTRA`) and `temp_store=MEMORY`;
-  - defer/drop `log_event(body)` and `log_attr(key)` indexes during ingest,
-    build post-load;
-  - reduce per-record insert count (e.g. JSON-encode attrs into a single column
-    instead of one row per attribute).
-- **Batcher has no time-based flush.** It flushes only when a batch reaches
-  `BatchSize` records; `Config.FlushInterval` is used only by the writer's
-  ticker. A low-rate producer therefore experiences unbounded end-to-end latency
-  until the batcher is stopped. Add a flush ticker to the batcher tied to
-  `FlushInterval`.
-- **Single writer goroutine** serializes all persistence; SQLite WAL allows a
-  separate reader, but writes are inherently single-threaded for this driver.
-  Sharding by resource/tenant across multiple databases would scale writes
-  horizontally if persistence-latency requirements exceed ~4.7k rec/s.
+Tracked in `plan.md` (throughput plan). Summary:
+
+- Measure uncapped process rate (profile B) before claiming wins.
+- Raise batcher/writer transaction sizing now that EAV is gone.
+- Cut per-record JSON marshal allocs (`marshalEventAttrs`).
+- Optional: writer-side resource ID cache, FK-off on writer connection,
+  multi-row inserts, WAL autocheckpoint tuning.
+- Single writer remains the architectural ceiling; sharding is a later plan.
 
 ## Reproduce
 
-Run the density report after the writer has stopped and the database has been
-checkpointed. The report uses the current SQLite driver during Phase 0; its
-import is updated when the repository switches drivers.
-
 ```bash
-# Build the report and inspect page/table/index density.
-go run ./scripts/db_density_report ./path/to/otel-logs.db
+# Density after stop + checkpoint:
+CGO_ENABLED=1 go run -tags fts5 ./scripts/db_density_report ./path/to/otel-logs.db
 
-# Sustained process baseline (flat queue):
+# Full matrix:
 make loadtest-up
-make loadtest-run LOADTEST_CLIENTS=32 LOADTEST_RECORDS=150 \
-                   LOADTEST_DURATION=60s LOADTEST_RPS=1
+make loadtest-keepup
+make loadtest-process
+make loadtest-burst-drain
 make loadtest-down
 
-# Burst intake ceiling:
-make loadtest-run LOADTEST_CLIENTS=32 LOADTEST_RECORDS=1000 \
-                   LOADTEST_DURATION=30s LOADTEST_RPS=0
+# Host writer benches:
+CGO_ENABLED=1 go test -tags fts5 ./internal/storage/sqlite -run '^$' \
+  -bench 'BenchmarkWriter_' -benchtime=3s -count=1
 ```

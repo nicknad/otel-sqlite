@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -138,29 +137,8 @@ func loadConfig() (*config.Config, error) {
 	}
 	cfg.Maintenance = maintCfg
 
-	// Apply legacy BATCH_SIZE / FLUSH_INTERVAL env vars (deprecated;
-	// prefer BATCHER_BATCH_SIZE / BATCHER_FLUSH_INTERVAL).  Only fall back
-	// when the specific vars weren't set.
-	if v := os.Getenv("BATCH_SIZE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			if cfg.BatcherBatchSize == 0 {
-				cfg.BatcherBatchSize = n
-			}
-			if cfg.WriterBatchSize == 0 {
-				cfg.WriterBatchSize = n
-			}
-		}
-	}
-	if v := os.Getenv("FLUSH_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			if cfg.BatcherFlushInterval == 0 {
-				cfg.BatcherFlushInterval = d
-			}
-			if cfg.WriterFlushInterval == 0 {
-				cfg.WriterFlushInterval = d
-			}
-		}
-	}
+	// Legacy BATCH_SIZE / FLUSH_INTERVAL are applied inside cfg.LoadFromEnv
+	// (config.ApplyLegacyEnv) with correct "specific env unset" precedence.
 
 	return cfg, nil
 }
@@ -252,6 +230,18 @@ func (a *Application) start() error {
 	log.Println("OTLP collector started successfully")
 	log.Printf("gRPC server listening on %s", a.config.ListenAddress)
 	log.Printf("Metrics server listening on %s", a.config.MetricsAddress)
+	log.Printf(
+		"pipeline config: ingress_queue=%d batch_queue=%d "+
+			"batcher_batch_size=%d batcher_flush=%s "+
+			"writer_batch_size=%d writer_flush=%s max_tx_records=%d",
+		a.config.IngressQueueCapacity,
+		a.config.BatchQueueCapacity,
+		a.config.BatcherBatchSize,
+		a.config.BatcherFlushInterval,
+		a.config.WriterBatchSize,
+		a.config.WriterFlushInterval,
+		a.config.WriterMaxTransactionRecords,
+	)
 
 	return nil
 }
