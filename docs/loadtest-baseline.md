@@ -41,6 +41,10 @@ make loadtest                          # up + run + down
 
 ## Measured Baseline
 
+The numbers below are the pre-rewrite historical baseline. Keep them intact and
+append new runs after the inline-attributes/native-driver work so the workload
+and environment remain auditable.
+
 Container config (env in `docker-compose.loadtest.yml`):
 `INGRESS_QUEUE_CAPACITY=200000 BATCH_QUEUE_CAPACITY=20000 BATCH_SIZE=500 FLUSH_INTERVAL=1s`,
 SQLite WAL, `synchronous=NORMAL`, single writer goroutine, 4 string attributes
@@ -52,6 +56,24 @@ per record (=> 1 `log_event` + 4 `log_attr` inserts per record + 1 dedup'd
 | **Burst** (32 clients × 1000 rec, 30s, uncapped) | **277,889 rec/s** | ~0 at scrape (draining) | 0.30% | batch queue filled to ~16k batches |
 | **Capped burst** (32 × 1000 × 2 req/s ≈ 64k rec/s, 60s) | 63,470 rec/s | 5,342 rec/s (commit rate) | 0% | grew continuously |
 | **Sustained** (32 × 150 × 1 req/s ≈ 4.72k rec/s, 60s) | 4,720 rec/s | **4,717 rec/s** | 0% | **flat (~10 batches)** |
+
+### Phase 0 capture for the rewrite
+
+A fresh local container run was captured before changing the schema or driver:
+
+- Command: `make loadtest-run LOADTEST_CLIENTS=32 LOADTEST_RECORDS=150 LOADTEST_DURATION=60s LOADTEST_RPS=1`
+- Environment: Podman-backed Docker Compose, current Dockerfile, WAL,
+  `synchronous=NORMAL`, batch size 500, four attributes per record.
+- Client result: 283,200 records sent, 0 export errors, 4,720.20 records/sec.
+- Final persisted result after stopping the collector: 283,200 events and
+  1,132,800 attribute rows (four per event), 123,863,040 logical database
+  bytes, 437.37 logical bytes/event.
+- `dbstat` at capture: `log_event` 43,057,152 bytes, `log_attr` 45,527,040
+  bytes, `idx_log_attr_event_id` 15,405,056 bytes, event timestamp/resource
+  indexes 19,820,544 bytes combined. The collector was stopped before copying
+  the database, so the reported database file excludes separate WAL/shm files.
+
+This capture is the comparison point for the fixed-workload post-rewrite run.
 
 ### Interpretation
 
@@ -111,7 +133,14 @@ per record (=> 1 `log_event` + 4 `log_attr` inserts per record + 1 dedup'd
 
 ## Reproduce
 
+Run the density report after the writer has stopped and the database has been
+checkpointed. The report uses the current SQLite driver during Phase 0; its
+import is updated when the repository switches drivers.
+
 ```bash
+# Build the report and inspect page/table/index density.
+go run ./scripts/db_density_report ./path/to/otel-logs.db
+
 # Sustained process baseline (flat queue):
 make loadtest-up
 make loadtest-run LOADTEST_CLIENTS=32 LOADTEST_RECORDS=150 \
