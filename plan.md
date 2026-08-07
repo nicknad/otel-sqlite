@@ -424,7 +424,7 @@ Additional rules:
 - [x] Density and throughput measurements are recorded with their workload and
   environment; the 1.41x density result and unchanged capped throughput are
   documented rather than treated as an unexplained regression.
-- [ ] `git diff --check`, `go vet ./...`, and the repository linter pass.
+- [x] `git diff --check`, `go vet -tags fts5 ./...`, and the repository linter pass.
 
 ---
 
