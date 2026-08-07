@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"testing"
@@ -136,13 +137,17 @@ func TestWriterWriteAndQuery(t *testing.T) {
 		t.Errorf("service_name = %q, want %q", svcName, "test-svc")
 	}
 
-	// Verify attribute
-	var attrKey string
-	if err := w.db.QueryRow("SELECT key FROM log_attr WHERE event_id = 1").Scan(&attrKey); err != nil {
-		t.Fatalf("query attr: %v", err)
+	// Verify event attributes are stored inline as compact JSON.
+	var attrsJSON string
+	if err := w.db.QueryRow("SELECT attributes_json FROM log_event WHERE id = 1").Scan(&attrsJSON); err != nil {
+		t.Fatalf("query event attributes: %v", err)
 	}
-	if attrKey != "key1" {
-		t.Errorf("attr key = %q, want %q", attrKey, "key1")
+	var attrs map[string]interface{}
+	if err := json.Unmarshal([]byte(attrsJSON), &attrs); err != nil {
+		t.Fatalf("parse event attributes: %v", err)
+	}
+	if attrs["key1"] != "val1" {
+		t.Errorf("key1 = %v, want %q", attrs["key1"], "val1")
 	}
 }
 
