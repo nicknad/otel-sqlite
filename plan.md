@@ -301,7 +301,7 @@ Additional rules:
   `log_attr` SQL exists outside intentional historical migration/backfill tests.
 - [x] Attribute round-trip tests pass, purge tests pass, and
   `go test ./internal/storage/sqlite ./internal/batcher ./internal/otlp` passes.
-- [ ] A modernc-backed Phase 2 benchmark is captured so the schema change can
+- [x] A modernc-backed Phase 2 benchmark is captured so the schema change can
   be compared independently from the driver change.
 
 ---
@@ -384,7 +384,7 @@ Additional rules:
 - [x] Run the sustained profile and record process rate, ingest rate, queue
   depth, errors, elapsed time, database bytes/event, and table/index bytes.
 - [ ] Run the burst profile and record drain time separately from intake rate.
-- [ ] Compare Phase 2 (old driver/new schema) and Phase 3 (native driver/new
+- [x] Compare Phase 2 (old driver/new schema) and Phase 3 (native driver/new
   schema) where the environment permits. Do not attribute a schema gain to
   CGO or a driver gain to removed EAV rows.
 - [x] Treat the existing ~4.7k records/sec sustained figure as a baseline, not

@@ -98,6 +98,34 @@ reduces total storage substantially. Throughput was effectively unchanged at
 this capped 4.72k records/sec workload; further performance claims require a
 higher-rate burst/drain run.
 
+### Driver microbenchmark
+
+To isolate the driver on the inline-JSON schema, the same
+`BenchmarkWriterInsert` benchmark was run at commit `f330adb` (modernc) and
+again with the native driver. Each benchmark operation writes 100 events.
+
+| Benchmark | modernc | native `go-sqlite3` | Native speedup |
+|---|---:|---:|---:|
+| IndividualInserts | 3.075 ms/op | 0.994 ms/op | 3.09x |
+| BatchInsert | 3.587 ms/op | 1.203 ms/op | 2.98x |
+| PreparedBatchInsert | 3.362 ms/op | 1.004 ms/op | 3.35x |
+| FewerIndexes | 1.876 ms/op | 0.687 ms/op | 2.73x |
+
+Commands used:
+
+```bash
+# At f330adb in a temporary worktree:
+CGO_ENABLED=0 go test ./internal/storage/sqlite -run '^$' \\
+  -bench 'BenchmarkWriter(Insert|WithFewerIndexes)$' -benchtime=3s -count=1
+
+# Current tree:
+CGO_ENABLED=1 go test -tags fts5 ./internal/storage/sqlite -run '^$' \\
+  -bench 'BenchmarkWriter(Insert|WithFewerIndexes)$' -benchtime=3s -count=1
+```
+
+This demonstrates a driver-level improvement in the synthetic benchmark, while
+production throughput remains capped by the tested sustained workload.
+
 ### Interpretation
 
 - **Ingest intake ceiling** is high: the gRPC server + bounded ingress queue
