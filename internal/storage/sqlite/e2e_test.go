@@ -150,7 +150,7 @@ func TestE2E_OTLPToSQLite(t *testing.T) {
 	writer.Wait()
 
 	// ---- assert: open DB read-only and verify everything ----
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestE2E_OTLPToSQLite(t *testing.T) {
 	// The logs_fts table starts empty (migration creates it but doesn't populate).
 	// Run a rebuild and verify it works end-to-end.
 	ftsCmd := NewRebuildFtsCommand()
-	db2, err := sql.Open("sqlite", dbPath)
+	db2, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		t.Fatalf("open db for FTS: %v", err)
 	}
@@ -325,7 +325,7 @@ func TestE2E_ForeignKeysAreEnforced(t *testing.T) {
 	writer.Wait()
 
 	// Open the DB separately and verify FK pragma is on.
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -384,7 +384,7 @@ func TestE2E_RetentionDeletesAllExpiredRows(t *testing.T) {
 	defer writer.Stop()
 
 	// Insert a resource so FKs are satisfied.
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}

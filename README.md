@@ -69,7 +69,8 @@ Database maintenance is handled by a generic, pluggable worker (`internal/mainte
 
 ### Prerequisites
 
-- Go 1.24+
+- Go 1.25+
+- A C compiler/toolchain (GCC/Clang) because SQLite uses CGO
 - protoc (Protocol Buffers compiler)
 - protoc-gen-go
 - protoc-gen-go-grpc
@@ -86,6 +87,10 @@ Database maintenance is handled by a generic, pluggable worker (`internal/mainte
    ```bash
    go mod download
    ```
+
+   Native SQLite builds require CGO. On Debian/Ubuntu install `gcc`; on
+   Alpine install `build-base`. The Makefile enables the `fts5` build tag,
+   which is required by the `logs_fts` maintenance index.
 
 3. **Generate protobuf code**:
    ```bash
@@ -349,12 +354,17 @@ The collector exposes Prometheus metrics on `METRICS_ADDRESS` (default `:9090`).
 ### Tables
 
 - **log_resource**: Resource metadata (service.name, host.name, schema_url, etc.) with deterministic IDs for deduplication
-- **log_event**: Log record metadata (timestamp, severity, trace/span IDs, body, scope, etc.)
-- **log_attr**: Log record attributes (key-value pairs with typed values)
+- **log_event**: Log record metadata plus compact event attributes in
+  `attributes_json` (one JSON object per event)
+- **log_attr**: Removed from the final schema by migration 005. Existing
+  databases are backfilled automatically; external readers must use
+  `log_event.attributes_json` instead.
 
 ### Views
 
-- **logs**: Read-side view joining `log_event` with `log_resource`, exposing `service_name`, `host_name`, `schema_url`, and all event columns
+- **logs**: Read-side view joining `log_event` with `log_resource`, exposing
+  `service_name`, `host_name`, `schema_url`, all event columns, and
+  `attributes_json`
 
 ### Full-Text Search
 

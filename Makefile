@@ -1,6 +1,8 @@
 # OTLP SQLite Collector Makefile
 
 GO := go
+GO_SQLITE_TAGS ?= fts5
+GO_SQLITE_FLAGS := -tags "$(GO_SQLITE_TAGS)"
 GOPATH := $(shell $(GO) env GOPATH)
 BINARY_NAME := otel-collector
 BINARY_PATH := bin/$(BINARY_NAME)
@@ -43,12 +45,12 @@ generate: $(PROTO_FILES)
 build: generate
 	@echo "Building $(BINARY_NAME)..."
 	@mkdir -p bin
-	$(GO) build -o $(BINARY_PATH) -v ./cmd/collector
+	CGO_ENABLED=1 $(GO) build $(GO_SQLITE_FLAGS) -o $(BINARY_PATH) -v ./cmd/collector
 	@echo "Build complete: $(BINARY_PATH)"
 
 test:
 	@echo "Running tests..."
-	$(GO) test -v -race ./...
+	CGO_ENABLED=1 $(GO) test $(GO_SQLITE_FLAGS) -v -race ./...
 	@echo "Tests complete."
 
 lint:

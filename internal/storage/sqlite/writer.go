@@ -15,7 +15,7 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/metrics"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage"
 
-	_ "modernc.org/sqlite" // SQLite driver
+	_ "github.com/mattn/go-sqlite3" // SQLite driver
 )
 
 // preparedStatementsSQL is the list of SQL statements prepared at Writer
@@ -362,7 +362,7 @@ func (w *Writer) cleanup() {
 // openDatabase opens a SQLite database with performance and durability
 // pragmas tuned for write-heavy log ingestion workloads.
 func openDatabase(path string, walMode bool) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}

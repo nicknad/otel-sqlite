@@ -8,7 +8,9 @@ writes with one JSON value on `log_event`, then switching the SQL driver to
 
 The repository was inspected before writing this plan. The important facts are:
 
-- `go test ./...` currently passes.
+- `go test ./...` currently passes before the CGO cutover. After the native
+  driver is enabled, use `CGO_ENABLED=1 go test -tags fts5 ./...` because
+  go-sqlite3 requires the `fts5` build tag for the existing FTS schema.
 - The writer is already single-consumer/single-connection and uses prepared
   statements in `internal/storage/sqlite`.
 - `log_event` currently has no `attributes_json`; `log_attr` is still created by
@@ -231,7 +233,7 @@ Additional rules:
 - [ ] Both fresh and pre-existing databases migrate successfully.
 - [ ] Final schema has one event row per event, no attribute table/indexes, and a
   queryable `logs.attributes_json` column.
-- [ ] `go test ./internal/storage/sqlite ./internal/batcher` passes before any
+- [x] `go test ./internal/storage/sqlite ./internal/batcher` passes before any
   driver change is made.
 
 ---
@@ -297,7 +299,7 @@ Additional rules:
 
 - [ ] The production path executes one event insert per record and no
   `log_attr` SQL exists outside intentional historical migration/backfill tests.
-- [ ] Attribute round-trip tests pass, purge tests pass, and
+- [x] Attribute round-trip tests pass, purge tests pass, and
   `go test ./internal/storage/sqlite ./internal/batcher ./internal/otlp` passes.
 - [ ] A modernc-backed Phase 2 benchmark is captured so the schema change can
   be compared independently from the driver change.
@@ -324,25 +326,26 @@ Additional rules:
 - [ ] Keep `SetMaxOpenConns(1)` and `SetMaxIdleConns(1)` and all existing
   foreign-key, WAL, busy-timeout, cache, mmap, temp-store, checkpoint, and
   journal-size pragmas.
-- [ ] Add/retain an `openDatabase` test checking `journal_mode`, foreign keys,
+- [x] Add/retain an `openDatabase` test checking `journal_mode`, foreign keys,
   and the key performance pragmas under the native driver.
-- [ ] Verify `LastInsertId`, BLOB scan/bind behavior, `RETURN`/error behavior,
-  FTS5, `VACUUM`, and `PRAGMA wal_checkpoint` under go-sqlite3. Do not assume
+- [x] Verify `LastInsertId`, BLOB scan/bind behavior, error behavior, FTS5,
+  `VACUUM`, and `PRAGMA wal_checkpoint` under go-sqlite3. Do not assume
   modernc and native driver error strings are identical in assertions.
-- [ ] Run `CGO_ENABLED=1 go test ./...` and `CGO_ENABLED=1 go test -race ./...`.
-  A deliberate `CGO_ENABLED=0` build is expected to fail; document that as a
-  prerequisite rather than retaining a second driver/build tag.
+- [x] Run `CGO_ENABLED=1 go test -tags fts5 ./...` and the equivalent race
+  suite through `make test`. A deliberate `CGO_ENABLED=0` build is expected to
+  fail; document that as a prerequisite rather than retaining a second driver.
 
 ### Docker and developer build
 
-- [ ] In `Dockerfile`, install `build-base` in the builder, set/use
-  `CGO_ENABLED=1`, and build the collector with the existing target.
+- [x] In `Dockerfile`, install `build-base` in the builder, set/use
+  `CGO_ENABLED=1`, and build the collector with the existing target and `fts5`.
 - [ ] Keep the runtime Alpine image compatible with the generated binary;
   inspect `ldd /usr/local/bin/otel-collector` (or the equivalent image command)
   and add only the required runtime libraries. The default bundled driver does
   not require `sqlite-dev` in the runtime image.
-- [ ] Update `Makefile` targets/comments so build, test, and loadtest use CGO
-  intentionally. Do not add a fake static CGO claim.
+- [x] Update `Makefile` targets/comments so build, test, and loadtest use CGO
+  intentionally, including the required `fts5` tag. Do not add a fake static
+  CGO claim.
 - [ ] Update README build/development instructions with GCC/build-base
   prerequisites for local Linux/macOS builds and the cross-compilation caveat.
 - [ ] Rebuild `docker-compose.loadtest.yml` and verify the collector starts,
@@ -361,7 +364,8 @@ Additional rules:
 
 ### Functional validation
 
-- [ ] Run `go test ./...` and `go test -race ./...` with CGO enabled.
+- [ ] Run `CGO_ENABLED=1 go test -tags fts5 ./...` and
+  `CGO_ENABLED=1 go test -race -tags fts5 ./...` with CGO enabled.
 - [ ] Run the migration tests against: fresh DB, a legacy DB with attributes,
   an empty legacy DB, an already-migrated DB, and a DB reopened after migration.
 - [ ] Run FTS rebuild/search, retention, vacuum, checkpoint, resource dedup,
@@ -409,7 +413,7 @@ Additional rules:
 
 ### Final acceptance checklist
 
-- [ ] `go test ./...` passes with CGO enabled.
+- [x] `CGO_ENABLED=1 go test -tags fts5 ./...` passes with CGO enabled.
 - [ ] Fresh and legacy migrations pass and leave no `log_attr` table/index.
 - [ ] All event attribute kinds round-trip through JSON, including bytes and
   null; resource attributes remain intact.

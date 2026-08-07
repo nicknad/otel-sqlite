@@ -3,7 +3,8 @@
 # Build stage
 FROM golang:1.25-alpine AS builder
 
-# Install dependencies
+# Install dependencies, including a C compiler required by go-sqlite3.
+RUN apk add --no-cache build-base
 WORKDIR /app
 
 # Copy go mod files
@@ -21,7 +22,7 @@ RUN apk add --no-cache make protoc protobuf-dev && \
     make generate
 
 # Build application
-RUN CGO_ENABLED=0 GOOS=linux go build -o /otel-collector ./cmd/collector
+RUN CGO_ENABLED=1 GOOS=linux go build -tags fts5 -o /otel-collector ./cmd/collector
 
 # Runtime stage
 FROM alpine:3.19

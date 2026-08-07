@@ -11,7 +11,7 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // ---------------------------------------------------------------------------
@@ -27,7 +27,7 @@ const (
 // openWithPragmas opens a SQLite database with a specific set of pragmas
 // so we can compare baseline vs optimized.
 func openWithPragmas(path, label string, optimized bool) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return nil, err
 	}

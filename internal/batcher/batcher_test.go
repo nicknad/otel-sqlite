@@ -14,7 +14,7 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/storage"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage/sqlite"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // drainCommandQueue reads all commands until the queue is closed and returns
@@ -312,7 +312,7 @@ func TestBatcherResourceInsertion(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	// Query SQLite to verify resource insertion.
-	db, err := sql.Open("sqlite", dbpath)
+	db, err := sql.Open("sqlite3", dbpath)
 	if err != nil {
 		t.Fatalf("open read db: %v", err)
 	}
