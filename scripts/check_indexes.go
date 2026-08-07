@@ -6,7 +6,7 @@ import (
 	"log"
 	"os"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 func main() {
@@ -21,7 +21,7 @@ func run() error {
 		dbPath = os.Args[1]
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return err
 	}

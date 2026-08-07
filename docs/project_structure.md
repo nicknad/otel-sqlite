@@ -87,7 +87,8 @@ otel-sqlite/
 │       └── sqlite/         # SQLite writer implementation
 │           ├── writer.go           # Single-goroutine writer, transaction lifecycle, pragmas
 │           ├── write_batch_command.go  # WriteBatchCommand: hot-path log insertion
-│           ├── migrator.go         # Schema migrations (001-004) with tracking table
+│           ├── migrator.go         # Schema migrations (001-005) with tracking table
+│           ├── migrate005.go       # Typed legacy log_attr backfill and final view
 │           ├── checkpoint_command.go   # WAL checkpoint (non-transactional)
 │           ├── optimize_command.go     # PRAGMA optimize (non-transactional)
 │           ├── vacuum_command.go       # Database vacuum (non-transactional)

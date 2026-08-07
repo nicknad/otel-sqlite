@@ -300,8 +300,10 @@ It does NOT own command construction.
 ### Tables
 
 - `log_resource`: Resource metadata (service.name, host.name, etc.)
-- `log_event`: Log record metadata (timestamp, severity, trace context, body, scope, `attributes_json`, etc.)
-- `log_attr`: Log record attributes (key-value pairs)
+- `log_event`: Log record metadata plus compact event attributes in
+  `attributes_json` (one JSON object per event)
+- `log_attr`: Historical EAV table removed by migration 005 after typed rows are
+  backfilled into `log_event.attributes_json`.
 
 ### Indexes
 
@@ -310,8 +312,13 @@ It does NOT own command construction.
 - Active indexes (prioritizing write performance):
   - `timestamp_ns` for time-range queries
   - `resource_id` for resource filtering
-  - `event_id` on attributes
-- **Removed indexes** (migration 004): `severity_number`, `trace_id`, `severity_text`, `body`, `event_name`, composite `(resource_id, timestamp_ns)`, composite `(trace_id, timestamp_ns)`, and attribute value indexes — justified by benchmark results showing ~33% write improvement with negligible read impact
+  - no attribute indexes; individual keys are queried from JSON only when a
+    deliberate `json_extract`/expression-index decision is made
+- **Removed indexes** (migration 004/005): `severity_number`, `trace_id`,
+  `severity_text`, `body`, `event_name`, composite `(resource_id,
+  timestamp_ns)`, composite `(trace_id, timestamp_ns)`, and all attribute
+  indexes — justified by benchmark results and the removal of per-attribute
+  writes.
 
 ### Future Enhancements
 

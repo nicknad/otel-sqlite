@@ -9,7 +9,7 @@ import (
 	"os"
 	"sort"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type objectSize struct {
@@ -30,7 +30,7 @@ func main() {
 }
 
 func report(path string) error {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}

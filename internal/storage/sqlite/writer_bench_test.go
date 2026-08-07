@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 const insertEventSQL = "INSERT INTO log_event (resource_id, timestamp, severity, body, " +
@@ -16,7 +16,7 @@ const insertEventPrefix = "INSERT INTO log_event (resource_id, timestamp, severi
 	"trace_id, span_id, flags, attributes_json) VALUES "
 
 func BenchmarkWriterInsert(b *testing.B) {
-	db, err := sql.Open("sqlite", ":memory:")
+	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func BenchmarkWriterInsert(b *testing.B) {
 }
 
 func BenchmarkWriterWithFewerIndexes(b *testing.B) {
-	db, err := sql.Open("sqlite", ":memory:")
+	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
 		b.Fatal(err)
 	}
