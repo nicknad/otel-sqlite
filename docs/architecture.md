@@ -278,6 +278,8 @@ It does NOT own command construction.
 - **In-Memory Temp Store**: `temp_store=MEMORY` avoids temporary file I/O for sorts and indices
 - **WAL Size Cap**: `journal_size_limit=64MB` prevents runaway WAL growth
 - **Lock Retry**: `busy_timeout=5000ms` avoids spurious failures during maintenance operations
+- **Native SQLite**: `github.com/mattn/go-sqlite3` is used with CGO and the
+  `fts5` build tag; the writer remains single-connection/single-writer
 
 ## OTLP Boundary
 
