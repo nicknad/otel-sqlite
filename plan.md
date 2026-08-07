@@ -148,7 +148,7 @@ Additional rules:
   the driver phase.
 - [x] Inventory every runtime, test, benchmark, and script reference with:
   `rg -n 'modernc.org/sqlite|sql.Open\("sqlite"|log_attr|attributes_json' --glob '!vendor/**' .`
-- [ ] Treat historical migration references to `log_attr` as intentional. The
+- [x] Treat historical migration references to `log_attr` as intentional. The
   final runtime code, final schema assertions, writer SQL, purge SQL, and
   current docs must not depend on it.
 
@@ -168,14 +168,14 @@ Additional rules:
 
 ### 1. Define the migration
 
-- [ ] Add `migrations/005_inline_event_attributes.sql` with the canonical DDL
+- [x] Add `migrations/005_inline_event_attributes.sql` with the canonical DDL
   for adding `attributes_json TEXT NOT NULL DEFAULT '{}'` to `log_event`.
-- [ ] Add the matching `migration005SQL` to `migrator.go` and add version 005 to
+- [x] Add the matching `migration005SQL` to `migrator.go` and add version 005 to
   `allMigrations()`.
-- [ ] Refactor migration application so each migration runs in a transaction
+- [x] Refactor migration application so each migration runs in a transaction
   and its `schema_migrations` row is inserted in that same transaction. Preserve
   current behavior for 001–004 while making failure/retry safe.
-- [ ] Give migration 005 a Go hook because typed EAV values cannot be safely
+- [x] Give migration 005 a Go hook because typed EAV values cannot be safely
   aggregated by a simple SQLite expression. The hook must run in one transaction
   and in this order:
   1. inspect `PRAGMA table_info(log_event)` and execute `migration005SQL` only
@@ -186,29 +186,29 @@ Additional rules:
   5. drop and recreate `logs` with an explicit column list including
      `attributes_json`;
   6. insert the version-005 tracking row and commit the same transaction.
-- [ ] Define `migration005SQL` and the checked-in 005 SQL file as the guarded
+- [x] Define `migration005SQL` and the checked-in 005 SQL file as the guarded
   column-add DDL contract. The Go hook owns the conditional execution,
   backfill, table removal, and view recreation; this avoids an `ALTER TABLE`
   duplicate-column failure on a retry while keeping the two SQL copies clear.
-- [ ] Detect whether `log_attr` exists before querying it. A fresh final schema
+- [x] Detect whether `log_attr` exists before querying it. A fresh final schema
   and a legacy schema with no attribute table must both migrate successfully.
 ### 2. Backfill implementation
 
-- [ ] Read `event_id, id, key, value_type, string_value, int_value,
+- [x] Read `event_id, id, key, value_type, string_value, int_value,
   double_value, bool_value, bytes_value` with nullable scan types.
-- [ ] Convert each legacy row using the locked encoding rules. Bind one prepared
+- [x] Convert each legacy row using the locked encoding rules. Bind one prepared
   update statement and flush each completed event; do not build a whole large
   database in memory.
-- [ ] Preserve empty byte slices, null values, integer range, booleans, and
+- [x] Preserve empty byte slices, null values, integer range, booleans, and
   special characters. Use standard base64 for bytes.
-- [ ] Use deterministic duplicate-key behavior (last row by legacy `id`).
-- [ ] Drop `idx_log_attr_event_id`, `idx_log_attr_key`, all legacy value indexes,
+- [x] Use deterministic duplicate-key behavior (last row by legacy `id`).
+- [x] Drop `idx_log_attr_event_id`, `idx_log_attr_key`, all legacy value indexes,
   and any other `idx_log_attr_*` indexes with `IF EXISTS` before dropping the
   table. Do not drop event timestamp/resource indexes used by purge.
-- [ ] Recreate the `logs` view explicitly; preserve every existing column and
+- [x] Recreate the `logs` view explicitly; preserve every existing column and
   append/name `attributes_json` without using `le.*`. Keep FTS as the existing
   separate `logs_fts` object.
-- [ ] Keep `migrations/005_inline_event_attributes.sql` and the embedded SQL
+- [x] Keep `migrations/005_inline_event_attributes.sql` and the embedded SQL
   comments clear about the Go backfill hook; the file must not imply that a
   typed EAV backfill happens in SQL alone. The file is the auditable DDL
   contract, while `RunMigrations` is the only supported complete application
@@ -216,22 +216,22 @@ Additional rules:
 
 ### 3. Migration tests
 
-- [ ] Add a fresh-database test asserting `RunMigrations` is idempotent and the
+- [x] Add a fresh-database test asserting `RunMigrations` is idempotent and the
   final `sqlite_master` has no `log_attr` table or `idx_log_attr_*` indexes.
-- [ ] Add a legacy-database test that creates the 001–004 shape, inserts one
+- [x] Add a legacy-database test that creates the 001–004 shape, inserts one
   event with string/int/double/bool/bytes/null attributes (including a special
   key and duplicate key), marks 001–004 applied, and runs `RunMigrations`.
-- [ ] Assert the backfilled JSON values, duplicate-key rule, empty case `{}`,
+- [x] Assert the backfilled JSON values, duplicate-key rule, empty case `{}`,
   absence of `log_attr`, migration version 005, and `logs.attributes_json`.
 - [ ] Assert a failed backfill rolls back the schema/data change and can be
   retried, if the migration hook has an injectable invalid-value path.
-- [ ] Keep the existing FTS rebuild test and add an assertion that migration
+- [x] Keep the existing FTS rebuild test and add an assertion that migration
   005 does not drop or repopulate `logs_fts` unexpectedly.
 
 ### Exit criteria
 
-- [ ] Both fresh and pre-existing databases migrate successfully.
-- [ ] Final schema has one event row per event, no attribute table/indexes, and a
+- [x] Both fresh and pre-existing databases migrate successfully.
+- [x] Final schema has one event row per event, no attribute table/indexes, and a
   queryable `logs.attributes_json` column.
 - [x] `go test ./internal/storage/sqlite ./internal/batcher` passes before any
   driver change is made.
@@ -242,62 +242,62 @@ Additional rules:
 
 ### 1. Write SQL and prepared statements
 
-- [ ] Add `attributes_json` to `sqlInsertEvent` and its values list.
-- [ ] Remove `sqlInsertAttr`, `InsertAttr`, `insertAttributeRow`, and
+- [x] Add `attributes_json` to `sqlInsertEvent` and its values list.
+- [x] Remove `sqlInsertAttr`, `InsertAttr`, `insertAttributeRow`, and
   `attrValues` from the production write path.
-- [ ] Reduce `PreparedStatements` and `preparedStatementsSQL` to resource/event
+- [x] Reduce `PreparedStatements` and `preparedStatementsSQL` to resource/event
   statements only; update close/error cleanup and all tests that inspect them.
-- [ ] Implement `marshalEventAttrs(attrs []model.Attribute) (string, error)` in
+- [x] Implement `marshalEventAttrs(attrs []model.Attribute) (string, error)` in
   the SQLite storage package. Marshal once per record before the event insert.
-- [ ] Bind `{}` for nil/empty attributes. Bind the compact scalar values and
+- [x] Bind `{}` for nil/empty attributes. Bind the compact scalar values and
   bytes wrapper exactly as specified above.
-- [ ] Decide and test command error ownership: if JSON encoding or event insert
+- [x] Decide and test command error ownership: if JSON encoding or event insert
   fails, return an error that causes the writer transaction to roll back and
   return every record to its pool exactly once. Do not log-and-continue while
   silently losing a record.
 
 ### 2. Safe row slimming
 
-- [ ] Add a small helper for the stored severity text: bind `NULL` when
+- [x] Add a small helper for the stored severity text: bind `NULL` when
   `SeverityText == ""` or exactly equals `record.SeverityNumber.String()`;
   retain non-empty custom OTLP text.
-- [ ] Add tests for standard severity, unspecified severity, custom text, and
+- [x] Add tests for standard severity, unspecified severity, custom text, and
   empty text. Confirm `severity_text` remains nullable in the existing schema.
-- [ ] Continue binding `observed_timestamp_ns` as an integer, including zero;
+- [x] Continue binding `observed_timestamp_ns` as an integer, including zero;
   do not bind `NULL` because migration 001 declares it `NOT NULL`.
-- [ ] Leave flags, dropped-attribute count, scope, IDs, body, and resource ID
+- [x] Leave flags, dropped-attribute count, scope, IDs, body, and resource ID
   semantics unchanged. Do not remove columns based only on an unmeasured guess.
 
 ### 3. Retention and query-side checks
 
-- [ ] Remove the `DELETE FROM log_attr` statement and its error path from
+- [x] Remove the `DELETE FROM log_attr` statement and its error path from
   `PurgeLogsCommand`. Delete expired `log_event` rows and rely on the declared
   event/resource relationship plus the existing orphan-resource cleanup.
-- [ ] Keep the purge batching/iteration limit and timestamp index behavior.
-- [ ] Rewrite purge SQL syntax tests so they insert attributes in
+- [x] Keep the purge batching/iteration limit and timestamp index behavior.
+- [x] Rewrite purge SQL syntax tests so they insert attributes in
   `attributes_json`, never into `log_attr`.
-- [ ] Confirm deleting events does not leave FTS behavior/regression issues;
+- [x] Confirm deleting events does not leave FTS behavior/regression issues;
   `logs_fts` is rebuilt by the existing maintenance command, not incrementally.
 
 ### 4. Write-path tests and benchmarks
 
-- [ ] Update `writer_test.go` to query and unmarshal `log_event.attributes_json`
+- [x] Update `writer_test.go` to query and unmarshal `log_event.attributes_json`
   for all supported scalar kinds and `{}` for empty attributes.
-- [ ] Update `e2e_test.go` to assert event attribute keys/values in JSON. Keep
+- [x] Update `e2e_test.go` to assert event attribute keys/values in JSON. Keep
   the existing resource-attribute assertions in their current verbose format.
-- [ ] Update `sql_syntax_test.go` DDL expectations: `log_attr` must be absent;
+- [x] Update `sql_syntax_test.go` DDL expectations: `log_attr` must be absent;
   surviving indexes are the timestamp/resource indexes plus the resource
   service-name index as appropriate. Remove direct EAV insert/delete cases.
 - [ ] Update batcher integration assertions to read event JSON where relevant.
 - [ ] Update all SQLite benchmarks to measure the new event statement and add
   a focused marshal benchmark. Remove benchmark assumptions that count one
   attribute insert per attribute.
-- [ ] Add table tests for key escaping, Unicode, quotes, all scalar types,
+- [x] Add table tests for key escaping, Unicode, quotes, all scalar types,
   empty attributes, duplicate keys, and invalid non-finite doubles.
 
 ### Exit criteria
 
-- [ ] The production path executes one event insert per record and no
+- [x] The production path executes one event insert per record and no
   `log_attr` SQL exists outside intentional historical migration/backfill tests.
 - [x] Attribute round-trip tests pass, purge tests pass, and
   `go test ./internal/storage/sqlite ./internal/batcher ./internal/otlp` passes.
