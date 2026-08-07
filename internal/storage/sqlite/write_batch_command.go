@@ -210,10 +210,7 @@ func insertEventRecord(ctx context.Context, stmt *sql.Stmt, record *model.LogRec
 		return err
 	}
 
-	var severityText any
-	if record.SeverityText != "" && record.SeverityText != record.SeverityNumber.String() {
-		severityText = record.SeverityText
-	}
+	severityText := storedSeverityText(record)
 
 	_, err = stmt.ExecContext(
 		ctx,
@@ -247,6 +244,13 @@ func marshalResourceAttrs(attrs map[string]model.AttributeValue) string {
 		return "{}"
 	}
 	return string(b)
+}
+
+func storedSeverityText(record *model.LogRecord) any {
+	if record.SeverityText == "" || record.SeverityText == record.SeverityNumber.String() {
+		return nil
+	}
+	return record.SeverityText
 }
 
 // marshalEventAttrs serializes event attributes as a compact JSON object.
