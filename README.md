@@ -381,7 +381,9 @@ maintenance task during an operations window if the on-disk file must shrink.
 ### Indexes
 
 - Primary keys on all tables
-- Indexes on: `timestamp_ns` (time-range queries), `resource_id` (resource filtering), `event_id` on attributes
+- Indexes on: `timestamp_ns` (time-range queries) and `resource_id`
+  (resource filtering)
+- No event-attribute indexes; attributes are stored inline as JSON
 
 ### SQLite Performance Tuning
 
@@ -400,6 +402,37 @@ The writer applies these pragmas at startup for production-grade durability and 
 | `foreign_keys` | ON | Enforce referential integrity at insert time |
 
 These settings are most impactful on large, established databases where B-tree depth is significant. On fresh databases with fast NVMe storage, the WAL absorbs write latency — the B-tree optimizations primarily benefit read queries, maintenance operations, and sustained write throughput over time.
+
+### Measured Rewrite Results
+
+Measurements were taken with the same container load-test configuration:
+32 clients, 150 records/request, four attributes/record, eight resources, and
+one request/second/client for 60 seconds.
+
+| Measurement | Before rewrite | After inline JSON + native SQLite |
+|---|---:|---:|
+| Ingest rate | 4,720.20 records/sec | 4,720.21 records/sec |
+| Persisted events | 283,200 | 283,200 |
+| Database bytes/event | 437.37 | 309.64 |
+| Attribute storage | `log_attr` table and index | Inline `log_event.attributes_json` |
+
+The sustained workload was rate-capped at approximately 4.72k records/sec, so
+it does not establish the maximum native-driver throughput. Overall database
+storage was reduced by approximately 29.2% (1.41x denser).
+
+A synthetic 100-event-per-operation benchmark using the inline-JSON schema
+showed the native driver was approximately 2.7–3.35x faster than modernc,
+depending on the insert pattern:
+
+| Benchmark | modernc | native `go-sqlite3` | Speedup |
+|---|---:|---:|---:|
+| Individual inserts | 3.075 ms/op | 0.994 ms/op | 3.09x |
+| Batch insert | 3.587 ms/op | 1.203 ms/op | 2.98x |
+| Prepared batch insert | 3.362 ms/op | 1.004 ms/op | 3.35x |
+| Fewer indexes | 1.876 ms/op | 0.687 ms/op | 2.73x |
+
+See [`docs/loadtest-baseline.md`](docs/loadtest-baseline.md) for commands,
+workload details, and limitations of these measurements.
 
 ## License
 
