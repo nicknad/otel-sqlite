@@ -31,7 +31,8 @@ type WriterConfig struct {
 	// Database path
 	Path string
 
-	// Maximum number of commands to accumulate before flushing a transaction
+	// Maximum number of commands to accumulate before flushing a transaction.
+	// This is a count of Command values, not log records.
 	BatchSize int
 
 	// Flush interval for automatic flushing of partial batches
@@ -39,6 +40,12 @@ type WriterConfig struct {
 
 	// WAL mode settings
 	WALMode bool
+
+	// EnforceForeignKeys controls PRAGMA foreign_keys on the writer connection.
+	// Default (false) skips per-row parent lookups; the single writer always
+	// inserts the resource row before events in the same transaction.
+	// Set true to keep SQLite FK enforcement on the writer connection.
+	EnforceForeignKeys bool
 
 	// Metrics is optional. When non-nil the writer reports metrics.
 	Metrics *metrics.Metrics
@@ -63,6 +70,10 @@ type Writer struct {
 
 	// Pre-prepared SQL statements, reused across transactions via tx.Stmt().
 	preparedStmts *PreparedStatements
+
+	// Process-local set of resource IDs successfully inserted. Only touched
+	// from the writer goroutine. Avoids repeated INSERT OR IGNORE probes.
+	seenResources map[string]struct{}
 
 	// Command queue for receiving commands
 	cmdQueue storage.CommandQueue
@@ -96,7 +107,7 @@ func NewWriter(cmdQueue storage.CommandQueue, config *WriterConfig) (*Writer, er
 	}
 
 	// Open database
-	db, err := openDatabase(config.Path, config.WALMode)
+	db, err := openDatabase(config.Path, config.WALMode, config.EnforceForeignKeys)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
@@ -119,6 +130,7 @@ func NewWriter(cmdQueue storage.CommandQueue, config *WriterConfig) (*Writer, er
 		config:        *config,
 		db:            db,
 		preparedStmts: preparedStmts,
+		seenResources: make(map[string]struct{}, 64),
 		cmdQueue:      cmdQueue,
 		aMetrics:      config.Metrics,
 		stopped:       make(chan struct{}),
@@ -294,11 +306,12 @@ func (w *Writer) executeTransaction(commands []storage.Command) {
 		return
 	}
 
-	// Inject pre-prepared statements into WriteBatchCommand instances so
-	// they use tx.Stmt() instead of re-compiling SQL every transaction.
+	// Inject pre-prepared statements and the process-local resource cache
+	// into WriteBatchCommand instances.
 	for _, cmd := range commands {
 		if wbc, ok := cmd.(*WriteBatchCommand); ok {
 			wbc.SetPreparedStatements(w.preparedStmts)
+			wbc.SetSeenResources(w.seenResources)
 		}
 	}
 
@@ -361,7 +374,11 @@ func (w *Writer) cleanup() {
 
 // openDatabase opens a SQLite database with performance and durability
 // pragmas tuned for write-heavy log ingestion workloads.
-func openDatabase(path string, walMode bool) (*sql.DB, error) {
+//
+// enforceFK controls PRAGMA foreign_keys. The writer defaults to off because
+// the single-writer insert order always writes resources before events; tests
+// that assert FK rejection pass enforceFK=true.
+func openDatabase(path string, walMode, enforceFK bool) (*sql.DB, error) {
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
@@ -375,11 +392,13 @@ func openDatabase(path string, walMode bool) (*sql.DB, error) {
 
 	// --- Durability & data integrity ---
 
-	// Enable foreign key enforcement. SQLite defaults to OFF; turning it ON
-	// makes declared FK constraints actually reject violations.
-	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+	fkValue := "OFF"
+	if enforceFK {
+		fkValue = "ON"
+	}
+	if _, err := db.Exec("PRAGMA foreign_keys = " + fkValue); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("failed to enable foreign keys: %w", err)
+		return nil, fmt.Errorf("failed to set foreign_keys=%s: %w", fkValue, err)
 	}
 
 	// Busy timeout: if another connection holds a SHARED lock (e.g., a

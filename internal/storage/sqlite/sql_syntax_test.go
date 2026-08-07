@@ -19,7 +19,7 @@ func TestAllSQLStatements(t *testing.T) {
 	defer os.Remove(dbpath + "-wal")
 	defer os.Remove(dbpath + "-shm")
 
-	db, err := openDatabase(dbpath, false)
+	db, err := openDatabase(dbpath, false, true)
 	if err != nil {
 		t.Fatalf("openDatabase: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestSQLStatementsIsolated(t *testing.T) {
 			defer os.Remove(dbpath)
 			defer os.Remove(dbpath + "-wal")
 			defer os.Remove(dbpath + "-shm")
-			db, err := openDatabase(dbpath, false)
+			db, err := openDatabase(dbpath, false, true)
 			if err != nil {
 				t.Fatal(err)
 			}

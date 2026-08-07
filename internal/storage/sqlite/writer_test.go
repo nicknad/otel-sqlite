@@ -18,7 +18,7 @@ func TestOpenDatabase(t *testing.T) {
 	defer os.Remove(dbpath + "-wal")
 	defer os.Remove(dbpath + "-shm")
 
-	db, err := openDatabase(dbpath, true)
+	db, err := openDatabase(dbpath, true, true)
 	if err != nil {
 		t.Fatalf("openDatabase() error: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestRunMigrations(t *testing.T) {
 	defer os.Remove(dbpath + "-wal")
 	defer os.Remove(dbpath + "-shm")
 
-	db, err := openDatabase(dbpath, false)
+	db, err := openDatabase(dbpath, false, true)
 	if err != nil {
 		t.Fatalf("openDatabase() error: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestWriteBatchCommandExecute(t *testing.T) {
 	dbpath := fmt.Sprintf("test_cmd_exec_%d.db", time.Now().UnixNano())
 	defer os.Remove(dbpath)
 
-	db, err := openDatabase(dbpath, false)
+	db, err := openDatabase(dbpath, false, true)
 	if err != nil {
 		t.Fatalf("openDatabase() error: %v", err)
 	}
@@ -451,7 +451,7 @@ func TestWriterShutdownDrainsQueue(t *testing.T) {
 	w.Wait()
 
 	// Reopen the database to verify all records were written.
-	db2, err := openDatabase(dbpath, false)
+	db2, err := openDatabase(dbpath, false, true)
 	if err != nil {
 		t.Fatalf("reopen db: %v", err)
 	}

@@ -203,20 +203,25 @@ loadtest compose sizes (`batcher=500`, `writer_commands=50`,
 | Profile | Process rec/s (client window) | Ingest rec/s | Export errors | Drain | Notes |
 |---|---:|---:|---:|---:|---|
 | A keep-up | kept up (final written = 283200) | 4,720.19 | 0% | 507ms complete | flat; not a ceiling |
-| **B process** | **58,298.67** | 257,210.81 | 0.06% | 1m7.9s complete | **baseline to beat** |
+| **B process (Phase 0)** | **58,298.67** | 257,210.81 | 0.06% | 1m7.9s complete | baseline before Phase 2 |
+| **B process (Phase 2)** | **70,257.54** | 250,401.88 | 0.03% | see note | **+20.5% vs Phase 0** |
 | C burst+drain | (same shape as B at higher fan-in; re-run when comparing) | ≥278k historical | — | — | use `make loadtest-burst-drain` |
 
-Profile B detail (`make loadtest-process`):
+Profile B detail — Phase 0 (`make loadtest-process`):
 
 - 8 clients × 250 records/req, 30s, uncapped
-- Client sent 7,716,500 records; collector received/wrote 7,717,250
 - Written during client window: 1,749,000 → **58,298.67 rec/s process**
-- Full drain after clients stopped: 67.9s (complete within 2m timeout)
-- `write_errors_total` delta 0 (one pre-existing counter from startup checkpoint race)
 
-This replaces any reading of ~4.7k as the process ceiling. Phase 2+ changes
-must beat **~58k written rec/s** on the same profile B command, or explain a
-regression with profiling.
+Profile B detail — Phase 2 (same command, after JSON/FK/resource-cache/defaults):
+
+- Written during client window: 2,107,500 → **70,257.54 rec/s process**
+- 10s spot check: **71,372.78 rec/s**
+- `write_errors_total` still only the startup checkpoint race (not write-path)
+- Host writer bench: ~45k → **~64k rec/s**; marshal: 23 allocs → **3 allocs**, ~5.8µs → **~1.2µs**
+
+Phase 2 changes that landed: specialized pooled `marshalEventAttrs`, process-local
+resource ID cache, writer `foreign_keys=OFF` by default, production defaults
+`batcher=500` / `writer_commands=50` / `max_tx_records=10000`.
 
 ## Write-path hot spots (Phase 1 profile)
 

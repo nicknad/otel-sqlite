@@ -20,14 +20,17 @@ func TestDefaultConfig(t *testing.T) {
 	if c.BatchQueueCapacity != 5000 {
 		t.Errorf("expected 5000, got %d", c.BatchQueueCapacity)
 	}
-	if c.BatcherBatchSize != 250 {
-		t.Errorf("expected 250, got %d", c.BatcherBatchSize)
+	if c.BatcherBatchSize != 500 {
+		t.Errorf("expected 500, got %d", c.BatcherBatchSize)
 	}
 	if c.BatcherFlushInterval != 1*time.Second {
 		t.Errorf("expected 1s, got %s", c.BatcherFlushInterval)
 	}
-	if c.WriterBatchSize != 100 {
-		t.Errorf("expected 100, got %d", c.WriterBatchSize)
+	if c.WriterBatchSize != 50 {
+		t.Errorf("expected 50, got %d", c.WriterBatchSize)
+	}
+	if c.WriterMaxTransactionRecords != 10000 {
+		t.Errorf("expected 10000, got %d", c.WriterMaxTransactionRecords)
 	}
 	if c.WriterFlushInterval != 1*time.Second {
 		t.Errorf("expected 1s, got %s", c.WriterFlushInterval)
@@ -189,8 +192,8 @@ func TestLoadFromEnv_legacyBatchSizeAndFlush(t *testing.T) {
 		{
 			name:             "FLUSH_INTERVAL alone fills both flushes",
 			env:              map[string]string{"FLUSH_INTERVAL": "250ms"},
-			wantBatcherSize:  250,
-			wantWriterSize:   100,
+			wantBatcherSize:  500,
+			wantWriterSize:   50,
 			wantBatcherFlush: 250 * time.Millisecond,
 			wantWriterFlush:  250 * time.Millisecond,
 			wantOverridesMin: 1,
@@ -227,8 +230,8 @@ func TestLoadFromEnv_legacyBatchSizeAndFlush(t *testing.T) {
 				"BATCHER_FLUSH_INTERVAL": "3s",
 				"WRITER_FLUSH_INTERVAL":  "4s",
 			},
-			wantBatcherSize:  250,
-			wantWriterSize:   100,
+			wantBatcherSize:  500,
+			wantWriterSize:   50,
 			wantBatcherFlush: 3 * time.Second,
 			wantWriterFlush:  4 * time.Second,
 			wantOverridesMin: 2,

@@ -144,12 +144,12 @@ Or directly:
 | `SQLITE_PATH` | `otel-logs.db` | Path to SQLite database file |
 | `INGRESS_QUEUE_CAPACITY` | `10000` | Maximum ingress queue size |
 | `BATCH_QUEUE_CAPACITY` | `1000` | Maximum command queue size |
-| `BATCHER_BATCH_SIZE` | `250` | Number of log records per batch (batcher) |
+| `BATCHER_BATCH_SIZE` | `500` | Number of log records per batch (batcher) |
 | `BATCHER_FLUSH_INTERVAL` | `1s` | Maximum time between batch flushes |
 | `BATCHER_ERROR_SEVERITY_THRESHOLD` | `ERROR` | Minimum severity to forward to notification worker |
-| `WRITER_BATCH_SIZE` | `100` | Number of **commands** collected per writer transaction (not records) |
+| `WRITER_BATCH_SIZE` | `50` | Number of **commands** collected per writer transaction (not records) |
 | `WRITER_FLUSH_INTERVAL` | `1s` | Maximum time between transaction flushes |
-| `WRITER_MAX_TRANSACTION_RECORDS` | `5000` | Maximum records per SQLite transaction |
+| `WRITER_MAX_TRANSACTION_RECORDS` | `10000` | Maximum records per SQLite transaction |
 | `BATCH_SIZE` | — | **Deprecated.** If set and the specific `*_BATCH_SIZE` vars are unset, applies to both batcher and writer sizes |
 | `FLUSH_INTERVAL` | — | **Deprecated.** If set and the specific `*_FLUSH_INTERVAL` vars are unset, applies to both flush intervals |
 | `METRICS_ADDRESS` | `:9090` | Prometheus metrics server address |
@@ -401,7 +401,7 @@ The writer applies these pragmas at startup for production-grade durability and 
 | `journal_size_limit` | 67108864 (64 MB) | Cap WAL file growth; force checkpoint if exceeded |
 | `wal_autocheckpoint` | 1000 pages | Auto-checkpoint after ~4-8 MB written |
 | `busy_timeout` | 5000 ms | Retry on lock contention instead of immediate failure |
-| `foreign_keys` | ON | Enforce referential integrity at insert time |
+| `foreign_keys` | OFF (writer default) | Writer skips FK parent lookups; insert order guarantees resource-before-event. Opt in via `WriterConfig.EnforceForeignKeys`. |
 
 These settings are most impactful on large, established databases where B-tree depth is significant. On fresh databases with fast NVMe storage, the WAL absorbs write latency — the B-tree optimizations primarily benefit read queries, maintenance operations, and sustained write throughput over time.
 
