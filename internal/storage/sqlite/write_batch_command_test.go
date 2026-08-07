@@ -8,6 +8,31 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
 )
 
+func TestStoredSeverityText(t *testing.T) {
+	tests := []struct {
+		name     string
+		number   model.Severity
+		text     string
+		expected any
+	}{
+		{"empty", model.SeverityInfo, "", nil},
+		{"standard", model.SeverityInfo, "INFO", nil},
+		{"unspecified", model.SeverityUnspecified, "UNSPECIFIED", nil},
+		{"custom", model.SeverityInfo, "informational", "informational"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actual := storedSeverityText(&model.LogRecord{
+				SeverityNumber: test.number,
+				SeverityText:   test.text,
+			})
+			if actual != test.expected {
+				t.Fatalf("stored severity text = %#v, want %#v", actual, test.expected)
+			}
+		})
+	}
+}
+
 func TestMarshalEventAttrs(t *testing.T) {
 	encoded, err := marshalEventAttrs([]model.Attribute{
 		{Key: "string", Str: "value", Kind: model.ValueString},
