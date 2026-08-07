@@ -370,6 +370,14 @@ The collector exposes Prometheus metrics on `METRICS_ADDRESS` (default `:9090`).
 
 - **logs_fts**: Contentless FTS5 virtual table over the `logs` view, indexed on `body` and `service_name`. Rebuilt by the maintenance framework (not by triggers) to keep the write path free of FTS overhead.
 
+### Migration and Operations
+
+Migration 005 backfills existing `log_attr` rows into `log_event.attributes_json`
+inside a transaction and removes the legacy table and indexes. External tools
+that queried `log_attr` must be updated before or after the migration to read the
+JSON column. Dropping the table frees pages logically; run the existing Vacuum
+maintenance task during an operations window if the on-disk file must shrink.
+
 ### Indexes
 
 - Primary keys on all tables

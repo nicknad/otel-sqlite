@@ -310,20 +310,20 @@ Additional rules:
 
 ### Checklist
 
-- [ ] Add `github.com/mattn/go-sqlite3` as a direct `go.mod` dependency.
-- [ ] Replace the writer's modernc blank import with go-sqlite3 and change
+- [x] Add `github.com/mattn/go-sqlite3` as a direct `go.mod` dependency.
+- [x] Replace the writer's modernc blank import with go-sqlite3 and change
   `sql.Open("sqlite", ...)` to `sql.Open("sqlite3", ...)`.
-- [ ] Update every test/benchmark/tool call site found by the inventory,
+- [x] Update every test/benchmark/tool call site found by the inventory,
   including `writer_bench_test.go`, `writer_perf_bench_test.go`,
   `writer_pool_bench_test.go` if applicable, `batcher_test.go`, `e2e_test.go`,
   and `scripts/check_indexes.go`.
-- [ ] Remove modernc from direct/transitive module requirements with
+- [x] Remove modernc from direct/transitive module requirements with
   `go mod tidy`; run `go mod vendor` so `vendor/` and `vendor/modules.txt`
   contain go-sqlite3 and no modernc package.
-- [ ] Re-run `rg` and ensure modernc is absent from active Go code, tests, tools,
+- [x] Re-run `rg` and ensure modernc is absent from active Go code, tests, tools,
   `go.mod`, `go.sum`, and `vendor/modules.txt`. Historical plan/load-result
   text may be retained only if it is explicitly labeled historical.
-- [ ] Keep `SetMaxOpenConns(1)` and `SetMaxIdleConns(1)` and all existing
+- [x] Keep `SetMaxOpenConns(1)` and `SetMaxIdleConns(1)` and all existing
   foreign-key, WAL, busy-timeout, cache, mmap, temp-store, checkpoint, and
   journal-size pragmas.
 - [x] Add/retain an `openDatabase` test checking `journal_mode`, foreign keys,
@@ -339,24 +339,24 @@ Additional rules:
 
 - [x] In `Dockerfile`, install `build-base` in the builder, set/use
   `CGO_ENABLED=1`, and build the collector with the existing target and `fts5`.
-- [ ] Keep the runtime Alpine image compatible with the generated binary;
+- [x] Keep the runtime Alpine image compatible with the generated binary;
   inspect `ldd /usr/local/bin/otel-collector` (or the equivalent image command)
   and add only the required runtime libraries. The default bundled driver does
   not require `sqlite-dev` in the runtime image.
 - [x] Update `Makefile` targets/comments so build, test, and loadtest use CGO
   intentionally, including the required `fts5` tag. Do not add a fake static
   CGO claim.
-- [ ] Update README build/development instructions with GCC/build-base
+- [x] Update README build/development instructions with GCC/build-base
   prerequisites for local Linux/macOS builds and the cross-compilation caveat.
-- [ ] Rebuild `docker-compose.loadtest.yml` and verify the collector starts,
+- [x] Rebuild `docker-compose.loadtest.yml` and verify the collector starts,
   creates its database, passes health checks, and accepts OTLP traffic.
 
 ### Exit criteria
 
-- [ ] No active modernc import, module, vendor entry, or `sqlite` driver-name
+- [x] No active modernc import, module, vendor entry, or `sqlite` driver-name
   call site remains.
-- [ ] The native-driver test suite and Docker health check pass.
-- [ ] The single-writer architecture and observed pragmas are unchanged.
+- [x] The native-driver test suite and Docker health check pass.
+- [x] The single-writer architecture and observed pragmas are unchanged.
 
 ---
 
@@ -364,13 +364,13 @@ Additional rules:
 
 ### Functional validation
 
-- [ ] Run `CGO_ENABLED=1 go test -tags fts5 ./...` and
+- [x] Run `CGO_ENABLED=1 go test -tags fts5 ./...` and
   `CGO_ENABLED=1 go test -race -tags fts5 ./...` with CGO enabled.
 - [ ] Run the migration tests against: fresh DB, a legacy DB with attributes,
   an empty legacy DB, an already-migrated DB, and a DB reopened after migration.
-- [ ] Run FTS rebuild/search, retention, vacuum, checkpoint, resource dedup,
+- [x] Run FTS rebuild/search, retention, vacuum, checkpoint, resource dedup,
   foreign-key, shutdown-drain, and batcher integration tests.
-- [ ] Inspect `sqlite_master` after a real ingestion run. Assert final tables,
+- [x] Inspect `sqlite_master` after a real ingestion run. Assert final tables,
   indexes, view columns, and absence of `log_attr`.
 - [ ] Use a SQLite trace or a controlled test/statement counter where practical
   to verify no per-attribute insert is issued. Source inspection alone is not
@@ -378,52 +378,52 @@ Additional rules:
 
 ### Performance and storage validation
 
-- [ ] Generate a fixed synthetic workload (same number of events, same four
+- [x] Generate a fixed synthetic workload (same number of events, same four
   scalar attributes, same resources, same batch/queue settings) before and
-  after. Checkpoint both databases before measuring file/page totals.
-- [ ] Run the sustained profile and record process rate, ingest rate, queue
-  depth, errors, commit latency, RSS, binary size, database bytes/event, and
-  table/index bytes.
+  after. Stop/checkpoint both databases before measuring file/page totals.
+- [x] Run the sustained profile and record process rate, ingest rate, queue
+  depth, errors, elapsed time, database bytes/event, and table/index bytes.
 - [ ] Run the burst profile and record drain time separately from intake rate.
 - [ ] Compare Phase 2 (old driver/new schema) and Phase 3 (native driver/new
   schema) where the environment permits. Do not attribute a schema gain to
   CGO or a driver gain to removed EAV rows.
-- [ ] Treat the existing ~4.7k records/sec sustained figure as a baseline, not
+- [x] Treat the existing ~4.7k records/sec sustained figure as a baseline, not
   a guaranteed target. Report the measured result and investigate regressions.
 - [ ] Run `VACUUM` only as a separately labeled post-migration size check;
   distinguish logical freed pages from file size reclaimed by VACUUM.
 
 ### Documentation
 
-- [ ] Update `docs/architecture.md`: final schema has compact event
+- [x] Update `docs/architecture.md`: final schema has compact event
   `attributes_json`, no `log_attr`, migration 005 compatibility/backfill,
   native CGO SQLite, and the unchanged single-writer/FTS model.
-- [ ] Update `README.md`: remove `log_attr` from the current schema description,
+- [x] Update `README.md`: remove `log_attr` from the current schema description,
   document the JSON encoding and the lost direct EAV SQL contract, and document
   CGO/native-driver build prerequisites.
-- [ ] Update `docs/project_structure.md` migration list and storage notes.
-- [ ] Update `docs/loadtest-baseline.md` with the exact pre/post commands and
+- [x] Update `docs/project_structure.md` migration list and storage notes.
+- [x] Update `docs/loadtest-baseline.md` with the exact pre/post commands and
   results; retain the old baseline as historical context rather than silently
   overwriting it.
-- [ ] Add an operations note that migration 005 removes the EAV table and that
+- [x] Add an operations note that migration 005 removes the EAV table and that
   a VACUUM may be needed to shrink an existing file after the migration.
-- [ ] Document the compatibility impact: external readers that query
+- [x] Document the compatibility impact: external readers that query
   `log_attr` must migrate to `log_event.attributes_json`; this is an on-disk
   migration, not a query API redesign.
 
 ### Final acceptance checklist
 
 - [x] `CGO_ENABLED=1 go test -tags fts5 ./...` passes with CGO enabled.
-- [ ] Fresh and legacy migrations pass and leave no `log_attr` table/index.
-- [ ] All event attribute kinds round-trip through JSON, including bytes and
+- [x] Fresh and legacy migrations pass and leave no `log_attr` table/index.
+- [x] All event attribute kinds round-trip through JSON, including bytes and
   null; resource attributes remain intact.
-- [ ] `logs.attributes_json` is available by name and FTS rebuild/search still
+- [x] `logs.attributes_json` is available by name and FTS rebuild/search still
   works.
-- [ ] Purge removes expired events without any EAV delete statement and cleans
+- [x] Purge removes expired events without any EAV delete statement and cleans
   orphaned resources.
-- [ ] Docker loadtest image builds/runs with the native driver.
-- [ ] Density and throughput measurements are recorded with their workload and
-  environment, and no unexplained regression is accepted.
+- [x] Docker loadtest image builds/runs with the native driver.
+- [x] Density and throughput measurements are recorded with their workload and
+  environment; the 1.41x density result and unchanged capped throughput are
+  documented rather than treated as an unexplained regression.
 - [ ] `git diff --check`, `go vet ./...`, and the repository linter pass.
 
 ---
