@@ -167,6 +167,140 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnv_legacyBatchSizeAndFlush(t *testing.T) {
+	tests := []struct {
+		name             string
+		env              map[string]string
+		wantBatcherSize  int
+		wantWriterSize   int
+		wantBatcherFlush time.Duration
+		wantWriterFlush  time.Duration
+		wantOverridesMin int
+	}{
+		{
+			name:             "BATCH_SIZE alone fills both sizes",
+			env:              map[string]string{"BATCH_SIZE": "500"},
+			wantBatcherSize:  500,
+			wantWriterSize:   500,
+			wantBatcherFlush: time.Second, // default
+			wantWriterFlush:  time.Second,
+			wantOverridesMin: 1,
+		},
+		{
+			name:             "FLUSH_INTERVAL alone fills both flushes",
+			env:              map[string]string{"FLUSH_INTERVAL": "250ms"},
+			wantBatcherSize:  250,
+			wantWriterSize:   100,
+			wantBatcherFlush: 250 * time.Millisecond,
+			wantWriterFlush:  250 * time.Millisecond,
+			wantOverridesMin: 1,
+		},
+		{
+			name: "specific batch sizes win over BATCH_SIZE",
+			env: map[string]string{
+				"BATCH_SIZE":         "500",
+				"BATCHER_BATCH_SIZE": "10",
+				"WRITER_BATCH_SIZE":  "20",
+			},
+			wantBatcherSize:  10,
+			wantWriterSize:   20,
+			wantBatcherFlush: time.Second,
+			wantWriterFlush:  time.Second,
+			wantOverridesMin: 2, // two specific bindings; legacy applies nothing
+		},
+		{
+			name: "BATCH_SIZE fills only unset side",
+			env: map[string]string{
+				"BATCH_SIZE":        "500",
+				"WRITER_BATCH_SIZE": "20",
+			},
+			wantBatcherSize:  500,
+			wantWriterSize:   20,
+			wantBatcherFlush: time.Second,
+			wantWriterFlush:  time.Second,
+			wantOverridesMin: 2,
+		},
+		{
+			name: "specific flush wins over FLUSH_INTERVAL",
+			env: map[string]string{
+				"FLUSH_INTERVAL":         "250ms",
+				"BATCHER_FLUSH_INTERVAL": "3s",
+				"WRITER_FLUSH_INTERVAL":  "4s",
+			},
+			wantBatcherSize:  250,
+			wantWriterSize:   100,
+			wantBatcherFlush: 3 * time.Second,
+			wantWriterFlush:  4 * time.Second,
+			wantOverridesMin: 2,
+		},
+		{
+			name: "loadtest-style legacy env is honored over defaults",
+			env: map[string]string{
+				"BATCH_SIZE":     "500",
+				"FLUSH_INTERVAL": "1s",
+			},
+			wantBatcherSize:  500,
+			wantWriterSize:   500,
+			wantBatcherFlush: time.Second,
+			wantWriterFlush:  time.Second,
+			wantOverridesMin: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			c := DefaultConfig()
+			n, err := c.LoadFromEnv()
+			if err != nil {
+				t.Fatalf("LoadFromEnv() error: %v", err)
+			}
+			if n < tt.wantOverridesMin {
+				t.Errorf("overrides = %d, want at least %d", n, tt.wantOverridesMin)
+			}
+			if c.BatcherBatchSize != tt.wantBatcherSize {
+				t.Errorf("BatcherBatchSize = %d, want %d", c.BatcherBatchSize, tt.wantBatcherSize)
+			}
+			if c.WriterBatchSize != tt.wantWriterSize {
+				t.Errorf("WriterBatchSize = %d, want %d", c.WriterBatchSize, tt.wantWriterSize)
+			}
+			if c.BatcherFlushInterval != tt.wantBatcherFlush {
+				t.Errorf("BatcherFlushInterval = %s, want %s", c.BatcherFlushInterval, tt.wantBatcherFlush)
+			}
+			if c.WriterFlushInterval != tt.wantWriterFlush {
+				t.Errorf("WriterFlushInterval = %s, want %s", c.WriterFlushInterval, tt.wantWriterFlush)
+			}
+		})
+	}
+}
+
+func TestApplyLegacyEnv_errors(t *testing.T) {
+	t.Run("invalid BATCH_SIZE", func(t *testing.T) {
+		t.Setenv("BATCH_SIZE", "nope")
+		c := DefaultConfig()
+		if _, err := c.ApplyLegacyEnv(); err == nil {
+			t.Fatal("expected error for invalid BATCH_SIZE")
+		}
+	})
+	t.Run("non-positive BATCH_SIZE", func(t *testing.T) {
+		t.Setenv("BATCH_SIZE", "0")
+		c := DefaultConfig()
+		if _, err := c.ApplyLegacyEnv(); err == nil {
+			t.Fatal("expected error for non-positive BATCH_SIZE")
+		}
+	})
+	t.Run("invalid FLUSH_INTERVAL", func(t *testing.T) {
+		t.Setenv("FLUSH_INTERVAL", "nope")
+		c := DefaultConfig()
+		if _, err := c.ApplyLegacyEnv(); err == nil {
+			t.Fatal("expected error for invalid FLUSH_INTERVAL")
+		}
+	})
+}
+
 func TestLoadFromEnv_errors(t *testing.T) {
 	tests := []struct {
 		name string

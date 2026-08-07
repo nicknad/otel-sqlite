@@ -4,7 +4,7 @@
 #
 # Usage:
 #   podman compose -f docker-compose.loadtest.yml up -d --build
-#   make loadtest-run            # runs cmd/loadtest against localhost:4317
+#   make loadtest-run            # runs cmd/loadtest against localhost:14317
 #   podman compose -f docker-compose.loadtest.yml down -v
 
 services:
@@ -22,11 +22,14 @@ services:
       - LISTEN_ADDRESS=:4317
       - METRICS_ADDRESS=:9090
       - SQLITE_PATH=/var/lib/otel-collector/otel-logs.db
-      # Throughput-oriented tuning (see internal/config/config.go for semantics)
+      # Throughput-oriented tuning (explicit names; see internal/config).
       - INGRESS_QUEUE_CAPACITY=200000
       - BATCH_QUEUE_CAPACITY=20000
-      - BATCH_SIZE=500
-      - FLUSH_INTERVAL=1s
+      - BATCHER_BATCH_SIZE=500
+      - WRITER_BATCH_SIZE=50
+      - BATCHER_FLUSH_INTERVAL=1s
+      - WRITER_FLUSH_INTERVAL=1s
+      - WRITER_MAX_TRANSACTION_RECORDS=10000
       - SHUTDOWN_TIMEOUT=30s
     restart: "no"
     healthcheck:

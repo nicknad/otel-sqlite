@@ -104,8 +104,10 @@ LOADTEST_DURATION ?= 30s
 LOADTEST_RPS      ?= 0
 LOADTEST_ATTRS   ?= 4
 LOADTEST_RESOURCES ?= 8
+LOADTEST_DRAIN_TIMEOUT ?= 2m
 
-.PHONY: loadtest-build loadtest-up loadtest-down loadtest-run loadtest
+.PHONY: loadtest-build loadtest-up loadtest-down loadtest-run loadtest \
+	loadtest-keepup loadtest-process loadtest-burst-drain
 
 loadtest-build:
 	@echo "Building collector image..."
@@ -134,7 +136,26 @@ loadtest-run:
 		-duration $(LOADTEST_DURATION) \
 		-rps-per-client $(LOADTEST_RPS) \
 		-attrs $(LOADTEST_ATTRS) \
-		-resources $(LOADTEST_RESOURCES)
+		-resources $(LOADTEST_RESOURCES) \
+		-drain-timeout $(LOADTEST_DRAIN_TIMEOUT)
+
+# Profile A: capped keep-up (~4.72k rec/s). Proves no backlog at a fixed rate.
+loadtest-keepup:
+	$(MAKE) loadtest-run \
+		LOADTEST_CLIENTS=32 LOADTEST_RECORDS=150 LOADTEST_DURATION=60s \
+		LOADTEST_RPS=1 LOADTEST_DRAIN_TIMEOUT=30s
+
+# Profile B: uncapped process ceiling. Report logs_written_total rate.
+loadtest-process:
+	$(MAKE) loadtest-run \
+		LOADTEST_CLIENTS=8 LOADTEST_RECORDS=250 LOADTEST_DURATION=30s \
+		LOADTEST_RPS=0 LOADTEST_DRAIN_TIMEOUT=2m
+
+# Profile C: burst intake + drain. High fan-in then wait for written==received.
+loadtest-burst-drain:
+	$(MAKE) loadtest-run \
+		LOADTEST_CLIENTS=32 LOADTEST_RECORDS=1000 LOADTEST_DURATION=30s \
+		LOADTEST_RPS=0 LOADTEST_DRAIN_TIMEOUT=5m
 
 # Convenience: up + run + down
 loadtest: loadtest-up loadtest-run loadtest-down
