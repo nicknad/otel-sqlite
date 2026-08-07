@@ -218,6 +218,55 @@ This replaces any reading of ~4.7k as the process ceiling. Phase 2+ changes
 must beat **~58k written rec/s** on the same profile B command, or explain a
 regression with profiling.
 
+## Write-path hot spots (Phase 1 profile)
+
+Captured with:
+
+```bash
+CGO_ENABLED=1 go test -tags fts5 ./internal/storage/sqlite -run '^$' \
+  -bench 'BenchmarkWriter_OptimizedPragmas$' -benchtime=3s -count=1 \
+  -cpuprofile=/tmp/writer_cpu.prof -memprofile=/tmp/writer_mem.prof
+go tool pprof -top -cum /tmp/writer_cpu.prof
+go tool pprof -top -alloc_space /tmp/writer_mem.prof
+```
+
+Host: AMD Ryzen 5 4500U, ~43.8k rec/s on that bench sample.
+
+### CPU (cumulative share of bench time)
+
+| Area | Approx cum % | Notes |
+|---|---:|---|
+| `WriteBatchCommand.Execute` / `insertEventRecord` | ~66% | whole per-row path |
+| `database/sql` `Stmt.ExecContext` → go-sqlite3 `exec` / `sqlite3_step` | ~45% / ~24% step | dominant; CGO boundary `runtime.cgocall` ~40% flat |
+| `marshalEventAttrs` → `encoding/json.Marshal` | ~19% / ~14% | map encode + key sort |
+| go-sqlite3 bind path | ~13% | per-column bind |
+| `Tx.Commit` | ~9% | WAL commit |
+
+### Allocations (alloc_space)
+
+| Area | Share | Notes |
+|---|---:|---|
+| `marshalEventAttrs` | ~50% | map + JSON buffer + `string([]byte)` |
+| `database/sql.driverArgsConnLocked` | ~32% | per-Exec args slice |
+| `encoding/json.Marshal` / map encode | ~25% overlapping with marshal | reflection + key sort |
+| `fmt.Sprintf` in bench setup | ~6% | bench-only body/attr formatting |
+
+### Statement mix (hook proof)
+
+`TestWriteBatchInsertMix` registers go-sqlite3 `RegisterUpdateHook` and asserts:
+
+- 1 `log_resource` insert on first batch, 0 on repeat resource (`INSERT OR IGNORE`)
+- N `log_event` inserts for N records
+- 0 `log_attr` (or other) inserts
+
+### Phase 2 priority implied by this profile
+
+1. Keep SQLite work per row down (tx sizing, multi-row insert, optional FK-off,
+   resource ID cache) — largest CPU bucket is still `sqlite3_step` + bind.
+2. Replace `map`+`encoding/json` marshal — ~19% CPU and ~50% allocs, fully under
+   our control.
+3. Reduce `database/sql` per-Exec overhead (multi-row VALUES, fewer Exec calls).
+
 ## Optimizations Identified and Applied
 
 1. **Observability was broken** — the writer/batcher never updated Prometheus

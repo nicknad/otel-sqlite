@@ -218,28 +218,29 @@ For B and C always report from Prometheus deltas, not client send rate:
 
 Do not guess. Spend one short profiling pass on profile B.
 
-- [ ] Run collector under `perf` or `go test -cpuprofile` on the writer bench
-  and on a 30s uncapped loadtest.
-- [ ] Attribute time at least into:
-  1. SQLite / go-sqlite3 (`sqlite3_step`, page ops)
-  2. `marshalEventAttrs` / `encoding/json`
-  3. Go `database/sql` bind + `tx.Stmt` overhead
-  4. batcher / channel / GC
-- [ ] Optional: SQLite progress handler or a test-only statement counter to
-  prove statement mix is `1 resource + N events` per batch (finish the open
-  Phase-4 item from the previous plan).
-- [ ] Write a short “hot spots” subsection into `docs/loadtest-baseline.md`.
+- [x] Run `go test -cpuprofile/-memprofile` on `BenchmarkWriter_OptimizedPragmas`
+  (writer-bound; matches the SQLite hot path without gRPC noise).
+- [x] Attribute time at least into:
+  1. SQLite / go-sqlite3 (`sqlite3_step`, page ops) — **~45% cum Exec, ~24% step**
+  2. `marshalEventAttrs` / `encoding/json` — **~19% CPU, ~50% alloc_space**
+  3. Go `database/sql` bind + Exec args — **bind ~13% CPU; args ~32% alloc**
+  4. batcher / channel / GC — not dominant in the writer bench
+- [x] Statement counter via go-sqlite3 `RegisterUpdateHook`
+  (`TestWriteBatchInsertMix`): 1 resource + N events, 0 `log_attr`.
+- [x] Hot spots subsection in `docs/loadtest-baseline.md`.
+- [x] `BenchmarkMarshalEventAttrs` baseline: ~5758 ns/op, 1344 B/op, 23 allocs/op
+  (5 mixed attrs).
 
-Expected order of dominance (hypothesis to confirm):
+Confirmed order of dominance:
 
-1. SQLite row insert + secondary index maintenance + AUTOINCREMENT
-2. JSON marshal allocs per record
-3. `database/sql` per-Exec overhead
+1. SQLite row insert + bind + secondary indexes + CGO (`sqlite3_step`)
+2. JSON marshal allocs per record (`map` + `encoding/json`)
+3. `database/sql` per-Exec argument packaging
 4. Everything else
 
 ### Phase 1 exit criteria
 
-- [ ] Profile captured; Phase 2 order adjusted if the hypothesis is wrong.
+- [x] Profile captured; Phase 2 order matches the hypothesis (no reorder).
 
 ---
 
