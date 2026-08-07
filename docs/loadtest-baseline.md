@@ -75,6 +75,29 @@ A fresh local container run was captured before changing the schema or driver:
 
 This capture is the comparison point for the fixed-workload post-rewrite run.
 
+### Post-rewrite capture
+
+The same sustained command was run after migration 005, inline JSON writes, and
+native `go-sqlite3`:
+
+- Client result: 283,200 records sent, 0 export errors, 4,720.21 records/sec;
+  all 283,200 records were persisted after shutdown.
+- Final database: 87,691,264 logical bytes, 283,200 events, and no `log_attr`
+  rows/table; 309.64 logical bytes/event.
+- SQLite CLI `dbstat`: `log_event` 67,657,728 bytes, timestamp/resource
+  indexes 19,988,480 bytes combined, and no attribute table/index.
+- The Go density reporter reported `dbstat` unavailable for the bundled native
+  build, so the post-rewrite object figures above were collected with the
+  system `sqlite3` CLI. Page-level figures remain available from the Go tool.
+
+Compared with the pre-rewrite 437.37 logical bytes/event, this workload is
+1.41x denser overall (29.2% fewer logical database bytes), not the aspirational
+2x target. The event table itself is larger because compact JSON replaces the
+small scalar EAV row payload, but removing the EAV table and attribute index
+reduces total storage substantially. Throughput was effectively unchanged at
+this capped 4.72k records/sec workload; further performance claims require a
+higher-rate burst/drain run.
+
 ### Interpretation
 
 - **Ingest intake ceiling** is high: the gRPC server + bounded ingress queue
