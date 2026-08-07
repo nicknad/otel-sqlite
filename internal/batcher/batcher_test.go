@@ -3,6 +3,7 @@ package batcher
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -298,6 +299,9 @@ func TestBatcherResourceInsertion(t *testing.T) {
 		record.SeverityNumber = model.SeverityInfo
 		record.SeverityText = "INFO"
 		record.Body = fmt.Sprintf("msg-%d", i)
+		record.Attributes = append(record.Attributes, model.Attribute{
+			Key: "batch.key", Str: fmt.Sprintf("value-%d", i), Kind: model.ValueString,
+		})
 		record.ResourceID = resource.ID
 		record.Resource = resource
 		batch.AddRecord(record)
@@ -354,5 +358,19 @@ func TestBatcherResourceInsertion(t *testing.T) {
 	}
 	if eventResourceID != resource.ID {
 		t.Errorf("event resource_id = %q, want %q", eventResourceID, resource.ID)
+	}
+
+	var attributesJSON string
+	if err := db.QueryRow(
+		"SELECT attributes_json FROM log_event WHERE body = ?", "msg-1",
+	).Scan(&attributesJSON); err != nil {
+		t.Fatalf("query inline event attributes: %v", err)
+	}
+	var attributes map[string]interface{}
+	if err := json.Unmarshal([]byte(attributesJSON), &attributes); err != nil {
+		t.Fatalf("parse inline event attributes: %v", err)
+	}
+	if attributes["batch.key"] != "value-1" {
+		t.Errorf("batch.key = %v, want value-1", attributes["batch.key"])
 	}
 }
