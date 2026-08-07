@@ -1,12 +1,15 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
+	"sync"
 	"time"
 
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
@@ -63,6 +66,10 @@ type WriteBatchCommand struct {
 	// pre-prepared statements, injected by the writer before Execute.
 	// When nil, Execute falls back to inline tx.PrepareContext.
 	preparedStmts *PreparedStatements
+
+	// optional process-local set of resource IDs already inserted successfully.
+	// When the batch resource ID is present, the INSERT OR IGNORE is skipped.
+	seenResources map[string]struct{}
 }
 
 // NewWriteBatchCommand creates a new WriteBatchCommand from a LogBatch.
@@ -84,6 +91,13 @@ func NewWriteBatchCommand(batch *model.LogBatch) *WriteBatchCommand {
 // instead of calling tx.PrepareContext, avoiding repeated statement compilation.
 func (c *WriteBatchCommand) SetPreparedStatements(stmts *PreparedStatements) {
 	c.preparedStmts = stmts
+}
+
+// SetSeenResources injects a process-local cache of resource IDs that have
+// already been inserted successfully. The map is owned by the Writer and must
+// only be used from the single writer goroutine.
+func (c *WriteBatchCommand) SetSeenResources(seen map[string]struct{}) {
+	c.seenResources = seen
 }
 
 // Size returns the number of log records in this command.
@@ -146,23 +160,31 @@ func (c *WriteBatchCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 	defer func() { _ = insertResource.Close() }()
 	defer func() { _ = insertEvent.Close() }()
 
-	// Insert the resource row (INSERT OR IGNORE for dedup).
+	// Insert the resource row (INSERT OR IGNORE for dedup). Skip the SQL when
+	// this process has already inserted the same resource ID successfully.
 	if c.batch.Resource != nil {
-		serviceName := c.batch.Resource.GetServiceName()
-		hostName := c.batch.Resource.GetHostName()
-		attrsJSON := marshalResourceAttrs(c.batch.Resource.Attributes)
-		if _, err := insertResource.ExecContext(
-			ctx,
-			c.batch.Resource.ID,
-			serviceName,
-			hostName,
-			c.batch.Resource.SchemaURL,
-			attrsJSON,
-		); err != nil {
-			for _, record := range c.batch.Records {
-				model.PutRecord(record)
+		resourceID := c.batch.Resource.ID
+		_, alreadySeen := c.seenResources[resourceID]
+		if !alreadySeen {
+			serviceName := c.batch.Resource.GetServiceName()
+			hostName := c.batch.Resource.GetHostName()
+			attrsJSON := marshalResourceAttrs(c.batch.Resource.Attributes)
+			if _, err := insertResource.ExecContext(
+				ctx,
+				resourceID,
+				serviceName,
+				hostName,
+				c.batch.Resource.SchemaURL,
+				attrsJSON,
+			); err != nil {
+				for _, record := range c.batch.Records {
+					model.PutRecord(record)
+				}
+				return fmt.Errorf("insert resource %q: %w", resourceID, err)
 			}
-			return fmt.Errorf("insert resource %q: %w", c.batch.Resource.ID, err)
+			if c.seenResources != nil && resourceID != "" {
+				c.seenResources[resourceID] = struct{}{}
+			}
 		}
 	}
 
@@ -212,6 +234,7 @@ func insertEventRecord(ctx context.Context, stmt *sql.Stmt, record *model.LogRec
 
 	severityText := storedSeverityText(record)
 
+	// Bind attributes as []byte to avoid an extra string copy; SQLite stores TEXT.
 	_, err = stmt.ExecContext(
 		ctx,
 		nil, // ID will be auto-generated
@@ -253,40 +276,128 @@ func storedSeverityText(record *model.LogRecord) any {
 	return record.SeverityText
 }
 
+// emptyEventAttrsJSON is the canonical encoding for records with no attributes.
+var emptyEventAttrsJSON = []byte("{}")
+
+// attrJSONBufPool reuses buffers for hand-rolled event-attribute JSON.
+var attrJSONBufPool = sync.Pool{
+	New: func() any {
+		// Typical 4–8 string attrs fit under 512B; grows as needed.
+		b := make([]byte, 0, 512)
+		return bytes.NewBuffer(b)
+	},
+}
+
 // marshalEventAttrs serializes event attributes as a compact JSON object.
-func marshalEventAttrs(attrs []model.Attribute) (string, error) {
+// Duplicate keys are last-write-wins. Returns a fresh []byte safe to bind
+// after the pooled buffer is returned.
+func marshalEventAttrs(attrs []model.Attribute) ([]byte, error) {
 	if len(attrs) == 0 {
-		return "{}", nil
+		return emptyEventAttrsJSON, nil
 	}
 
-	values := make(map[string]any, len(attrs))
-	for _, attr := range attrs {
-		switch attr.Kind {
-		case model.ValueString:
-			values[attr.Key] = attr.Str
-		case model.ValueInt:
-			values[attr.Key] = attr.Num
-		case model.ValueDouble:
-			if math.IsNaN(attr.Dbl) || math.IsInf(attr.Dbl, 0) {
-				return "", fmt.Errorf("attribute %q has non-finite double", attr.Key)
-			}
-			values[attr.Key] = attr.Dbl
-		case model.ValueBool:
-			values[attr.Key] = attr.Flag
-		case model.ValueBytes:
-			values[attr.Key] = map[string]string{
-				"$b": base64.StdEncoding.EncodeToString(attr.Raw),
-			}
-		case model.ValueNull:
-			values[attr.Key] = nil
-		default:
-			return "", fmt.Errorf("attribute %q has unsupported kind %d", attr.Key, attr.Kind)
+	// Last-write-wins index without allocating map[string]any or using
+	// encoding/json reflection on the hot path.
+	lastIdx := make(map[string]int, len(attrs))
+	for i, attr := range attrs {
+		lastIdx[attr.Key] = i
+	}
+
+	buf := attrJSONBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer attrJSONBufPool.Put(buf)
+
+	buf.WriteByte('{')
+	first := true
+	for i, attr := range attrs {
+		if lastIdx[attr.Key] != i {
+			continue
+		}
+		if !first {
+			buf.WriteByte(',')
+		}
+		first = false
+		writeJSONString(buf, attr.Key)
+		buf.WriteByte(':')
+		if err := writeJSONAttrValue(buf, attr); err != nil {
+			return nil, err
 		}
 	}
+	buf.WriteByte('}')
 
-	encoded, err := json.Marshal(values)
-	if err != nil {
-		return "", fmt.Errorf("marshal event attributes: %w", err)
+	// Copy out of the pooled buffer so the caller owns the result.
+	out := make([]byte, buf.Len())
+	copy(out, buf.Bytes())
+	return out, nil
+}
+
+func writeJSONAttrValue(buf *bytes.Buffer, attr model.Attribute) error {
+	switch attr.Kind {
+	case model.ValueString:
+		writeJSONString(buf, attr.Str)
+	case model.ValueInt:
+		buf.WriteString(strconv.FormatInt(attr.Num, 10))
+	case model.ValueDouble:
+		if math.IsNaN(attr.Dbl) || math.IsInf(attr.Dbl, 0) {
+			return fmt.Errorf("attribute %q has non-finite double", attr.Key)
+		}
+		// ES6-style shortest round-trip, matching encoding/json for finite floats.
+		buf.WriteString(strconv.FormatFloat(attr.Dbl, 'f', -1, 64))
+	case model.ValueBool:
+		if attr.Flag {
+			buf.WriteString("true")
+		} else {
+			buf.WriteString("false")
+		}
+	case model.ValueBytes:
+		buf.WriteString(`{"$b":`)
+		writeJSONString(buf, base64.StdEncoding.EncodeToString(attr.Raw))
+		buf.WriteByte('}')
+	case model.ValueNull:
+		buf.WriteString("null")
+	default:
+		return fmt.Errorf("attribute %q has unsupported kind %d", attr.Key, attr.Kind)
 	}
-	return string(encoded), nil
+	return nil
+}
+
+// writeJSONString writes a JSON string value including surrounding quotes.
+func writeJSONString(buf *bytes.Buffer, s string) {
+	buf.WriteByte('"')
+	start := 0
+	for i := range len(s) {
+		c := s[i]
+		if c >= 0x20 && c != '"' && c != '\\' {
+			continue
+		}
+		if start < i {
+			buf.WriteString(s[start:i])
+		}
+		switch c {
+		case '"', '\\':
+			buf.WriteByte('\\')
+			buf.WriteByte(c)
+		case '\b':
+			buf.WriteString(`\b`)
+		case '\f':
+			buf.WriteString(`\f`)
+		case '\n':
+			buf.WriteString(`\n`)
+		case '\r':
+			buf.WriteString(`\r`)
+		case '\t':
+			buf.WriteString(`\t`)
+		default:
+			// Control characters as \u00XX.
+			const hex = "0123456789abcdef"
+			buf.WriteString(`\u00`)
+			buf.WriteByte(hex[c>>4])
+			buf.WriteByte(hex[c&0xf])
+		}
+		start = i + 1
+	}
+	if start < len(s) {
+		buf.WriteString(s[start:])
+	}
+	buf.WriteByte('"')
 }

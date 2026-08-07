@@ -55,20 +55,36 @@ func TestMarshalEventAttrs(t *testing.T) {
 	}
 
 	var values map[string]interface{}
-	if err := json.Unmarshal([]byte(encoded), &values); err != nil {
+	if err := json.Unmarshal(encoded, &values); err != nil {
 		t.Fatal(err)
 	}
 	if values["string"] != "value" || values["int"] != float64(42) || values["double"] != 3.5 || values["bool"] != true || values["null"] != nil || values["duplicate"] != "last" {
 		t.Fatalf("unexpected JSON: %s", encoded)
 	}
-	bytes, ok := values["bytes"].(map[string]interface{})
-	if !ok || bytes["$b"] != "AP8=" {
+	bytesVal, ok := values["bytes"].(map[string]interface{})
+	if !ok || bytesVal["$b"] != "AP8=" {
 		t.Fatalf("unexpected bytes: %#v", values["bytes"])
 	}
 
 	empty, err := marshalEventAttrs(nil)
-	if err != nil || empty != "{}" {
+	if err != nil || string(empty) != "{}" {
 		t.Fatalf("empty attributes = %q, err = %v", empty, err)
+	}
+
+	// Escaping / Unicode round-trip through encoding/json.
+	escaped, err := marshalEventAttrs([]model.Attribute{
+		{Key: `a"b\c`, Str: "line1\nline2\t\u0001", Kind: model.ValueString},
+		{Key: "uni", Str: "żźć", Kind: model.ValueString},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var escapedMap map[string]string
+	if err := json.Unmarshal(escaped, &escapedMap); err != nil {
+		t.Fatalf("escaped JSON %s: %v", escaped, err)
+	}
+	if escapedMap[`a"b\c`] != "line1\nline2\t\u0001" || escapedMap["uni"] != "żźć" {
+		t.Fatalf("escaped round-trip: %#v", escapedMap)
 	}
 }
 
@@ -86,7 +102,7 @@ func TestMarshalEventAttrsRejectsNonFiniteDouble(t *testing.T) {
 // statement-level counter so source inspection is not the only proof.
 func TestWriteBatchInsertMix(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "insert-mix.db")
-	db, err := openDatabase(path, true)
+	db, err := openDatabase(path, true, false)
 	if err != nil {
 		t.Fatalf("openDatabase: %v", err)
 	}

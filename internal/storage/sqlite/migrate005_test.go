@@ -15,7 +15,7 @@ func TestMigration005BackfillsLegacyAttributes(t *testing.T) {
 	defer os.Remove(path + "-wal")
 	defer os.Remove(path + "-shm")
 
-	db, err := openDatabase(path, false)
+	db, err := openDatabase(path, false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestMigration005EmptyLegacyDatabaseCanReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := openDatabase(path, false)
+	reopened, err := openDatabase(path, false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestMigration005EmptyLegacyDatabaseCanReopen(t *testing.T) {
 
 func openLegacyDatabase(t *testing.T, path string) *sql.DB {
 	t.Helper()
-	db, err := openDatabase(path, false)
+	db, err := openDatabase(path, false, true)
 	if err != nil {
 		t.Fatal(err)
 	}

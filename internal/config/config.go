@@ -152,12 +152,12 @@ func DefaultConfig() *Config {
 		SQLitePath:                        "otel-logs.db",
 		IngressQueueCapacity:              10000,
 		BatchQueueCapacity:                5000,
-		BatcherBatchSize:                  250,
+		BatcherBatchSize:                  500,
 		BatcherFlushInterval:              1 * time.Second,
 		BatcherErrorSeverityThreshold:     "ERROR",
-		WriterBatchSize:                   100,
+		WriterBatchSize:                   50, // commands per tx collection, not records
 		WriterFlushInterval:               1 * time.Second,
-		WriterMaxTransactionRecords:       5000,
+		WriterMaxTransactionRecords:       10000,
 		MetricsAddress:                    ":9090",
 		GrpcMaxRecvMsgSize:                16 * 1024 * 1024, // 16 MB
 		GrpcMaxSendMsgSize:                16 * 1024 * 1024, // 16 MB

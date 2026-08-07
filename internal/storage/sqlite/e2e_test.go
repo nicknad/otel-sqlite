@@ -302,18 +302,20 @@ func TestE2E_OTLPToSQLite(t *testing.T) {
 		len(attrs), count)
 }
 
-// TestE2E_ForeignKeysAreEnforced verifies that PRAGMA foreign_keys is ON
-// and that the declared FKs actually reject violations.
+// TestE2E_ForeignKeysAreEnforced verifies that declared FKs reject violations
+// when PRAGMA foreign_keys is ON. The writer defaults to FK off for throughput;
+// this test opts back in via EnforceForeignKeys and a reader connection.
 func TestE2E_ForeignKeysAreEnforced(t *testing.T) {
 	dbPath := t.TempDir() + "/fk-test.db"
 
-	// Create the DB through the writer (which runs migrations and enables FKs).
+	// Create the DB through the writer (runs migrations). Opt into FK checks.
 	cmdQueue := storage.NewCommandQueue(10)
 	writer, err := NewWriter(cmdQueue, &WriterConfig{
-		Path:          dbPath,
-		BatchSize:     10,
-		FlushInterval: 100 * time.Millisecond,
-		WALMode:       true,
+		Path:               dbPath,
+		BatchSize:          10,
+		FlushInterval:      100 * time.Millisecond,
+		WALMode:            true,
+		EnforceForeignKeys: true,
 	})
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
@@ -324,15 +326,13 @@ func TestE2E_ForeignKeysAreEnforced(t *testing.T) {
 	writer.Stop()
 	writer.Wait()
 
-	// Open the DB separately and verify FK pragma is on.
+	// Open the DB separately; PRAGMA foreign_keys is per-connection.
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
 
-	// Enable foreign keys on this connection (PRAGMA is per-connection;
-	// the writer enables it on its own connection).
 	_, err = db.Exec("PRAGMA foreign_keys = ON")
 	if err != nil {
 		t.Fatalf("enable foreign_keys: %v", err)
