@@ -10,7 +10,6 @@ A high-performance OpenTelemetry log collector that receives OTLP logs over gRPC
 - **Prometheus Metrics**: Comprehensive observability with built-in metrics for ingestion, batching, commands, storage, and maintenance
 - **Backpressure**: Graceful handling of load spikes without data loss at every pipeline stage
 - **Batch-Level Ingress**: Batches sent through the ingress queue instead of individual records — 250× fewer channel operations
-- **Production-Tuned SQLite**: WAL mode, 64MB page cache, 256MB mmap I/O, temp_store=MEMORY, journal size limit
 - **OTLP Type Isolation**: Protobuf types confined to the transport layer; internal packages depend only on domain models
 - **Notification Pipeline**: Rule-based alerting with sliding-window aggregation, threshold counting, alert state machine (pending→firing→resolved), and dead-letter queue
 - **Pluggable Notifiers**: HTTP webhook and log-based notifiers; add your own via the `Notifier` interface
@@ -134,10 +133,6 @@ Or directly:
 
 ### Environment Variables
 
-> **Legacy support:** The older `BATCH_SIZE` and `FLUSH_INTERVAL` env vars are
-> still accepted. When set, they apply to **both** the batcher and writer
-> unless the specific `BATCHER_*` / `WRITER_*` variables are provided.
-
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LISTEN_ADDRESS` | `:4317` | gRPC server listen address |
@@ -254,17 +249,6 @@ ERROR event
 
 Each rule×resource pair creates one Alert. Multiple error messages from the same resource under the same rule count toward a single alert.
 
-**Features:**
-- **Rule-based matching**: filter by severity, resource ID (regex), body (regex), attributes
-- **Sliding-window aggregation**: count events within a configurable time window per rule
-- **Threshold-based alerting**: fire when count reaches `alert_threshold`; resolve after `alert_resolve_window` of silence
-- **Cooldown**: minimum interval between notifications for the same alert
-- **Retry with backoff**: exponential backoff (base × 2^attempt), capped at 2^10
-- **Dead-letter queue**: persistent storage for deliveries that exhausted retries or received 4xx responses
-- **Garbage collection**: resolved alerts older than `resolved_alert_retention` (default 24h) are automatically cleaned up; idle Pending/Firing alerts evicted after `alert_idle_ttl`
-- **Graceful shutdown**: drains buffered events before stopping
-- **Metrics**: events received, matched, delivered, failed, dead-lettered; queue depth
-
 **Configuration example** (`config.yaml`):
 ```yaml
 notification:
@@ -302,23 +286,6 @@ notification:
 ```
 
 **HTTP notifier**: sends JSON POST requests with the alert payload (id, rule_id, resource_id, status, severity, opened_at, updated_at, last_matched, count). Non-retryable errors (4xx) go straight to DLQ; retryable errors (5xx, network) follow the retry backoff.
-
-### Load Testing
-
-A built-in load generator simulates multiple concurrent gRPC clients:
-
-```bash
-# Run a 30-second burst test (default)
-make loadtest
-
-# Tune parameters
-make loadtest-run LOADTEST_CLIENTS=64 LOADTEST_RECORDS=2000 LOADTEST_DURATION=60s
-
-# Full lifecycle (up → run → down)
-make loadtest
-```
-
-See [docs/loadtest-baseline.md](docs/loadtest-baseline.md) for measured throughput baselines and optimization guidance.
 
 ## Observability
 
@@ -396,9 +363,7 @@ The collector exposes Prometheus metrics on `METRICS_ADDRESS` (default `:9090`).
 ### Indexes
 
 - Primary keys on all tables
-- Foreign keys for referential integrity
 - Indexes on: `timestamp_ns` (time-range queries), `resource_id` (resource filtering), `event_id` on attributes
-- Unused indexes removed (migration 004): `severity_number`, `trace_id`, `severity_text`, `body`, `event_name`, composite `(resource_id, timestamp_ns)`, composite `(trace_id, timestamp_ns)`, and all attribute value indexes — write performance is prioritized over read performance on non-critical query paths
 
 ### SQLite Performance Tuning
 
@@ -418,12 +383,6 @@ The writer applies these pragmas at startup for production-grade durability and 
 
 These settings are most impactful on large, established databases where B-tree depth is significant. On fresh databases with fast NVMe storage, the WAL absorbs write latency — the B-tree optimizations primarily benefit read queries, maintenance operations, and sustained write throughput over time.
 
-### Migrations
-
-Database migrations are stored in the `migrations/` directory:
-
-The collector applies the initial schema on startup via `CREATE TABLE IF NOT EXISTS` statements embedded in the SQLite Writer. Migration files are provided for schema documentation and manual upgrades.
-
 ## License
 
 Copyright 2024 nnadolski
@@ -439,18 +398,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
-## Acknowledgments
-
-- [OpenTelemetry](https://opentelemetry.io/) for the OTLP protocol
-- [gRPC](https://grpc.io/) for the RPC framework
-- [SQLite](https://sqlite.org/) for the embedded database
-- [Prometheus](https://prometheus.io/) for metrics collection
-- [ModernC SQLite](https://modernc.org/sqlite) for the pure-Go SQLite driver
-
-## Related Projects
-
-- [OpenTelemetry Collector](https://github.com/open-telemetry/opentelemetry-collector)
-- [SQLite](https://www.sqlite.org/index.html)
-- [gRPC-Go](https://github.com/grpc/grpc-go)
-- [Prometheus Client Golang](https://github.com/prometheus/client_golang)
