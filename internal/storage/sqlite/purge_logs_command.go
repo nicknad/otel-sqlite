@@ -47,20 +47,8 @@ func (c *PurgeLogsCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 	totalDeleted := int64(0)
 
 	for range MaxPurgeIterations {
-		// First delete attributes for expired events.
-		_, err := tx.ExecContext(
-			ctx,
-			`DELETE FROM log_attr WHERE event_id IN (
-				SELECT id FROM log_event WHERE timestamp_ns < ?
-				ORDER BY id LIMIT ?
-			)`,
-			c.cutoffNanos, c.batchSize,
-		)
-		if err != nil {
-			return fmt.Errorf("delete expired attributes: %w", err)
-		}
-
-		// Then delete the events themselves.
+		// Event attributes are stored on log_event, so deleting the event is
+		// the only data delete required for retention.
 		result, err := tx.ExecContext(
 			ctx,
 			`DELETE FROM log_event WHERE rowid IN (

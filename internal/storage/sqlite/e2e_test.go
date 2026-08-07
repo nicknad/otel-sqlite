@@ -220,14 +220,23 @@ func TestE2E_OTLPToSQLite(t *testing.T) {
 		t.Errorf("body = %q, want %q", body1, "disk full on /data")
 	}
 
-	// 3. Event attributes are persisted.
-	var attrCount int
-	err = db.QueryRow("SELECT COUNT(*) FROM log_attr").Scan(&attrCount)
+	// 3. Event attributes are persisted inline on the event row.
+	var eventAttrsJSON string
+	err = db.QueryRow(
+		"SELECT attributes_json FROM log_event WHERE body LIKE ?", "%disk full%",
+	).Scan(&eventAttrsJSON)
 	if err != nil {
-		t.Fatalf("count attrs: %v", err)
+		t.Fatalf("query event attributes: %v", err)
 	}
-	if attrCount < 2 {
-		t.Errorf("expected at least 2 event attributes, got %d", attrCount)
+	var eventAttrs map[string]interface{}
+	if err := json.Unmarshal([]byte(eventAttrsJSON), &eventAttrs); err != nil {
+		t.Fatalf("parse event attributes: %v", err)
+	}
+	if eventAttrs["disk.path"] != "/data" {
+		t.Errorf("disk.path = %v, want %q", eventAttrs["disk.path"], "/data")
+	}
+	if eventAttrs["disk.usage_pct"] != float64(99) {
+		t.Errorf("disk.usage_pct = %v, want 99", eventAttrs["disk.usage_pct"])
 	}
 
 	// 4. FTS index is populated (rebuild to populate, then query).
@@ -289,8 +298,8 @@ func TestE2E_OTLPToSQLite(t *testing.T) {
 		t.Errorf("FTS returned body = %q, want 'request processed successfully'", ftsBody)
 	}
 
-	t.Logf("E2E: resource attributes preserved (%d keys), %d events, %d attrs, FTS OK",
-		len(attrs), count, attrCount)
+	t.Logf("E2E: resource attributes preserved (%d keys), %d events, inline event attrs, FTS OK",
+		len(attrs), count)
 }
 
 // TestE2E_ForeignKeysAreEnforced verifies that PRAGMA foreign_keys is ON

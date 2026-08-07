@@ -12,6 +12,7 @@ type migration struct {
 	version     string
 	description string
 	sql         string
+	apply       func(*sql.Tx) error
 }
 
 // allMigrations returns all known migrations in application order.
@@ -37,6 +38,12 @@ func allMigrations() []migration {
 			version:     "004",
 			description: "Remove unused indexes to improve write performance",
 			sql:         migration004SQL,
+		},
+		{
+			version:     "005",
+			description: "Inline event attributes as compact JSON and remove log_attr",
+			sql:         migration005SQL,
+			apply:       applyMigration005,
 		},
 	}
 }
@@ -83,18 +90,34 @@ func RunMigrations(db *sql.DB) error {
 
 		log.Printf("Applying migration %s: %s", m.version, m.description)
 
-		if _, err := db.Exec(m.sql); err != nil {
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin migration %s: %w", m.version, err)
+		}
+
+		apply := m.apply
+		if apply == nil {
+			apply = func(tx *sql.Tx) error {
+				_, err := tx.Exec(m.sql)
+				return err
+			}
+		}
+		if err := apply(tx); err != nil {
+			_ = tx.Rollback()
 			return fmt.Errorf("migration %s failed: %w", m.version, err)
 		}
 
-		// Record the migration.  The migration SQL may also include an
-		// INSERT OR IGNORE of its own; that is harmless because the table
-		// already has the row at that point and IGNORE makes it a no-op.
-		if _, err := db.Exec(
+		// Record the migration in the same transaction as its schema/data
+		// changes so a failed migration can be retried safely.
+		if _, err := tx.Exec(
 			`INSERT OR IGNORE INTO schema_migrations (version, description) VALUES (?, ?)`,
 			m.version, m.description,
 		); err != nil {
+			_ = tx.Rollback()
 			return fmt.Errorf("record migration %s: %w", m.version, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration %s: %w", m.version, err)
 		}
 
 		log.Printf("Migration %s applied successfully", m.version)
@@ -259,4 +282,12 @@ DROP INDEX IF EXISTS idx_log_attr_key;
 DROP INDEX IF EXISTS idx_log_attr_value_string;
 DROP INDEX IF EXISTS idx_log_attr_value_int;
 DROP INDEX IF EXISTS idx_log_attr_value_double;
+`
+
+// migration005SQL is the DDL contract for the inline event attribute
+// migration. The Go hook executes it only when the column is absent, then
+// performs the typed backfill and removes the legacy EAV table in the same
+// transaction.
+const migration005SQL = `
+ALTER TABLE log_event ADD COLUMN attributes_json TEXT NOT NULL DEFAULT '{}';
 `

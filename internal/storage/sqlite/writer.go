@@ -24,7 +24,6 @@ import (
 var preparedStatementsSQL = []string{
 	sqlInsertResource,
 	sqlInsertEvent,
-	sqlInsertAttr,
 }
 
 // WriterConfig holds configuration for the SQLite writer.
@@ -487,6 +486,5 @@ func initPreparedStatements(db *sql.DB) (*PreparedStatements, error) {
 	return &PreparedStatements{
 		InsertResource: stmts[0],
 		InsertEvent:    stmts[1],
-		InsertAttr:     stmts[2],
 	}, nil
 }

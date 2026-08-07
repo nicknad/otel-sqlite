@@ -3,9 +3,10 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
+	"math"
 	"time"
 
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
@@ -22,12 +23,8 @@ const (
 		(id, resource_id, timestamp_ns, observed_timestamp_ns,
 		severity_number, severity_text, trace_id, span_id,
 		body, event_name, flags, dropped_attributes_count,
-		scope_name, scope_version)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-
-	sqlInsertAttr = `INSERT INTO log_attr
-		(event_id, key, value_type, string_value, int_value, double_value, bool_value, bytes_value)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+		scope_name, scope_version, attributes_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 )
 
 // PreparedStatements holds SQL statements prepared once at startup
@@ -35,7 +32,6 @@ const (
 type PreparedStatements struct {
 	InsertResource *sql.Stmt
 	InsertEvent    *sql.Stmt
-	InsertAttr     *sql.Stmt
 }
 
 // Close closes all prepared statements.
@@ -48,9 +44,6 @@ func (ps *PreparedStatements) Close() {
 	}
 	if ps.InsertEvent != nil {
 		ps.InsertEvent.Close()
-	}
-	if ps.InsertAttr != nil {
-		ps.InsertAttr.Close()
 	}
 }
 
@@ -131,14 +124,12 @@ func (c *WriteBatchCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 	var (
 		insertResource *sql.Stmt
 		insertEvent    *sql.Stmt
-		insertAttr     *sql.Stmt
 	)
 
 	if c.preparedStmts != nil {
 		// Bind pre-prepared statements to this transaction.
 		insertResource = tx.Stmt(c.preparedStmts.InsertResource)
 		insertEvent = tx.Stmt(c.preparedStmts.InsertEvent)
-		insertAttr = tx.Stmt(c.preparedStmts.InsertAttr)
 	} else {
 		// Fallback: prepare inline (used when command runs without the Writer).
 		var err error
@@ -148,19 +139,12 @@ func (c *WriteBatchCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 		}
 		insertEvent, err = tx.PrepareContext(ctx, sqlInsertEvent)
 		if err != nil {
-			insertResource.Close()
+			_ = insertResource.Close()
 			return fmt.Errorf("prepare log_event: %w", err)
 		}
-		insertAttr, err = tx.PrepareContext(ctx, sqlInsertAttr)
-		if err != nil {
-			insertResource.Close()
-			insertEvent.Close()
-			return fmt.Errorf("prepare log_attr: %w", err)
-		}
 	}
-	defer insertResource.Close()
-	defer insertEvent.Close()
-	defer insertAttr.Close()
+	defer func() { _ = insertResource.Close() }()
+	defer func() { _ = insertEvent.Close() }()
 
 	// Insert the resource row (INSERT OR IGNORE for dedup).
 	if c.batch.Resource != nil {
@@ -175,25 +159,21 @@ func (c *WriteBatchCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 			c.batch.Resource.SchemaURL,
 			attrsJSON,
 		); err != nil {
+			for _, record := range c.batch.Records {
+				model.PutRecord(record)
+			}
 			return fmt.Errorf("insert resource %q: %w", c.batch.Resource.ID, err)
 		}
 	}
 
-	// Insert each log record and its attributes.
-	for _, record := range c.batch.Records {
-		eventID, err := insertEventRecord(ctx, insertEvent, record)
-		if err != nil {
-			log.Printf("error inserting event: %v", err)
-			model.PutRecord(record) // Return to pool even on error
-			continue
-		}
-
-		if len(record.Attributes) > 0 {
-			for _, attr := range record.Attributes {
-				if err := insertAttributeRow(ctx, insertAttr, eventID, attr); err != nil {
-					log.Printf("error inserting attribute for event %d: %v", eventID, err)
-				}
+	// Insert each log record. Event attributes are encoded into the same row;
+	// there is no per-attribute SQL operation.
+	for i, record := range c.batch.Records {
+		if err := insertEventRecord(ctx, insertEvent, record); err != nil {
+			for _, pending := range c.batch.Records[i:] {
+				model.PutRecord(pending)
 			}
+			return fmt.Errorf("insert event: %w", err)
 		}
 
 		// Return record to pool after writing (ownership: writer releases records)
@@ -213,29 +193,36 @@ func ensureResourceID(resource *model.Resource) string {
 	return resource.ID
 }
 
-// insertEventRecord inserts a single log event row and returns its auto-generated ID.
-func insertEventRecord(ctx context.Context, stmt *sql.Stmt, record *model.LogRecord) (int64, error) {
-	// Convert fixed-size arrays to slices for SQLite (only if present)
+// insertEventRecord inserts a single log event row, including all event
+// attributes, in one SQL operation.
+func insertEventRecord(ctx context.Context, stmt *sql.Stmt, record *model.LogRecord) error {
+	// Convert fixed-size arrays to slices for SQLite (only if present).
 	var traceID, spanID any
 	if record.HasTrace {
 		traceID = record.TraceID[:]
-	} else {
-		traceID = nil
 	}
 	if record.HasSpan {
 		spanID = record.SpanID[:]
-	} else {
-		spanID = nil
 	}
 
-	result, err := stmt.ExecContext(
+	attributesJSON, err := marshalEventAttrs(record.Attributes)
+	if err != nil {
+		return err
+	}
+
+	var severityText any
+	if record.SeverityText != "" && record.SeverityText != record.SeverityNumber.String() {
+		severityText = record.SeverityText
+	}
+
+	_, err = stmt.ExecContext(
 		ctx,
 		nil, // ID will be auto-generated
 		record.ResourceID,
 		record.Timestamp,
 		record.ObservedTimestamp,
 		int64(record.SeverityNumber),
-		record.SeverityText,
+		severityText,
 		traceID,
 		spanID,
 		record.Body,
@@ -244,11 +231,9 @@ func insertEventRecord(ctx context.Context, stmt *sql.Stmt, record *model.LogRec
 		uint64(record.DroppedAttributesCount),
 		record.ScopeName,
 		record.ScopeVersion,
+		attributesJSON,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.LastInsertId()
+	return err
 }
 
 // marshalResourceAttrs serializes resource attributes to JSON for the
@@ -264,38 +249,40 @@ func marshalResourceAttrs(attrs map[string]model.AttributeValue) string {
 	return string(b)
 }
 
-// insertAttributeRow inserts a single attribute row using the prepared statement.
-func insertAttributeRow(ctx context.Context, stmt *sql.Stmt, eventID int64, attr model.Attribute) error {
-	strVal, intVal, dblVal, boolVal, bytesVal := attrValues(&attr)
-	_, err := stmt.ExecContext(
-		ctx,
-		eventID,
-		attr.Key,
-		attr.Kind.String(),
-		strVal,
-		intVal,
-		dblVal,
-		boolVal,
-		bytesVal,
-	)
-	return err
-}
-
-// attrValues extracts typed pointers from an attribute for SQL binding.
-func attrValues(attr *model.Attribute) (
-	strVal *string, intVal *int64, dblVal *float64, boolVal *bool, bytesVal []byte,
-) {
-	switch attr.Kind {
-	case model.ValueString:
-		strVal = &attr.Str
-	case model.ValueInt:
-		intVal = &attr.Num
-	case model.ValueDouble:
-		dblVal = &attr.Dbl
-	case model.ValueBool:
-		boolVal = &attr.Flag
-	case model.ValueBytes:
-		bytesVal = attr.Raw
+// marshalEventAttrs serializes event attributes as a compact JSON object.
+func marshalEventAttrs(attrs []model.Attribute) (string, error) {
+	if len(attrs) == 0 {
+		return "{}", nil
 	}
-	return
+
+	values := make(map[string]any, len(attrs))
+	for _, attr := range attrs {
+		switch attr.Kind {
+		case model.ValueString:
+			values[attr.Key] = attr.Str
+		case model.ValueInt:
+			values[attr.Key] = attr.Num
+		case model.ValueDouble:
+			if math.IsNaN(attr.Dbl) || math.IsInf(attr.Dbl, 0) {
+				return "", fmt.Errorf("attribute %q has non-finite double", attr.Key)
+			}
+			values[attr.Key] = attr.Dbl
+		case model.ValueBool:
+			values[attr.Key] = attr.Flag
+		case model.ValueBytes:
+			values[attr.Key] = map[string]string{
+				"$b": base64.StdEncoding.EncodeToString(attr.Raw),
+			}
+		case model.ValueNull:
+			values[attr.Key] = nil
+		default:
+			return "", fmt.Errorf("attribute %q has unsupported kind %d", attr.Key, attr.Kind)
+		}
+	}
+
+	encoded, err := json.Marshal(values)
+	if err != nil {
+		return "", fmt.Errorf("marshal event attributes: %w", err)
+	}
+	return string(encoded), nil
 }
