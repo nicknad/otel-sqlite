@@ -15,10 +15,6 @@ A high-performance OpenTelemetry log collector that receives OTLP logs over gRPC
 - **Pluggable Notifiers**: HTTP webhook and log-based notifiers; add your own via the `Notifier` interface
 - **YAML Configuration**: Optional config file support via `CONFIG_FILE` environment variable
 
-## Architecture
-
-See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation.
-
 ### Pipeline Flow
 
 ```
@@ -405,25 +401,6 @@ The writer applies these pragmas at startup for production-grade durability and 
 
 These settings are most impactful on large, established databases where B-tree depth is significant. On fresh databases with fast NVMe storage, the WAL absorbs write latency — the B-tree optimizations primarily benefit read queries, maintenance operations, and sustained write throughput over time.
 
-### Measured Rewrite Results
-
-**Density** (capped keep-up workload, same before/after):
-32 clients × 150 records × 1 req/s/client for 60s ≈ 4.72k rec/s client budget.
-This profile only proves the pipeline keeps up; it is **not** the process
-ceiling.
-
-| Measurement | Before rewrite | After inline JSON + native SQLite |
-|---|---:|---:|
-| Ingest rate (capped) | 4,720.20 records/sec | 4,720.21 records/sec |
-| Persisted events | 283,200 | 283,200 |
-| Database bytes/event | 437.37 | 309.64 |
-| Attribute storage | `log_attr` table and index | Inline `log_event.attributes_json` |
-
-Overall database storage fell ~29.2% (1.41× denser). A synthetic insert
-microbenchmark on the inline-JSON schema showed the native driver ~2.7–3.35×
-faster than modernc.
-
-**Process ceiling** must be measured with the uncapped profiles:
 
 ```bash
 make loadtest-up
@@ -433,13 +410,6 @@ make loadtest-keepup           # profile A: capped keep-up regression
 make loadtest-down
 ```
 
-See [`docs/loadtest-baseline.md`](docs/loadtest-baseline.md) for the full
-measurement matrix, host writer-bench numbers, and current baselines.
-
-**Env precedence:** specific vars (`BATCHER_BATCH_SIZE`, `WRITER_BATCH_SIZE`,
-`BATCHER_FLUSH_INTERVAL`, `WRITER_FLUSH_INTERVAL`) always win. Deprecated
-`BATCH_SIZE` / `FLUSH_INTERVAL` fill only the sides whose specific var is
-unset. Defaults are never treated as "already configured" for that check.
 
 ## License
 
