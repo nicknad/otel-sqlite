@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"codeberg.org/nicknad/otel-sqlite/internal/storage"
@@ -44,17 +45,20 @@ func NewCheckpointCommand(mode CheckpointMode) *CheckpointCommand {
 	return &CheckpointCommand{Mode: mode}
 }
 
-// Execute runs PRAGMA wal_checkpoint inside the given transaction.
-// SQLite allows checkpoint inside a transaction, though the WAL file
-// cannot be fully recycled until the transaction commits.
 func (c *CheckpointCommand) Execute(ctx context.Context, tx *sql.Tx) error {
+	return errors.New("wal_checkpoint cannot run inside a transaction; writer must use ExecuteNonTransactional")
+}
+
+func (c *CheckpointCommand) ExecuteNonTransactional(ctx context.Context, db *sql.DB) error {
 	query := fmt.Sprintf("PRAGMA wal_checkpoint(%s)", c.Mode)
-	_, err := tx.ExecContext(ctx, query)
-	if err != nil {
+	if _, err := db.ExecContext(ctx, query); err != nil {
 		return fmt.Errorf("wal_checkpoint(%s): %w", c.Mode, err)
 	}
 	return nil
 }
 
 // Compile-time interface checks.
-var _ storage.Command = (*CheckpointCommand)(nil)
+var (
+	_ storage.Command                 = (*CheckpointCommand)(nil)
+	_ storage.NonTransactionalCommand = (*CheckpointCommand)(nil)
+)
