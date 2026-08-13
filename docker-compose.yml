@@ -15,6 +15,7 @@ services:
       - LISTEN_ADDRESS=:4317
       - SQLITE_PATH=/var/lib/otel-collector/otel-logs.db
       - METRICS_ADDRESS=:9090
+      - CONFIG_FILE=/etc/otel-collector/config.yaml
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/health"]

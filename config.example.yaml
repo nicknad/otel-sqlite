@@ -29,17 +29,18 @@ grpc_max_concurrent_streams: 100  # Max concurrent gRPC streams per connection (
 sqlite_path: "otel-logs.db"      # Path to SQLite database file
 
 # Ingestion pipeline configuration
-ingress_queue_capacity: 10000   # Maximum number of log records in ingress queue
-batch_queue_capacity: 1000      # Maximum number of batches in batch queue
+ingress_queue_capacity: 10000   # Maximum number of batches in ingress queue
+batch_queue_capacity: 5000      # Maximum number of commands in batch queue
 
 # Batcher configuration (groups records into WriteBatchCommand objects)
-batcher_batch_size: 250         # Number of log records per batch (batcher)
-batcher_flush_interval: "5s"    # Maximum time between batch flushes
+batcher_batch_size: 500         # Number of log records per batch (batcher)
+batcher_flush_interval: "1s"    # Maximum time between batch flushes
+batcher_error_severity_threshold: "ERROR"  # Minimum severity sent to notifications
 
 # Writer configuration (groups commands into SQLite transactions)
-writer_batch_size: 100          # Number of commands per transaction (writer)
-writer_flush_interval: "5s"     # Maximum time between transaction flushes
-writer_max_transaction_records: 5000  # Max records per SQLite transaction
+writer_batch_size: 50           # Number of commands per transaction (writer)
+writer_flush_interval: "1s"     # Maximum time between transaction flushes
+writer_max_transaction_records: 10000  # Max records per SQLite transaction
 
 # Legacy batching configuration (applies to both batcher and writer
 # if the specific fields above are not set)
@@ -173,12 +174,13 @@ fts:
 #
 # Pipeline:
 #   INGRESS_QUEUE_CAPACITY          - Ingress queue capacity (default: 10000)
-#   BATCH_QUEUE_CAPACITY            - Command queue capacity (default: 1000)
-#   BATCHER_BATCH_SIZE              - Records per batcher batch (default: 250)
-#   BATCHER_FLUSH_INTERVAL          - Max batcher flush interval (default: 5s)
-#   WRITER_BATCH_SIZE               - Commands per writer transaction (default: 100)
-#   WRITER_FLUSH_INTERVAL           - Max writer flush interval (default: 5s)
-#   WRITER_MAX_TRANSACTION_RECORDS  - Max records per SQLite transaction (default: 5000)
+#   BATCH_QUEUE_CAPACITY            - Command queue capacity (default: 5000)
+#   BATCHER_ERROR_SEVERITY_THRESHOLD - Minimum severity sent to notifications (default: ERROR)
+#   BATCHER_BATCH_SIZE              - Records per batcher batch (default: 500)
+#   BATCHER_FLUSH_INTERVAL          - Max batcher flush interval (default: 1s)
+#   WRITER_BATCH_SIZE               - Commands per writer transaction (default: 50)
+#   WRITER_FLUSH_INTERVAL           - Max writer flush interval (default: 1s)
+#   WRITER_MAX_TRANSACTION_RECORDS  - Max records per SQLite transaction (default: 10000)
 #   (Legacy: BATCH_SIZE/FLUSH_INTERVAL also accepted, apply to both batcher and writer)
 #   SHUTDOWN_TIMEOUT                - Graceful shutdown timeout (default: 30s)
 #
