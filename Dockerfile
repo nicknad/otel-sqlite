@@ -27,8 +27,8 @@ RUN CGO_ENABLED=1 GOOS=linux go build -tags fts5 -o /otel-collector ./cmd/collec
 # Runtime stage
 FROM alpine:3.19
 
-# Install ca-certificates for HTTPS
-RUN apk --no-cache add ca-certificates tzdata
+# Install ca-certificates for HTTPS, tzdata for timezones and sqlite for the CLI
+RUN apk --no-cache add ca-certificates tzdata sqlite
 
 # Copy binary
 COPY --from=builder /otel-collector /usr/local/bin/otel-collector

@@ -241,9 +241,18 @@ func (w *Writer) executeCommands(commands []storage.Command) {
 	// Walk commands and flush in record-capped chunks.
 	start := 0
 	for start < len(commands) {
+		if _, ok := commands[start].(storage.NonTransactionalCommand); ok {
+			w.executeTransaction(commands[start : start+1])
+			start++
+			continue
+		}
+
 		end := start
 		acc := 0
 		for end < len(commands) {
+			if _, ok := commands[end].(storage.NonTransactionalCommand); ok {
+				break
+			}
 			// Estimate record count: WriteBatchCommand exposes Size(),
 			// other command types default to 1 for splitting purposes.
 			recs := commandRecordCount(commands[end])

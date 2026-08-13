@@ -23,9 +23,9 @@ type PurgeLogsCommand struct {
 }
 
 // NewPurgeLogsCommand creates a command that deletes log records with
-// timestamp_ns < cutoff (where cutoff is the retention boundary).
+// observed_timestamp_ns < cutoff (where cutoff is the retention boundary).
 //
-// cutoffAge is the retention duration (e.g., 30 days). Records older than
+// cutoffAge is the retention duration (e.g., 30 days). Records observed before
 // (now - cutoffAge) are eligible for deletion.
 // batchSize controls how many records are deleted in a single statement.
 func NewPurgeLogsCommand(cutoffAge time.Duration, batchSize int) *PurgeLogsCommand {
@@ -52,7 +52,7 @@ func (c *PurgeLogsCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 		result, err := tx.ExecContext(
 			ctx,
 			`DELETE FROM log_event WHERE rowid IN (
-				SELECT rowid FROM log_event WHERE timestamp_ns < ?
+				SELECT rowid FROM log_event WHERE observed_timestamp_ns < ?
 				ORDER BY rowid LIMIT ?
 			)`,
 			c.cutoffNanos, c.batchSize,

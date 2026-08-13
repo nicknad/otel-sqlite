@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"strconv"
 	"sync"
+	"time"
 
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
 
@@ -155,6 +156,12 @@ func (m *Mapper) mapLogRecord(protoRecord *logsV1.LogRecord, resource *model.Res
 	// Map timestamps (protobuf fixed64 → int64; overflow impossible for reasonable dates)
 	record.Timestamp = int64(protoRecord.TimeUnixNano)                 //nolint:gosec
 	record.ObservedTimestamp = int64(protoRecord.ObservedTimeUnixNano) //nolint:gosec
+
+	// Correct observed timesstamps
+	nowNanos := time.Now().UTC().UnixNano()
+	if record.ObservedTimestamp <= 0 || record.ObservedTimestamp > nowNanos {
+		record.ObservedTimestamp = nowNanos
+	}
 
 	// Map severity
 	record.SeverityNumber = model.Severity(protoRecord.SeverityNumber)
