@@ -184,6 +184,109 @@ func TestAllSQLStatements(t *testing.T) {
 		}
 	})
 
+	t.Run("MetricsViews", func(t *testing.T) {
+		// Migration 007 must create the read-side views.
+		for _, view := range []string{"metrics", "metric_buckets"} {
+			var name string
+			if err := db.QueryRow(
+				"SELECT name FROM sqlite_master WHERE type='view' AND name=?", view,
+			).Scan(&name); err != nil {
+				t.Errorf("view %q missing: %v", view, err)
+			}
+		}
+
+		// Insert a histogram data point and verify json_each normalization.
+		resource := model.NewResource(map[string]model.AttributeValue{
+			"service.name": model.NewStringValue("views-svc"),
+		})
+		resource.ID = "res-views"
+		batch := model.NewMetricBatch(1)
+		batch.Resource = resource
+		batch.AddMetric(&model.Metric{
+			ID:         "metric-views",
+			ResourceID: resource.ID,
+			ScopeID:    "scope-views",
+			ScopeName:  "views",
+			Name:       "views.histogram",
+			Type:       model.MetricTypeHistogram,
+			Series: []*model.MetricSeries{
+				{
+					ID: "series-views",
+					DataPoints: []*model.DataPoint{
+						{
+							Timestamp: 1000,
+							Count:     uint64Ptr(3),
+							HistogramJSON: []byte(
+								`{"bounds":[1,5,10],"counts":[2,1,0,4]}`),
+						},
+					},
+				},
+			},
+		})
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := NewWriteMetricsCommand(batch).Execute(ctx, tx); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("metrics write: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+
+		// The metrics view joins the full context.
+		var serviceName string
+		if err := db.QueryRow(
+			"SELECT service_name FROM metrics WHERE series_id = ?", "series-views",
+		).Scan(&serviceName); err != nil {
+			t.Errorf("metrics view: %v", err)
+		}
+		if serviceName != "views-svc" {
+			t.Errorf("metrics view service = %q", serviceName)
+		}
+
+		// metric_buckets normalizes the JSON payload into rows: len(counts)
+		// buckets (bounds + the implicit +Inf overflow bucket).
+		var buckets int
+		if err := db.QueryRow(
+			"SELECT COUNT(*) FROM metric_buckets WHERE series_id = ?", "series-views",
+		).Scan(&buckets); err != nil {
+			t.Errorf("metric_buckets view: %v", err)
+		}
+		if buckets != 4 {
+			t.Errorf("expected 4 bucket rows, got %d", buckets)
+		}
+		var firstBound float64
+		if err := db.QueryRow(
+			"SELECT bound FROM metric_buckets WHERE series_id = ? AND bucket_index = 1", "series-views",
+		).Scan(&firstBound); err != nil {
+			t.Errorf("bucket bound: %v", err)
+		}
+		if firstBound != 5 {
+			t.Errorf("bucket 1 bound = %v, want 5", firstBound)
+		}
+		// The overflow bucket has an implicit +Inf bound (NULL numeric).
+		var overflowBound sql.NullFloat64
+		if err := db.QueryRow(
+			"SELECT bound FROM metric_buckets WHERE series_id = ? AND bucket_index = 3", "series-views",
+		).Scan(&overflowBound); err != nil {
+			t.Errorf("overflow bucket bound: %v", err)
+		}
+		if overflowBound.Valid {
+			t.Errorf("overflow bucket bound = %v, want NULL (+Inf)", overflowBound.Float64)
+		}
+		var overflowCount int64
+		if err := db.QueryRow(
+			"SELECT bucket_count FROM metric_buckets WHERE series_id = ? AND bucket_index = 3", "series-views",
+		).Scan(&overflowCount); err != nil {
+			t.Errorf("overflow bucket count: %v", err)
+		}
+		if overflowCount != 4 {
+			t.Errorf("overflow bucket count = %d, want 4", overflowCount)
+		}
+	})
+
 	t.Run("PurgeLogsCommand_Execute", func(t *testing.T) {
 		if _, err := db.ExecContext(ctx, "INSERT OR IGNORE INTO log_resource(id, service_name) VALUES(?, ?)", "res-purge", "purge-svc"); err != nil {
 			t.Fatal(err)

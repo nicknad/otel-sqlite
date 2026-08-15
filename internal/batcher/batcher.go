@@ -172,6 +172,10 @@ func (b *Batcher) run() {
 		select {
 		case <-b.ctx.Done():
 			log.Printf("batcher: shutting down: %v", context.Cause(b.ctx))
+			// Drain any in-flight batches before flushing: the shutdown
+			// select can otherwise pick ctx.Done() while the ingress queue
+			// still holds data, silently dropping it.
+			b.drainIngress()
 			b.flushCurrentBatch()
 			return
 
@@ -185,15 +189,7 @@ func (b *Batcher) run() {
 			}
 
 			b.mu.Lock()
-			// Carry resource from the incoming batch if current batch has none
-			if b.currentBatch.Resource == nil && batch.Resource != nil {
-				b.currentBatch.Resource = batch.Resource
-			}
-			// Add all records from the incoming batch
-			for _, record := range batch.Records {
-				b.currentBatch.AddRecord(record)
-				b.maybeNotify(record)
-			}
+			b.addBatch(batch)
 			isFull := b.currentBatch.Size() >= b.batchSize
 			b.mu.Unlock()
 
@@ -203,6 +199,41 @@ func (b *Batcher) run() {
 			if isFull {
 				b.flushCurrentBatch()
 			}
+		}
+	}
+}
+
+// addBatch merges an incoming batch into the current batch, notifying the
+// error notifier per record. The caller must hold b.mu.
+func (b *Batcher) addBatch(batch *model.LogBatch) {
+	if batch == nil || batch.IsEmpty() {
+		return
+	}
+	// Carry resource from the incoming batch if current batch has none
+	if b.currentBatch.Resource == nil && batch.Resource != nil {
+		b.currentBatch.Resource = batch.Resource
+	}
+	for _, record := range batch.Records {
+		b.currentBatch.AddRecord(record)
+		b.maybeNotify(record)
+	}
+}
+
+// drainIngress consumes any remaining batches from the ingress queue so that
+// shutdown does not drop in-flight data. Non-blocking: concurrent producers
+// are expected to have stopped (gRPC server shutdown precedes the batcher).
+func (b *Batcher) drainIngress() {
+	for {
+		select {
+		case batch, ok := <-b.ingressQueue.Chan():
+			if !ok {
+				return
+			}
+			b.mu.Lock()
+			b.addBatch(batch)
+			b.mu.Unlock()
+		default:
+			return
 		}
 	}
 }

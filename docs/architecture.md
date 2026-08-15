@@ -1,17 +1,36 @@
 # Architecture
 
-The collector accepts OTLP Logs over gRPC, maps protobuf messages to internal
-models, and persists them through a single SQLite writer.
+The collector accepts OTLP Logs and Metrics over gRPC, maps protobuf
+messages to internal models, and persists them through SQLite writers.
+
+Default (shared) mode — one writer, one database file:
 
 ```text
-gRPC OTLP
+gRPC OTLP Logs
   -> mapper
-  -> bounded ingress queue (batches)
-  -> batcher
-  -> bounded command queue
-  -> single SQLite writer
-  -> SQLite (WAL)
+  -> bounded ingress queue (log batches)
+  -> log batcher
+        |
+        +-----> bounded command queue -> single SQLite writer -> SQLite (WAL)
+        |
+gRPC OTLP Metrics
+  -> mapper
+  -> bounded ingress queue (metric batches)
+  -> metric batcher ----+  (both batchers share the one writer's queue)
+```
 
+Separate-DB mode (`metrics_sqlite_path` set, `metrics_enabled: true`) — a
+second writer + queue isolates metrics write load from the log path:
+
+```text
+gRPC OTLP Logs
+  -> mapper -> log ingress queue -> log batcher -> log cmd queue -> log writer -> logs.db
+
+gRPC OTLP Metrics
+  -> mapper -> metric ingress queue -> metric batcher -> metric cmd queue -> metric writer -> metrics.db
+```
+
+```text
 batcher --non-blocking--> optional notification worker --> notifiers
 HTTP /metrics and /health run on a separate listener.
 ```
@@ -20,35 +39,69 @@ HTTP /metrics and /health run on a separate listener.
 
 | Package | Responsibility |
 |---|---|
-| `internal/otlp` | gRPC service and protobuf-to-domain mapping |
-| `internal/model` | Transport- and storage-independent log types |
-| `internal/ingest` | Bounded ingress queue |
-| `internal/batcher` | Combine incoming batches and create commands |
+| `internal/otlp` | gRPC services and protobuf-to-domain mapping (logs + metrics) |
+| `internal/model` | Transport- and storage-independent log and metric types |
+| `internal/ingest` | Bounded ingress queues (log and metric) |
+| `internal/batcher` | Combine incoming batches and create commands (log + metric) |
 | `internal/storage` | Queue and command interfaces |
 | `internal/storage/sqlite` | Migrations, SQLite commands, and writer |
+| `internal/query` | Read-side queries over the metrics views (series, data points, buckets, exemplars) |
 | `internal/maintenance` | Scheduled database maintenance |
 | `internal/notifications`, `internal/rules`, `internal/alerts` | Alert matching, state, delivery, retry, and DLQ |
-| `internal/metrics` | Prometheus instrumentation |
+| `internal/metrics` | Prometheus instrumentation (collector self-telemetry only) |
 
 OTLP protobuf types must remain in `internal/otlp`; other packages use the
 internal domain model.
 
+Two distinct "metrics" exist and must not be conflated:
+
+- `internal/metrics` instruments the collector itself and is exposed on
+  `GET /metrics` (Prometheus). It never stores or serves ingested data.
+- Ingested OTLP metrics are application telemetry, mapped to
+  `internal/model` metric types and persisted in SQLite (`metric`,
+  `metric_series`, `metric_data_point`). They are never exposed on
+  `/metrics`.
+
 ## Write path
 
-1. The gRPC handler maps each request to one or more internal batches.
+1. The gRPC handler maps each request to one or more internal batches
+   (logs: `LogBatch`; metrics: `MetricBatch`).
 2. Batches enter the bounded ingress queue. A full queue blocks the request;
    an optional fullness threshold rejects it with `Unavailable`.
-3. The batcher combines records and submits immutable `WriteBatchCommand`
-   values to the command queue.
-4. The writer consumes commands in one goroutine and commits transactions.
-   `WRITER_BATCH_SIZE` counts commands; `WRITER_MAX_TRANSACTION_RECORDS`
-   limits records.
-5. Resources are inserted before their events. The writer uses WAL mode and
-   prepared statements by default.
+3. The batcher combines batches and submits immutable commands
+   (`WriteBatchCommand` for logs, `WriteMetricsCommand` for metrics) to a
+   writer via `storage.CommandExecutor`. In default mode both batchers
+   submit to the single shared writer; with `metrics_sqlite_path` set the
+   metric batcher submits to the dedicated metrics writer.
+4. Each writer consumes its command queue in one goroutine and commits
+   transactions. `WRITER_BATCH_SIZE` counts commands;
+   `WRITER_MAX_TRANSACTION_RECORDS` limits records — for metrics this counts
+   data points, not metric objects.
+5. Resources are inserted before their events/metrics (resource → scope →
+   metric → series → data point). The writer uses WAL mode and prepared
+   statements by default.
 
 The storage path prefers backpressure to loss, but requests can still fail when
 the client context is cancelled or early rejection is enabled. Clients should
 retry `Unavailable` responses.
+
+### Separate metrics database (`metrics_sqlite_path`)
+
+When `metrics_sqlite_path` is set (and `metrics_enabled: true`), OTLP metric
+data points are stored in their own SQLite database with their own writer +
+batcher pipeline, isolating metrics write load from the log path. Each DB
+runs the full 001–007 migration set at startup; dedup caches are per-writer
+(per-DB) and Prometheus counters stay combined (both writers share the one
+`Metrics` instance). Metric retention submits `PurgeMetricDataPointsCommand`
+to the metrics writer through a per-task submitter override; checkpoint /
+vacuum / optimize / FTS-rebuild remain log-DB-only (the metrics DB's WAL
+self-manages via `wal_autocheckpoint=1000`).
+
+When `metrics_sqlite_path` is empty (the default), metrics share
+`sqlite_path` with logs through the single shared writer — behavior is
+unchanged. Setting `metrics_sqlite_path` while `metrics_enabled` is false
+logs a startup warning and is ignored. The read side (`internal/query`,
+`cmd/metrics-query`) is writer-agnostic: point it at either file path.
 
 ## Commands
 
@@ -59,9 +112,12 @@ type Command interface {
 ```
 
 Implemented commands include `WriteBatchCommand`, `PurgeLogsCommand`,
-`CheckpointCommand`, `OptimizeCommand`, `VacuumCommand`, and
-`RebuildFtsCommand`. Maintenance tasks submit commands rather than accessing
-SQLite directly.
+`WriteMetricsCommand`, `PurgeMetricDataPointsCommand`, `CheckpointCommand`,
+`OptimizeCommand`, `VacuumCommand`, and `RebuildFtsCommand`. Maintenance
+submits commands rather than accessing SQLite directly. Tasks may override
+the worker's default submitter per-task (`maintenance.SubmitterTask`) — the
+metric-retention task uses this to target the metrics writer in separate-DB
+mode.
 
 ## Notifications
 
@@ -90,14 +146,44 @@ Migrations are applied in order at startup:
 - `004`: removes unused indexes
 - `005`: backfills attributes into `log_event.attributes_json` and removes
   `log_attr`
+- `006`: metrics schema (`scope`, `metric`, `metric_series`,
+  `metric_data_point`)
+- `007`: metrics read views (`metrics`, `metric_buckets` via `json_each`)
 
 The `logs` view joins `log_event` and `log_resource`. `logs_fts` indexes only
 `body` and `service_name`; it is rebuilt with `DROP`/`CREATE` by maintenance,
 not updated by triggers. It can be empty until the first rebuild.
 
+For metrics, `006` stores all five OTLP metric types losslessly (histogram /
+exponential-histogram / summary payloads as JSON, exemplars preserved). `007`
+exposes the read side: the `metrics` view joins data points through
+series → metric → scope → log_resource, and `metric_buckets` normalizes
+`histogram_json` into one row per bucket via `json_each`. Buckets stay in
+JSON on the write path (single-row inserts); normalization happens at query
+time. Float values in the JSON payloads may be numbers or string markers
+(`"NaN"`, `"+Inf"`, `"-Inf"`) — non-finite floats cannot be serialized by
+`encoding/json`, and NaN scalars are stored as NULL plus a `nan_mask` bit.
+
 The supported deployment shape is one collector per writable database file.
 SQLite permits concurrent readers in WAL mode, but multiple collector writers
 sharing a file are not a scaling mechanism.
+
+## Querying stored metrics
+
+Reads go through `internal/query` (a read-only store opening its own
+connection — WAL permits concurrent readers next to the writer) or the
+`metrics-query` CLI:
+
+```sh
+metrics-query -db otel.db -series                  # list time series
+metrics-query -db otel.db -metric req.duration -points
+metrics-query -db otel.db -metric req.duration -buckets   # histogram buckets
+metrics-query -db otel.db -trace <hex-trace-id>           # exemplar correlation
+```
+
+The `series_id + timestamp_ns` index serves the time-window data point
+queries. Exemplar trace correlation uses `json_each` on `exemplars_json`, so
+the match is structural (not a substring scan).
 
 ## Operational endpoints
 

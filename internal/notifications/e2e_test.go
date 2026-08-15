@@ -397,6 +397,111 @@ func (n *alwaysFailNotifier) Close() error { return nil }
 var errAlwaysFail = NewNotRetryableError(fmt.Errorf("always fails"))
 
 // ---------------------------------------------------------------------------
+// Retryable failure: backoff increments then DLQ on retry exhaustion
+// ---------------------------------------------------------------------------
+
+// flakyNotifier fails with a plain (retryable) error and counts attempts.
+type flakyNotifier struct {
+	mu       sync.Mutex
+	attempts int
+}
+
+func (n *flakyNotifier) Send(_ context.Context, _ *alerts.Alert) error {
+	n.mu.Lock()
+	n.attempts++
+	n.mu.Unlock()
+	return fmt.Errorf("transient upstream failure")
+}
+func (n *flakyNotifier) Name() string { return "flaky" }
+func (n *flakyNotifier) Close() error { return nil }
+func (n *flakyNotifier) count() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.attempts
+}
+
+// TestE2E_RetryableFailureBackoffAndDLQ exercises the genuine retry path:
+// a retryable notifier failure increments RetryCount with exponential
+// backoff, and the alert is dead-lettered once MaxRetries is exhausted.
+// TestE2E_RetryAndDLQ above only covers the non-retryable branch.
+func TestE2E_RetryableFailureBackoffAndDLQ(t *testing.T) {
+	alertStore, _ := alerts.NewBboltAlertStore(filepath.Join(t.TempDir(), "retry-alerts.db"))
+	defer alertStore.Close()
+	notifStore, _ := NewBboltStore(filepath.Join(t.TempDir(), "retry-notif.db"))
+	defer notifStore.Close()
+
+	flaky := &flakyNotifier{}
+	engine, _ := rules.NewRuleEngine([]rules.Rule{
+		{
+			Name:          "retry-rule",
+			MatchSeverity: model.SeverityError,
+			Cooldown:      0,
+			MaxRetries:    3,
+			// Long enough that the first retry scan happens after the alert
+			// is flushed to bbolt (flush interval is 200ms); otherwise the
+			// retry loop sees no persisted alert and deletes the state.
+			RetryBackoff:       500 * time.Millisecond,
+			AlertThreshold:     1,
+			AlertResolveWindow: 60 * time.Second,
+			Destination:        "flaky",
+		},
+	})
+
+	w := NewWorker(&WorkerConfig{
+		AlertStore:      alertStore,
+		NotifStore:      notifStore,
+		Engine:          engine,
+		Notifiers:       map[string]Notifier{"flaky": flaky},
+		EventQueueDepth: 50,
+		RetryInterval:   50 * time.Millisecond,
+		GCInterval:      10 * time.Minute, // long so GC doesn't interfere
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+
+	// One error event fires the alert immediately (threshold=1) and the
+	// first delivery attempt fails with a retryable error.
+	ev := &events.Event{
+		Severity:   model.SeverityError,
+		Body:       "flaky backend",
+		ResourceID: "host-7",
+		Timestamp:  time.Now().UnixNano(),
+	}
+	if err := w.Send(ctx, ev); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	// Wait for retry exhaustion: each failed attempt increments RetryCount;
+	// the alert lands in the DLQ once RetryCount reaches MaxRetries, and its
+	// notification state is deleted. Initial attempt + (MaxRetries-1)
+	// retries = MaxRetries total notifier calls.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		dlq, _ := notifStore.ListDLQ(ctx)
+		if len(dlq) >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for DLQ entry after retry exhaustion")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	w.Stop()
+
+	if got := flaky.count(); got != 3 {
+		t.Errorf("notifier attempts = %d, want 3 (initial + 2 retries, MaxRetries=3)", got)
+	}
+
+	// The notification state must be gone (DLQ owns the alert now).
+	alertID := alerts.AlertID("retry-rule", "host-7")
+	if _, err := notifStore.GetNotificationState(ctx, alertID); err == nil {
+		t.Error("notification state still present after dead-lettering")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // DLQ retention test
 // ---------------------------------------------------------------------------
 

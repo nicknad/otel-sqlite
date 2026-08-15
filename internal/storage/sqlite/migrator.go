@@ -45,6 +45,16 @@ func allMigrations() []migration {
 			sql:         migration005SQL,
 			apply:       applyMigration005,
 		},
+		{
+			version:     "006",
+			description: "Metrics schema (scope, metric, metric_series, metric_data_point)",
+			sql:         migration006SQL,
+		},
+		{
+			version:     "007",
+			description: "Metrics read views (metrics, metric_buckets via json_each)",
+			sql:         migration007SQL,
+		},
 	}
 }
 
@@ -290,4 +300,147 @@ DROP INDEX IF EXISTS idx_log_attr_value_double;
 // transaction.
 const migration005SQL = `
 ALTER TABLE log_event ADD COLUMN attributes_json TEXT NOT NULL DEFAULT '{}';
+`
+
+// migration006SQL creates the metrics storage model (scope, metric,
+// metric_series, metric_data_point). Identical to
+// migrations/006_metrics.sql minus the schema_migrations DML, which is
+// handled by RunMigrations. All DDL is idempotent (IF NOT EXISTS).
+const migration006SQL = `
+CREATE TABLE IF NOT EXISTS scope (
+    id TEXT PRIMARY KEY,
+    resource_id TEXT NOT NULL,
+    name TEXT,
+    version TEXT,
+    schema_url TEXT,
+    FOREIGN KEY (resource_id) REFERENCES log_resource(id)
+);
+
+CREATE TABLE IF NOT EXISTS metric (
+    id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    unit TEXT,
+    type INTEGER NOT NULL,
+    is_monotonic INTEGER NOT NULL DEFAULT 0,
+    aggregation_temporality INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (scope_id) REFERENCES scope(id)
+);
+
+CREATE TABLE IF NOT EXISTS metric_series (
+    id TEXT PRIMARY KEY,
+    metric_id TEXT NOT NULL,
+    attributes_json TEXT NOT NULL,
+    FOREIGN KEY (metric_id) REFERENCES metric(id)
+);
+
+CREATE TABLE IF NOT EXISTS metric_data_point (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    series_id TEXT NOT NULL,
+    timestamp_ns INTEGER NOT NULL,
+    start_timestamp_ns INTEGER,
+    flags INTEGER NOT NULL DEFAULT 0,
+    double_value REAL,
+    int_value INTEGER,
+    count INTEGER,
+    sum REAL,
+    min REAL,
+    max REAL,
+    nan_mask INTEGER NOT NULL DEFAULT 0, -- bits: 1=double_value, 2=sum, 4=min, 8=max are NaN
+    histogram_json TEXT,
+    exponential_histogram_json TEXT,
+    summary_json TEXT,
+    exemplars_json TEXT,
+    FOREIGN KEY (series_id) REFERENCES metric_series(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_metric_dp_series_time
+    ON metric_data_point(series_id, timestamp_ns);
+CREATE INDEX IF NOT EXISTS idx_metric_series_metric
+    ON metric_series(metric_id);
+CREATE INDEX IF NOT EXISTS idx_metric_scope
+    ON metric(scope_id);
+`
+
+// migration007SQL creates the metrics read-side views: the `metrics` view
+// (metric_data_point joined through series → metric → scope → log_resource,
+// mirroring the `logs` view from migration 003) and the `metric_buckets`
+// view that normalizes histogram_json at query time via json_each.
+//
+// Histogram bucket normalization decision (proposal §10): buckets stay in
+// metric_data_point.histogram_json (lossless, single-row writes); query-time
+// normalization happens through json_each. A dedicated bucket table is
+// deferred until real aggregation requirements exist.
+const migration007SQL = `
+CREATE VIEW IF NOT EXISTS metrics AS
+SELECT
+    dp.id                         AS id,
+    dp.series_id                  AS series_id,
+    dp.timestamp_ns               AS timestamp_ns,
+    dp.start_timestamp_ns         AS start_timestamp_ns,
+    dp.flags                      AS flags,
+    dp.double_value               AS double_value,
+    dp.int_value                  AS int_value,
+    dp.count                      AS count,
+    dp.sum                        AS sum,
+    dp.min                        AS min,
+    dp.max                        AS max,
+    dp.nan_mask                   AS nan_mask,
+    dp.histogram_json             AS histogram_json,
+    dp.exponential_histogram_json AS exponential_histogram_json,
+    dp.summary_json               AS summary_json,
+    dp.exemplars_json             AS exemplars_json,
+    ms.attributes_json            AS series_attributes,
+    m.id                          AS metric_id,
+    m.name                        AS metric_name,
+    m.description                 AS metric_description,
+    m.unit                        AS unit,
+    m.type                        AS metric_type,
+    m.is_monotonic                AS is_monotonic,
+    m.aggregation_temporality     AS aggregation_temporality,
+    s.id                          AS scope_id,
+    s.name                        AS scope_name,
+    s.version                     AS scope_version,
+    s.schema_url                  AS scope_schema_url,
+    r.id                          AS resource_id,
+    r.service_name                AS service_name,
+    r.host_name                   AS host_name,
+    r.schema_url                  AS resource_schema_url
+FROM metric_data_point dp
+JOIN metric_series ms ON ms.id = dp.series_id
+JOIN metric m       ON m.id = ms.metric_id
+JOIN scope s        ON s.id = m.scope_id
+JOIN log_resource r ON r.id = s.resource_id;
+
+CREATE VIEW IF NOT EXISTS metric_buckets AS
+SELECT
+    dp.id                         AS data_point_id,
+    dp.series_id                  AS series_id,
+    dp.timestamp_ns               AS timestamp_ns,
+    CAST(b.key AS INTEGER)        AS bucket_index,
+    b.value                       AS bound_json,
+    CASE WHEN json_type(b.value) IN ('integer', 'real')
+         THEN CAST(b.value AS REAL) END AS bound,
+    CAST(c.value AS INTEGER)      AS bucket_count
+FROM metric_data_point dp
+JOIN json_each(dp.histogram_json, '$.bounds') b
+JOIN json_each(dp.histogram_json, '$.counts') c ON c.key = b.key
+WHERE dp.histogram_json IS NOT NULL
+UNION ALL
+-- The overflow bucket: counts[len(bounds)] has no explicit bound.
+SELECT
+    dp.id,
+    dp.series_id,
+    dp.timestamp_ns,
+    CAST(c.key AS INTEGER),
+    '"+Inf"',
+    NULL,
+    CAST(c.value AS INTEGER)
+FROM metric_data_point dp
+JOIN json_each(dp.histogram_json, '$.counts') c
+WHERE dp.histogram_json IS NOT NULL
+  AND CAST(c.key AS INTEGER) = (
+      SELECT COUNT(*) FROM json_each(dp.histogram_json, '$.bounds')
+  );
 `

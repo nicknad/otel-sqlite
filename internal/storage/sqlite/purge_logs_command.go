@@ -70,11 +70,15 @@ func (c *PurgeLogsCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 		}
 	}
 
-	// Clean up orphaned resources (resources with no remaining events).
+	// Clean up orphaned resources. log_resource is shared with the metrics
+	// path, so a resource referenced by a metric scope must survive even when
+	// it has no remaining log events.
 	_, err := tx.ExecContext(
 		ctx,
 		`DELETE FROM log_resource WHERE id NOT IN (
 			SELECT DISTINCT resource_id FROM log_event
+		) AND id NOT IN (
+			SELECT DISTINCT resource_id FROM scope
 		)`,
 	)
 	if err != nil {

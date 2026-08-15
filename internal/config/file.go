@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"codeberg.org/nicknad/otel-sqlite/internal/duration"
 )
 
 // FileConfig mirrors the top-level YAML config structure.
@@ -21,6 +23,11 @@ type FileConfig struct {
 	BatcherErrorSeverityThreshold string `yaml:"batcher_error_severity_threshold"`
 	WriterBatchSize               int    `yaml:"writer_batch_size"`
 	WriterFlushInterval           string `yaml:"writer_flush_interval"`
+	// MetricsEnabled is a *bool so YAML "false" is distinguishable from
+	// "unset" (the default is true). MetricsSQLitePath follows the string
+	// pattern: only applied when non-empty.
+	MetricsEnabled    *bool  `yaml:"metrics_enabled"`
+	MetricsSQLitePath string `yaml:"metrics_sqlite_path"`
 	// Legacy fields (mapped to both batcher and writer if specific fields unset)
 	BatchSize                         int     `yaml:"batch_size"`
 	FlushInterval                     string  `yaml:"flush_interval"`
@@ -114,6 +121,14 @@ func (c *Config) loadCoreConfig(fc *FileConfig) error {
 	}
 	if fc.BatcherErrorSeverityThreshold != "" {
 		c.BatcherErrorSeverityThreshold = fc.BatcherErrorSeverityThreshold
+	}
+	if fc.MetricsSQLitePath != "" {
+		c.MetricsSQLitePath = fc.MetricsSQLitePath
+	}
+
+	// Bool fields: *bool distinguishes "false" from "unset".
+	if fc.MetricsEnabled != nil {
+		c.MetricsEnabled = *fc.MetricsEnabled
 	}
 
 	// Int fields (only if non-zero to distinguish "unset" from "set to 0").
@@ -351,23 +366,5 @@ func parseRuleDurationField(fr *FileRuleConfig, field string, setter func(string
 // parseDurationExt parses a duration string supporting Go durations and "d" for days.
 // Examples: "30d", "24h", "1h30m", "5s".
 func parseDurationExt(s string) (time.Duration, error) {
-	// Try standard Go duration first.
-	if d, err := time.ParseDuration(s); err == nil {
-		return d, nil
-	}
-
-	// Custom handling for "d" suffix (days).
-	if len(s) >= 2 && s[len(s)-1] == 'd' {
-		daysStr := s[:len(s)-1]
-		var days int
-		if _, err := fmt.Sscanf(daysStr, "%d", &days); err != nil {
-			return 0, fmt.Errorf("invalid duration %q: %w", s, err)
-		}
-		if days < 0 {
-			return 0, fmt.Errorf("invalid duration %q: negative days not allowed", s)
-		}
-		return time.Duration(days) * 24 * time.Hour, nil
-	}
-
-	return 0, fmt.Errorf("invalid duration %q", s)
+	return duration.Parse(s)
 }

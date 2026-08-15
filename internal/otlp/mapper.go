@@ -79,7 +79,21 @@ func (m *Mapper) mapResourceLogs(resourceLogs *logsV1.ResourceLogs) *model.LogBa
 // ResourceLogs message (the OTLP Resource message itself has none).
 func (m *Mapper) mapResource(resource *resourceV1.Resource, schemaURL string) *model.Resource {
 	if resource == nil {
-		return model.NewResource(nil)
+		// OTLP allows ResourceMetrics/ResourceLogs with Resource unset. The
+		// resource still needs a stable, non-empty ID: the writer inserts the
+		// log_resource row keyed by ID and every metric/log record must
+		// reference that same ID or the read-side views (which join
+		// scope/log_event -> log_resource) silently drop the rows. An empty
+		// ID would also make the writer's ensureResourceID fallback mint a
+		// fresh time-based ID per batch, breaking dedup. A nil resource is
+		// therefore mapped to the deterministic "empty resource" identity
+		// (hash of the empty attribute set + schema URL), shared by both
+		// signals so logs and metrics from resource-less senders land in the
+		// same log_resource row.
+		r := model.NewResource(nil)
+		r.SchemaURL = schemaURL
+		r.ID = computeResourceID(nil, schemaURL)
+		return r
 	}
 
 	attributes := make(map[string]model.AttributeValue, len(resource.Attributes))

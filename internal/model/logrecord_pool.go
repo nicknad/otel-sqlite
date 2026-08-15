@@ -70,12 +70,3 @@ func PutRecord(r *LogRecord) {
 	r.Attributes = r.Attributes[:0]
 	recordPool.Put(r)
 }
-
-// NewLogRecord creates a new LogRecord with pre-allocated attribute slice.
-//
-// Deprecated: Use GetRecord() for better performance via object pooling.
-func NewLogRecord() *LogRecord {
-	return &LogRecord{
-		Attributes: make([]Attribute, 0, 4),
-	}
-}
