@@ -1,8 +1,7 @@
 # Plan: separate SQLite database for metrics (`metrics_sqlite_path`)
 
 Status: implemented
-Related: `docs/metrics-extension-proposal.md`, `docs/metrics-phase2-handoff.md`,
-`docs/loadtest-baseline.md` (mixed-load contention numbers)
+Related: `docs/loadtest-baseline.md` (mixed-load contention numbers)
 
 ## 1. Goal
 
