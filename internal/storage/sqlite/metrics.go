@@ -104,11 +104,6 @@ func (c *WriteMetricsCommand) Size() int {
 	return c.points
 }
 
-// Batch returns the underlying MetricBatch (for metrics and diagnostics).
-func (c *WriteMetricsCommand) Batch() *model.MetricBatch {
-	return c.batch
-}
-
 // Execute writes the metric batch inside the supplied transaction.
 func (c *WriteMetricsCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 	if c.batch == nil || c.batch.IsEmpty() {

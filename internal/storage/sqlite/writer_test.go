@@ -13,6 +13,7 @@ import (
 
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage"
+	"codeberg.org/nicknad/otel-sqlite/internal/testutil"
 )
 
 func TestOpenDatabase(t *testing.T) {
@@ -315,9 +316,6 @@ func TestWriteBatchCommandImmutability(t *testing.T) {
 	batch.AddRecord(&model.LogRecord{Body: "immutable"})
 
 	cmd := NewWriteBatchCommand(batch)
-	if cmd.Batch() != batch {
-		t.Error("Batch() should return the same batch reference")
-	}
 	// Verify the command caches the record count correctly
 	batch.AddRecord(&model.LogRecord{Body: "extra"})
 	// Size() should return the original count, not the updated batch count
@@ -366,7 +364,7 @@ func TestWriterRollbackDoesNotPoisonDedupCaches(t *testing.T) {
 	})
 
 	// Nothing committed, and the dedup caches must be empty.
-	assertCount(t, w.db, "metric_data_point", 0)
+	testutil.AssertTableCount(t, w.db, "metric_data_point", 0)
 	if len(w.seenResources) != 0 || len(w.seenScopes) != 0 || len(w.seenMetrics) != 0 || len(w.seenSeries) != 0 {
 		t.Fatalf("dedup caches poisoned by rolled-back transaction: resources=%d scopes=%d metrics=%d series=%d",
 			len(w.seenResources), len(w.seenScopes), len(w.seenMetrics), len(w.seenSeries))
@@ -376,10 +374,10 @@ func TestWriterRollbackDoesNotPoisonDedupCaches(t *testing.T) {
 	// was not poisoned), and after commit the caches are populated.
 	w.executeCommands([]storage.Command{NewWriteMetricsCommand(buildMetricBatch())})
 
-	assertCount(t, w.db, "scope", 1)
-	assertCount(t, w.db, "metric", 2)
-	assertCount(t, w.db, "metric_series", 3)
-	assertCount(t, w.db, "metric_data_point", 4)
+	testutil.AssertTableCount(t, w.db, "scope", 1)
+	testutil.AssertTableCount(t, w.db, "metric", 2)
+	testutil.AssertTableCount(t, w.db, "metric_series", 3)
+	testutil.AssertTableCount(t, w.db, "metric_data_point", 4)
 	if len(w.seenResources) != 1 || len(w.seenScopes) != 1 || len(w.seenMetrics) != 2 || len(w.seenSeries) != 3 {
 		t.Fatalf("caches not populated after commit: resources=%d scopes=%d metrics=%d series=%d",
 			len(w.seenResources), len(w.seenScopes), len(w.seenMetrics), len(w.seenSeries))

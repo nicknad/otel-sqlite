@@ -58,7 +58,6 @@ type MetricBatcher struct {
 	// Control
 	ctx     context.Context
 	cancel  context.CancelCauseFunc
-	wg      sync.WaitGroup
 	stopped chan struct{}
 }
 
@@ -114,7 +113,6 @@ func (b *MetricBatcher) Start(ctx context.Context) {
 		panic("batcher: MetricBatcher.Start called before WithCommandFactory")
 	}
 	b.ctx, b.cancel = context.WithCancelCause(ctx)
-	b.wg.Add(1)
 
 	// #nosec G118 -- batcher uses WithCancelCause context, not Background
 	go b.run()
@@ -128,14 +126,8 @@ func (b *MetricBatcher) Stop() {
 	<-b.stopped
 }
 
-// Wait waits for the batcher to finish.
-func (b *MetricBatcher) Wait() {
-	b.wg.Wait()
-}
-
 // run is the main batcher loop.
 func (b *MetricBatcher) run() {
-	defer b.wg.Done()
 	defer close(b.stopped)
 
 	flushTicker := time.NewTicker(b.flushInterval)
@@ -145,6 +137,10 @@ func (b *MetricBatcher) run() {
 		select {
 		case <-b.ctx.Done():
 			log.Printf("metric batcher: shutting down: %v", context.Cause(b.ctx))
+			// Drain any in-flight batches before flushing: the shutdown
+			// select can otherwise pick ctx.Done() while the ingress queue
+			// still holds data, silently dropping it.
+			b.drainIngress()
 			b.flushCurrentBatch()
 			return
 
@@ -176,6 +172,30 @@ func (b *MetricBatcher) run() {
 			if isFull {
 				b.flushCurrentBatch()
 			}
+		}
+	}
+}
+
+// drainIngress consumes any remaining batches from the ingress queue so that
+// shutdown does not drop in-flight data. Non-blocking: concurrent producers
+// are expected to have stopped (gRPC server shutdown precedes the batcher).
+func (b *MetricBatcher) drainIngress() {
+	for {
+		select {
+		case batch, ok := <-b.ingressQueue.Chan():
+			if !ok {
+				return
+			}
+			b.mu.Lock()
+			if !b.merge(batch) {
+				// Different resource: flush the current batch first so nothing
+				// is dropped.
+				b.flushLocked()
+				b.currentBatch = batch
+			}
+			b.mu.Unlock()
+		default:
+			return
 		}
 	}
 }

@@ -65,6 +65,10 @@ func (s *Server) Export(ctx context.Context, request *logsV1.ExportLogsServiceRe
 		return &logsV1.ExportLogsServiceResponse{}, nil
 	}
 
+	if s.ingressQueue == nil {
+		return nil, status.Error(codes.Unavailable, "log ingestion is disabled")
+	}
+
 	// Optional early backpressure: reject before mapping if the ingress queue
 	// is already too full, protecting memory even under extreme client concurrency.
 	if backpressureRejected(s.backpressureThreshold, s.ingressQueue.Len(), s.ingressQueue.Cap()) {

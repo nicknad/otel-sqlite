@@ -14,7 +14,6 @@ import (
 // mockWriteMetricsCommand is a lightweight stand-in for
 // sqlite.WriteMetricsCommand used in batcher tests.
 type mockWriteMetricsCommand struct {
-	batch  *model.MetricBatch
 	points int
 }
 
@@ -26,10 +25,6 @@ func (m *mockWriteMetricsCommand) Size() int {
 	return m.points
 }
 
-func (m *mockWriteMetricsCommand) Batch() *model.MetricBatch {
-	return m.batch
-}
-
 // newMockMetricsCmd creates a mock command from a batch (same signature as
 // sqlite.NewWriteMetricsCommand).
 func newMockMetricsCmd(batch *model.MetricBatch) storage.Command {
@@ -37,7 +32,7 @@ func newMockMetricsCmd(batch *model.MetricBatch) storage.Command {
 	if batch != nil {
 		points = batch.Size()
 	}
-	return &mockWriteMetricsCommand{batch: batch, points: points}
+	return &mockWriteMetricsCommand{points: points}
 }
 
 type testMetricQueues struct {
@@ -170,6 +165,30 @@ func TestMetricBatcherSeparatesResources(t *testing.T) {
 }
 
 // TestMetricBatcherFlushOnClose verifies shutdown flushes the partial batch.
+// TestMetricBatcherStopDrainsIngress is a regression test for shutdown
+// dropping in-flight batches: Stop must drain the ingress queue before
+// flushing, even when the shutdown select could otherwise pick ctx.Done()
+// first.
+func TestMetricBatcherStopDrainsIngress(t *testing.T) {
+	q := newTestMetricQueues(10)
+	b := NewMetricBatcher(q.ingress, &queueExecutor{q: q.cmdQueue}, &MetricBatcherConfig{BatchSize: 1000})
+	b.WithCommandFactory(newMockMetricsCmd)
+
+	b.Start(context.Background())
+
+	// Send AFTER Start, then stop immediately — no sleep: any shutdown path
+	// that skips the ingress queue drops these points.
+	_ = q.ingress.Send(context.Background(), makeMetricBatch("r1", 3))
+	_ = q.ingress.Send(context.Background(), makeMetricBatch("r1", 4))
+	b.Stop()
+
+	q.cmdQueue.Close()
+	total := drainCommandQueue(q.cmdQueue)
+	if total != 7 {
+		t.Errorf("total points flushed = %d, want 7", total)
+	}
+}
+
 func TestMetricBatcherFlushOnClose(t *testing.T) {
 	q := newTestMetricQueues(10)
 	b := NewMetricBatcher(q.ingress, &queueExecutor{q: q.cmdQueue}, &MetricBatcherConfig{BatchSize: 1000})

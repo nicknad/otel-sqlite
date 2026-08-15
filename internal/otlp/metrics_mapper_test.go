@@ -343,6 +343,139 @@ func TestMapMetricsData_HistogramAndSummary(t *testing.T) {
 	}
 }
 
+// TestMapMetricsData_ExponentialHistogram covers the exp-histogram mapping,
+// which preserves the full bucket layout (scale/offset/counts) and the
+// zero-threshold as a JSON payload. Non-finite zero thresholds must survive
+// as string markers ("NaN"), and missing positive/negative bucket sets must
+// serialize as omitted fields rather than null entries.
+func TestMapMetricsData_ExponentialHistogram(t *testing.T) {
+	now := uint64(time.Now().UnixNano())
+	expH := &metricsV1.ExponentialHistogram{
+		AggregationTemporality: metricsV1.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA,
+		DataPoints: []*metricsV1.ExponentialHistogramDataPoint{
+			{
+				TimeUnixNano: now, Count: 5, Sum: float64ptr(2.5), Min: float64ptr(0.1), Max: float64ptr(1.9),
+				Scale: 3, ZeroCount: 2, ZeroThreshold: math.NaN(),
+				Positive: &metricsV1.ExponentialHistogramDataPoint_Buckets{
+					Offset: -1, BucketCounts: []uint64{1, 2},
+				},
+				// Negative buckets omitted on purpose.
+			},
+			// nil data point must be skipped, not panic.
+			nil,
+		},
+	}
+	m := NewMapper()
+	batches := m.MapMetricsData([]*metricsV1.ResourceMetrics{
+		{
+			Resource: &resourceV1.Resource{
+				Attributes: []*commonV1.KeyValue{{Key: "service.name", Value: strValue("exp-api")}},
+			},
+			ScopeMetrics: []*metricsV1.ScopeMetrics{
+				{
+					Scope: &commonV1.InstrumentationScope{Name: "exp-scope", Version: "1.0.0"},
+					Metrics: []*metricsV1.Metric{
+						{
+							Name: "request.size",
+							Unit: "By",
+							Data: &metricsV1.Metric_ExponentialHistogram{ExponentialHistogram: expH},
+						},
+					},
+				},
+			},
+		},
+	})
+	batch := batches[0]
+
+	metric := batch.Metrics[0]
+	if metric.Type != model.MetricTypeExponentialHistogram || metric.Temporality != model.TemporalityDelta {
+		t.Errorf("exp-histogram type/temporality = %v/%v", metric.Type, metric.Temporality)
+	}
+
+	dp := metric.Series[0].DataPoints[0]
+	if dp.Count == nil || *dp.Count != 5 || dp.Sum == nil || *dp.Sum != 2.5 {
+		t.Errorf("exp-histogram count/sum = %v/%v", dp.Count, dp.Sum)
+	}
+	if dp.Min == nil || *dp.Min != 0.1 || dp.Max == nil || *dp.Max != 1.9 {
+		t.Errorf("exp-histogram min/max = %v/%v", dp.Min, dp.Max)
+	}
+
+	var payload struct {
+		Scale         int32  `json:"scale"`
+		ZeroCount     uint64 `json:"zero_count"`
+		ZeroThreshold any    `json:"zero_threshold"`
+		Positive      struct {
+			Offset       int32    `json:"offset"`
+			BucketCounts []uint64 `json:"bucket_counts"`
+		} `json:"positive"`
+		Negative json.RawMessage `json:"negative"`
+	}
+	if err := json.Unmarshal(dp.ExponentialHistogramJSON, &payload); err != nil {
+		t.Fatalf("exp-histogram JSON: %v", err)
+	}
+	if payload.Scale != 3 || payload.ZeroCount != 2 {
+		t.Errorf("exp-histogram scale/zero_count = %d/%d", payload.Scale, payload.ZeroCount)
+	}
+	if payload.ZeroThreshold != "NaN" {
+		t.Errorf("zero_threshold = %v, want \"NaN\" marker", payload.ZeroThreshold)
+	}
+	if payload.Positive.Offset != -1 || len(payload.Positive.BucketCounts) != 2 || payload.Positive.BucketCounts[1] != 2 {
+		t.Errorf("positive buckets = %+v", payload.Positive)
+	}
+	// Absent negative buckets must be omitted entirely, not "null".
+	if len(payload.Negative) != 0 {
+		t.Errorf("negative = %s, want omitted", payload.Negative)
+	}
+}
+
+// TestMapMetricsData_ExponentialHistogramNegativeBuckets covers the
+// negative-bucket branch of the exp-histogram payload (mapBucketsJSON with a
+// non-nil Buckets value).
+func TestMapMetricsData_ExponentialHistogramNegativeBuckets(t *testing.T) {
+	now := uint64(time.Now().UnixNano())
+	m := NewMapper()
+	batches := m.MapMetricsData([]*metricsV1.ResourceMetrics{
+		{
+			Resource: &resourceV1.Resource{
+				Attributes: []*commonV1.KeyValue{{Key: "service.name", Value: strValue("exp-api")}},
+			},
+			ScopeMetrics: []*metricsV1.ScopeMetrics{
+				{
+					Scope: &commonV1.InstrumentationScope{Name: "exp-scope", Version: "1.0.0"},
+					Metrics: []*metricsV1.Metric{
+						{
+							Name: "request.size",
+							Data: &metricsV1.Metric_ExponentialHistogram{ExponentialHistogram: &metricsV1.ExponentialHistogram{
+								DataPoints: []*metricsV1.ExponentialHistogramDataPoint{
+									{
+										TimeUnixNano: now, Count: 1,
+										Negative: &metricsV1.ExponentialHistogramDataPoint_Buckets{
+											Offset: 2, BucketCounts: []uint64{3},
+										},
+									},
+								},
+							}},
+						},
+					},
+				},
+			},
+		},
+	})
+	dp := batches[0].Metrics[0].Series[0].DataPoints[0]
+	var payload struct {
+		Negative struct {
+			Offset       int32    `json:"offset"`
+			BucketCounts []uint64 `json:"bucket_counts"`
+		} `json:"negative"`
+	}
+	if err := json.Unmarshal(dp.ExponentialHistogramJSON, &payload); err != nil {
+		t.Fatalf("exp-histogram JSON: %v", err)
+	}
+	if payload.Negative.Offset != 2 || len(payload.Negative.BucketCounts) != 1 || payload.Negative.BucketCounts[0] != 3 {
+		t.Errorf("negative buckets = %+v", payload.Negative)
+	}
+}
+
 func TestMapMetricsData_DeterministicIDs(t *testing.T) {
 	m := NewMapper()
 	b1 := m.MapMetricsData([]*metricsV1.ResourceMetrics{buildResourceMetrics()})[0]

@@ -339,7 +339,9 @@ func (w *Writer) executeTransaction(commands []storage.Command) {
 	tx, err := w.db.Begin()
 	if err != nil {
 		log.Printf("error beginning transaction: %v", err)
-		w.aMetrics.IncrementWriteErrors()
+		if w.aMetrics != nil {
+			w.aMetrics.IncrementWriteErrors()
+		}
 		return
 	}
 
@@ -365,7 +367,9 @@ func (w *Writer) executeTransaction(commands []storage.Command) {
 	for _, cmd := range commands {
 		if err := cmd.Execute(dbCtx, tx); err != nil {
 			log.Printf("command %T failed: %v", cmd, err)
-			w.aMetrics.IncrementWriteErrors()
+			if w.aMetrics != nil {
+				w.aMetrics.IncrementWriteErrors()
+			}
 			// Rollback the entire transaction on command failure.
 			_ = tx.Rollback()
 			return
@@ -381,7 +385,9 @@ func (w *Writer) executeTransaction(commands []storage.Command) {
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		log.Printf("error committing transaction: %v", err)
-		w.aMetrics.IncrementWriteErrors()
+		if w.aMetrics != nil {
+			w.aMetrics.IncrementWriteErrors()
+		}
 		return
 	}
 

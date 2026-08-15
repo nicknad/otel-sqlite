@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"codeberg.org/nicknad/otel-sqlite/internal/duration"
 )
 
 // fileMaintenanceConfig is the YAML-deserializable subset of maintenance config.
@@ -154,21 +156,9 @@ func (c *Config) LoadFile(path string) error {
 	return nil
 }
 
-// parseDurationExt is a copy of config.parseDurationExt to avoid a
-// circular dependency. It supports Go durations and "d" for days.
+// parseDurationExt parses a duration string supporting Go durations and "d" for days.
+// Examples: "30d", "24h", "1h30m", "5s". The implementation lives in the
+// shared internal/duration package (config and maintenance both use it).
 func parseDurationExt(s string) (time.Duration, error) {
-	if d, err := time.ParseDuration(s); err == nil {
-		return d, nil
-	}
-	if len(s) >= 2 && s[len(s)-1] == 'd' {
-		var days int
-		if _, err := fmt.Sscanf(s[:len(s)-1], "%d", &days); err != nil {
-			return 0, fmt.Errorf("invalid duration %q: %w", s, err)
-		}
-		if days < 0 {
-			return 0, fmt.Errorf("invalid duration %q: negative days not allowed", s)
-		}
-		return time.Duration(days) * 24 * time.Hour, nil
-	}
-	return 0, fmt.Errorf("invalid duration %q", s)
+	return duration.Parse(s)
 }

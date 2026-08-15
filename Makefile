@@ -212,5 +212,10 @@ loadtest-separate-baselines: loadtest-separate-up
 	$(MAKE) loadtest-baseline-mixed
 	$(MAKE) loadtest-separate-down
 
+# check-indexes lists the SQLite indexes on a database file (default: otel-logs.db).
+.PHONY: check-indexes
+check-indexes:
+	$(GO) run ./scripts/check_indexes.go $(DB_PATH)
+
 # Helper targets
 .PHONY: deps install-tools

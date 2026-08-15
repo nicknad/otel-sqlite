@@ -9,6 +9,7 @@ import (
 	"codeberg.org/nicknad/otel-sqlite/internal/maintenance"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage/sqlite"
+	"codeberg.org/nicknad/otel-sqlite/internal/testutil"
 )
 
 func TestMetricRetentionTask_Name(t *testing.T) {
@@ -281,11 +282,5 @@ func assertTaskDBCount(t *testing.T, path, table string, want int) {
 	t.Helper()
 	db := openTaskDB(t, path)
 	defer func() { _ = db.Close() }()
-	var n int
-	if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
-		t.Fatalf("count %s: %v", table, err)
-	}
-	if n != want {
-		t.Errorf("%s count in %s = %d, want %d", table, path, n, want)
-	}
+	testutil.AssertTableCount(t, db, table, want)
 }
