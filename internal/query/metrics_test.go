@@ -44,7 +44,7 @@ func seedDB(t *testing.T, path string) {
 	nan := math.NaN()
 	histJSON, _ := json.Marshal(map[string]any{
 		"bounds": []any{1.0, 5.0, 10.0},
-		"counts": []uint64{3, 7, 2},
+		"counts": []uint64{3, 7, 2, 9}, // +1 entry: implicit +Inf overflow bucket
 	})
 	exemplars := []model.Exemplar{
 		{
@@ -275,20 +275,30 @@ func TestBuckets_Normalized(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Buckets: %v", err)
 	}
-	if len(buckets) != 3 {
-		t.Fatalf("expected 3 buckets, got %d", len(buckets))
+	if len(buckets) != 4 {
+		t.Fatalf("expected 4 buckets (incl. overflow), got %d", len(buckets))
 	}
 	wantBounds := []float64{1, 5, 10}
-	wantCounts := []uint64{3, 7, 2}
+	wantCounts := []uint64{3, 7, 2, 9}
 	for i, b := range buckets {
 		if b.Index != i {
 			t.Errorf("bucket %d index = %d", i, b.Index)
 		}
-		if b.Bound == nil || *b.Bound != wantBounds[i] {
-			t.Errorf("bucket %d bound = %v, want %v", i, b.Bound, wantBounds[i])
-		}
 		if b.Count != wantCounts[i] {
 			t.Errorf("bucket %d count = %d, want %d", i, b.Count, wantCounts[i])
+		}
+		if i < len(wantBounds) {
+			if b.Bound == nil || *b.Bound != wantBounds[i] {
+				t.Errorf("bucket %d bound = %v, want %v", i, b.Bound, wantBounds[i])
+			}
+		} else {
+			// Overflow bucket: implicit +Inf, numeric bound is NULL.
+			if b.Bound != nil {
+				t.Errorf("overflow bucket bound = %v, want nil (+Inf)", *b.Bound)
+			}
+			if b.BoundJSON != `"+Inf"` {
+				t.Errorf("overflow bucket bound_json = %s, want %q", b.BoundJSON, `"+Inf"`)
+			}
 		}
 		if b.SeriesID != "series-hist" || b.DataPointID == 0 {
 			t.Errorf("bucket %d context = %+v", i, b)
