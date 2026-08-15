@@ -117,6 +117,81 @@ func TestRuleEngine_BodyFilter(t *testing.T) {
 	}
 }
 
+// TestRuleEngine_AttributeFilter covers matchAttribute/attrValueString: a
+// rule with AttributeFilters matches only when an attribute with the key
+// exists AND its string form matches the regex. All four value kinds are
+// exercised (string, int, double, bool).
+func TestRuleEngine_AttributeFilter(t *testing.T) {
+	engine, err := NewRuleEngine([]Rule{
+		{
+			Name:             "attr-rule",
+			MatchSeverity:    model.SeverityError,
+			AttributeFilters: map[string]string{"host": "prod-.*"},
+			Destination:      "log",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		attrs   []model.Attribute
+		matched bool
+	}{
+		{"string match", []model.Attribute{{Key: "host", Kind: model.ValueString, Str: "prod-1"}}, true},
+		{"string no match", []model.Attribute{{Key: "host", Kind: model.ValueString, Str: "staging-1"}}, false},
+		{"int match via format", []model.Attribute{{Key: "host", Kind: model.ValueInt, Num: 7}}, false}, // "7" vs "prod-.*"
+		{"wrong key", []model.Attribute{{Key: "service", Kind: model.ValueString, Str: "prod-1"}}, false},
+		{"no attributes", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := &events.Event{Severity: model.SeverityError, Attributes: tc.attrs}
+			_, matched := engine.Evaluate(context.Background(), ev)
+			if matched != tc.matched {
+				t.Errorf("matched = %v, want %v", matched, tc.matched)
+			}
+		})
+	}
+}
+
+// TestRuleEngine_AttributeFilterAllKinds verifies attrValueString renders
+// every attribute kind for regex matching: an "always true" pattern must
+// match int/double/bool attributes too, not just strings.
+func TestRuleEngine_AttributeFilterAllKinds(t *testing.T) {
+	engine, err := NewRuleEngine([]Rule{
+		{
+			Name:             "kind-rule",
+			MatchSeverity:    model.SeverityError,
+			AttributeFilters: map[string]string{"code": ".*"},
+			Destination:      "log",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		attr  model.Attribute
+		match bool
+	}{
+		{"int", model.Attribute{Key: "code", Kind: model.ValueInt, Num: 42}, true},
+		{"double", model.Attribute{Key: "code", Kind: model.ValueDouble, Dbl: 3.5}, true},
+		{"bool", model.Attribute{Key: "code", Kind: model.ValueBool, Flag: true}, true},
+		{"null kind", model.Attribute{Key: "code", Kind: model.ValueNull}, true}, // "" matches .*
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := &events.Event{Severity: model.SeverityError, Attributes: []model.Attribute{tc.attr}}
+			_, matched := engine.Evaluate(context.Background(), ev)
+			if matched != tc.match {
+				t.Errorf("matched = %v, want %v", matched, tc.match)
+			}
+		})
+	}
+}
+
 func TestRuleEngine_FirstMatchWins(t *testing.T) {
 	engine, err := NewRuleEngine([]Rule{
 		{Name: "first", MatchSeverity: model.SeverityError, Destination: "log"},

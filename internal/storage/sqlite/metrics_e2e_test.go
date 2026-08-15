@@ -6,11 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/nicknad/otel-sqlite/internal/batcher"
-	"codeberg.org/nicknad/otel-sqlite/internal/ingest"
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
 	"codeberg.org/nicknad/otel-sqlite/internal/otlp"
-	"codeberg.org/nicknad/otel-sqlite/internal/storage"
+	"codeberg.org/nicknad/otel-sqlite/internal/testutil"
 
 	metricsCollectorV1 "codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/collector/metrics/v1"
 	commonV1 "codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/common/v1"
@@ -27,34 +25,7 @@ func TestE2E_OTLPMetricsToSQLite(t *testing.T) {
 	dbPath := t.TempDir() + "/metrics-e2e.db"
 
 	// Full pipeline: metric ingress queue → metric batcher → shared cmd queue → writer.
-	metricIngressQueue := ingest.NewMetricIngressQueue(1000)
-	cmdQueue := storage.NewCommandQueue(100)
-
-	writer, err := NewWriter(cmdQueue, &WriterConfig{
-		Path:          dbPath,
-		BatchSize:     10,
-		FlushInterval: 100 * time.Millisecond,
-		WALMode:       true,
-	})
-	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	writer.Start(ctx)
-	defer writer.Stop()
-
-	mb := batcher.NewMetricBatcher(metricIngressQueue, writer, &batcher.MetricBatcherConfig{
-		BatchSize:     50,
-		FlushInterval: 50 * time.Millisecond,
-	})
-	mb.WithCommandFactory(func(batch *model.MetricBatch) storage.Command {
-		return NewWriteMetricsCommand(batch)
-	})
-	mb.Start(context.Background())
-	defer mb.Stop()
-
-	svr := otlp.NewMetricsServer(metricIngressQueue, nil)
+	p := startMetricPipeline(t, dbPath)
 
 	// ---- send: OTLP ExportMetrics request ----
 	now := uint64(time.Now().UnixNano())
@@ -119,14 +90,12 @@ func TestE2E_OTLPMetricsToSQLite(t *testing.T) {
 		},
 	}
 
-	if _, err := svr.Export(context.Background(), req); err != nil {
+	if _, err := p.server.Export(context.Background(), req); err != nil {
 		t.Fatalf("ExportMetrics: %v", err)
 	}
 
 	// ---- wait for pipeline to drain ----
-	time.Sleep(500 * time.Millisecond)
-	writer.Stop()
-	writer.Wait()
+	p.stop()
 
 	// ---- assert: open DB read-only and verify everything ----
 	db, err := sql.Open("sqlite3", dbPath)
@@ -152,7 +121,7 @@ func TestE2E_OTLPMetricsToSQLite(t *testing.T) {
 	}
 
 	// 3. Metric rows (2 definitions).
-	assertCount(t, db, "metric", 2)
+	testutil.AssertTableCount(t, db, "metric", 2)
 	var unit string
 	var typeVal int
 	if err := db.QueryRow(
@@ -174,7 +143,7 @@ func TestE2E_OTLPMetricsToSQLite(t *testing.T) {
 	}
 
 	// 4. Series rows: gauge has 2 series, sum has 1.
-	assertCount(t, db, "metric_series", 3)
+	testutil.AssertTableCount(t, db, "metric_series", 3)
 	var seriesID string
 	if err := db.QueryRow(
 		"SELECT ms.id FROM metric_series ms JOIN metric m ON m.id = ms.metric_id WHERE m.name = ? AND ms.attributes_json = ?",
@@ -184,7 +153,7 @@ func TestE2E_OTLPMetricsToSQLite(t *testing.T) {
 	}
 
 	// 5. Data points: 3 total, values preserved.
-	assertCount(t, db, "metric_data_point", 3)
+	testutil.AssertTableCount(t, db, "metric_data_point", 3)
 	var doubleVal float64
 	if err := db.QueryRow(
 		"SELECT double_value FROM metric_data_point WHERE series_id = ? AND timestamp_ns = ?",
@@ -231,34 +200,7 @@ func TestE2E_MetricsDisabled(t *testing.T) {
 func TestE2E_NilResourceMetricsStayVisible(t *testing.T) {
 	dbPath := t.TempDir() + "/nil-resource.db"
 
-	metricIngressQueue := ingest.NewMetricIngressQueue(1000)
-	cmdQueue := storage.NewCommandQueue(100)
-
-	writer, err := NewWriter(cmdQueue, &WriterConfig{
-		Path:          dbPath,
-		BatchSize:     10,
-		FlushInterval: 100 * time.Millisecond,
-		WALMode:       true,
-	})
-	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	writer.Start(ctx)
-	defer writer.Stop()
-
-	mb := batcher.NewMetricBatcher(metricIngressQueue, writer, &batcher.MetricBatcherConfig{
-		BatchSize:     50,
-		FlushInterval: 50 * time.Millisecond,
-	})
-	mb.WithCommandFactory(func(batch *model.MetricBatch) storage.Command {
-		return NewWriteMetricsCommand(batch)
-	})
-	mb.Start(context.Background())
-	defer mb.Stop()
-
-	svr := otlp.NewMetricsServer(metricIngressQueue, nil)
+	p := startMetricPipeline(t, dbPath)
 
 	// Resource is nil — the spec-legal "no resource info is known" case.
 	now := uint64(time.Now().UnixNano())
@@ -284,7 +226,7 @@ func TestE2E_NilResourceMetricsStayVisible(t *testing.T) {
 			},
 		},
 	}
-	if _, err := svr.Export(context.Background(), req); err != nil {
+	if _, err := p.server.Export(context.Background(), req); err != nil {
 		t.Fatalf("Export: %v", err)
 	}
 

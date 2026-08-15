@@ -134,12 +134,14 @@ WHERE e.value ->> 'trace_id' = ?
    `CommitSeen()` only after `tx.Commit()`. Rolled-back transactions never
    poison the caches. Any new command touching the seen caches must follow
    this pattern (the log path's `WriteBatchCommand` does too).
-7. **Batcher shutdown gap (e2e script works around it).** `Batcher.Stop()`
-   flushes only the *current* batch — items still in the ingress channel are
-   dropped. The collector's `cleanup()` stops the batcher before the writer,
-   so in-flight acks can be lost on shutdown. `scripts/e2e-mixed.sh` settles
-   for 5s (>> 1s batcher flush interval) before SIGTERM. If a future session
-   makes shutdown drain the ingress queue, remove the settle.
+7. **Batcher shutdown gap (fixed).** `Batcher.Stop()` now drains the
+   ingress queue before flushing the current batch, so in-flight batches are
+   no longer dropped when the shutdown select picks `ctx.Done()` first. Both
+   the log and metric batchers got the fix (`drainIngress`); regression
+   tests: `TestBatcherStopDrainsIngress` and
+   `TestMetricBatcherStopDrainsIngress`. `scripts/e2e-mixed.sh` still
+   settles for 5s before SIGTERM — harmless, but the settle is no longer
+   required for correctness.
 8. **The query package opens its own connection** (`sql.Open` + `PRAGMA
    query_only`, `SetMaxOpenConns(4)`). WAL allows concurrent readers next to
    the single writer — proven by `TestQueryConcurrentWithWriter`.
@@ -183,9 +185,11 @@ WHERE e.value ->> 'trace_id' = ?
    revisit only if cardinality becomes a problem.
 4. Deferred forever-ish (proposal §1): PromQL, query API, downsampling,
    rate calculation, cardinality management, alerting on ingested values.
-5. Optional hardening: drain the ingress queue on shutdown (gotcha 7), and
-   a metrics read view/CLI parity check for exp-histogram + summary payloads
-   (they are stored but only histogram is normalized into rows).
+5. Optional hardening: a metrics read view/CLI parity check for
+   exp-histogram + summary payloads (they are stored but only histogram is
+   normalized into rows). Mapper-level exp-histogram coverage now exists
+   (`TestMapMetricsData_ExponentialHistogram*`), but `metric_buckets`/CLI
+   still only normalize plain histograms.
 
 ## Open questions carried from the proposal (§11)
 

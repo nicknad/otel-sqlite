@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
+	"codeberg.org/nicknad/otel-sqlite/internal/testutil"
 )
 
 // buildMetricBatch constructs a hand-built MetricBatch with known IDs:
@@ -107,13 +108,13 @@ func TestWriteMetricsCommand_RowsInserted(t *testing.T) {
 		t.Fatalf("commit: %v", err)
 	}
 
-	assertCount(t, db, "scope", 1)
-	assertCount(t, db, "metric", 2)
-	assertCount(t, db, "metric_series", 3)
-	assertCount(t, db, "metric_data_point", 4)
+	testutil.AssertTableCount(t, db, "scope", 1)
+	testutil.AssertTableCount(t, db, "metric", 2)
+	testutil.AssertTableCount(t, db, "metric_series", 3)
+	testutil.AssertTableCount(t, db, "metric_data_point", 4)
 
 	// Resource row shared with logs.
-	assertCount(t, db, "log_resource", 1)
+	testutil.AssertTableCount(t, db, "log_resource", 1)
 
 	// Gauge series attribute identity stored as canonical JSON.
 	var attrsJSON string
@@ -211,11 +212,11 @@ func TestWriteMetricsCommand_DedupByIdentity(t *testing.T) {
 		cmd.CommitSeen()
 	}
 
-	assertCount(t, db, "scope", 1)
-	assertCount(t, db, "metric", 2)
-	assertCount(t, db, "metric_series", 3)
+	testutil.AssertTableCount(t, db, "scope", 1)
+	testutil.AssertTableCount(t, db, "metric", 2)
+	testutil.AssertTableCount(t, db, "metric_series", 3)
 	// Data points duplicated (8 total: 4 per execution).
-	assertCount(t, db, "metric_data_point", 8)
+	testutil.AssertTableCount(t, db, "metric_data_point", 8)
 
 	// Dedup must also hold without the process-local cache (INSERT OR IGNORE
 	// alone is sufficient) — clear caches and write again.
@@ -233,10 +234,10 @@ func TestWriteMetricsCommand_DedupByIdentity(t *testing.T) {
 		t.Fatalf("commit: %v", err)
 	}
 	cmd.CommitSeen()
-	assertCount(t, db, "scope", 1)
-	assertCount(t, db, "metric", 2)
-	assertCount(t, db, "metric_series", 3)
-	assertCount(t, db, "metric_data_point", 12)
+	testutil.AssertTableCount(t, db, "scope", 1)
+	testutil.AssertTableCount(t, db, "metric", 2)
+	testutil.AssertTableCount(t, db, "metric_series", 3)
+	testutil.AssertTableCount(t, db, "metric_data_point", 12)
 }
 
 func TestWriteMetricsCommand_ExemplarsJSON(t *testing.T) {
@@ -397,7 +398,7 @@ func TestWriteMetricsCommand_RollbackDoesNotPoisonCaches(t *testing.T) {
 	}
 
 	// No rows committed, and the caches must not claim any.
-	assertCount(t, db, "metric_data_point", 0)
+	testutil.AssertTableCount(t, db, "metric_data_point", 0)
 	if len(seen.Resources) != 0 || len(seen.Scopes) != 0 || len(seen.Metrics) != 0 || len(seen.Series) != 0 {
 		t.Fatalf("dedup caches poisoned by rolled-back transaction: resources=%d scopes=%d metrics=%d series=%d",
 			len(seen.Resources), len(seen.Scopes), len(seen.Metrics), len(seen.Series))
@@ -420,10 +421,10 @@ func TestWriteMetricsCommand_RollbackDoesNotPoisonCaches(t *testing.T) {
 	}
 	cmd2.CommitSeen()
 
-	assertCount(t, db, "scope", 1)
-	assertCount(t, db, "metric", 2)
-	assertCount(t, db, "metric_series", 3)
-	assertCount(t, db, "metric_data_point", 4)
+	testutil.AssertTableCount(t, db, "scope", 1)
+	testutil.AssertTableCount(t, db, "metric", 2)
+	testutil.AssertTableCount(t, db, "metric_series", 3)
+	testutil.AssertTableCount(t, db, "metric_data_point", 4)
 
 	if len(seen.Resources) != 1 || len(seen.Scopes) != 1 || len(seen.Metrics) != 2 || len(seen.Series) != 3 {
 		t.Fatalf("caches not populated after commit: resources=%d scopes=%d metrics=%d series=%d",
@@ -541,16 +542,5 @@ func TestWriteMetricsCommand_NanMask(t *testing.T) {
 	}
 	if mask != 0 {
 		t.Errorf("finite row nan_mask = %d, want 0", mask)
-	}
-}
-
-func assertCount(t *testing.T, db *sql.DB, table string, want int) {
-	t.Helper()
-	var got int
-	if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&got); err != nil {
-		t.Fatalf("count %s: %v", table, err)
-	}
-	if got != want {
-		t.Errorf("count(%s) = %d, want %d", table, got, want)
 	}
 }

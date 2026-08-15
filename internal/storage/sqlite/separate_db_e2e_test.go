@@ -2,16 +2,13 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"testing"
 	"time"
 
-	"codeberg.org/nicknad/otel-sqlite/internal/batcher"
-	"codeberg.org/nicknad/otel-sqlite/internal/ingest"
-	"codeberg.org/nicknad/otel-sqlite/internal/model"
-	"codeberg.org/nicknad/otel-sqlite/internal/otlp"
 	"codeberg.org/nicknad/otel-sqlite/internal/query"
-	"codeberg.org/nicknad/otel-sqlite/internal/storage"
+	"codeberg.org/nicknad/otel-sqlite/internal/testutil"
 
 	logsV1 "codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/collector/logs/v1"
 	metricsCollectorV1 "codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/collector/metrics/v1"
@@ -35,66 +32,14 @@ func TestE2E_OTLPMetricsSeparateDB(t *testing.T) {
 	metricsPath := dir + "/metrics.db"
 
 	// ---- log pipeline: ingress → log batcher → log writer (logPath) ----
-	logIngressQueue := ingest.NewIngressQueue(1000)
-	logCmdQueue := storage.NewCommandQueue(100)
-	logWriter, err := NewWriter(logCmdQueue, &WriterConfig{
-		Path:          logPath,
-		BatchSize:     10,
-		FlushInterval: 100 * time.Millisecond,
-		WALMode:       true,
-	})
-	if err != nil {
-		t.Fatalf("log NewWriter: %v", err)
-	}
-	logCtx, logCancel := context.WithCancel(context.Background())
-	defer logCancel()
-	logWriter.Start(logCtx)
-	defer logWriter.Stop()
-
-	logBatcher := batcher.NewBatcher(logIngressQueue, logCmdQueue, &batcher.BatcherConfig{
-		BatchSize:     50,
-		FlushInterval: 50 * time.Millisecond,
-	})
-	logBatcher.WithCommandFactory(func(batch *model.LogBatch) storage.Command {
-		return NewWriteBatchCommand(batch)
-	})
-	logBatcher.Start(context.Background())
-	defer logBatcher.Stop()
-
-	logSvr := otlp.NewServer(logIngressQueue, nil)
+	logP := startLogPipeline(t, logPath)
 
 	// ---- metric pipeline: ingress → metric batcher → metric writer (metricsPath) ----
-	metricIngressQueue := ingest.NewMetricIngressQueue(1000)
-	metricCmdQueue := storage.NewCommandQueue(100)
-	metricWriter, err := NewWriter(metricCmdQueue, &WriterConfig{
-		Path:          metricsPath,
-		BatchSize:     10,
-		FlushInterval: 100 * time.Millisecond,
-		WALMode:       true,
-	})
-	if err != nil {
-		t.Fatalf("metrics NewWriter: %v", err)
-	}
-	metricCtx, metricCancel := context.WithCancel(context.Background())
-	defer metricCancel()
-	metricWriter.Start(metricCtx)
-	defer metricWriter.Stop()
-
-	mb := batcher.NewMetricBatcher(metricIngressQueue, metricWriter, &batcher.MetricBatcherConfig{
-		BatchSize:     50,
-		FlushInterval: 50 * time.Millisecond,
-	})
-	mb.WithCommandFactory(func(batch *model.MetricBatch) storage.Command {
-		return NewWriteMetricsCommand(batch)
-	})
-	mb.Start(context.Background())
-	defer mb.Stop()
-
-	metricSvr := otlp.NewMetricsServer(metricIngressQueue, nil)
+	metricP := startMetricPipeline(t, metricsPath)
 
 	// ---- send: one log record ----
 	now := uint64(time.Now().UnixNano())
-	if _, err := logSvr.Export(context.Background(), &logsV1.ExportLogsServiceRequest{
+	if _, err := logP.server.Export(context.Background(), &logsV1.ExportLogsServiceRequest{
 		ResourceLogs: []*logsPB.ResourceLogs{
 			{
 				Resource: &resourceV1.Resource{
@@ -127,7 +72,7 @@ func TestE2E_OTLPMetricsSeparateDB(t *testing.T) {
 	}
 
 	// ---- send: one metric data point ----
-	if _, err := metricSvr.Export(context.Background(), &metricsCollectorV1.ExportMetricsServiceRequest{
+	if _, err := metricP.server.Export(context.Background(), &metricsCollectorV1.ExportMetricsServiceRequest{
 		ResourceMetrics: []*metricsV1.ResourceMetrics{
 			{
 				Resource: &resourceV1.Resource{
@@ -160,11 +105,8 @@ func TestE2E_OTLPMetricsSeparateDB(t *testing.T) {
 	}
 
 	// ---- wait for both pipelines to drain, then stop the writers ----
-	time.Sleep(500 * time.Millisecond)
-	logWriter.Stop()
-	logWriter.Wait()
-	metricWriter.Stop()
-	metricWriter.Wait()
+	logP.stop()
+	metricP.stop()
 
 	// ---- assert: two DB files exist ----
 	for _, p := range []string{logPath, metricsPath} {
@@ -205,14 +147,13 @@ func TestE2E_OTLPMetricsSeparateDB(t *testing.T) {
 	assertDBCount(t, logPath, "metric_data_point", 0)
 }
 
-// assertDBCount opens path read-only and asserts COUNT(*) on table.
+// assertDBCount opens path and asserts COUNT(*) on table.
 func assertDBCount(t *testing.T, path, table string, want int) {
 	t.Helper()
-	var n int
-	if err := writerDBQuery(path, "SELECT COUNT(*) FROM "+table, &n); err != nil {
-		t.Fatalf("count %s in %s: %v", table, path, err)
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
 	}
-	if n != want {
-		t.Errorf("%s count in %s = %d, want %d", table, path, n, want)
-	}
+	defer func() { _ = db.Close() }()
+	testutil.AssertTableCount(t, db, table, want)
 }

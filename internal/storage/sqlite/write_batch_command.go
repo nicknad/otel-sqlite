@@ -124,11 +124,6 @@ func (c *WriteBatchCommand) Size() int {
 	return c.records
 }
 
-// Batch returns the underlying LogBatch (for metrics and diagnostics).
-func (c *WriteBatchCommand) Batch() *model.LogBatch {
-	return c.batch
-}
-
 // Execute writes the log batch inside the supplied transaction.
 func (c *WriteBatchCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 	if c.batch == nil || c.batch.IsEmpty() {

@@ -348,6 +348,104 @@ func TestByExemplarTrace_Correlation(t *testing.T) {
 	}
 }
 
+// TestByExemplarTrace_NonFiniteExemplarValues covers the read side of the
+// JSON float encoding contract: the mapper stores NaN/+Inf/-Inf exemplar
+// values as string markers ("NaN", "+Inf", "-Inf"), and ByExemplarTrace
+// must parse them back into the original float values.
+func TestByExemplarTrace_NonFiniteExemplarValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "query-nonfinite.db")
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	if err := sqlite.RunMigrations(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	resource := model.NewResource(map[string]model.AttributeValue{
+		"service.name": model.NewStringValue("query-svc"),
+	})
+	resource.ID = "res-nf"
+
+	nan, posInf, negInf := math.NaN(), math.Inf(1), math.Inf(-1)
+	metric := &model.Metric{
+		ID:           "metric-nf",
+		ResourceID:   resource.ID,
+		ScopeID:      "scope-nf",
+		ScopeName:    "nf-scope",
+		ScopeVersion: "1.0.0",
+		Name:         "nf.exemplars",
+		Unit:         "1",
+		Type:         model.MetricTypeGauge,
+		Series: []*model.MetricSeries{
+			{
+				ID: "series-nf",
+				DataPoints: []*model.DataPoint{
+					{
+						Timestamp: 1000,
+						Exemplars: []model.Exemplar{
+							{Timestamp: 1, DoubleValue: &nan, TraceID: [16]byte{0x11}, HasTrace: true},
+							{Timestamp: 2, DoubleValue: &posInf, TraceID: [16]byte{0x22}, HasTrace: true},
+							{Timestamp: 3, DoubleValue: &negInf, TraceID: [16]byte{0x33}, HasTrace: true},
+							{Timestamp: 4, IntValue: i64(99), TraceID: [16]byte{0x44}, HasTrace: true},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	batch := model.NewMetricBatch(1)
+	batch.Resource = resource
+	batch.AddMetric(metric)
+	ctx := context.Background()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := sqlite.NewWriteMetricsCommand(batch).Execute(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("execute: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	store := openStore(t, path)
+	hits, err := store.ByExemplarTrace(ctx, "11000000000000000000000000000000", 0)
+	if err != nil {
+		t.Fatalf("ByExemplarTrace: %v", err)
+	}
+	if len(hits) != 1 || hits[0].ExemplarDouble == nil || !math.IsNaN(*hits[0].ExemplarDouble) {
+		t.Fatalf("NaN exemplar = %+v", hits)
+	}
+
+	hits, err = store.ByExemplarTrace(ctx, "22000000000000000000000000000000", 0)
+	if err != nil {
+		t.Fatalf("ByExemplarTrace +Inf: %v", err)
+	}
+	if len(hits) != 1 || hits[0].ExemplarDouble == nil || !math.IsInf(*hits[0].ExemplarDouble, 1) {
+		t.Fatalf("+Inf exemplar = %+v", hits)
+	}
+
+	hits, err = store.ByExemplarTrace(ctx, "33000000000000000000000000000000", 0)
+	if err != nil {
+		t.Fatalf("ByExemplarTrace -Inf: %v", err)
+	}
+	if len(hits) != 1 || hits[0].ExemplarDouble == nil || !math.IsInf(*hits[0].ExemplarDouble, -1) {
+		t.Fatalf("-Inf exemplar = %+v", hits)
+	}
+
+	hits, err = store.ByExemplarTrace(ctx, "44000000000000000000000000000000", 0)
+	if err != nil {
+		t.Fatalf("ByExemplarTrace int: %v", err)
+	}
+	if len(hits) != 1 || hits[0].ExemplarInt == nil || *hits[0].ExemplarInt != 99 {
+		t.Fatalf("int exemplar = %+v", hits)
+	}
+}
+
 // TestQueryConcurrentWithWriter proves WAL allows the read handle to work
 // while the writer is active (the query sidecar scenario): the writer's
 // connection and the query Store run against the same file simultaneously.
