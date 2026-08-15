@@ -33,8 +33,12 @@ const (
 // PreparedStatements holds SQL statements prepared once at startup
 // and reused across transactions via tx.Stmt().
 type PreparedStatements struct {
-	InsertResource *sql.Stmt
-	InsertEvent    *sql.Stmt
+	InsertResource  *sql.Stmt
+	InsertEvent     *sql.Stmt
+	InsertScope     *sql.Stmt
+	InsertMetric    *sql.Stmt
+	InsertSeries    *sql.Stmt
+	InsertDataPoint *sql.Stmt
 }
 
 // Close closes all prepared statements.
@@ -42,11 +46,17 @@ func (ps *PreparedStatements) Close() {
 	if ps == nil {
 		return
 	}
-	if ps.InsertResource != nil {
-		ps.InsertResource.Close()
-	}
-	if ps.InsertEvent != nil {
-		ps.InsertEvent.Close()
+	for _, stmt := range []*sql.Stmt{
+		ps.InsertResource,
+		ps.InsertEvent,
+		ps.InsertScope,
+		ps.InsertMetric,
+		ps.InsertSeries,
+		ps.InsertDataPoint,
+	} {
+		if stmt != nil {
+			stmt.Close()
+		}
 	}
 }
 
