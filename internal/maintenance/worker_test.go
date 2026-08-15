@@ -243,6 +243,64 @@ func TestWorker_Extensibility(t *testing.T) {
 	}
 }
 
+// submitterTask is a dummyTask that also implements SubmitterTask, so the
+// worker routes its Run to the per-task submitter override.
+type submitterTask struct {
+	dummyTask
+	submitter CommandSubmitter
+}
+
+func (t *submitterTask) Submitter() CommandSubmitter { return t.submitter }
+
+// TestWorker_UsesTaskSubmitterOverride verifies that a task implementing
+// SubmitterTask with a non-nil Submitter() runs with that submitter instead
+// of the worker's default (the metric-retention → metrics-writer routing).
+func TestWorker_UsesTaskSubmitterOverride(t *testing.T) {
+	defaultSub := &stubSubmitter{}
+	overrideSub := &stubSubmitter{}
+
+	task := &submitterTask{
+		dummyTask: dummyTask{name: "override-task", enabled: true, due: true},
+		submitter: overrideSub,
+	}
+	task.runFn = func(ctx context.Context, s CommandSubmitter) error {
+		return s.Submit(ctx, &stubCommand{name: "via-override"})
+	}
+
+	w := NewWorker(DefaultConfig(), defaultSub, nil)
+	w.Register(task)
+	w.evaluateAndRun(time.Now())
+
+	if defaultSub.submittedCount() != 0 {
+		t.Errorf("default submitter received %d commands, want 0", defaultSub.submittedCount())
+	}
+	if overrideSub.submittedCount() != 1 {
+		t.Errorf("override submitter received %d commands, want 1", overrideSub.submittedCount())
+	}
+}
+
+// TestWorker_TaskSubmitterNilFallsBackToDefault verifies that a nil
+// Submitter() keeps the worker's default submitter (shared-mode behavior).
+func TestWorker_TaskSubmitterNilFallsBackToDefault(t *testing.T) {
+	defaultSub := &stubSubmitter{}
+
+	task := &submitterTask{
+		dummyTask: dummyTask{name: "nil-override-task", enabled: true, due: true},
+		submitter: nil,
+	}
+	task.runFn = func(ctx context.Context, s CommandSubmitter) error {
+		return s.Submit(ctx, &stubCommand{name: "via-default"})
+	}
+
+	w := NewWorker(DefaultConfig(), defaultSub, nil)
+	w.Register(task)
+	w.evaluateAndRun(time.Now())
+
+	if defaultSub.submittedCount() != 1 {
+		t.Errorf("default submitter received %d commands, want 1", defaultSub.submittedCount())
+	}
+}
+
 func TestWorker_Metrics(t *testing.T) {
 	metrics := NewMetrics()
 	submitter := &stubSubmitter{}

@@ -103,6 +103,7 @@ install-tools:
 LOADTEST_COMPOSE ?= docker-compose.loadtest.yml
 LOADTEST_ADDR    ?= localhost:14317
 LOADTEST_METRICS ?= http://localhost:19090/metrics
+LOADTEST_SIGNAL  ?= logs
 LOADTEST_CLIENTS ?= 32
 LOADTEST_RECORDS ?= 1000
 LOADTEST_DURATION ?= 30s
@@ -136,6 +137,7 @@ loadtest-run:
 	$(GO) run ./cmd/loadtest \
 		-addr $(LOADTEST_ADDR) \
 		-metrics $(LOADTEST_METRICS) \
+		-signal $(LOADTEST_SIGNAL) \
 		-clients $(LOADTEST_CLIENTS) \
 		-records $(LOADTEST_RECORDS) \
 		-duration $(LOADTEST_DURATION) \
@@ -161,6 +163,27 @@ loadtest-burst-drain:
 	$(MAKE) loadtest-run \
 		LOADTEST_CLIENTS=32 LOADTEST_RECORDS=1000 LOADTEST_DURATION=30s \
 		LOADTEST_RPS=0 LOADTEST_DRAIN_TIMEOUT=5m
+
+# Baseline profiles: log-only, metric-only and mixed (half log + half metric
+# clients) at the same per-client shape as Profile B, so per-signal process
+# rates are directly comparable and a regression in one signal is visible.
+loadtest-baseline-logs:
+	$(MAKE) loadtest-run \
+		LOADTEST_SIGNAL=logs \
+		LOADTEST_CLIENTS=8 LOADTEST_RECORDS=250 LOADTEST_DURATION=30s \
+		LOADTEST_RPS=0 LOADTEST_DRAIN_TIMEOUT=2m
+
+loadtest-baseline-metrics:
+	$(MAKE) loadtest-run \
+		LOADTEST_SIGNAL=metrics \
+		LOADTEST_CLIENTS=8 LOADTEST_RECORDS=250 LOADTEST_DURATION=30s \
+		LOADTEST_RPS=0 LOADTEST_DRAIN_TIMEOUT=3m
+
+loadtest-baseline-mixed:
+	$(MAKE) loadtest-run \
+		LOADTEST_SIGNAL=mixed \
+		LOADTEST_CLIENTS=8 LOADTEST_RECORDS=250 LOADTEST_DURATION=30s \
+		LOADTEST_RPS=0 LOADTEST_DRAIN_TIMEOUT=3m
 
 # Convenience: up + run + down
 loadtest: loadtest-up loadtest-run loadtest-down

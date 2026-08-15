@@ -64,6 +64,38 @@ the profiles after code or hardware changes.
 | Process, same workload (Phase 2) | 70,258/s | 250,402/s | 0.03% export errors |
 | Historical burst, 32 clients × 1,000 records, uncapped, 30s | — | 277,889/s | backlog remained to drain |
 
+## Metric-extension baselines (added with the metrics feature)
+
+The metric feature added a second ingestion path (OTLP metrics → same command
+queue → same single-writer SQLite connection) and changed migration 005-era
+numbers only through contention: metric data points are wider (15 columns +
+JSON payloads) and ~3× more expensive per insert than log events, so mixed
+load splits the writer's bandwidth.
+
+Workload shape for all three rows below: 8 clients × 250 records-or-points per
+request, uncapped, 30s (`loadtest-baseline-{logs,metrics,mixed}`). The logs row
+is the Phase-2 profile re-measured on the same machine (AMD Ryzen 5 4500U)
+after the metrics feature landed — it confirms no log-ingress regression.
+
+| Signal | Make target | Ingest rate | Process rate (client window) | Drain | Export errors |
+|---|---|---:|---:|---|---:|
+| Logs (run 1) | `make loadtest-baseline-logs` | 263,875/s | 69,431/s | complete, 57s | 0.16% |
+| Logs (run 2) | `make loadtest-baseline-logs` | 262,317/s | 69,746/s | complete, 59s | 0.03% |
+| Metrics | `make loadtest-baseline-metrics` | 198,954/s | 23,584/s | complete, 2m52s | 0.07% |
+| Mixed (4 log + 4 metric) | `make loadtest-baseline-mixed` | 219,957/s | logs 16,068/s + metrics 14,402/s = 30,470/s combined | incomplete at 3m (≈250 points, one request, still draining; 0.008% gap) | 0.03% |
+
+Interpretation:
+
+- **Logs did not regress.** 69,431–69,746/s vs the 70,258/s Phase-2 baseline is
+  −1%, run-to-run noise. Drain is faster (57–59s vs 1m8s).
+- **Metrics ceiling is ~23.6k/s** for this shape — the writer, not ingestion,
+  is the bottleneck (ingest accepts ~199k/s and queues the rest).
+- **Mixed throughput is sub-additive**: 30.5k/s combined vs 69.4k/s log-only,
+  because metric inserts dominate the shared writer. Per-client log rate drops
+  from ~8.7k/s (solo) to ~4.0k/s next to metrics.
+- Drain completeness: give metrics/mixed runs a ≥3m drain timeout; the metric
+  backlog drains at the same slow writer rate.
+
 The keep-up result is a capped regression check, not a process ceiling. The
 process profile is also workload- and hardware-dependent.
 

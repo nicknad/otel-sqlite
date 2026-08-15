@@ -1,8 +1,10 @@
 // Package batcher provides batch building functionality for the ingestion pipeline.
 // The MetricBatcher is the metrics-signal analogue of Batcher: it collects
 // metric batches from the metrics ingress queue, merges them into larger
-// batches, then wraps each completed batch in a Command and submits it to the
-// shared command queue consumed by the single SQLite writer.
+// batches, then wraps each completed batch in a Command and submits it to an
+// executor — the *sqlite.Writer, which owns its command queue. In shared
+// mode that is the single log/metrics writer; in separate-DB mode it is the
+// dedicated metrics writer.
 package batcher
 
 import (
@@ -23,9 +25,17 @@ import (
 // exactly like NewWriteBatchCommand for logs.
 type NewWriteMetricsCommand func(batch *model.MetricBatch) storage.Command
 
+// commandExecutorWithDepth is the interface the MetricBatcher needs from its
+// submit target: command submission plus queue-depth reporting for the
+// batch-queue-depth gauge. *sqlite.Writer satisfies it.
+type commandExecutorWithDepth interface {
+	storage.CommandExecutor
+	QueueDepth() int
+}
+
 // MetricBatcher collects metric batches and groups them into larger batches.
-// It reads from a metrics ingress queue and submits Commands to the shared
-// command queue.
+// It reads from a metrics ingress queue and submits Commands to an executor
+// (the SQLite writer).
 //
 // Unlike the log batcher it has no error notifier: severity is a log-only
 // concept. Batches are merged only when they share the same resource so the
@@ -33,7 +43,7 @@ type NewWriteMetricsCommand func(batch *model.MetricBatch) storage.Command
 // writer relies on).
 type MetricBatcher struct {
 	ingressQueue  ingest.MetricIngressQueue
-	cmdQueue      storage.CommandQueue
+	executor      storage.CommandExecutor
 	batchSize     int // counted in data points
 	flushInterval time.Duration
 
@@ -67,7 +77,9 @@ type MetricBatcherConfig struct {
 }
 
 // NewMetricBatcher creates a new MetricBatcher with the given configuration.
-func NewMetricBatcher(ingressQueue ingest.MetricIngressQueue, cmdQueue storage.CommandQueue, config *MetricBatcherConfig) *MetricBatcher { //nolint:lll
+// executor is the submit target for completed batches — the *sqlite.Writer
+// in both shared and separate-DB modes.
+func NewMetricBatcher(ingressQueue ingest.MetricIngressQueue, executor storage.CommandExecutor, config *MetricBatcherConfig) *MetricBatcher { //nolint:lll
 	if config == nil {
 		config = &MetricBatcherConfig{BatchSize: 100}
 	}
@@ -77,7 +89,7 @@ func NewMetricBatcher(ingressQueue ingest.MetricIngressQueue, cmdQueue storage.C
 	}
 	return &MetricBatcher{
 		ingressQueue:  ingressQueue,
-		cmdQueue:      cmdQueue,
+		executor:      executor,
 		batchSize:     config.BatchSize,
 		flushInterval: flushInterval,
 		currentBatch:  model.NewMetricBatch(config.BatchSize),
@@ -153,7 +165,11 @@ func (b *MetricBatcher) run() {
 				b.currentBatch = batch
 			}
 			b.aMetrics.UpdateIngressQueueDepth(b.ingressQueue.Len())
-			b.aMetrics.UpdateBatchQueueDepth(b.cmdQueue.Len())
+			// The executor owns the command queue; report its depth through
+			// the optional QueueDepth() method (*sqlite.Writer implements it).
+			if qd, ok := b.executor.(commandExecutorWithDepth); ok {
+				b.aMetrics.UpdateBatchQueueDepth(qd.QueueDepth())
+			}
 			isFull := b.currentBatch.Size() >= b.batchSize
 			b.mu.Unlock()
 
@@ -183,7 +199,7 @@ func (b *MetricBatcher) merge(batch *model.MetricBatch) bool {
 	return true
 }
 
-// flushCurrentBatch sends the current batch as a Command to the command queue
+// flushCurrentBatch submits the current batch as a Command to the executor
 // and starts a new batch. Uses context.Background() so the flush works even
 // when the batcher context is canceled.
 func (b *MetricBatcher) flushCurrentBatch() {
@@ -193,13 +209,16 @@ func (b *MetricBatcher) flushCurrentBatch() {
 }
 
 // flushLocked flushes the current batch; the caller must hold b.mu.
+// Uses context.Background() so the flush works even when the batcher context
+// is canceled. sqlite.Writer.Submit is exactly cmdQueue.Send, so backpressure
+// semantics are unchanged from the pre-executor wiring.
 func (b *MetricBatcher) flushLocked() {
 	if b.currentBatch.IsEmpty() {
 		return
 	}
 
 	cmd := b.newCmd(b.currentBatch)
-	_ = b.cmdQueue.Send(context.Background(), cmd)
+	_ = b.executor.Submit(context.Background(), cmd)
 
 	b.aMetrics.IncrementBatchesCreated()
 	b.aMetrics.RecordBatchSize(b.currentBatch.Size())

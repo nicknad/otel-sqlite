@@ -39,6 +39,18 @@ type MaintenanceTask interface {
 	Run(ctx context.Context, submitter CommandSubmitter) error
 }
 
+// SubmitterTask is an optional interface a task may implement to override
+// the worker's default submitter. Used by MetricRetentionTask when metrics
+// live in their own database: retention must submit PurgeMetricDataPoints
+// to the metrics writer, not the log writer.
+type SubmitterTask interface {
+	MaintenanceTask
+
+	// Submitter returns the submitter this task should use, or nil to use
+	// the worker's default submitter.
+	Submitter() CommandSubmitter
+}
+
 // CommandSubmitter is the only allowed interface for producing side effects
 // from maintenance tasks. It is intentionally minimal: tasks can submit
 // commands but have no access to queues, channels, or database internals.

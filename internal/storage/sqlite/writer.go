@@ -157,6 +157,13 @@ func (w *Writer) Submit(ctx context.Context, cmd storage.Command) error {
 	return w.cmdQueue.Send(ctx, cmd)
 }
 
+// QueueDepth returns the current number of commands waiting in the writer's
+// command queue. The metric batcher uses it to report batch-queue depth now
+// that the queue is owned by the writer rather than passed to the batcher.
+func (w *Writer) QueueDepth() int {
+	return w.cmdQueue.Len()
+}
+
 // Start starts the writer goroutine.
 func (w *Writer) Start(ctx context.Context) {
 	w.ctx, w.cancel = context.WithCancelCause(ctx)

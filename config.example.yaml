@@ -39,6 +39,14 @@ batch_queue_capacity: 5000      # Maximum number of commands in batch queue
 # endpoint, which reports collector self-telemetry only.
 metrics_enabled: true
 
+# Optional: when set (and metrics_enabled: true), OTLP metric data points are
+# stored in their own SQLite database with their own writer + batcher
+# pipeline, isolating metrics write load from the log path. When empty
+# (default), metrics share sqlite_path with logs via the single shared
+# writer. Setting this while metrics_enabled is false logs a startup warning
+# and is ignored.
+# metrics_sqlite_path: "otel-metrics.db"
+
 # Batcher configuration (groups records into WriteBatchCommand objects)
 # The same sizes/intervals apply to the metric batcher (counted in data
 # points rather than log records).

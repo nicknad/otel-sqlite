@@ -21,6 +21,11 @@ type FileConfig struct {
 	BatcherErrorSeverityThreshold string `yaml:"batcher_error_severity_threshold"`
 	WriterBatchSize               int    `yaml:"writer_batch_size"`
 	WriterFlushInterval           string `yaml:"writer_flush_interval"`
+	// MetricsEnabled is a *bool so YAML "false" is distinguishable from
+	// "unset" (the default is true). MetricsSQLitePath follows the string
+	// pattern: only applied when non-empty.
+	MetricsEnabled    *bool  `yaml:"metrics_enabled"`
+	MetricsSQLitePath string `yaml:"metrics_sqlite_path"`
 	// Legacy fields (mapped to both batcher and writer if specific fields unset)
 	BatchSize                         int     `yaml:"batch_size"`
 	FlushInterval                     string  `yaml:"flush_interval"`
@@ -114,6 +119,14 @@ func (c *Config) loadCoreConfig(fc *FileConfig) error {
 	}
 	if fc.BatcherErrorSeverityThreshold != "" {
 		c.BatcherErrorSeverityThreshold = fc.BatcherErrorSeverityThreshold
+	}
+	if fc.MetricsSQLitePath != "" {
+		c.MetricsSQLitePath = fc.MetricsSQLitePath
+	}
+
+	// Bool fields: *bool distinguishes "false" from "unset".
+	if fc.MetricsEnabled != nil {
+		c.MetricsEnabled = *fc.MetricsEnabled
 	}
 
 	// Int fields (only if non-zero to distinguish "unset" from "set to 0").

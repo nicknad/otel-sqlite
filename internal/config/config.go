@@ -30,6 +30,13 @@ type Config struct {
 	// the metrics gRPC service returns Unavailable.
 	MetricsEnabled bool `mapstructure:"metrics_enabled"`
 
+	// MetricsSQLitePath, when set (and MetricsEnabled), stores OTLP metric
+	// data points in their own SQLite database with their own writer +
+	// batcher pipeline, isolating metrics write load from the log path.
+	// When empty (default) metrics share SQLitePath with logs via the single
+	// shared writer — today's behavior.
+	MetricsSQLitePath string `mapstructure:"metrics_sqlite_path"`
+
 	// Batcher configuration
 	BatcherBatchSize              int           `mapstructure:"batcher_batch_size"`
 	BatcherFlushInterval          time.Duration `mapstructure:"batcher_flush_interval"`
@@ -199,6 +206,8 @@ var envBindings = []envBinding{
 	// Strings
 	{env: "LISTEN_ADDRESS", parse: parseString, apply: func(c *Config, v any) { c.ListenAddress = v.(string) }},
 	{env: "SQLITE_PATH", parse: parseString, apply: func(c *Config, v any) { c.SQLitePath = v.(string) }},
+	{env: "METRICS_SQLITE_PATH", parse: parseString, //nolint:lll
+		apply: func(c *Config, v any) { c.MetricsSQLitePath = v.(string) }},
 	{env: "METRICS_ADDRESS", parse: parseString, apply: func(c *Config, v any) { c.MetricsAddress = v.(string) }},
 	{
 		env: "BATCHER_ERROR_SEVERITY_THRESHOLD", parse: parseString,
@@ -407,6 +416,28 @@ func (c *Config) ApplyLegacyEnv() (int, error) {
 	}
 
 	return count, nil
+}
+
+// MetricsSeparateDB reports whether OTLP metrics are stored in their own
+// SQLite database with their own writer + batcher pipeline. Both conditions
+// must hold: metrics must be enabled, and metrics_sqlite_path must be set.
+func (c *Config) MetricsSeparateDB() bool {
+	return c.MetricsEnabled && c.MetricsSQLitePath != ""
+}
+
+// MetricsSeparateDBWarning returns a non-empty message when
+// metrics_sqlite_path is set while metrics are disabled. Callers (e.g. main)
+// log it as a startup warning; it is deliberately NOT a validation error so
+// existing configs that disable metrics keep working.
+func (c *Config) MetricsSeparateDBWarning() string {
+	if c.MetricsSQLitePath != "" && !c.MetricsEnabled {
+		return fmt.Sprintf(
+			"metrics_sqlite_path %q is set but metrics_enabled is false; "+
+				"separate-DB mode is disabled and metrics are not ingested",
+			c.MetricsSQLitePath,
+		)
+	}
+	return ""
 }
 
 // ensureNotification returns the Notification config, creating it if nil.

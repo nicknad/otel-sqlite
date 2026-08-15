@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -55,6 +56,82 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if c.GoMemoryLimitMB != 0 {
 		t.Errorf("expected 0, got %d", c.GoMemoryLimitMB)
+	}
+}
+
+func TestMetricsSeparateDB(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want bool
+	}{
+		{name: "default shared", cfg: DefaultConfig(), want: false},
+		{name: "path set but metrics disabled", cfg: &Config{MetricsEnabled: false, MetricsSQLitePath: "m.db"}, want: false},
+		{name: "enabled but path empty", cfg: &Config{MetricsEnabled: true}, want: false},
+		{name: "enabled and path set", cfg: &Config{MetricsEnabled: true, MetricsSQLitePath: "m.db"}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.MetricsSeparateDB(); got != tt.want {
+				t.Errorf("MetricsSeparateDB() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMetricsSeparateDBWarning(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want string // empty = no warning
+	}{
+		{name: "path set but disabled", cfg: &Config{MetricsEnabled: false, MetricsSQLitePath: "m.db"}, want: "metrics_sqlite_path"},
+		{name: "enabled and path set", cfg: &Config{MetricsEnabled: true, MetricsSQLitePath: "m.db"}, want: ""},
+		{name: "disabled and no path", cfg: &Config{MetricsEnabled: false}, want: ""},
+		{name: "defaults", cfg: DefaultConfig(), want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.MetricsSeparateDBWarning()
+			if tt.want == "" && got != "" {
+				t.Errorf("MetricsSeparateDBWarning() = %q, want no warning", got)
+			}
+			if tt.want != "" && !strings.Contains(got, tt.want) {
+				t.Errorf("MetricsSeparateDBWarning() = %q, want it to mention %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadFromEnv_metricsSQLitePath(t *testing.T) {
+	t.Setenv("METRICS_SQLITE_PATH", "/data/metrics.db")
+
+	c := DefaultConfig()
+	n, err := c.LoadFromEnv()
+	if err != nil {
+		t.Fatalf("LoadFromEnv() error: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 override, got %d", n)
+	}
+	if c.MetricsSQLitePath != "/data/metrics.db" {
+		t.Errorf("MetricsSQLitePath = %q, want %q", c.MetricsSQLitePath, "/data/metrics.db")
+	}
+	if !c.MetricsSeparateDB() {
+		t.Error("expected MetricsSeparateDB() to be true with default metrics_enabled + path set")
+	}
+}
+
+func TestValidate_metricsSQLitePathWhileDisabledIsWarningNotError(t *testing.T) {
+	c := DefaultConfig()
+	c.MetricsEnabled = false
+	c.MetricsSQLitePath = "otel-metrics.db"
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil: metrics_sqlite_path with metrics disabled is a warning, not an error", err)
+	}
+	if w := c.MetricsSeparateDBWarning(); w == "" {
+		t.Error("expected a startup warning when metrics_sqlite_path is set while metrics are disabled")
 	}
 }
 

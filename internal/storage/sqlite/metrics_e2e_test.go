@@ -44,7 +44,7 @@ func TestE2E_OTLPMetricsToSQLite(t *testing.T) {
 	writer.Start(ctx)
 	defer writer.Stop()
 
-	mb := batcher.NewMetricBatcher(metricIngressQueue, cmdQueue, &batcher.MetricBatcherConfig{
+	mb := batcher.NewMetricBatcher(metricIngressQueue, writer, &batcher.MetricBatcherConfig{
 		BatchSize:     50,
 		FlushInterval: 50 * time.Millisecond,
 	})
@@ -219,4 +219,119 @@ func TestE2E_MetricsDisabled(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected Unavailable when metric ingestion is disabled, got nil")
 	}
+}
+
+// TestE2E_NilResourceMetricsStayVisible guards the fix for resource-less
+// senders: OTLP allows ResourceMetrics with Resource unset. The mapper gives
+// such batches a deterministic resource ID, so the scope row references a
+// real log_resource row and the data points remain visible through the
+// read-side `metrics` view. Before the fix, scope.resource_id was empty, the
+// view's inner join to log_resource dropped every row, and the points were
+// written but permanently unqueryable.
+func TestE2E_NilResourceMetricsStayVisible(t *testing.T) {
+	dbPath := t.TempDir() + "/nil-resource.db"
+
+	metricIngressQueue := ingest.NewMetricIngressQueue(1000)
+	cmdQueue := storage.NewCommandQueue(100)
+
+	writer, err := NewWriter(cmdQueue, &WriterConfig{
+		Path:          dbPath,
+		BatchSize:     10,
+		FlushInterval: 100 * time.Millisecond,
+		WALMode:       true,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	writer.Start(ctx)
+	defer writer.Stop()
+
+	mb := batcher.NewMetricBatcher(metricIngressQueue, writer, &batcher.MetricBatcherConfig{
+		BatchSize:     50,
+		FlushInterval: 50 * time.Millisecond,
+	})
+	mb.WithCommandFactory(func(batch *model.MetricBatch) storage.Command {
+		return NewWriteMetricsCommand(batch)
+	})
+	mb.Start(context.Background())
+	defer mb.Stop()
+
+	svr := otlp.NewMetricsServer(metricIngressQueue, nil)
+
+	// Resource is nil — the spec-legal "no resource info is known" case.
+	now := uint64(time.Now().UnixNano())
+	req := &metricsCollectorV1.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricsV1.ResourceMetrics{
+			{
+				Resource: nil,
+				ScopeMetrics: []*metricsV1.ScopeMetrics{
+					{
+						Scope: &commonV1.InstrumentationScope{Name: "nil-e2e-scope", Version: "0.1.0"},
+						Metrics: []*metricsV1.Metric{
+							{
+								Name: "nil.resource.gauge",
+								Data: &metricsV1.Metric_Gauge{Gauge: &metricsV1.Gauge{
+									DataPoints: []*metricsV1.NumberDataPoint{
+										{TimeUnixNano: now, Value: &metricsV1.NumberDataPoint_AsDouble{AsDouble: 42.5}},
+									},
+								}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	if _, err := svr.Export(context.Background(), req); err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	// Let the pipeline flush + write.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var n int
+		if err := writerDBQuery(dbPath, "SELECT COUNT(*) FROM metric_data_point", &n); err != nil {
+			t.Fatalf("query data point count: %v", err)
+		}
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for data point to be written (count=%d)", n)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The write must be internally consistent: no scope row referencing a
+	// missing resource (the invariant the e2e verifier checks).
+	var orphans int
+	if err := writerDBQuery(dbPath, `SELECT COUNT(*) FROM scope s LEFT JOIN log_resource r ON r.id = s.resource_id WHERE r.id IS NULL`, &orphans); err != nil {
+		t.Fatalf("query orphan scopes: %v", err)
+	}
+	if orphans != 0 {
+		t.Errorf("found %d scope rows referencing a missing resource", orphans)
+	}
+
+	// And the data point must be VISIBLE through the read-side `metrics` view
+	// (the actual regression this test guards).
+	var visible int
+	if err := writerDBQuery(dbPath, `SELECT COUNT(*) FROM metrics WHERE metric_name = 'nil.resource.gauge'`, &visible); err != nil {
+		t.Fatalf("query metrics view: %v", err)
+	}
+	if visible != 1 {
+		t.Errorf("data point invisible to `metrics` view: visible=%d, want 1", visible)
+	}
+}
+
+// writerDBQuery opens a short-lived read-only connection to the writer's
+// database file. WAL mode permits concurrent readers next to the writer.
+func writerDBQuery(dbPath, query string, dst ...any) error {
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	return db.QueryRow(query).Scan(dst...)
 }
