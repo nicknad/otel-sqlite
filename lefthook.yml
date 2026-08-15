@@ -34,7 +34,9 @@ pre-push:
     security:
       run: |
         which gosec >/dev/null 2>&1 || go install github.com/securego/gosec/v2/cmd/gosec@latest
-        gosec -quiet -exclude=G104,G304,G115 -exclude-dir internal/generated ./...
+        # G202 excluded to match .golangci.yml: SQL fragments are fixed
+        # constants; dynamic input always goes through ? placeholders.
+        gosec -quiet -exclude=G104,G202,G304,G115 -exclude-dir internal/generated ./...
 
     test:
       run: CGO_ENABLED=1 go test -tags fts5 -count=1 -race -timeout 120s ./...
