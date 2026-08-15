@@ -1,8 +1,9 @@
 # Architecture
 
 The collector accepts OTLP Logs and Metrics over gRPC, maps protobuf
-messages to internal models, and persists them through a single SQLite
-writer.
+messages to internal models, and persists them through SQLite writers.
+
+Default (shared) mode — one writer, one database file:
 
 ```text
 gRPC OTLP Logs
@@ -15,8 +16,21 @@ gRPC OTLP Logs
 gRPC OTLP Metrics
   -> mapper
   -> bounded ingress queue (metric batches)
-  -> metric batcher
+  -> metric batcher ----+  (both batchers share the one writer's queue)
+```
 
+Separate-DB mode (`metrics_sqlite_path` set, `metrics_enabled: true`) — a
+second writer + queue isolates metrics write load from the log path:
+
+```text
+gRPC OTLP Logs
+  -> mapper -> log ingress queue -> log batcher -> log cmd queue -> log writer -> logs.db
+
+gRPC OTLP Metrics
+  -> mapper -> metric ingress queue -> metric batcher -> metric cmd queue -> metric writer -> metrics.db
+```
+
+```text
 batcher --non-blocking--> optional notification worker --> notifiers
 HTTP /metrics and /health run on a separate listener.
 ```
@@ -55,11 +69,14 @@ Two distinct "metrics" exist and must not be conflated:
 2. Batches enter the bounded ingress queue. A full queue blocks the request;
    an optional fullness threshold rejects it with `Unavailable`.
 3. The batcher combines batches and submits immutable commands
-   (`WriteBatchCommand` for logs, `WriteMetricsCommand` for metrics) to the
-   shared command queue.
-4. The writer consumes commands in one goroutine and commits transactions.
-   `WRITER_BATCH_SIZE` counts commands; `WRITER_MAX_TRANSACTION_RECORDS`
-   limits records — for metrics this counts data points, not metric objects.
+   (`WriteBatchCommand` for logs, `WriteMetricsCommand` for metrics) to a
+   writer via `storage.CommandExecutor`. In default mode both batchers
+   submit to the single shared writer; with `metrics_sqlite_path` set the
+   metric batcher submits to the dedicated metrics writer.
+4. Each writer consumes its command queue in one goroutine and commits
+   transactions. `WRITER_BATCH_SIZE` counts commands;
+   `WRITER_MAX_TRANSACTION_RECORDS` limits records — for metrics this counts
+   data points, not metric objects.
 5. Resources are inserted before their events/metrics (resource → scope →
    metric → series → data point). The writer uses WAL mode and prepared
    statements by default.
@@ -67,6 +84,24 @@ Two distinct "metrics" exist and must not be conflated:
 The storage path prefers backpressure to loss, but requests can still fail when
 the client context is cancelled or early rejection is enabled. Clients should
 retry `Unavailable` responses.
+
+### Separate metrics database (`metrics_sqlite_path`)
+
+When `metrics_sqlite_path` is set (and `metrics_enabled: true`), OTLP metric
+data points are stored in their own SQLite database with their own writer +
+batcher pipeline, isolating metrics write load from the log path. Each DB
+runs the full 001–007 migration set at startup; dedup caches are per-writer
+(per-DB) and Prometheus counters stay combined (both writers share the one
+`Metrics` instance). Metric retention submits `PurgeMetricDataPointsCommand`
+to the metrics writer through a per-task submitter override; checkpoint /
+vacuum / optimize / FTS-rebuild remain log-DB-only (the metrics DB's WAL
+self-manages via `wal_autocheckpoint=1000`).
+
+When `metrics_sqlite_path` is empty (the default), metrics share
+`sqlite_path` with logs through the single shared writer — behavior is
+unchanged. Setting `metrics_sqlite_path` while `metrics_enabled` is false
+logs a startup warning and is ignored. The read side (`internal/query`,
+`cmd/metrics-query`) is writer-agnostic: point it at either file path.
 
 ## Commands
 
@@ -79,7 +114,10 @@ type Command interface {
 Implemented commands include `WriteBatchCommand`, `PurgeLogsCommand`,
 `WriteMetricsCommand`, `PurgeMetricDataPointsCommand`, `CheckpointCommand`,
 `OptimizeCommand`, `VacuumCommand`, and `RebuildFtsCommand`. Maintenance
-submits commands rather than accessing SQLite directly.
+submits commands rather than accessing SQLite directly. Tasks may override
+the worker's default submitter per-task (`maintenance.SubmitterTask`) — the
+metric-retention task uses this to target the metrics writer in separate-DB
+mode.
 
 ## Notifications
 

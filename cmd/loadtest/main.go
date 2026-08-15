@@ -8,7 +8,9 @@
 // counters so an ingest-vs-process baseline can be established.
 //
 // Use -signal metrics to exercise the OTLP metrics ingestion path (data
-// points per request, gauge/sum/histogram mix, exemplars with trace ids).
+// points per request, gauge/sum/histogram mix, exemplars with trace ids) and
+// -signal mixed to drive both signals concurrently against the shared
+// command queue/writer (even client ids send logs, odd send metrics).
 package main
 
 import (
@@ -41,7 +43,7 @@ import (
 
 func main() {
 	addr := flag.String("addr", "localhost:4317", "collector gRPC address")
-	signalName := flag.String("signal", "logs", "signal to generate: \"logs\" or \"metrics\"")
+	signalName := flag.String("signal", "logs", "signal to generate: \"logs\", \"metrics\" or \"mixed\"")
 	metrics := flag.String(
 		"metrics", "",
 		"collector Prometheus /metrics URL (e.g. http://localhost:9090/metrics); empty disables scraping",
@@ -65,9 +67,9 @@ func main() {
 		log.Fatal("drain-timeout must be >= 0")
 	}
 	switch *signalName {
-	case "logs", "metrics":
+	case "logs", "metrics", "mixed":
 	default:
-		log.Fatalf("signal must be \"logs\" or \"metrics\", got %q", *signalName)
+		log.Fatalf("signal must be \"logs\", \"metrics\" or \"mixed\", got %q", *signalName)
 	}
 
 	// Shared gRPC connection (HTTP/2 multiplexes concurrent streams).
@@ -118,7 +120,10 @@ func main() {
 	for i := 0; i < *clients; i++ {
 		wg.Add(1)
 		svc := resources[i%len(resources)]
-		if *signalName == "metrics" {
+		// In mixed mode clients alternate signals (even id = logs, odd id =
+		// metrics) so both paths feed the shared command queue concurrently.
+		isMetric := *signalName == "metrics" || (*signalName == "mixed" && i%2 == 1)
+		if isMetric {
 			mclient := metricsCollectorV1.NewMetricsServiceClient(conn)
 			go func(id int) {
 				defer wg.Done()
@@ -166,18 +171,26 @@ func main() {
 			drainTook time.Duration
 			drained   bool
 		)
-		recvField, writField := "logsReceived", "logsWritten"
-		if *signalName == "metrics" {
-			recvField, writField = "metricsReceived", "metricPointsWritten"
+		// Signals present in this run; the drain check must cover all of them.
+		signals := []sigCounter{{name: "logs", recvField: "logsReceived", writField: "logsWritten"}}
+		if *signalName == "metrics" || *signalName == "mixed" {
+			signals = append(signals, sigCounter{name: "metrics", recvField: "metricsReceived", writField: "metricPointsWritten"})
 		}
 		if *drainTimeout > 0 {
 			drainStart := time.Now()
 			deadline := drainStart.Add(*drainTimeout)
 			for {
 				after = scrapeMetrics(*metrics)
-				recv, _ := diffCounter(&after, &baseline, recvField)
-				writ, _ := diffCounter(&after, &baseline, writField)
-				if recv > 0 && writ >= recv {
+				allDrained := true
+				for _, sig := range signals {
+					recv, _ := diffCounter(&after, &baseline, sig.recvField)
+					writ, _ := diffCounter(&after, &baseline, sig.writField)
+					if recv > 0 && writ < recv {
+						allDrained = false
+						break
+					}
+				}
+				if allDrained {
 					drained = true
 					drainTook = time.Since(drainStart)
 					break
@@ -192,49 +205,59 @@ func main() {
 
 		fmt.Println()
 		fmt.Println("----------- Prometheus counters -----------")
-		if *signalName == "metrics" {
-			fmt.Printf("metrics_received_total:         %s -> %s (delta %s)\n",
-				baseline.metricsReceived, after.metricsReceived, subCounters(after.metricsReceived, baseline.metricsReceived))
-			fmt.Printf("metric_data_points_written_total: %s -> %s (delta %s)\n",
-				baseline.metricPointsWritten, after.metricPointsWritten, subCounters(after.metricPointsWritten, baseline.metricPointsWritten))
-		} else {
+		if *signalName == "logs" || *signalName == "mixed" {
 			fmt.Printf("logs_received_total:           %s -> %s (delta %s)\n",
 				baseline.logsReceived, after.logsReceived, subCounters(after.logsReceived, baseline.logsReceived))
 			fmt.Printf("logs_written_total:            %s -> %s (delta %s)\n",
 				baseline.logsWritten, after.logsWritten, subCounters(after.logsWritten, baseline.logsWritten))
+		}
+		if *signalName == "metrics" || *signalName == "mixed" {
+			fmt.Printf("metrics_received_total:         %s -> %s (delta %s)\n",
+				baseline.metricsReceived, after.metricsReceived, subCounters(after.metricsReceived, baseline.metricsReceived))
+			fmt.Printf("metric_data_points_written_total: %s -> %s (delta %s)\n",
+				baseline.metricPointsWritten, after.metricPointsWritten, subCounters(after.metricPointsWritten, baseline.metricPointsWritten))
 		}
 		fmt.Printf("batches_written_total:         %s -> %s (delta %s)\n",
 			baseline.batchesWritten, after.batchesWritten, subCounters(after.batchesWritten, baseline.batchesWritten))
 		fmt.Printf("write_errors_total:            %s -> %s (delta %s)\n",
 			baseline.writeErrors, after.writeErrors, subCounters(after.writeErrors, baseline.writeErrors))
 
-		writFinal, errW := diffCounter(&after, &baseline, writField)
-		recvFinal, errR := diffCounter(&after, &baseline, recvField)
-		writActive, _ := diffCounter(&activeEnd, &baseline, writField)
-		if errW == nil && writFinal > 0 {
-			// Process rate during the client-active window (the ceiling).
-			activeRate := float64(writActive) / clientElapsed.Seconds()
-			fmt.Printf("\nProcess rate (client window):  %d written / %s = %.2f rec/s\n",
-				writActive, clientElapsed.Round(time.Millisecond), activeRate)
-			fmt.Printf("Confirmed written (final):     %d records\n", writFinal)
-		}
-		if errR == nil && errW == nil && recvFinal > 0 {
-			if *drainTimeout > 0 {
-				status := "incomplete"
-				if drained {
-					status = "complete"
-				}
-				fmt.Printf("Drain after clients stopped:  %s (%s, timeout %s)\n",
-					drainTook.Round(time.Millisecond), status, *drainTimeout)
+		// Per-signal process rate during the client-active window (the ceiling)
+		// and confirmed final write totals, with a combined rate for mixed runs.
+		for _, sig := range signals {
+			writFinal, errW := diffCounter(&after, &baseline, sig.writField)
+			recvFinal, errR := diffCounter(&after, &baseline, sig.recvField)
+			writActive, _ := diffCounter(&activeEnd, &baseline, sig.writField)
+			if errW == nil && writFinal > 0 {
+				activeRate := float64(writActive) / clientElapsed.Seconds()
+				fmt.Printf("\nProcess rate (%s, client window): %d written / %s = %.2f rec/s\n",
+					sig.name, writActive, clientElapsed.Round(time.Millisecond), activeRate)
+				fmt.Printf("Confirmed written (%s, final):     %d records\n", sig.name, writFinal)
 			}
-			if writFinal < recvFinal {
+			if errR == nil && errW == nil && recvFinal > 0 && writFinal < recvFinal {
 				gap := recvFinal - writFinal
 				pct := float64(gap) / float64(recvFinal) * 100
 				if pct > 5.0 {
-					log.Printf("\n*** WARNING: possible data loss: received=%d written=%d gap=%d (%.1f%%)\n",
-						recvFinal, writFinal, gap, pct)
+					log.Printf("\n*** WARNING: possible data loss (%s): received=%d written=%d gap=%d (%.1f%%)\n",
+						sig.name, recvFinal, writFinal, gap, pct)
 				}
 			}
+		}
+		if *signalName == "mixed" {
+			writLogs, _ := diffCounter(&activeEnd, &baseline, "logsWritten")
+			writMetrics, _ := diffCounter(&activeEnd, &baseline, "metricPointsWritten")
+			if combined := writLogs + writMetrics; combined > 0 {
+				fmt.Printf("\nProcess rate (combined, client window): %d written / %s = %.2f rec/s\n",
+					combined, clientElapsed.Round(time.Millisecond), float64(combined)/clientElapsed.Seconds())
+			}
+		}
+		if *drainTimeout > 0 {
+			status := "incomplete"
+			if drained {
+				status = "complete"
+			}
+			fmt.Printf("\nDrain after clients stopped:  %s (%s, timeout %s)\n",
+				drainTook.Round(time.Millisecond), status, *drainTimeout)
 		}
 	}
 	fmt.Println("===================================================")
@@ -555,6 +578,14 @@ func randomSpanID(clientID, idx int) []byte {
 }
 
 // ---------- metrics scraping ----------
+
+// sigCounter names one signal's received/written counter pair for drain
+// checking and per-signal rate reporting (mixed runs track both).
+type sigCounter struct {
+	name      string
+	recvField string
+	writField string
+}
 
 type metricsSnapshot struct {
 	logsReceived        string

@@ -18,6 +18,11 @@ type MetricRetentionTask struct {
 	cleanupInterval time.Duration
 	batchSize       int
 
+	// submitter, when non-nil, overrides the worker's default submitter.
+	// Set via WithSubmitter so retention targets the metrics writer when
+	// metrics live in their own database.
+	submitter maintenance.CommandSubmitter
+
 	mu      sync.Mutex
 	lastRun time.Time
 }
@@ -56,6 +61,19 @@ func (t *MetricRetentionTask) Due(now time.Time) bool {
 	return now.Sub(t.lastRun) >= t.cleanupInterval
 }
 
+// WithSubmitter overrides the submitter this task submits to. nil (the
+// default) means the worker's default submitter is used. In separate-DB mode
+// the collector passes the metrics writer so purges hit the metrics database.
+func (t *MetricRetentionTask) WithSubmitter(s maintenance.CommandSubmitter) *MetricRetentionTask {
+	t.submitter = s
+	return t
+}
+
+// Submitter implements maintenance.SubmitterTask. nil = use worker default.
+func (t *MetricRetentionTask) Submitter() maintenance.CommandSubmitter {
+	return t.submitter
+}
+
 // Run creates and submits a PurgeMetricDataPointsCommand.
 func (t *MetricRetentionTask) Run(ctx context.Context, submitter maintenance.CommandSubmitter) error {
 	cmd := sqlite.NewPurgeMetricDataPointsCommand(t.keepMetrics, t.batchSize)
@@ -73,3 +91,6 @@ func (t *MetricRetentionTask) Run(ctx context.Context, submitter maintenance.Com
 
 // Ensure MetricRetentionTask satisfies MaintenanceTask at compile time.
 var _ maintenance.MaintenanceTask = (*MetricRetentionTask)(nil)
+
+// Ensure MetricRetentionTask satisfies SubmitterTask at compile time.
+var _ maintenance.SubmitterTask = (*MetricRetentionTask)(nil)

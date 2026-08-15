@@ -52,6 +52,26 @@ func newTestMetricQueues(capacity int) *testMetricQueues {
 	}
 }
 
+// queueExecutor adapts a storage.CommandQueue to the storage.CommandExecutor
+// interface the MetricBatcher now takes (the production executor is
+// *sqlite.Writer, which submits through its own internal queue).
+type queueExecutor struct {
+	q storage.CommandQueue
+}
+
+func (e *queueExecutor) Submit(ctx context.Context, cmd storage.Command) error {
+	return e.q.Send(ctx, cmd)
+}
+
+func (e *queueExecutor) QueueDepth() int {
+	return e.q.Len()
+}
+
+var _ interface {
+	storage.CommandExecutor
+	QueueDepth() int
+} = (*queueExecutor)(nil)
+
 // makeMetricBatch creates a MetricBatch with n data points across one series.
 func makeMetricBatch(resourceID string, n int) *model.MetricBatch {
 	batch := model.NewMetricBatch(1)
@@ -72,7 +92,7 @@ func makeMetricBatch(resourceID string, n int) *model.MetricBatch {
 
 func TestMetricBatcherBatchesByPoints(t *testing.T) {
 	q := newTestMetricQueues(100)
-	b := NewMetricBatcher(q.ingress, q.cmdQueue, &MetricBatcherConfig{BatchSize: 5})
+	b := NewMetricBatcher(q.ingress, &queueExecutor{q: q.cmdQueue}, &MetricBatcherConfig{BatchSize: 5})
 	b.WithCommandFactory(newMockMetricsCmd)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -108,7 +128,7 @@ func TestMetricBatcherBatchesByPoints(t *testing.T) {
 // inserted before its metrics, and a merged batch could only carry one.
 func TestMetricBatcherSeparatesResources(t *testing.T) {
 	q := newTestMetricQueues(100)
-	b := NewMetricBatcher(q.ingress, q.cmdQueue, &MetricBatcherConfig{BatchSize: 1000})
+	b := NewMetricBatcher(q.ingress, &queueExecutor{q: q.cmdQueue}, &MetricBatcherConfig{BatchSize: 1000})
 	b.WithCommandFactory(newMockMetricsCmd)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -152,7 +172,7 @@ func TestMetricBatcherSeparatesResources(t *testing.T) {
 // TestMetricBatcherFlushOnClose verifies shutdown flushes the partial batch.
 func TestMetricBatcherFlushOnClose(t *testing.T) {
 	q := newTestMetricQueues(10)
-	b := NewMetricBatcher(q.ingress, q.cmdQueue, &MetricBatcherConfig{BatchSize: 1000})
+	b := NewMetricBatcher(q.ingress, &queueExecutor{q: q.cmdQueue}, &MetricBatcherConfig{BatchSize: 1000})
 	b.WithCommandFactory(newMockMetricsCmd)
 
 	ctx, cancel := context.WithCancel(context.Background())

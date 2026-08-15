@@ -433,3 +433,54 @@ func TestMapMetricsData_EmptyInputs(t *testing.T) {
 		t.Errorf("metric without data produced %d batches, want 0", len(got))
 	}
 }
+
+// TestMapMetricsData_NilResourceGetsStableID guards the fix for resource-less
+// senders: OTLP allows ResourceMetrics with Resource unset, and the storage
+// writer inserts the log_resource row keyed by the resource ID. An empty ID
+// would make scope rows reference a resource that does not exist, silently
+// dropping every data point from the read-side views (which join
+// scope -> log_resource). The nil-resource batch must therefore carry a
+// deterministic, non-empty ID so writes and reads stay consistent.
+func TestMapMetricsData_NilResourceGetsStableID(t *testing.T) {
+	m := NewMapper()
+	rm := &metricsV1.ResourceMetrics{
+		Resource:  nil, // spec-legal: "no resource info is known"
+		SchemaUrl: "https://opentelemetry.io/schemas/1.21.0",
+		ScopeMetrics: []*metricsV1.ScopeMetrics{{
+			Scope:   &commonV1.InstrumentationScope{Name: "nil-res-scope", Version: "1.0.0"},
+			Metrics: []*metricsV1.Metric{{Name: "nil.res.metric", Data: &metricsV1.Metric_Gauge{Gauge: &metricsV1.Gauge{DataPoints: []*metricsV1.NumberDataPoint{{Value: &metricsV1.NumberDataPoint_AsDouble{AsDouble: 1}}}}}}},
+		}},
+	}
+
+	b1 := m.MapMetricsData([]*metricsV1.ResourceMetrics{rm})
+	if len(b1) != 1 {
+		t.Fatalf("got %d batches, want 1", len(b1))
+	}
+	batch := b1[0]
+	if batch.Resource == nil || batch.Resource.ID == "" {
+		t.Fatalf("nil OTLP resource must map to a resource with a non-empty ID, got %q", batch.Resource.ID)
+	}
+	if len(batch.Metrics) != 1 || batch.Metrics[0].ResourceID != batch.Resource.ID {
+		t.Fatalf("metric ResourceID=%q must equal batch resource ID %q", batch.Metrics[0].ResourceID, batch.Resource.ID)
+	}
+	// Scope identity must be derived from the same (non-empty) resource ID.
+	if batch.Metrics[0].ScopeID == "" {
+		t.Fatalf("scope ID must be derivable from the stable resource ID")
+	}
+
+	// Deterministic: a second mapping of the same input yields the same IDs.
+	b2 := m.MapMetricsData([]*metricsV1.ResourceMetrics{rm})
+	if b2[0].Resource.ID != batch.Resource.ID {
+		t.Errorf("resource ID not deterministic: %q vs %q", b2[0].Resource.ID, batch.Resource.ID)
+	}
+	if b2[0].Metrics[0].ScopeID != batch.Metrics[0].ScopeID {
+		t.Errorf("scope ID not deterministic: %q vs %q", b2[0].Metrics[0].ScopeID, batch.Metrics[0].ScopeID)
+	}
+
+	// Different schema URLs are distinct identities (same rule as non-nil resources).
+	rmOther := &metricsV1.ResourceMetrics{ScopeMetrics: rm.ScopeMetrics}
+	b3 := m.MapMetricsData([]*metricsV1.ResourceMetrics{rmOther})
+	if b3[0].Resource.ID == batch.Resource.ID {
+		t.Errorf("resource ID must differ when schema URL differs")
+	}
+}

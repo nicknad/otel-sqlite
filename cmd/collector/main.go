@@ -47,8 +47,13 @@ type Application struct {
 	batcher      *batcher.Batcher
 	writer       *sqlite.Writer
 
-	// Metrics pipeline (OTLP metric ingestion)
+	// Metrics pipeline (OTLP metric ingestion). In separate-DB mode
+	// (metrics_sqlite_path set) metricCmdQueue + metricWriter are created
+	// and the metric batcher submits to metricWriter; otherwise both are
+	// nil and metrics share the log writer (single shared pipeline).
 	metricIngressQueue ingest.MetricIngressQueue
+	metricCmdQueue     storage.CommandQueue
+	metricWriter       *sqlite.Writer
 	metricBatcher      *batcher.MetricBatcher
 
 	// OTLP servers
@@ -76,6 +81,12 @@ func main() {
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("Invalid configuration: %v", err)
+	}
+
+	// metrics_sqlite_path set while metrics are disabled is a warning, not
+	// an error: existing configs that disable metrics must keep working.
+	if w := cfg.MetricsSeparateDBWarning(); w != "" {
+		log.Printf("warning: %s", w)
 	}
 
 	// Apply Go runtime memory limit if configured.
@@ -159,6 +170,11 @@ func (a *Application) initialize() error {
 	if a.config.MetricsEnabled {
 		a.metricIngressQueue = ingest.NewMetricIngressQueue(a.config.IngressQueueCapacity)
 	}
+	// Separate-DB mode: the metrics signal gets its own command queue
+	// consumed by its own writer goroutine.
+	if a.config.MetricsSeparateDB() {
+		a.metricCmdQueue = storage.NewCommandQueue(a.config.BatchQueueCapacity)
+	}
 
 	// Create OTLP servers with optional backpressure threshold
 	a.otlpServer = otlp.NewServer(a.ingressQueue, a.metrics)
@@ -174,6 +190,45 @@ func (a *Application) initialize() error {
 			a.config.IngressQueueBackpressureThreshold*100)
 	}
 
+	// Apply writer tuning configuration
+	if a.config.WriterMaxTransactionRecords > 0 {
+		sqlite.MaxTransactionRecords = a.config.WriterMaxTransactionRecords
+	}
+
+	// Create SQLite writer (implements CommandExecutor). This is the single
+	// shared writer in default mode; in separate-DB mode it handles the log
+	// signal only.
+	writerConfig := &sqlite.WriterConfig{
+		Path:          a.config.SQLitePath,
+		BatchSize:     a.config.WriterBatchSize,
+		FlushInterval: a.config.WriterFlushInterval,
+		WALMode:       true,
+		Metrics:       a.metrics,
+	}
+
+	var err error
+	a.writer, err = sqlite.NewWriter(a.cmdQueue, writerConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create SQLite writer: %w", err)
+	}
+
+	// Separate-DB mode: second writer + queue for the metrics signal, same
+	// tuning, sharing the Metrics instance (combined Prometheus counters).
+	// Fail startup on open error so we never leave a half-initialized app.
+	if a.config.MetricsSeparateDB() {
+		a.metricWriter, err = sqlite.NewWriter(a.metricCmdQueue, &sqlite.WriterConfig{
+			Path:          a.config.MetricsSQLitePath,
+			BatchSize:     a.config.WriterBatchSize,
+			FlushInterval: a.config.WriterFlushInterval,
+			WALMode:       true,
+			Metrics:       a.metrics,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create metrics SQLite writer: %w", err)
+		}
+		log.Printf("metrics pipeline: separate SQLite database enabled at %q", a.config.MetricsSQLitePath)
+	}
+
 	// Create batcher (wraps batches as WriteBatchCommand, sends to cmd queue)
 	a.batcher = batcher.NewBatcher(a.ingressQueue, a.cmdQueue, &batcher.BatcherConfig{
 		BatchSize:              a.config.BatcherBatchSize,
@@ -185,10 +240,15 @@ func (a *Application) initialize() error {
 		return sqlite.NewWriteBatchCommand(batch)
 	})
 
-	// Create the metric batcher (wraps MetricBatch → WriteMetricsCommand,
-	// sends to the same command queue consumed by the SQLite writer).
+	// Create the metric batcher (wraps MetricBatch → WriteMetricsCommand).
+	// Its executor is the dedicated metrics writer in separate-DB mode and
+	// the single shared writer otherwise — one uniform code path.
 	if a.config.MetricsEnabled {
-		a.metricBatcher = batcher.NewMetricBatcher(a.metricIngressQueue, a.cmdQueue, &batcher.MetricBatcherConfig{
+		executor := storage.CommandExecutor(a.writer)
+		if a.metricWriter != nil {
+			executor = a.metricWriter
+		}
+		a.metricBatcher = batcher.NewMetricBatcher(a.metricIngressQueue, executor, &batcher.MetricBatcherConfig{
 			BatchSize:     a.config.BatcherBatchSize,
 			FlushInterval: a.config.BatcherFlushInterval,
 			Metrics:       a.metrics,
@@ -196,26 +256,6 @@ func (a *Application) initialize() error {
 		a.metricBatcher.WithCommandFactory(func(batch *model.MetricBatch) storage.Command {
 			return sqlite.NewWriteMetricsCommand(batch)
 		})
-	}
-
-	// Create SQLite writer (implements CommandExecutor)
-	writerConfig := &sqlite.WriterConfig{
-		Path:          a.config.SQLitePath,
-		BatchSize:     a.config.WriterBatchSize,
-		FlushInterval: a.config.WriterFlushInterval,
-		WALMode:       true,
-		Metrics:       a.metrics,
-	}
-
-	// Apply writer tuning configuration
-	if a.config.WriterMaxTransactionRecords > 0 {
-		sqlite.MaxTransactionRecords = a.config.WriterMaxTransactionRecords
-	}
-
-	var err error
-	a.writer, err = sqlite.NewWriter(a.cmdQueue, writerConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create SQLite writer: %w", err)
 	}
 
 	// Initialize notification pipeline if enabled.
@@ -249,6 +289,12 @@ func (a *Application) start() error {
 	// Start SQLite writer
 	a.writer.Start(context.Background())
 
+	// Separate-DB mode: start the metrics writer (metric batcher starts
+	// before its writer, same rule as the log pair above).
+	if a.metricWriter != nil {
+		a.metricWriter.Start(context.Background())
+	}
+
 	// Start maintenance worker
 	a.startMaintenance()
 
@@ -263,7 +309,7 @@ func (a *Application) start() error {
 	log.Printf(
 		"pipeline config: ingress_queue=%d batch_queue=%d "+
 			"batcher_batch_size=%d batcher_flush=%s "+
-			"writer_batch_size=%d writer_flush=%s max_tx_records=%d metrics_enabled=%t",
+			"writer_batch_size=%d writer_flush=%s max_tx_records=%d metrics_enabled=%t metrics_db=%s",
 		a.config.IngressQueueCapacity,
 		a.config.BatchQueueCapacity,
 		a.config.BatcherBatchSize,
@@ -272,6 +318,7 @@ func (a *Application) start() error {
 		a.config.WriterFlushInterval,
 		a.config.WriterMaxTransactionRecords,
 		a.config.MetricsEnabled,
+		a.config.MetricsSQLitePath,
 	)
 
 	return nil
@@ -368,12 +415,19 @@ func (a *Application) startMaintenance() {
 		maintCfg.RetentionDeleteBatchSize,
 	))
 
-	a.maintenanceWorker.Register(tasks.NewMetricRetentionTask(
+	metricRetentionTask := tasks.NewMetricRetentionTask(
 		maintCfg.MetricRetentionEnabled,
 		maintCfg.RetentionKeepMetrics,
 		maintCfg.RetentionCleanupInterval,
 		maintCfg.RetentionDeleteBatchSize,
-	))
+	)
+	// Separate-DB mode: metric retention must purge the metrics database,
+	// so route its command to the metrics writer instead of the worker's
+	// default (the log writer).
+	if a.config.MetricsSeparateDB() {
+		metricRetentionTask.WithSubmitter(a.metricWriter)
+	}
+	a.maintenanceWorker.Register(metricRetentionTask)
 
 	a.maintenanceWorker.Register(tasks.NewCheckpointTask(
 		maintCfg.CheckpointEnabled,
@@ -432,16 +486,33 @@ func (a *Application) cleanup() {
 		}
 	}
 
-	// Stop pipeline components
-	a.batcher.Stop()
+	// Stop pipeline components — metric pipeline first. The metric batcher
+	// flushes its current batch into the metrics writer's queue (or the
+	// shared queue in default mode); the metrics writer then drains and
+	// executes that queue before closing its own database.
 	if a.metricBatcher != nil {
 		a.metricBatcher.Stop()
 	}
 
-	// Stop maintenance worker
+	// Stop the maintenance worker before any writer it can submit to is
+	// stopped: in separate-DB mode the metric-retention task submits
+	// directly to the metrics writer, and Send on a closed queue panics.
 	if a.maintenanceWorker != nil {
 		a.maintenanceWorker.Stop()
 	}
+
+	// Drain + close the metrics writer and its queue (separate-DB mode
+	// only; both nil in default shared mode).
+	if a.metricWriter != nil {
+		a.metricWriter.Stop()
+		a.metricWriter.Wait()
+	}
+	if a.metricCmdQueue != nil {
+		a.metricCmdQueue.Close()
+	}
+
+	// Existing log pipeline sequence.
+	a.batcher.Stop()
 
 	// Stop notification worker
 	if a.notifyWorker != nil {
