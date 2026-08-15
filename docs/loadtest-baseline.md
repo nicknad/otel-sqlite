@@ -99,6 +99,61 @@ Interpretation:
 The keep-up result is a capped regression check, not a process ceiling. The
 process profile is also workload- and hardware-dependent.
 
+## Separate-DB verification (`metrics_sqlite_path`)
+
+The separate-metrics-DB feature (`metrics_sqlite_path` set, `metrics_enabled:
+true`) gives the metrics signal its own SQLite database with its own writer +
+batcher pipeline. This section re-measures the same three profiles against
+that config on the same machine (AMD Ryzen 5 4500U) and compares with the
+shared-writer rows above.
+
+Reproduce with the compose override:
+
+```bash
+make loadtest-separate-up          # adds METRICS_SQLITE_PATH to the stack
+make loadtest-baseline-logs
+make loadtest-baseline-metrics
+make loadtest-baseline-mixed
+make loadtest-separate-down
+# or all at once: make loadtest-separate-baselines
+```
+
+The container then holds two database files (`otel-logs.db` and
+`otel-metrics.db`) and logs
+`metrics pipeline: separate SQLite database enabled at ...`.
+
+| Signal | Shared writer (above) | Separate DB | Delta |
+|---|---:|---:|---:|
+| Logs solo | 69,431 / 69,746 /s | 71,147 /s | +2% (no regression) |
+| Metrics solo | 23,584 /s | 23,567 /s | ≈0 (same per-writer ceiling) |
+| Mixed: logs | 16,068 /s (~4.0k/s per client) | 53,890 /s (~13.5k/s per client) | +235% |
+| Mixed: metrics | 14,402 /s | 19,861 /s | +38% |
+| Mixed: combined | 30,470 /s | 73,751 /s | +142% |
+| Mixed drain | incomplete at 3m | complete, 59s | — |
+
+Ingest rates and error rates are unchanged (263k/s and 198k/s solo ingest;
+0.02–0.03% export errors in all runs; zero data loss — written == received
+for every signal). The headline result is the mixed run: log clients are no
+longer starved by metric inserts on the shared writer. Per-client log rate
+recovers from ~4.0k/s (shared) to ~13.5k/s (separate) — actually above the
+solo per-client rate (8.9k/s) because only 4 log clients feed the log writer
+in the mixed shape. The mixed backlog drains completely in ~59s instead of
+remaining at the 3m timeout.
+
+Interpretation:
+
+- **Log-only is unchanged or slightly better** (+2%, within noise): a
+  dedicated metrics writer cannot regress the log path.
+- **Metric-only is unchanged** (~23.6k/s): that is the per-writer ceiling
+  for this shape; the separate DB does not make a single writer faster.
+- **Mixed is no longer sub-additive per signal**: each writer runs near its
+  own ceiling (53.9k/s logs vs 71k/s solo, 19.9k/s metrics vs 23.6k/s solo)
+  instead of sharing one ~30k/s budget. Combined 73.8k/s vs 30.5k/s shared.
+
+Limitations (unchanged from the shared-DB runs): per-signal tuning knobs are
+not yet configurable, Prometheus counters remain combined across DBs, and
+checkpoint/vacuum/optimize/FTS-rebuild still target the log DB only.
+
 ## Storage note
 
 Migration 005 stores event attributes in `log_event.attributes_json` and removes

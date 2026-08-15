@@ -101,6 +101,9 @@ install-tools:
 # throughput baseline. Override LOADTEST_* vars to change the shape of load.
 
 LOADTEST_COMPOSE ?= docker-compose.loadtest.yml
+# Load-testing with the separate metrics DB: pass both files, e.g.
+#   LOADTEST_COMPOSE="docker-compose.loadtest.yml docker-compose.loadtest-separate.yml"
+# Compose flags are expanded per file (docker compose -f a.yml -f b.yml).
 LOADTEST_ADDR    ?= localhost:14317
 LOADTEST_METRICS ?= http://localhost:19090/metrics
 LOADTEST_SIGNAL  ?= logs
@@ -112,15 +115,18 @@ LOADTEST_ATTRS   ?= 4
 LOADTEST_RESOURCES ?= 8
 LOADTEST_DRAIN_TIMEOUT ?= 2m
 
+COMPOSE_FILES = $(foreach f,$(LOADTEST_COMPOSE),-f $(f))
+
 .PHONY: loadtest-build loadtest-up loadtest-down loadtest-run loadtest \
-	loadtest-keepup loadtest-process loadtest-burst-drain
+	loadtest-keepup loadtest-process loadtest-burst-drain \
+	loadtest-separate-up loadtest-separate-down loadtest-separate-baselines
 
 loadtest-build:
 	@echo "Building collector image..."
-	docker compose -f $(LOADTEST_COMPOSE) build
+	docker compose $(COMPOSE_FILES) build
 
 loadtest-up:
-	docker compose -f $(LOADTEST_COMPOSE) up -d --build
+	docker compose $(COMPOSE_FILES) up -d --build
 	@echo "Waiting for collector health..."
 	@for i in $$(seq 1 30); do \
 		if curl -sf http://localhost:19090/health >/dev/null 2>&1; then \
@@ -131,7 +137,7 @@ loadtest-up:
 	echo "collector did not become healthy"; exit 1
 
 loadtest-down:
-	docker compose -f $(LOADTEST_COMPOSE) down -v
+	docker compose $(COMPOSE_FILES) down -v
 
 loadtest-run:
 	$(GO) run ./cmd/loadtest \
@@ -187,6 +193,24 @@ loadtest-baseline-mixed:
 
 # Convenience: up + run + down
 loadtest: loadtest-up loadtest-run loadtest-down
+
+# Separate-DB convenience: bring up the load-test collector with a dedicated
+# metrics database (metrics_sqlite_path), run the three baseline profiles
+# against it, then tear down. The baseline profiles are client-only, so they
+# work unchanged against the separate-DB stack.
+loadtest-separate-up:
+	$(MAKE) loadtest-up \
+		LOADTEST_COMPOSE="docker-compose.loadtest.yml docker-compose.loadtest-separate.yml"
+
+loadtest-separate-down:
+	$(MAKE) loadtest-down \
+		LOADTEST_COMPOSE="docker-compose.loadtest.yml docker-compose.loadtest-separate.yml"
+
+loadtest-separate-baselines: loadtest-separate-up
+	$(MAKE) loadtest-baseline-logs
+	$(MAKE) loadtest-baseline-metrics
+	$(MAKE) loadtest-baseline-mixed
+	$(MAKE) loadtest-separate-down
 
 # Helper targets
 .PHONY: deps install-tools
