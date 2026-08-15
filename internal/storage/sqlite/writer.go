@@ -378,6 +378,19 @@ func (w *Writer) executeTransaction(commands []storage.Command) {
 		return
 	}
 
+	// Dedup caches are updated only after commit. Rows inserted by commands
+	// whose transaction rolled back (command failure above, or commit
+	// failure) must never be recorded as seen, or later batches would skip
+	// the INSERT OR IGNORE and reference rows that do not exist.
+	for _, cmd := range commands {
+		switch c := cmd.(type) {
+		case *WriteBatchCommand:
+			c.CommitSeen()
+		case *WriteMetricsCommand:
+			c.CommitSeen()
+		}
+	}
+
 	// Update metrics for write-command executions.
 	var logRecords, metricPoints int
 	for _, cmd := range commands {
