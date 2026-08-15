@@ -1,7 +1,8 @@
 # Phase 1 handoff — OTLP metrics ingestion & storage
 
 This file is the context handoff for a fresh session. Read it first, then
-`docs/metrics-extension-proposal.md` (the original plan) and
+`docs/metrics-phase2-handoff.md` (Phase 2 context: read side, retention,
+loadtest, e2e), `docs/metrics-extension-proposal.md` (the original plan) and
 `docs/architecture.md` (updated for metrics).
 
 ## Where things live
