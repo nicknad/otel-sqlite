@@ -24,6 +24,19 @@ type Config struct {
 	IngressQueueCapacity int `mapstructure:"ingress_queue_capacity"`
 	BatchQueueCapacity   int `mapstructure:"batch_queue_capacity"`
 
+	// MetricsEnabled enables OTLP metric ingestion. Metric data points are
+	// stored in SQLite (tables created by migration 006); they are never
+	// exposed on the collector's Prometheus /metrics endpoint. When disabled
+	// the metrics gRPC service returns Unavailable.
+	MetricsEnabled bool `mapstructure:"metrics_enabled"`
+
+	// MetricsSQLitePath, when set (and MetricsEnabled), stores OTLP metric
+	// data points in their own SQLite database with their own writer +
+	// batcher pipeline, isolating metrics write load from the log path.
+	// When empty (default) metrics share SQLitePath with logs via the single
+	// shared writer — today's behavior.
+	MetricsSQLitePath string `mapstructure:"metrics_sqlite_path"`
+
 	// Batcher configuration
 	BatcherBatchSize              int           `mapstructure:"batcher_batch_size"`
 	BatcherFlushInterval          time.Duration `mapstructure:"batcher_flush_interval"`
@@ -152,6 +165,7 @@ func DefaultConfig() *Config {
 		SQLitePath:                        "otel-logs.db",
 		IngressQueueCapacity:              10000,
 		BatchQueueCapacity:                5000,
+		MetricsEnabled:                    true,
 		BatcherBatchSize:                  500,
 		BatcherFlushInterval:              1 * time.Second,
 		BatcherErrorSeverityThreshold:     "ERROR",
@@ -192,6 +206,8 @@ var envBindings = []envBinding{
 	// Strings
 	{env: "LISTEN_ADDRESS", parse: parseString, apply: func(c *Config, v any) { c.ListenAddress = v.(string) }},
 	{env: "SQLITE_PATH", parse: parseString, apply: func(c *Config, v any) { c.SQLitePath = v.(string) }},
+	{env: "METRICS_SQLITE_PATH", parse: parseString, //nolint:lll
+		apply: func(c *Config, v any) { c.MetricsSQLitePath = v.(string) }},
 	{env: "METRICS_ADDRESS", parse: parseString, apply: func(c *Config, v any) { c.MetricsAddress = v.(string) }},
 	{
 		env: "BATCHER_ERROR_SEVERITY_THRESHOLD", parse: parseString,
@@ -202,6 +218,10 @@ var envBindings = []envBinding{
 	{
 		env: "INGRESS_QUEUE_CAPACITY", parse: parseInt,
 		apply: func(c *Config, v any) { c.IngressQueueCapacity = v.(int) },
+	},
+	{
+		env: "METRICS_ENABLED", parse: parseBool,
+		apply: func(c *Config, v any) { c.MetricsEnabled = v.(bool) },
 	},
 	{
 		env: "BATCH_QUEUE_CAPACITY", parse: parseInt,
@@ -396,6 +416,28 @@ func (c *Config) ApplyLegacyEnv() (int, error) {
 	}
 
 	return count, nil
+}
+
+// MetricsSeparateDB reports whether OTLP metrics are stored in their own
+// SQLite database with their own writer + batcher pipeline. Both conditions
+// must hold: metrics must be enabled, and metrics_sqlite_path must be set.
+func (c *Config) MetricsSeparateDB() bool {
+	return c.MetricsEnabled && c.MetricsSQLitePath != ""
+}
+
+// MetricsSeparateDBWarning returns a non-empty message when
+// metrics_sqlite_path is set while metrics are disabled. Callers (e.g. main)
+// log it as a startup warning; it is deliberately NOT a validation error so
+// existing configs that disable metrics keep working.
+func (c *Config) MetricsSeparateDBWarning() string {
+	if c.MetricsSQLitePath != "" && !c.MetricsEnabled {
+		return fmt.Sprintf(
+			"metrics_sqlite_path %q is set but metrics_enabled is false; "+
+				"separate-DB mode is disabled and metrics are not ingested",
+			c.MetricsSQLitePath,
+		)
+	}
+	return ""
 }
 
 // ensureNotification returns the Notification config, creating it if nil.

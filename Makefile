@@ -17,7 +17,9 @@ GENERATED_DIR := internal/generated
 # Source files
 PROTO_FILES := \
 	$(PROTO_DIR)/opentelemetry/proto/collector/logs/v1/logs_service.proto \
+	$(PROTO_DIR)/opentelemetry/proto/collector/metrics/v1/metrics_service.proto \
 	$(PROTO_DIR)/opentelemetry/proto/logs/v1/logs.proto \
+	$(PROTO_DIR)/opentelemetry/proto/metrics/v1/metrics.proto \
 	$(PROTO_DIR)/opentelemetry/proto/common/v1/common.proto \
 	$(PROTO_DIR)/opentelemetry/proto/resource/v1/resource.proto
 
@@ -34,10 +36,13 @@ generate: $(PROTO_FILES)
 		--go_opt=Mopentelemetry/proto/common/v1/common.proto=codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/common/v1 \
 		--go_opt=Mopentelemetry/proto/resource/v1/resource.proto=codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/resource/v1 \
 		--go_opt=Mopentelemetry/proto/logs/v1/logs.proto=codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/logs/v1 \
+		--go_opt=Mopentelemetry/proto/metrics/v1/metrics.proto=codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/metrics/v1 \
 		--go_opt=Mopentelemetry/proto/collector/logs/v1/logs_service.proto=codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/collector/logs/v1 \
+		--go_opt=Mopentelemetry/proto/collector/metrics/v1/metrics_service.proto=codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/collector/metrics/v1 \
 		--go-grpc_out=$(GENERATED_DIR) \
 		--go-grpc_opt=paths=source_relative \
 		--go-grpc_opt=Mopentelemetry/proto/collector/logs/v1/logs_service.proto=codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/collector/logs/v1 \
+		--go-grpc_opt=Mopentelemetry/proto/collector/metrics/v1/metrics_service.proto=codeberg.org/nicknad/otel-sqlite/internal/generated/opentelemetry/proto/collector/metrics/v1 \
 		-I=$(PROTO_DIR) \
 		$(PROTO_FILES)
 	@echo "Protobuf code generation complete."
@@ -96,8 +101,12 @@ install-tools:
 # throughput baseline. Override LOADTEST_* vars to change the shape of load.
 
 LOADTEST_COMPOSE ?= docker-compose.loadtest.yml
+# Load-testing with the separate metrics DB: pass both files, e.g.
+#   LOADTEST_COMPOSE="docker-compose.loadtest.yml docker-compose.loadtest-separate.yml"
+# Compose flags are expanded per file (docker compose -f a.yml -f b.yml).
 LOADTEST_ADDR    ?= localhost:14317
 LOADTEST_METRICS ?= http://localhost:19090/metrics
+LOADTEST_SIGNAL  ?= logs
 LOADTEST_CLIENTS ?= 32
 LOADTEST_RECORDS ?= 1000
 LOADTEST_DURATION ?= 30s
@@ -106,15 +115,18 @@ LOADTEST_ATTRS   ?= 4
 LOADTEST_RESOURCES ?= 8
 LOADTEST_DRAIN_TIMEOUT ?= 2m
 
+COMPOSE_FILES = $(foreach f,$(LOADTEST_COMPOSE),-f $(f))
+
 .PHONY: loadtest-build loadtest-up loadtest-down loadtest-run loadtest \
-	loadtest-keepup loadtest-process loadtest-burst-drain
+	loadtest-keepup loadtest-process loadtest-burst-drain \
+	loadtest-separate-up loadtest-separate-down loadtest-separate-baselines
 
 loadtest-build:
 	@echo "Building collector image..."
-	docker compose -f $(LOADTEST_COMPOSE) build
+	docker compose $(COMPOSE_FILES) build
 
 loadtest-up:
-	docker compose -f $(LOADTEST_COMPOSE) up -d --build
+	docker compose $(COMPOSE_FILES) up -d --build
 	@echo "Waiting for collector health..."
 	@for i in $$(seq 1 30); do \
 		if curl -sf http://localhost:19090/health >/dev/null 2>&1; then \
@@ -125,12 +137,13 @@ loadtest-up:
 	echo "collector did not become healthy"; exit 1
 
 loadtest-down:
-	docker compose -f $(LOADTEST_COMPOSE) down -v
+	docker compose $(COMPOSE_FILES) down -v
 
 loadtest-run:
 	$(GO) run ./cmd/loadtest \
 		-addr $(LOADTEST_ADDR) \
 		-metrics $(LOADTEST_METRICS) \
+		-signal $(LOADTEST_SIGNAL) \
 		-clients $(LOADTEST_CLIENTS) \
 		-records $(LOADTEST_RECORDS) \
 		-duration $(LOADTEST_DURATION) \
@@ -157,8 +170,52 @@ loadtest-burst-drain:
 		LOADTEST_CLIENTS=32 LOADTEST_RECORDS=1000 LOADTEST_DURATION=30s \
 		LOADTEST_RPS=0 LOADTEST_DRAIN_TIMEOUT=5m
 
+# Baseline profiles: log-only, metric-only and mixed (half log + half metric
+# clients) at the same per-client shape as Profile B, so per-signal process
+# rates are directly comparable and a regression in one signal is visible.
+loadtest-baseline-logs:
+	$(MAKE) loadtest-run \
+		LOADTEST_SIGNAL=logs \
+		LOADTEST_CLIENTS=8 LOADTEST_RECORDS=250 LOADTEST_DURATION=30s \
+		LOADTEST_RPS=0 LOADTEST_DRAIN_TIMEOUT=2m
+
+loadtest-baseline-metrics:
+	$(MAKE) loadtest-run \
+		LOADTEST_SIGNAL=metrics \
+		LOADTEST_CLIENTS=8 LOADTEST_RECORDS=250 LOADTEST_DURATION=30s \
+		LOADTEST_RPS=0 LOADTEST_DRAIN_TIMEOUT=3m
+
+loadtest-baseline-mixed:
+	$(MAKE) loadtest-run \
+		LOADTEST_SIGNAL=mixed \
+		LOADTEST_CLIENTS=8 LOADTEST_RECORDS=250 LOADTEST_DURATION=30s \
+		LOADTEST_RPS=0 LOADTEST_DRAIN_TIMEOUT=3m
+
 # Convenience: up + run + down
 loadtest: loadtest-up loadtest-run loadtest-down
+
+# Separate-DB convenience: bring up the load-test collector with a dedicated
+# metrics database (metrics_sqlite_path), run the three baseline profiles
+# against it, then tear down. The baseline profiles are client-only, so they
+# work unchanged against the separate-DB stack.
+loadtest-separate-up:
+	$(MAKE) loadtest-up \
+		LOADTEST_COMPOSE="docker-compose.loadtest.yml docker-compose.loadtest-separate.yml"
+
+loadtest-separate-down:
+	$(MAKE) loadtest-down \
+		LOADTEST_COMPOSE="docker-compose.loadtest.yml docker-compose.loadtest-separate.yml"
+
+loadtest-separate-baselines: loadtest-separate-up
+	$(MAKE) loadtest-baseline-logs
+	$(MAKE) loadtest-baseline-metrics
+	$(MAKE) loadtest-baseline-mixed
+	$(MAKE) loadtest-separate-down
+
+# check-indexes lists the SQLite indexes on a database file (default: otel-logs.db).
+.PHONY: check-indexes
+check-indexes:
+	$(GO) run ./scripts/check_indexes.go $(DB_PATH)
 
 # Helper targets
 .PHONY: deps install-tools

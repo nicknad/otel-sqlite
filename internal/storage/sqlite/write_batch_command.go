@@ -33,8 +33,12 @@ const (
 // PreparedStatements holds SQL statements prepared once at startup
 // and reused across transactions via tx.Stmt().
 type PreparedStatements struct {
-	InsertResource *sql.Stmt
-	InsertEvent    *sql.Stmt
+	InsertResource  *sql.Stmt
+	InsertEvent     *sql.Stmt
+	InsertScope     *sql.Stmt
+	InsertMetric    *sql.Stmt
+	InsertSeries    *sql.Stmt
+	InsertDataPoint *sql.Stmt
 }
 
 // Close closes all prepared statements.
@@ -42,11 +46,17 @@ func (ps *PreparedStatements) Close() {
 	if ps == nil {
 		return
 	}
-	if ps.InsertResource != nil {
-		ps.InsertResource.Close()
-	}
-	if ps.InsertEvent != nil {
-		ps.InsertEvent.Close()
+	for _, stmt := range []*sql.Stmt{
+		ps.InsertResource,
+		ps.InsertEvent,
+		ps.InsertScope,
+		ps.InsertMetric,
+		ps.InsertSeries,
+		ps.InsertDataPoint,
+	} {
+		if stmt != nil {
+			stmt.Close()
+		}
 	}
 }
 
@@ -70,6 +80,12 @@ type WriteBatchCommand struct {
 	// optional process-local set of resource IDs already inserted successfully.
 	// When the batch resource ID is present, the INSERT OR IGNORE is skipped.
 	seenResources map[string]struct{}
+
+	// pendingResources holds resource IDs actually inserted during Execute.
+	// CommitSeen merges them into seenResources after the transaction
+	// commits; on rollback they are discarded with the command so the cache
+	// never references uncommitted rows.
+	pendingResources map[string]struct{}
 }
 
 // NewWriteBatchCommand creates a new WriteBatchCommand from a LogBatch.
@@ -95,7 +111,10 @@ func (c *WriteBatchCommand) SetPreparedStatements(stmts *PreparedStatements) {
 
 // SetSeenResources injects a process-local cache of resource IDs that have
 // already been inserted successfully. The map is owned by the Writer and must
-// only be used from the single writer goroutine.
+// only be used from the single writer goroutine. After the surrounding
+// transaction commits, the Writer must call CommitSeen so the resource IDs
+// inserted by Execute become visible to later transactions; after a rollback
+// it must not.
 func (c *WriteBatchCommand) SetSeenResources(seen map[string]struct{}) {
 	c.seenResources = seen
 }
@@ -103,11 +122,6 @@ func (c *WriteBatchCommand) SetSeenResources(seen map[string]struct{}) {
 // Size returns the number of log records in this command.
 func (c *WriteBatchCommand) Size() int {
 	return c.records
-}
-
-// Batch returns the underlying LogBatch (for metrics and diagnostics).
-func (c *WriteBatchCommand) Batch() *model.LogBatch {
-	return c.batch
 }
 
 // Execute writes the log batch inside the supplied transaction.
@@ -183,7 +197,10 @@ func (c *WriteBatchCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 				return fmt.Errorf("insert resource %q: %w", resourceID, err)
 			}
 			if c.seenResources != nil && resourceID != "" {
-				c.seenResources[resourceID] = struct{}{}
+				if c.pendingResources == nil {
+					c.pendingResources = make(map[string]struct{})
+				}
+				c.pendingResources[resourceID] = struct{}{}
 			}
 		}
 	}
@@ -213,6 +230,21 @@ func ensureResourceID(resource *model.Resource) string {
 	// Generate a unique ID for resources that lack one (e.g., unit tests).
 	resource.ID = fmt.Sprintf("res-%d", time.Now().UnixNano())
 	return resource.ID
+}
+
+// CommitSeen merges the resource IDs actually inserted during Execute into
+// the live seenResources cache. The Writer calls it after tx.Commit
+// succeeds; a rolled-back transaction leaves the cache untouched so the
+// resource row is re-inserted (INSERT OR IGNORE) next time. Safe to call
+// with the cache disabled.
+func (c *WriteBatchCommand) CommitSeen() {
+	if c.seenResources == nil || len(c.pendingResources) == 0 {
+		return
+	}
+	for id := range c.pendingResources {
+		c.seenResources[id] = struct{}{}
+	}
+	c.pendingResources = nil
 }
 
 // insertEventRecord inserts a single log event row, including all event

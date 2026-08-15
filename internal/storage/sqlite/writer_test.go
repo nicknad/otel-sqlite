@@ -2,14 +2,18 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
 	"codeberg.org/nicknad/otel-sqlite/internal/storage"
+	"codeberg.org/nicknad/otel-sqlite/internal/testutil"
 )
 
 func TestOpenDatabase(t *testing.T) {
@@ -312,14 +316,71 @@ func TestWriteBatchCommandImmutability(t *testing.T) {
 	batch.AddRecord(&model.LogRecord{Body: "immutable"})
 
 	cmd := NewWriteBatchCommand(batch)
-	if cmd.Batch() != batch {
-		t.Error("Batch() should return the same batch reference")
-	}
 	// Verify the command caches the record count correctly
 	batch.AddRecord(&model.LogRecord{Body: "extra"})
 	// Size() should return the original count, not the updated batch count
 	if cmd.Size() != 1 {
 		t.Errorf("Size() = %d, want 1 (cached at construction)", cmd.Size())
+	}
+}
+
+// failingCommand fails when executed inside a transaction, forcing the
+// writer to roll back the whole transaction (simulates a transient insert
+// error such as disk-full).
+type failingCommand struct{}
+
+func (failingCommand) Execute(ctx context.Context, tx *sql.Tx) error {
+	return errors.New("injected failure")
+}
+
+// TestWriterRollbackDoesNotPoisonDedupCaches is the writer-level regression
+// test for the dedup-cache rollback hazard: a transaction that rolls back
+// (a later command fails) must not leave the seen caches claiming rows were
+// inserted. Otherwise the same metric batch written afterwards would skip
+// the scope/metric/series INSERT OR IGNORE and produce orphan data points.
+func TestWriterRollbackDoesNotPoisonDedupCaches(t *testing.T) {
+	dbpath := filepath.Join(t.TempDir(), "writer-rollback-cache.db")
+
+	cmdQueue := storage.NewCommandQueue(10)
+	w, err := NewWriter(cmdQueue, &WriterConfig{
+		Path:          dbpath,
+		BatchSize:     100,
+		FlushInterval: 50 * time.Millisecond,
+		WALMode:       false,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter() error: %v", err)
+	}
+	defer func() { w.Stop(); w.Wait() }()
+
+	ctx := context.Background()
+	w.Start(ctx)
+
+	// A metric command followed by a failing command in the same
+	// transaction: the metric rows are inserted, then everything rolls back.
+	w.executeCommands([]storage.Command{
+		NewWriteMetricsCommand(buildMetricBatch()),
+		failingCommand{},
+	})
+
+	// Nothing committed, and the dedup caches must be empty.
+	testutil.AssertTableCount(t, w.db, "metric_data_point", 0)
+	if len(w.seenResources) != 0 || len(w.seenScopes) != 0 || len(w.seenMetrics) != 0 || len(w.seenSeries) != 0 {
+		t.Fatalf("dedup caches poisoned by rolled-back transaction: resources=%d scopes=%d metrics=%d series=%d",
+			len(w.seenResources), len(w.seenScopes), len(w.seenMetrics), len(w.seenSeries))
+	}
+
+	// The same batch written on its own must insert every row (the cache
+	// was not poisoned), and after commit the caches are populated.
+	w.executeCommands([]storage.Command{NewWriteMetricsCommand(buildMetricBatch())})
+
+	testutil.AssertTableCount(t, w.db, "scope", 1)
+	testutil.AssertTableCount(t, w.db, "metric", 2)
+	testutil.AssertTableCount(t, w.db, "metric_series", 3)
+	testutil.AssertTableCount(t, w.db, "metric_data_point", 4)
+	if len(w.seenResources) != 1 || len(w.seenScopes) != 1 || len(w.seenMetrics) != 2 || len(w.seenSeries) != 3 {
+		t.Fatalf("caches not populated after commit: resources=%d scopes=%d metrics=%d series=%d",
+			len(w.seenResources), len(w.seenScopes), len(w.seenMetrics), len(w.seenSeries))
 	}
 }
 

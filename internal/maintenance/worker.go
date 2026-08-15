@@ -128,8 +128,16 @@ func (w *Worker) evaluateAndRun(now time.Time) {
 		name := task.Name()
 		log.Printf("maintenance: starting task %q", name)
 
+		// Per-task submitter override: a SubmitterTask that returns a
+		// non-nil submitter (e.g. metric retention targeting the metrics
+		// writer in separate-DB mode) replaces the worker default.
+		s := w.submitter
+		if st, ok := task.(SubmitterTask); ok && st.Submitter() != nil {
+			s = st.Submitter()
+		}
+
 		startTime := time.Now()
-		err := task.Run(w.ctx, w.submitter)
+		err := task.Run(w.ctx, s)
 		elapsed := time.Since(startTime).Seconds()
 
 		if err != nil {

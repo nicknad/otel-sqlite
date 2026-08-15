@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"codeberg.org/nicknad/otel-sqlite/internal/duration"
 )
 
 // fileMaintenanceConfig is the YAML-deserializable subset of maintenance config.
@@ -16,10 +18,12 @@ type fileMaintenanceConfig struct {
 		CheckInterval string `yaml:"check_interval"`
 	} `yaml:"maintenance"`
 	Retention struct {
-		Enabled         *bool  `yaml:"enabled"`
-		KeepLogs        string `yaml:"keep_logs"`
-		CleanupInterval string `yaml:"cleanup_interval"`
-		DeleteBatchSize *int   `yaml:"delete_batch_size"`
+		Enabled                *bool  `yaml:"enabled"`
+		KeepLogs               string `yaml:"keep_logs"`
+		KeepMetrics            string `yaml:"keep_metrics"`
+		MetricRetentionEnabled *bool  `yaml:"metric_retention_enabled"`
+		CleanupInterval        string `yaml:"cleanup_interval"`
+		DeleteBatchSize        *int   `yaml:"delete_batch_size"`
 	} `yaml:"retention"`
 	Checkpoint struct {
 		Enabled  *bool  `yaml:"enabled"`
@@ -76,6 +80,16 @@ func (c *Config) LoadFile(path string) error {
 			return fmt.Errorf("retention.keep_logs: %w", err)
 		}
 		c.RetentionKeepLogs = d
+	}
+	if fc.Retention.KeepMetrics != "" {
+		d, err := parseDurationExt(fc.Retention.KeepMetrics)
+		if err != nil {
+			return fmt.Errorf("retention.keep_metrics: %w", err)
+		}
+		c.RetentionKeepMetrics = d
+	}
+	if fc.Retention.MetricRetentionEnabled != nil {
+		c.MetricRetentionEnabled = *fc.Retention.MetricRetentionEnabled
 	}
 	if fc.Retention.CleanupInterval != "" {
 		d, err := parseDurationExt(fc.Retention.CleanupInterval)
@@ -142,21 +156,9 @@ func (c *Config) LoadFile(path string) error {
 	return nil
 }
 
-// parseDurationExt is a copy of config.parseDurationExt to avoid a
-// circular dependency. It supports Go durations and "d" for days.
+// parseDurationExt parses a duration string supporting Go durations and "d" for days.
+// Examples: "30d", "24h", "1h30m", "5s". The implementation lives in the
+// shared internal/duration package (config and maintenance both use it).
 func parseDurationExt(s string) (time.Duration, error) {
-	if d, err := time.ParseDuration(s); err == nil {
-		return d, nil
-	}
-	if len(s) >= 2 && s[len(s)-1] == 'd' {
-		var days int
-		if _, err := fmt.Sscanf(s[:len(s)-1], "%d", &days); err != nil {
-			return 0, fmt.Errorf("invalid duration %q: %w", s, err)
-		}
-		if days < 0 {
-			return 0, fmt.Errorf("invalid duration %q: negative days not allowed", s)
-		}
-		return time.Duration(days) * 24 * time.Hour, nil
-	}
-	return 0, fmt.Errorf("invalid duration %q", s)
+	return duration.Parse(s)
 }

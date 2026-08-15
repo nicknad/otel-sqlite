@@ -5,74 +5,30 @@ import (
 	"time"
 )
 
-func TestWindow_Add(t *testing.T) {
-	base := time.Now().UnixNano()
-	w := NewWindow(1 * time.Second)
-
-	// Add within window.
-	n := w.Add(base)
-	if n != 1 {
-		t.Fatalf("count = %d, want 1", n)
-	}
-
-	// Add another within window.
-	n = w.Add(base + int64(500*time.Millisecond))
-	if n != 2 {
-		t.Fatalf("count = %d, want 2", n)
-	}
-
-	// Add outside window — should prune old ones.
-	n = w.Add(base + int64(2*time.Second))
-	if n != 1 {
-		t.Fatalf("count = %d, want 1 (old pruned), got %d", n, n)
+func TestAddToSlice_Appends(t *testing.T) {
+	got := AddToSlice(nil, 100, time.Minute)
+	if len(got) != 1 || got[0] != 100 {
+		t.Fatalf("AddToSlice(nil) = %v, want [100]", got)
 	}
 }
 
-func TestWindow_Prune(t *testing.T) {
-	base := time.Now().UnixNano()
-	w := NewWindow(1 * time.Second)
-
-	w.Add(base)
-	w.Add(base + int64(500*time.Millisecond))
-	w.Add(base + int64(2*time.Second)) // only this one should remain
-
-	w.Prune(base + int64(2*time.Second))
-	if w.Count() != 1 {
-		t.Errorf("Count after prune = %d, want 1", w.Count())
+func TestAddToSlice_PrunesExpired(t *testing.T) {
+	// Window is 1 minute; entries older than (ts - 1m) are pruned.
+	got := AddToSlice([]int64{1, 2, 59_000_000_000, 61_000_000_000}, 121_000_000_000, time.Minute)
+	want := []int64{61_000_000_000, 121_000_000_000}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
 	}
 }
 
-func TestWindow_Last(t *testing.T) {
-	w := NewWindow(1 * time.Second)
-	if w.Last() != 0 {
-		t.Error("empty window Last should be 0")
-	}
-
-	ts := time.Now().UnixNano()
-	w.Add(ts)
-	if w.Last() != ts {
-		t.Errorf("Last = %d, want %d", w.Last(), ts)
-	}
-}
-
-func TestWindow_SnapshotRoundtrip(t *testing.T) {
-	base := time.Now().UnixNano()
-	w := NewWindow(5 * time.Second)
-	w.Add(base)
-	w.Add(base + int64(1*time.Second))
-	w.Add(base + int64(2*time.Second))
-
-	snap := w.Snapshot()
-	if len(snap) != 3 {
-		t.Fatalf("snapshot len = %d, want 3", len(snap))
-	}
-
-	w2 := NewWindow(5 * time.Second)
-	w2.LoadFrom(snap)
-	if w2.Count() != 3 {
-		t.Errorf("loaded count = %d, want 3", w2.Count())
-	}
-	if w2.Last() != base+int64(2*time.Second) {
-		t.Errorf("loaded Last = %d, want %d", w2.Last(), base+int64(2*time.Second))
+func TestAddToSlice_PrunesAll(t *testing.T) {
+	got := AddToSlice([]int64{1, 2, 3}, 121_000_000_000, time.Minute)
+	if len(got) != 1 || got[0] != 121_000_000_000 {
+		t.Fatalf("got %v, want [121000000000]", got)
 	}
 }

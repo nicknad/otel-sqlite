@@ -26,13 +26,13 @@ func TestSeverityString(t *testing.T) {
 	}
 }
 
-func TestNewLogRecord(t *testing.T) {
-	r := NewLogRecord()
+func TestGetRecord(t *testing.T) {
+	r := GetRecord()
 	if r.Attributes == nil {
-		t.Error("expected non-nil Attributes map")
+		t.Error("expected non-nil Attributes slice")
 	}
 	if len(r.Attributes) != 0 {
-		t.Error("expected empty Attributes map")
+		t.Error("expected empty Attributes slice")
 	}
 }
 
@@ -82,8 +82,8 @@ func TestLogBatch(t *testing.T) {
 		t.Errorf("expected size 0, got %d", b.Size())
 	}
 
-	r1 := NewLogRecord()
-	r2 := NewLogRecord()
+	r1 := GetRecord()
+	r2 := GetRecord()
 	b.AddRecord(r1)
 	b.AddRecord(r2)
 

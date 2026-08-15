@@ -42,7 +42,6 @@ func drainCommandQueue(q storage.CommandQueue) int {
 // mockWriteBatchCommand is a lightweight stand-in for sqlite.WriteBatchCommand
 // used in tests so that batcher tests do not depend on the sqlite package.
 type mockWriteBatchCommand struct {
-	batch   *model.LogBatch
 	records int
 }
 
@@ -54,20 +53,13 @@ func (m *mockWriteBatchCommand) Size() int {
 	return m.records
 }
 
-func (m *mockWriteBatchCommand) Batch() *model.LogBatch {
-	return m.batch
-}
-
 // newMockCmd creates a mock command from a batch (same signature as sqlite.NewWriteBatchCommand).
 func newMockCmd(batch *model.LogBatch) storage.Command {
 	recs := 0
 	if batch != nil {
 		recs = batch.Size()
 	}
-	return &mockWriteBatchCommand{
-		batch:   batch,
-		records: recs,
-	}
+	return &mockWriteBatchCommand{records: recs}
 }
 
 type testQueues struct {
@@ -140,6 +132,29 @@ func TestBatcherEmptyOnStop(t *testing.T) {
 	total := drainCommandQueue(q.cmdQueue)
 	if total != 3 {
 		t.Errorf("expected 3 records flushed on stop, got %d", total)
+	}
+}
+
+// TestBatcherStopDrainsIngress is a regression test for shutdown dropping
+// in-flight batches: Stop must drain the ingress queue before flushing, even
+// when the shutdown select could otherwise pick ctx.Done() first.
+func TestBatcherStopDrainsIngress(t *testing.T) {
+	q := newTestQueues(10)
+	b := NewBatcher(q.ingress, q.cmdQueue, &BatcherConfig{BatchSize: 100})
+	b.WithCommandFactory(newMockCmd)
+
+	b.Start(context.Background())
+
+	// Send AFTER Start, then stop immediately — no sleep: any shutdown path
+	// that skips the ingress queue drops these records.
+	_ = q.ingress.Send(context.Background(), makeBatch(3))
+	_ = q.ingress.Send(context.Background(), makeBatch(4))
+	b.Stop()
+
+	q.cmdQueue.Close()
+	total := drainCommandQueue(q.cmdQueue)
+	if total != 7 {
+		t.Errorf("expected 7 records flushed on stop, got %d", total)
 	}
 }
 

@@ -15,11 +15,3 @@ func GetRecord() *LogRecord {
 func PutRecord(r *LogRecord) {
 	// no-op: heap-allocated records are GC'd
 }
-
-// NewLogRecord creates a new LogRecord with pre-allocated attribute slice.
-// Under nopool this is identical to GetRecord.
-func NewLogRecord() *LogRecord {
-	return &LogRecord{
-		Attributes: make([]Attribute, 0, 4),
-	}
-}

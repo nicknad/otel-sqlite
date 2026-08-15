@@ -9,10 +9,12 @@ import (
 // Metrics holds all Prometheus metrics for the collector.
 type Metrics struct {
 	// Ingestion metrics
-	LogsReceived      prometheus.Counter
-	LogsWritten       prometheus.Counter
-	IngressQueueDepth prometheus.Gauge
-	BatchQueueDepth   prometheus.Gauge
+	LogsReceived            prometheus.Counter
+	LogsWritten             prometheus.Counter
+	MetricsReceived         prometheus.Counter
+	MetricDataPointsWritten prometheus.Counter
+	IngressQueueDepth       prometheus.Gauge
+	BatchQueueDepth         prometheus.Gauge
 
 	// Batch metrics
 	BatchesCreated prometheus.Counter
@@ -53,6 +55,11 @@ func NewMetrics() *Metrics {
 		Namespace: "otel_collector", Subsystem: "ingest", Name: "logs_received_total",
 		Help: "Total number of log records received",
 	})
+	metricsReceived := promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "ingest", Name: "metrics_received_total",
+		Help: "Total number of OTLP metric data points received (ingested application telemetry, " +
+			"not collector self-telemetry)",
+	})
 	ingressQueueDepth := promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: "otel_collector", Subsystem: "ingest", Name: "ingress_queue_depth",
 		Help: "Current depth of the ingress queue",
@@ -81,6 +88,10 @@ func NewMetrics() *Metrics {
 	logsWritten := promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "otel_collector", Subsystem: "storage", Name: "logs_written_total",
 		Help: "Total number of log records written to storage",
+	})
+	metricDataPointsWritten := promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "otel_collector", Subsystem: "storage", Name: "metric_data_points_written_total",
+		Help: "Total number of OTLP metric data points written to storage",
 	})
 	batchesWritten := promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "otel_collector", Subsystem: "storage", Name: "batches_written_total",
@@ -154,6 +165,8 @@ func NewMetrics() *Metrics {
 	return &Metrics{
 		LogsReceived:             logsReceived,
 		LogsWritten:              logsWritten,
+		MetricsReceived:          metricsReceived,
+		MetricDataPointsWritten:  metricDataPointsWritten,
 		IngressQueueDepth:        ingressQueueDepth,
 		BatchQueueDepth:          batchQueueDepth,
 		BatchesCreated:           batchesCreated,
@@ -227,6 +240,25 @@ func (m *Metrics) IncrementLogsReceived(count int) {
 		return
 	}
 	m.LogsReceived.Add(float64(count))
+}
+
+// IncrementMetricsReceived increments the OTLP metric data points received
+// counter. This is collector self-telemetry about ingestion — distinct from
+// the ingested metric data stored in SQLite.
+func (m *Metrics) IncrementMetricsReceived(count int) {
+	if m == nil {
+		return
+	}
+	m.MetricsReceived.Add(float64(count))
+}
+
+// IncrementMetricDataPointsWritten increments the OTLP metric data points
+// written counter.
+func (m *Metrics) IncrementMetricDataPointsWritten(count int) {
+	if m == nil {
+		return
+	}
+	m.MetricDataPointsWritten.Add(float64(count))
 }
 
 // IncrementLogsWritten increments the logs written counter.

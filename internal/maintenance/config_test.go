@@ -21,6 +21,12 @@ func TestDefaultConfig(t *testing.T) {
 	if c.RetentionKeepLogs != 30*24*time.Hour {
 		t.Errorf("expected RetentionKeepLogs=30d, got %s", c.RetentionKeepLogs)
 	}
+	if !c.MetricRetentionEnabled {
+		t.Error("expected MetricRetentionEnabled to be true")
+	}
+	if c.RetentionKeepMetrics != 30*24*time.Hour {
+		t.Errorf("expected RetentionKeepMetrics=30d, got %s", c.RetentionKeepMetrics)
+	}
 	if c.RetentionCleanupInterval != 24*time.Hour {
 		t.Errorf("expected RetentionCleanupInterval=24h, got %s", c.RetentionCleanupInterval)
 	}
@@ -56,6 +62,22 @@ func TestLoadFromEnv(t *testing.T) {
 		env   map[string]string
 		check func(*testing.T, *Config)
 	}{
+		{
+			name: "metric retention env vars",
+			env: map[string]string{
+				"METRIC_RETENTION_ENABLED": "false",
+				"RETENTION_KEEP_METRICS":   "168h",
+			},
+			check: func(t *testing.T, c *Config) {
+				t.Helper()
+				if c.MetricRetentionEnabled {
+					t.Error("expected MetricRetentionEnabled=false")
+				}
+				if c.RetentionKeepMetrics != 7*24*time.Hour {
+					t.Errorf("expected RetentionKeepMetrics=7d, got %s", c.RetentionKeepMetrics)
+				}
+			},
+		},
 		{
 			name: "no env vars",
 			env:  map[string]string{},
@@ -256,6 +278,25 @@ func TestValidate(t *testing.T) {
 				return c
 			}(),
 			wantErr: true,
+		},
+		{
+			name: "metric retention enabled but zero keep_metrics",
+			cfg: func() *Config {
+				c := DefaultConfig()
+				c.RetentionKeepMetrics = 0
+				return c
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "metric retention disabled with invalid keep_metrics (should pass)",
+			cfg: func() *Config {
+				c := DefaultConfig()
+				c.MetricRetentionEnabled = false
+				c.RetentionKeepMetrics = 0
+				return c
+			}(),
+			wantErr: false,
 		},
 		{
 			name: "retention disabled with invalid values (should pass)",

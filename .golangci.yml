@@ -96,6 +96,8 @@ linters:
         - G104  # unhandled errors (audit only, catches too many intentional discards)
         - G307  # deferring unsafe Close (we use sql.DB which is safe)
         - G304  # file inclusion via variable (config files are user-controlled paths)
+        - G202  # SQL built from string concatenation (all fragments are fixed
+                # constants; dynamic input always goes through ? placeholders)
 
     staticcheck:
       checks:
