@@ -426,5 +426,21 @@ SELECT
 FROM metric_data_point dp
 JOIN json_each(dp.histogram_json, '$.bounds') b
 JOIN json_each(dp.histogram_json, '$.counts') c ON c.key = b.key
-WHERE dp.histogram_json IS NOT NULL;
+WHERE dp.histogram_json IS NOT NULL
+UNION ALL
+-- The overflow bucket: counts[len(bounds)] has no explicit bound.
+SELECT
+    dp.id,
+    dp.series_id,
+    dp.timestamp_ns,
+    CAST(c.key AS INTEGER),
+    '"+Inf"',
+    NULL,
+    CAST(c.value AS INTEGER)
+FROM metric_data_point dp
+JOIN json_each(dp.histogram_json, '$.counts') c
+WHERE dp.histogram_json IS NOT NULL
+  AND CAST(c.key AS INTEGER) = (
+      SELECT COUNT(*) FROM json_each(dp.histogram_json, '$.bounds')
+  );
 `

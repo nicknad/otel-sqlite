@@ -69,7 +69,10 @@ JOIN log_resource r ON r.id = s.resource_id;
 -- 2. The `metric_buckets` view: query-time normalization of histogram_json.
 --    histogram_json is {"bounds":[...],"counts":[...]}; bounds and counts
 --    are parallel arrays, so bounds[k] is the upper bound of bucket k with
---    count counts[k]. json_each.key is the array index.
+--    count counts[k]. OTLP bucket counts carry one MORE entry than bounds
+--    (the final "overflow" bucket above the last bound), so the view also
+--    emits that row with an implicit +Inf bound. json_each.key is the
+--    array index.
 -- ---------------------------------------------------------------------------
 CREATE VIEW IF NOT EXISTS metric_buckets AS
 SELECT
@@ -84,7 +87,23 @@ SELECT
 FROM metric_data_point dp
 JOIN json_each(dp.histogram_json, '$.bounds') b
 JOIN json_each(dp.histogram_json, '$.counts') c ON c.key = b.key
-WHERE dp.histogram_json IS NOT NULL;
+WHERE dp.histogram_json IS NOT NULL
+UNION ALL
+-- The overflow bucket: counts[len(bounds)] has no explicit bound.
+SELECT
+    dp.id,
+    dp.series_id,
+    dp.timestamp_ns,
+    CAST(c.key AS INTEGER),
+    '"+Inf"',
+    NULL,
+    CAST(c.value AS INTEGER)
+FROM metric_data_point dp
+JOIN json_each(dp.histogram_json, '$.counts') c
+WHERE dp.histogram_json IS NOT NULL
+  AND CAST(c.key AS INTEGER) = (
+      SELECT COUNT(*) FROM json_each(dp.histogram_json, '$.bounds')
+  );
 
 -- Record this migration
 INSERT OR IGNORE INTO schema_migrations (version, description)
