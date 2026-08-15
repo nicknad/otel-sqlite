@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"strconv"
 
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
@@ -190,8 +191,12 @@ func (m *Mapper) mapHistogramDataPoints(metric *model.Metric, points []*metricsV
 			Exemplars:      mapExemplars(p.Exemplars),
 		}
 		if len(p.BucketCounts) > 0 || len(p.ExplicitBounds) > 0 {
+			bounds := make([]any, len(p.ExplicitBounds))
+			for i, b := range p.ExplicitBounds {
+				bounds[i] = jsonFloat(b)
+			}
 			if payload, err := json.Marshal(histogramJSON{
-				Bounds: p.ExplicitBounds,
+				Bounds: bounds,
 				Counts: p.BucketCounts,
 			}); err == nil {
 				dp.HistogramJSON = payload
@@ -224,7 +229,7 @@ func (m *Mapper) mapExponentialHistogramDataPoints(metric *model.Metric, points 
 		payload, err := json.Marshal(expHistogramJSON{
 			Scale:         p.Scale,
 			ZeroCount:     p.ZeroCount,
-			ZeroThreshold: p.ZeroThreshold,
+			ZeroThreshold: jsonFloat(p.ZeroThreshold),
 			Positive:      mapBucketsJSON(p.Positive),
 			Negative:      mapBucketsJSON(p.Negative),
 		})
@@ -258,7 +263,10 @@ func (m *Mapper) mapSummaryDataPoints(metric *model.Metric, points []*metricsV1.
 				if qv == nil {
 					continue
 				}
-				quantiles = append(quantiles, quantileJSON{Quantile: qv.Quantile, Value: qv.Value})
+				quantiles = append(quantiles, quantileJSON{
+					Quantile: jsonFloat(qv.Quantile),
+					Value:    jsonFloat(qv.Value),
+				})
 			}
 			if payload, err := json.Marshal(summaryJSON{Quantiles: quantiles}); err == nil {
 				dp.SummaryJSON = payload
@@ -354,9 +362,14 @@ func computeScopeID(resourceID, name, version, schemaURL string) string {
 }
 
 // computeMetricID returns a stable identifier for a metric definition.
-// Unit and type are part of identity: a change in either creates a new
-// metric (and therefore new series), matching OTLP semantics.
+// Unit, type, monotonicity and temporality are part of identity: a change
+// in any of them creates a new metric (and therefore new series), matching
+// OTLP semantics. Description is metadata and deliberately excluded.
 func computeMetricID(m *model.Metric) string {
+	monotonic := "0"
+	if m.IsMonotonic {
+		monotonic = "1"
+	}
 	h := sha256.New()
 	h.Write([]byte(m.ResourceID))
 	h.Write([]byte{0})
@@ -371,6 +384,10 @@ func computeMetricID(m *model.Metric) string {
 	h.Write([]byte(m.Unit))
 	h.Write([]byte{0})
 	h.Write([]byte(strconv.Itoa(int(m.Type))))
+	h.Write([]byte{0})
+	h.Write([]byte(monotonic))
+	h.Write([]byte{0})
+	h.Write([]byte(strconv.Itoa(int(m.Temporality))))
 	return "metric-" + hex.EncodeToString(h.Sum(nil)[:16])
 }
 
@@ -385,16 +402,21 @@ func computeSeriesID(metricID string, attrsKey []byte) string {
 }
 
 // JSON payload shapes for rich metric data (Phase 2/3 storage).
+//
+// Non-finite floats (NaN/±Inf) are legal in OTLP but rejected by
+// encoding/json, so every float that can carry them is encoded via jsonFloat
+// as a JSON number when finite and a string marker ("NaN", "+Inf", "-Inf")
+// otherwise. Readers must accept both forms.
 
 type histogramJSON struct {
-	Bounds []float64 `json:"bounds,omitempty"`
-	Counts []uint64  `json:"counts,omitempty"`
+	Bounds []any    `json:"bounds,omitempty"`
+	Counts []uint64 `json:"counts,omitempty"`
 }
 
 type expHistogramJSON struct {
 	Scale         int32        `json:"scale"`
 	ZeroCount     uint64       `json:"zero_count"`
-	ZeroThreshold float64      `json:"zero_threshold"`
+	ZeroThreshold any          `json:"zero_threshold"`
 	Positive      *bucketsJSON `json:"positive,omitempty"`
 	Negative      *bucketsJSON `json:"negative,omitempty"`
 }
@@ -416,6 +438,22 @@ type summaryJSON struct {
 }
 
 type quantileJSON struct {
-	Quantile float64 `json:"quantile"`
-	Value    float64 `json:"value"`
+	Quantile any `json:"quantile"`
+	Value    any `json:"value"`
+}
+
+// jsonFloat returns the JSON-safe encoding of a float64: the value itself
+// when finite, or a string marker for NaN/±Inf (encoding/json rejects
+// non-finite floats).
+func jsonFloat(v float64) any {
+	switch {
+	case math.IsNaN(v):
+		return "NaN"
+	case math.IsInf(v, 1):
+		return "+Inf"
+	case math.IsInf(v, -1):
+		return "-Inf"
+	default:
+		return v
+	}
 }

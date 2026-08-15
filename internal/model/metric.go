@@ -118,6 +118,9 @@ type MetricSeries struct {
 //	Gauge/Sum                → DoubleValue or IntValue
 //	Histogram/ExpHistogram   → Count, Sum, Min, Max + JSON payload
 //	Summary                  → Count, Sum + SummaryJSON
+//
+// NaN double values are preserved in-memory; the SQLite writer persists
+// them as NULL plus a nan_mask bit (SQLite REAL cannot store NaN).
 type DataPoint struct {
 	// Timestamp is when the sample was taken (unix ns).
 	Timestamp int64

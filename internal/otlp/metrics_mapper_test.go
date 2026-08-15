@@ -2,6 +2,7 @@ package otlp
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 	"time"
 
@@ -98,6 +99,142 @@ func buildResourceMetrics() *metricsV1.ResourceMetrics {
 }
 
 func float64ptr(v float64) *float64 { return &v }
+
+// sumMetric builds an OTLP Sum metric with a single data point.
+func sumMetric(name string, temporality metricsV1.AggregationTemporality, monotonic bool) *metricsV1.Metric {
+	return &metricsV1.Metric{
+		Name: name,
+		Data: &metricsV1.Metric_Sum{Sum: &metricsV1.Sum{
+			IsMonotonic:            monotonic,
+			AggregationTemporality: temporality,
+			DataPoints: []*metricsV1.NumberDataPoint{
+				{TimeUnixNano: uint64(time.Now().UnixNano()), Value: &metricsV1.NumberDataPoint_AsInt{AsInt: 1}},
+			},
+		}},
+	}
+}
+
+// TestMapMetricsData_IdentityIncludesTemporalityAndMonotonicity guards the
+// metric identity hash: sums with the same name/unit/type but different
+// temporality or monotonicity are distinct metrics (and therefore distinct
+// series). Without this, INSERT OR IGNORE keeps the first definition and
+// merges both streams into one series.
+func TestMapMetricsData_IdentityIncludesTemporalityAndMonotonicity(t *testing.T) {
+	m := NewMapper()
+
+	build := func() *metricsV1.ResourceMetrics {
+		return &metricsV1.ResourceMetrics{
+			Resource: &resourceV1.Resource{
+				Attributes: []*commonV1.KeyValue{{Key: "service.name", Value: strValue("id-svc")}},
+			},
+			ScopeMetrics: []*metricsV1.ScopeMetrics{{
+				Scope: &commonV1.InstrumentationScope{Name: "id-scope"},
+				Metrics: []*metricsV1.Metric{
+					sumMetric("requests", metricsV1.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA, true),
+					sumMetric("requests", metricsV1.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE, true),
+					sumMetric("requests", metricsV1.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE, false),
+				},
+			}},
+		}
+	}
+
+	ids := func(batches []*model.MetricBatch) map[string]bool {
+		out := make(map[string]bool, len(batches[0].Metrics))
+		for _, mt := range batches[0].Metrics {
+			out[mt.ID] = true
+		}
+		return out
+	}
+
+	b1 := ids(m.MapMetricsData([]*metricsV1.ResourceMetrics{build()}))
+	b2 := ids(m.MapMetricsData([]*metricsV1.ResourceMetrics{build()}))
+	if len(b1) != 3 {
+		t.Fatalf("expected 3 distinct metric IDs for delta/cumulative/monotonic variants, got %d", len(b1))
+	}
+	for id := range b1 {
+		if !b2[id] {
+			t.Errorf("metric ID %s not stable across mapping runs", id)
+		}
+	}
+}
+
+// TestMapMetricsData_NonFiniteValuesSurvive verifies that NaN/±Inf metric
+// values — legal in OTLP but rejected by encoding/json — are preserved in
+// payload JSON as string markers instead of silently dropping the payload
+// (histogram bounds, summary quantiles) or failing the write (exemplars).
+func TestMapMetricsData_NonFiniteValuesSurvive(t *testing.T) {
+	m := NewMapper()
+	now := uint64(time.Now().UnixNano())
+	rm := &metricsV1.ResourceMetrics{
+		Resource: &resourceV1.Resource{
+			Attributes: []*commonV1.KeyValue{{Key: "service.name", Value: strValue("nan-svc")}},
+		},
+		ScopeMetrics: []*metricsV1.ScopeMetrics{{
+			Scope: &commonV1.InstrumentationScope{Name: "nan-scope"},
+			Metrics: []*metricsV1.Metric{
+				{
+					Name: "with.inf.bound",
+					Data: &metricsV1.Metric_Histogram{Histogram: &metricsV1.Histogram{
+						AggregationTemporality: metricsV1.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA,
+						DataPoints: []*metricsV1.HistogramDataPoint{{
+							TimeUnixNano: now, Count: 2, Sum: float64ptr(math.NaN()),
+							ExplicitBounds: []float64{0.1, math.Inf(1)},
+							BucketCounts:   []uint64{1, 1},
+						}},
+					}},
+				},
+				{
+					Name: "with.nan.quantile",
+					Data: &metricsV1.Metric_Summary{Summary: &metricsV1.Summary{
+						DataPoints: []*metricsV1.SummaryDataPoint{{
+							TimeUnixNano: now, Count: 1, Sum: 1,
+							QuantileValues: []*metricsV1.SummaryDataPoint_ValueAtQuantile{
+								{Quantile: 0.5, Value: math.NaN()},
+							},
+						}},
+					}},
+				},
+			},
+		}},
+	}
+
+	batches := m.MapMetricsData([]*metricsV1.ResourceMetrics{rm})
+
+	hist := batches[0].Metrics[0].Series[0].DataPoints[0]
+	if hist.Sum == nil || !math.IsNaN(*hist.Sum) {
+		t.Fatalf("histogram sum = %v, want NaN preserved in-memory", hist.Sum)
+	}
+	if len(hist.HistogramJSON) == 0 {
+		t.Fatal("histogram payload dropped: NaN sum / +Inf bound must still be serialized")
+	}
+	var hp struct {
+		Bounds []any    `json:"bounds"`
+		Counts []uint64 `json:"counts"`
+	}
+	if err := json.Unmarshal(hist.HistogramJSON, &hp); err != nil {
+		t.Fatalf("histogram JSON: %v", err)
+	}
+	if hp.Bounds[1] != "+Inf" {
+		t.Errorf("bounds[1] = %v, want \"+Inf\" marker", hp.Bounds[1])
+	}
+
+	sp := batches[0].Metrics[1].Series[0].DataPoints[0]
+	if len(sp.SummaryJSON) == 0 {
+		t.Fatal("summary payload dropped: NaN quantile must still be serialized")
+	}
+	var qp struct {
+		Quantiles []struct {
+			Quantile any `json:"quantile"`
+			Value    any `json:"value"`
+		} `json:"quantiles"`
+	}
+	if err := json.Unmarshal(sp.SummaryJSON, &qp); err != nil {
+		t.Fatalf("summary JSON: %v", err)
+	}
+	if qp.Quantiles[0].Value != "NaN" {
+		t.Errorf("quantile value = %v, want \"NaN\" marker", qp.Quantiles[0].Value)
+	}
+}
 
 func TestMapMetricsData_GaugeAndSum(t *testing.T) {
 	m := NewMapper()

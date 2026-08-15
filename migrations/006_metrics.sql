@@ -10,6 +10,11 @@
 -- columns (count/sum/min/max, JSON payloads, exemplars) are reserved so
 -- Histogram, ExponentialHistogram, Summary and Exemplars are preserved
 -- losslessly from day one.
+--
+-- nan_mask records which float columns hold NaN: SQLite stores NaN as NULL,
+-- so a NaN column is bound as NULL and its bit is set here, distinguishing
+-- "NaN" from "absent". Bit 0 = double_value, 1 = sum, 2 = min, 3 = max.
+-- ±Inf survives in REAL columns and needs no bit.
 
 -- Instrumentation scope (first-class, unlike the denormalized scope columns
 -- on log_event).
@@ -58,6 +63,7 @@ CREATE TABLE IF NOT EXISTS metric_data_point (
     sum REAL,
     min REAL,
     max REAL,
+    nan_mask INTEGER NOT NULL DEFAULT 0, -- bits: 1=double_value, 2=sum, 4=min, 8=max are NaN
     histogram_json TEXT,
     exponential_histogram_json TEXT,
     summary_json TEXT,

@@ -342,6 +342,7 @@ CREATE TABLE IF NOT EXISTS metric_data_point (
     sum REAL,
     min REAL,
     max REAL,
+    nan_mask INTEGER NOT NULL DEFAULT 0, -- bits: 1=double_value, 2=sum, 4=min, 8=max are NaN
     histogram_json TEXT,
     exponential_histogram_json TEXT,
     summary_json TEXT,

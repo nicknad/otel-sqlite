@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"codeberg.org/nicknad/otel-sqlite/internal/model"
 )
@@ -28,9 +29,9 @@ const (
 
 	sqlInsertDataPoint = `INSERT INTO metric_data_point
 		(series_id, timestamp_ns, start_timestamp_ns, flags,
-		double_value, int_value, count, sum, min, max,
+		double_value, int_value, count, sum, min, max, nan_mask,
 		histogram_json, exponential_histogram_json, summary_json, exemplars_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 )
 
 // MetricsSeenCaches holds the process-local dedup caches for metric writes.
@@ -48,6 +49,12 @@ type MetricsSeenCaches struct {
 // begins/commits/rolls back a transaction, and uses injected prepared
 // statements plus process-local dedup caches to skip INSERT OR IGNORE probes.
 //
+// The dedup caches are updated commit-atomically: Execute records the IDs it
+// actually inserted into a transaction-local pending set, and CommitSeen
+// (called by the Writer only after tx.Commit succeeds) merges them into the
+// live caches. A rolled-back transaction therefore never leaves the caches
+// claiming rows that do not exist.
+//
 // Execute order inside one transaction follows parent-before-child:
 // resource → scope → metric → series → data point.
 type WriteMetricsCommand struct {
@@ -56,6 +63,11 @@ type WriteMetricsCommand struct {
 
 	preparedStmts *PreparedStatements
 	seen          *MetricsSeenCaches
+
+	// pending holds the IDs actually inserted during Execute. Merged into
+	// seen by CommitSeen after commit; discarded with the command on
+	// rollback so the caches never reference uncommitted rows.
+	pending *MetricsSeenCaches
 }
 
 // NewWriteMetricsCommand creates a new WriteMetricsCommand from a
@@ -79,6 +91,9 @@ func (c *WriteMetricsCommand) SetPreparedStatements(stmts *PreparedStatements) {
 
 // SetSeenCaches injects the process-local dedup caches. The maps are owned
 // by the Writer and must only be used from the single writer goroutine.
+// After the surrounding transaction commits, the Writer must call
+// CommitSeen so the IDs inserted by Execute become visible to later
+// transactions; after a rollback it must not.
 func (c *WriteMetricsCommand) SetSeenCaches(seen *MetricsSeenCaches) {
 	c.seen = seen
 }
@@ -166,7 +181,7 @@ func (c *WriteMetricsCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 			); err != nil {
 				return fmt.Errorf("insert resource %q: %w", resourceID, err)
 			}
-			c.markResourceSeen(resourceID)
+			c.pendingResource(resourceID)
 		}
 	}
 
@@ -187,7 +202,7 @@ func (c *WriteMetricsCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 			); err != nil {
 				return fmt.Errorf("insert scope %q: %w", metric.ScopeID, err)
 			}
-			c.markScopeSeen(metric.ScopeID)
+			c.pendingScope(metric.ScopeID)
 		}
 
 		// Metric definition row (dedup).
@@ -205,7 +220,7 @@ func (c *WriteMetricsCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 			); err != nil {
 				return fmt.Errorf("insert metric %q: %w", metric.ID, err)
 			}
-			c.markMetricSeen(metric.ID)
+			c.pendingMetric(metric.ID)
 		}
 
 		for _, series := range metric.Series {
@@ -227,7 +242,7 @@ func (c *WriteMetricsCommand) Execute(ctx context.Context, tx *sql.Tx) error {
 				); err != nil {
 					return fmt.Errorf("insert metric_series %q: %w", series.ID, err)
 				}
-				c.markSeriesSeen(series.ID)
+				c.pendingSeries(series.ID)
 			}
 
 			// Data points (append-only).
@@ -258,12 +273,13 @@ func insertDataPointRow(ctx context.Context, stmt *sql.Stmt, seriesID string, dp
 		dp.Timestamp,
 		nullableInt64(dp.StartTimestamp),
 		dp.Flags,
-		dp.DoubleValue,
+		nanOrNil(dp.DoubleValue),
 		dp.IntValue,
 		nullableUint64(dp.Count),
-		dp.Sum,
-		dp.Min,
-		dp.Max,
+		nanOrNil(dp.Sum),
+		nanOrNil(dp.Min),
+		nanOrNil(dp.Max),
+		nanMask(dp),
 		nullableText(dp.HistogramJSON),
 		nullableText(dp.ExponentialHistogramJSON),
 		nullableText(dp.SummaryJSON),
@@ -282,10 +298,15 @@ func (c *WriteMetricsCommand) resourceSeen(id string) bool {
 	return ok
 }
 
-func (c *WriteMetricsCommand) markResourceSeen(id string) {
-	if c.seen != nil && c.seen.Resources != nil && id != "" {
-		c.seen.Resources[id] = struct{}{}
+// pendingResource records a resource row actually inserted during Execute.
+// Entries are merged into the live caches by CommitSeen only after the
+// surrounding transaction commits; a rolled-back transaction leaves the
+// caches untouched so the rows are re-inserted (INSERT OR IGNORE) next time.
+func (c *WriteMetricsCommand) pendingResource(id string) {
+	if c.seen == nil || id == "" {
+		return
 	}
+	c.pendingSeen().Resources[id] = struct{}{}
 }
 
 func (c *WriteMetricsCommand) scopeSeen(id string) bool {
@@ -296,10 +317,11 @@ func (c *WriteMetricsCommand) scopeSeen(id string) bool {
 	return ok
 }
 
-func (c *WriteMetricsCommand) markScopeSeen(id string) {
-	if c.seen != nil && c.seen.Scopes != nil && id != "" {
-		c.seen.Scopes[id] = struct{}{}
+func (c *WriteMetricsCommand) pendingScope(id string) {
+	if c.seen == nil || id == "" {
+		return
 	}
+	c.pendingSeen().Scopes[id] = struct{}{}
 }
 
 func (c *WriteMetricsCommand) metricSeen(id string) bool {
@@ -310,10 +332,11 @@ func (c *WriteMetricsCommand) metricSeen(id string) bool {
 	return ok
 }
 
-func (c *WriteMetricsCommand) markMetricSeen(id string) {
-	if c.seen != nil && c.seen.Metrics != nil && id != "" {
-		c.seen.Metrics[id] = struct{}{}
+func (c *WriteMetricsCommand) pendingMetric(id string) {
+	if c.seen == nil || id == "" {
+		return
 	}
+	c.pendingSeen().Metrics[id] = struct{}{}
 }
 
 func (c *WriteMetricsCommand) seriesSeen(id string) bool {
@@ -324,10 +347,53 @@ func (c *WriteMetricsCommand) seriesSeen(id string) bool {
 	return ok
 }
 
-func (c *WriteMetricsCommand) markSeriesSeen(id string) {
-	if c.seen != nil && c.seen.Series != nil && id != "" {
-		c.seen.Series[id] = struct{}{}
+func (c *WriteMetricsCommand) pendingSeries(id string) {
+	if c.seen == nil || id == "" {
+		return
 	}
+	c.pendingSeen().Series[id] = struct{}{}
+}
+
+// pendingSeen lazily allocates the transaction-local pending set. It is only
+// populated when dedup caches are enabled (c.seen != nil).
+func (c *WriteMetricsCommand) pendingSeen() *MetricsSeenCaches {
+	if c.pending == nil {
+		c.pending = &MetricsSeenCaches{
+			Resources: make(map[string]struct{}),
+			Scopes:    make(map[string]struct{}),
+			Metrics:   make(map[string]struct{}),
+			Series:    make(map[string]struct{}),
+		}
+	}
+	return c.pending
+}
+
+// CommitSeen merges the IDs actually inserted during Execute into the live
+// dedup caches. The Writer calls it after tx.Commit succeeds; commands that
+// ran inside a rolled-back transaction must never call it — the pending set
+// is simply discarded with the command. Safe to call with caches disabled.
+func (c *WriteMetricsCommand) CommitSeen() {
+	if c.seen == nil || c.pending == nil {
+		return
+	}
+	merge := func(dst, src map[string]struct{}) {
+		for id := range src {
+			dst[id] = struct{}{}
+		}
+	}
+	if c.seen.Resources != nil {
+		merge(c.seen.Resources, c.pending.Resources)
+	}
+	if c.seen.Scopes != nil {
+		merge(c.seen.Scopes, c.pending.Scopes)
+	}
+	if c.seen.Metrics != nil {
+		merge(c.seen.Metrics, c.pending.Metrics)
+	}
+	if c.seen.Series != nil {
+		merge(c.seen.Series, c.pending.Series)
+	}
+	c.pending = nil
 }
 
 // marshalExemplars serializes exemplars as a compact JSON array. Returns nil
@@ -340,8 +406,12 @@ func marshalExemplars(exemplars []model.Exemplar) ([]byte, error) {
 	for _, e := range exemplars {
 		item := exemplarJSON{
 			TimestampNs: e.Timestamp,
-			DoubleValue: e.DoubleValue,
 			IntValue:    e.IntValue,
+		}
+		if e.DoubleValue != nil {
+			// Non-finite values are encoded as string markers — encoding/json
+			// rejects NaN/±Inf, which previously failed the whole insert.
+			item.DoubleValue = jsonFloat(*e.DoubleValue)
 		}
 		if e.HasTrace {
 			item.TraceID = hex.EncodeToString(e.TraceID[:])
@@ -355,17 +425,75 @@ func marshalExemplars(exemplars []model.Exemplar) ([]byte, error) {
 	return json.Marshal(out)
 }
 
-// exemplarJSON is the wire shape for a single exemplar.
+// exemplarJSON is the wire shape for a single exemplar. DoubleValue is a
+// JSON number when finite and a string marker ("NaN", "+Inf", "-Inf")
+// otherwise — encoding/json rejects non-finite floats, which previously
+// failed the whole data point insert.
 type exemplarJSON struct {
-	TimestampNs int64    `json:"timestamp_ns"`
-	DoubleValue *float64 `json:"double_value,omitempty"`
-	IntValue    *int64   `json:"int_value,omitempty"`
-	TraceID     string   `json:"trace_id,omitempty"`
-	SpanID      string   `json:"span_id,omitempty"`
-	Attributes  []byte   `json:"attributes,omitempty"`
+	TimestampNs int64  `json:"timestamp_ns"`
+	DoubleValue any    `json:"double_value,omitempty"`
+	IntValue    *int64 `json:"int_value,omitempty"`
+	TraceID     string `json:"trace_id,omitempty"`
+	SpanID      string `json:"span_id,omitempty"`
+	Attributes  []byte `json:"attributes,omitempty"`
+}
+
+// jsonFloat returns the JSON-safe encoding of a float64 (see exemplarJSON).
+func jsonFloat(v float64) any {
+	switch {
+	case math.IsNaN(v):
+		return "NaN"
+	case math.IsInf(v, 1):
+		return "+Inf"
+	case math.IsInf(v, -1):
+		return "-Inf"
+	default:
+		return v
+	}
 }
 
 // Small SQL-binding helpers.
+
+// nan_mask bits for metric_data_point. SQLite stores NaN as NULL, so a NaN
+// float column is bound as NULL and its bit is set here to distinguish
+// "NaN" from "absent". ±Inf survives in REAL columns and needs no bit.
+const (
+	nanMaskDoubleValue = 1 << iota
+	nanMaskSum
+	nanMaskMin
+	nanMaskMax
+)
+
+// nanMask computes the nan_mask bits for a data point's float columns.
+func nanMask(dp *model.DataPoint) int {
+	mask := 0
+	if isNaN(dp.DoubleValue) {
+		mask |= nanMaskDoubleValue
+	}
+	if isNaN(dp.Sum) {
+		mask |= nanMaskSum
+	}
+	if isNaN(dp.Min) {
+		mask |= nanMaskMin
+	}
+	if isNaN(dp.Max) {
+		mask |= nanMaskMax
+	}
+	return mask
+}
+
+// nanOrNil returns nil when v is NaN (SQLite stores NaN as NULL; the NaN is
+// recorded in nan_mask) and the value itself otherwise.
+func nanOrNil(v *float64) any {
+	if v == nil || math.IsNaN(*v) {
+		return nil
+	}
+	return *v
+}
+
+func isNaN(v *float64) bool {
+	return v != nil && math.IsNaN(*v)
+}
 
 func boolToInt(b bool) int {
 	if b {

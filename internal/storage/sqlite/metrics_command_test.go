@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"math"
 	"path/filepath"
 	"testing"
 
@@ -79,6 +80,7 @@ func buildMetricBatch() *model.MetricBatch {
 
 func float64Ptr(v float64) *float64 { return &v }
 func int64Ptr(v int64) *int64       { return &v }
+func uint64Ptr(v uint64) *uint64    { return &v }
 
 func TestWriteMetricsCommand_RowsInserted(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "metrics-command.db")
@@ -205,6 +207,8 @@ func TestWriteMetricsCommand_DedupByIdentity(t *testing.T) {
 		if err := tx.Commit(); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
+		// Caches only become visible after commit, mirroring the writer.
+		cmd.CommitSeen()
 	}
 
 	assertCount(t, db, "scope", 1)
@@ -228,6 +232,7 @@ func TestWriteMetricsCommand_DedupByIdentity(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
+	cmd.CommitSeen()
 	assertCount(t, db, "scope", 1)
 	assertCount(t, db, "metric", 2)
 	assertCount(t, db, "metric_series", 3)
@@ -255,6 +260,14 @@ func TestWriteMetricsCommand_ExemplarsJSON(t *testing.T) {
 			HasTrace:    true,
 			DoubleValue: float64Ptr(0.35),
 		},
+		{
+			Timestamp:   101,
+			DoubleValue: float64Ptr(math.NaN()),
+		},
+		{
+			Timestamp:   102,
+			DoubleValue: float64Ptr(math.Inf(1)),
+		},
 	}
 
 	ctx := context.Background()
@@ -281,7 +294,7 @@ func TestWriteMetricsCommand_ExemplarsJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(exemplarsJSON), &exemplars); err != nil {
 		t.Fatalf("parse exemplars: %v", err)
 	}
-	if len(exemplars) != 1 {
+	if len(exemplars) != 3 {
 		t.Fatalf("exemplars = %d", len(exemplars))
 	}
 	if exemplars[0]["trace_id"] != "0102030405060708090a0b0c0d0e0f10" {
@@ -289,6 +302,15 @@ func TestWriteMetricsCommand_ExemplarsJSON(t *testing.T) {
 	}
 	if exemplars[0]["double_value"] != 0.35 {
 		t.Errorf("double_value = %v", exemplars[0]["double_value"])
+	}
+
+	// NaN and +Inf exemplar values must survive as string markers instead
+	// of failing json.Marshal (which previously rolled back the whole batch).
+	if exemplars[1]["double_value"] != "NaN" {
+		t.Errorf("NaN exemplar double_value = %v, want \"NaN\" marker", exemplars[1]["double_value"])
+	}
+	if exemplars[2]["double_value"] != "+Inf" {
+		t.Errorf("+Inf exemplar double_value = %v, want \"+Inf\" marker", exemplars[2]["double_value"])
 	}
 }
 
@@ -330,6 +352,195 @@ func TestMigration006_TablesExist(t *testing.T) {
 		"SELECT version FROM schema_migrations WHERE version = '006'",
 	).Scan(&applied); err != nil {
 		t.Errorf("migration 006 not recorded: %v", err)
+	}
+}
+
+// TestWriteMetricsCommand_RollbackDoesNotPoisonCaches verifies the fix for
+// the dedup-cache rollback hazard: IDs inserted by Execute are only merged
+// into the live caches after commit (via CommitSeen). If the surrounding
+// transaction rolls back, the caches must stay empty so the next write of
+// the same batch re-inserts every row instead of skipping them.
+func TestWriteMetricsCommand_RollbackDoesNotPoisonCaches(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metrics-rollback.db")
+	db, err := openDatabase(path, true, false)
+	if err != nil {
+		t.Fatalf("openDatabase: %v", err)
+	}
+	defer db.Close()
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	ctx := context.Background()
+	seen := &MetricsSeenCaches{
+		Resources: map[string]struct{}{},
+		Scopes:    map[string]struct{}{},
+		Metrics:   map[string]struct{}{},
+		Series:    map[string]struct{}{},
+	}
+
+	// Execute in a transaction that is rolled back (simulating a later
+	// command in the same transaction failing). CommitSeen is deliberately
+	// NOT called — the writer only calls it after a successful commit.
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	cmd := NewWriteMetricsCommand(buildMetricBatch())
+	cmd.SetSeenCaches(seen)
+	if err := cmd.Execute(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("Execute: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	// No rows committed, and the caches must not claim any.
+	assertCount(t, db, "metric_data_point", 0)
+	if len(seen.Resources) != 0 || len(seen.Scopes) != 0 || len(seen.Metrics) != 0 || len(seen.Series) != 0 {
+		t.Fatalf("dedup caches poisoned by rolled-back transaction: resources=%d scopes=%d metrics=%d series=%d",
+			len(seen.Resources), len(seen.Scopes), len(seen.Metrics), len(seen.Series))
+	}
+
+	// A fresh transaction must re-insert everything; after commit the
+	// caches reflect the committed rows.
+	tx2, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	cmd2 := NewWriteMetricsCommand(buildMetricBatch())
+	cmd2.SetSeenCaches(seen)
+	if err := cmd2.Execute(ctx, tx2); err != nil {
+		_ = tx2.Rollback()
+		t.Fatalf("Execute: %v", err)
+	}
+	if err := tx2.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	cmd2.CommitSeen()
+
+	assertCount(t, db, "scope", 1)
+	assertCount(t, db, "metric", 2)
+	assertCount(t, db, "metric_series", 3)
+	assertCount(t, db, "metric_data_point", 4)
+
+	if len(seen.Resources) != 1 || len(seen.Scopes) != 1 || len(seen.Metrics) != 2 || len(seen.Series) != 3 {
+		t.Fatalf("caches not populated after commit: resources=%d scopes=%d metrics=%d series=%d",
+			len(seen.Resources), len(seen.Scopes), len(seen.Metrics), len(seen.Series))
+	}
+}
+
+// TestWriteMetricsCommand_NanMask verifies the NaN persistence policy: NaN
+// float columns are stored as NULL with the corresponding nan_mask bit set
+// (SQLite REAL cannot store NaN), ±Inf survives as a real value, and finite
+// points carry nan_mask = 0.
+func TestWriteMetricsCommand_NanMask(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metrics-nanmask.db")
+	db, err := openDatabase(path, true, false)
+	if err != nil {
+		t.Fatalf("openDatabase: %v", err)
+	}
+	defer db.Close()
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	batch := buildMetricBatch()
+
+	// Gauge point: double_value = NaN, everything else finite/absent.
+	gaugeDP := batch.Metrics[0].Series[0].DataPoints[0]
+	gaugeDP.DoubleValue = float64Ptr(math.NaN())
+
+	// Histogram point: sum = NaN, min = NaN, max = +Inf (finite, survives).
+	batch.AddMetric(&model.Metric{
+		ID:           "metric-hist",
+		ResourceID:   "res-metrics-test",
+		ScopeID:      "scope-test",
+		ScopeName:    "test-scope",
+		ScopeVersion: "1.0.0",
+		Name:         "hist",
+		Type:         model.MetricTypeHistogram,
+		Temporality:  model.TemporalityDelta,
+		Series: []*model.MetricSeries{
+			{
+				ID: "series-hist",
+				DataPoints: []*model.DataPoint{
+					{
+						Timestamp: 200,
+						Count:     uint64Ptr(2),
+						Sum:       float64Ptr(math.NaN()),
+						Min:       float64Ptr(math.NaN()),
+						Max:       float64Ptr(math.Inf(1)),
+					},
+					{
+						Timestamp: 201,
+						Count:     uint64Ptr(3),
+						Sum:       float64Ptr(4.5),
+						Min:       float64Ptr(1),
+						Max:       float64Ptr(8),
+					},
+				},
+			},
+		},
+	})
+
+	ctx := context.Background()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := NewWriteMetricsCommand(batch).Execute(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("Execute: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// Gauge row: NaN double_value stored as NULL + bit 0.
+	var doubleValue sql.NullFloat64
+	var mask int
+	if err := db.QueryRow(
+		"SELECT double_value, nan_mask FROM metric_data_point WHERE series_id = ? AND timestamp_ns = 100",
+		"series-gauge-empty",
+	).Scan(&doubleValue, &mask); err != nil {
+		t.Fatalf("query gauge row: %v", err)
+	}
+	if doubleValue.Valid {
+		t.Errorf("double_value = %v, want NULL for NaN", doubleValue)
+	}
+	if mask != nanMaskDoubleValue {
+		t.Errorf("gauge nan_mask = %d, want %d (double_value NaN)", mask, nanMaskDoubleValue)
+	}
+
+	// Histogram row 1: sum + min NaN → bits 1|2, max +Inf preserved.
+	var sumV, minV, maxV sql.NullFloat64
+	if err := db.QueryRow(
+		"SELECT sum, min, max, nan_mask FROM metric_data_point WHERE series_id = ? AND timestamp_ns = 200",
+		"series-hist",
+	).Scan(&sumV, &minV, &maxV, &mask); err != nil {
+		t.Fatalf("query hist row: %v", err)
+	}
+	if sumV.Valid || minV.Valid {
+		t.Errorf("sum/min = %v/%v, want NULL for NaN", sumV, minV)
+	}
+	if !maxV.Valid || maxV.Float64 != math.Inf(1) {
+		t.Errorf("max = %v, want +Inf preserved", maxV)
+	}
+	if mask != nanMaskSum|nanMaskMin {
+		t.Errorf("hist nan_mask = %d, want %d (sum|min NaN)", mask, nanMaskSum|nanMaskMin)
+	}
+
+	// Histogram row 2: all finite → nan_mask 0.
+	if err := db.QueryRow(
+		"SELECT nan_mask FROM metric_data_point WHERE series_id = ? AND timestamp_ns = 201",
+		"series-hist",
+	).Scan(&mask); err != nil {
+		t.Fatalf("query finite row: %v", err)
+	}
+	if mask != 0 {
+		t.Errorf("finite row nan_mask = %d, want 0", mask)
 	}
 }
 
