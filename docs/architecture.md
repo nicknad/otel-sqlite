@@ -31,6 +31,7 @@ HTTP /metrics and /health run on a separate listener.
 | `internal/batcher` | Combine incoming batches and create commands (log + metric) |
 | `internal/storage` | Queue and command interfaces |
 | `internal/storage/sqlite` | Migrations, SQLite commands, and writer |
+| `internal/query` | Read-side queries over the metrics views (series, data points, buckets, exemplars) |
 | `internal/maintenance` | Scheduled database maintenance |
 | `internal/notifications`, `internal/rules`, `internal/alerts` | Alert matching, state, delivery, retry, and DLQ |
 | `internal/metrics` | Prometheus instrumentation (collector self-telemetry only) |
@@ -76,9 +77,9 @@ type Command interface {
 ```
 
 Implemented commands include `WriteBatchCommand`, `PurgeLogsCommand`,
-`CheckpointCommand`, `OptimizeCommand`, `VacuumCommand`, and
-`RebuildFtsCommand`. Maintenance tasks submit commands rather than accessing
-SQLite directly.
+`WriteMetricsCommand`, `PurgeMetricDataPointsCommand`, `CheckpointCommand`,
+`OptimizeCommand`, `VacuumCommand`, and `RebuildFtsCommand`. Maintenance
+submits commands rather than accessing SQLite directly.
 
 ## Notifications
 
@@ -107,14 +108,44 @@ Migrations are applied in order at startup:
 - `004`: removes unused indexes
 - `005`: backfills attributes into `log_event.attributes_json` and removes
   `log_attr`
+- `006`: metrics schema (`scope`, `metric`, `metric_series`,
+  `metric_data_point`)
+- `007`: metrics read views (`metrics`, `metric_buckets` via `json_each`)
 
 The `logs` view joins `log_event` and `log_resource`. `logs_fts` indexes only
 `body` and `service_name`; it is rebuilt with `DROP`/`CREATE` by maintenance,
 not updated by triggers. It can be empty until the first rebuild.
 
+For metrics, `006` stores all five OTLP metric types losslessly (histogram /
+exponential-histogram / summary payloads as JSON, exemplars preserved). `007`
+exposes the read side: the `metrics` view joins data points through
+series → metric → scope → log_resource, and `metric_buckets` normalizes
+`histogram_json` into one row per bucket via `json_each`. Buckets stay in
+JSON on the write path (single-row inserts); normalization happens at query
+time. Float values in the JSON payloads may be numbers or string markers
+(`"NaN"`, `"+Inf"`, `"-Inf"`) — non-finite floats cannot be serialized by
+`encoding/json`, and NaN scalars are stored as NULL plus a `nan_mask` bit.
+
 The supported deployment shape is one collector per writable database file.
 SQLite permits concurrent readers in WAL mode, but multiple collector writers
 sharing a file are not a scaling mechanism.
+
+## Querying stored metrics
+
+Reads go through `internal/query` (a read-only store opening its own
+connection — WAL permits concurrent readers next to the writer) or the
+`metrics-query` CLI:
+
+```sh
+metrics-query -db otel.db -series                  # list time series
+metrics-query -db otel.db -metric req.duration -points
+metrics-query -db otel.db -metric req.duration -buckets   # histogram buckets
+metrics-query -db otel.db -trace <hex-trace-id>           # exemplar correlation
+```
+
+The `series_id + timestamp_ns` index serves the time-window data point
+queries. Exemplar trace correlation uses `json_each` on `exemplars_json`, so
+the match is structural (not a substring scan).
 
 ## Operational endpoints
 

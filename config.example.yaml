@@ -137,11 +137,14 @@ maintenance:
   enabled: true                  # Master switch for the maintenance worker
   check_interval: "1h"           # How often the worker evaluates tasks
 
-# Retention: purges log records older than keep_logs.
-# Runs on its own cleanup_interval, independent of check_interval.
+# Retention: purges log records older than keep_logs, and metric data
+# points older than keep_metrics. Each runs on its own cleanup_interval,
+# independent of check_interval.
 retention:
   enabled: true
   keep_logs: "30d"               # Delete logs older than this
+  keep_metrics: "30d"            # Delete metric data points older than this
+  metric_retention_enabled: true # Master switch for the metric retention task
   cleanup_interval: "24h"        # How often to run retention
   delete_batch_size: 10000      # Max records per delete batch
 
@@ -215,6 +218,8 @@ fts:
 # Task-specific (env overrides use Go durations, not "d" suffix):
 #   RETENTION_ENABLED           (default: true)
 #   RETENTION_KEEP_LOGS         (default: 720h i.e. 30d)
+#   RETENTION_KEEP_METRICS      (default: 720h i.e. 30d)
+#   METRIC_RETENTION_ENABLED    (default: true)
 #   RETENTION_CLEANUP_INTERVAL  (default: 24h)
 #   RETENTION_DELETE_BATCH_SIZE (default: 10000)
 #   CHECKPOINT_ENABLED          (default: true)
