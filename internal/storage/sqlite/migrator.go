@@ -50,6 +50,11 @@ func allMigrations() []migration {
 			description: "Metrics schema (scope, metric, metric_series, metric_data_point)",
 			sql:         migration006SQL,
 		},
+		{
+			version:     "007",
+			description: "Metrics read views (metrics, metric_buckets via json_each)",
+			sql:         migration007SQL,
+		},
 	}
 }
 
@@ -356,4 +361,70 @@ CREATE INDEX IF NOT EXISTS idx_metric_series_metric
     ON metric_series(metric_id);
 CREATE INDEX IF NOT EXISTS idx_metric_scope
     ON metric(scope_id);
+`
+
+// migration007SQL creates the metrics read-side views: the `metrics` view
+// (metric_data_point joined through series → metric → scope → log_resource,
+// mirroring the `logs` view from migration 003) and the `metric_buckets`
+// view that normalizes histogram_json at query time via json_each.
+//
+// Histogram bucket normalization decision (proposal §10): buckets stay in
+// metric_data_point.histogram_json (lossless, single-row writes); query-time
+// normalization happens through json_each. A dedicated bucket table is
+// deferred until real aggregation requirements exist.
+const migration007SQL = `
+CREATE VIEW IF NOT EXISTS metrics AS
+SELECT
+    dp.id                         AS id,
+    dp.series_id                  AS series_id,
+    dp.timestamp_ns               AS timestamp_ns,
+    dp.start_timestamp_ns         AS start_timestamp_ns,
+    dp.flags                      AS flags,
+    dp.double_value               AS double_value,
+    dp.int_value                  AS int_value,
+    dp.count                      AS count,
+    dp.sum                        AS sum,
+    dp.min                        AS min,
+    dp.max                        AS max,
+    dp.nan_mask                   AS nan_mask,
+    dp.histogram_json             AS histogram_json,
+    dp.exponential_histogram_json AS exponential_histogram_json,
+    dp.summary_json               AS summary_json,
+    dp.exemplars_json             AS exemplars_json,
+    ms.attributes_json            AS series_attributes,
+    m.id                          AS metric_id,
+    m.name                        AS metric_name,
+    m.description                 AS metric_description,
+    m.unit                        AS unit,
+    m.type                        AS metric_type,
+    m.is_monotonic                AS is_monotonic,
+    m.aggregation_temporality     AS aggregation_temporality,
+    s.id                          AS scope_id,
+    s.name                        AS scope_name,
+    s.version                     AS scope_version,
+    s.schema_url                  AS scope_schema_url,
+    r.id                          AS resource_id,
+    r.service_name                AS service_name,
+    r.host_name                   AS host_name,
+    r.schema_url                  AS resource_schema_url
+FROM metric_data_point dp
+JOIN metric_series ms ON ms.id = dp.series_id
+JOIN metric m       ON m.id = ms.metric_id
+JOIN scope s        ON s.id = m.scope_id
+JOIN log_resource r ON r.id = s.resource_id;
+
+CREATE VIEW IF NOT EXISTS metric_buckets AS
+SELECT
+    dp.id                         AS data_point_id,
+    dp.series_id                  AS series_id,
+    dp.timestamp_ns               AS timestamp_ns,
+    CAST(b.key AS INTEGER)        AS bucket_index,
+    b.value                       AS bound_json,
+    CASE WHEN json_type(b.value) IN ('integer', 'real')
+         THEN CAST(b.value AS REAL) END AS bound,
+    CAST(c.value AS INTEGER)      AS bucket_count
+FROM metric_data_point dp
+JOIN json_each(dp.histogram_json, '$.bounds') b
+JOIN json_each(dp.histogram_json, '$.counts') c ON c.key = b.key
+WHERE dp.histogram_json IS NOT NULL;
 `

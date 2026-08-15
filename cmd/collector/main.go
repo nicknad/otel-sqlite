@@ -368,6 +368,13 @@ func (a *Application) startMaintenance() {
 		maintCfg.RetentionDeleteBatchSize,
 	))
 
+	a.maintenanceWorker.Register(tasks.NewMetricRetentionTask(
+		maintCfg.MetricRetentionEnabled,
+		maintCfg.RetentionKeepMetrics,
+		maintCfg.RetentionCleanupInterval,
+		maintCfg.RetentionDeleteBatchSize,
+	))
+
 	a.maintenanceWorker.Register(tasks.NewCheckpointTask(
 		maintCfg.CheckpointEnabled,
 		sqlite.CheckpointMode(maintCfg.CheckpointMode),

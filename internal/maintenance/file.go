@@ -16,10 +16,12 @@ type fileMaintenanceConfig struct {
 		CheckInterval string `yaml:"check_interval"`
 	} `yaml:"maintenance"`
 	Retention struct {
-		Enabled         *bool  `yaml:"enabled"`
-		KeepLogs        string `yaml:"keep_logs"`
-		CleanupInterval string `yaml:"cleanup_interval"`
-		DeleteBatchSize *int   `yaml:"delete_batch_size"`
+		Enabled                *bool  `yaml:"enabled"`
+		KeepLogs               string `yaml:"keep_logs"`
+		KeepMetrics            string `yaml:"keep_metrics"`
+		MetricRetentionEnabled *bool  `yaml:"metric_retention_enabled"`
+		CleanupInterval        string `yaml:"cleanup_interval"`
+		DeleteBatchSize        *int   `yaml:"delete_batch_size"`
 	} `yaml:"retention"`
 	Checkpoint struct {
 		Enabled  *bool  `yaml:"enabled"`
@@ -76,6 +78,16 @@ func (c *Config) LoadFile(path string) error {
 			return fmt.Errorf("retention.keep_logs: %w", err)
 		}
 		c.RetentionKeepLogs = d
+	}
+	if fc.Retention.KeepMetrics != "" {
+		d, err := parseDurationExt(fc.Retention.KeepMetrics)
+		if err != nil {
+			return fmt.Errorf("retention.keep_metrics: %w", err)
+		}
+		c.RetentionKeepMetrics = d
+	}
+	if fc.Retention.MetricRetentionEnabled != nil {
+		c.MetricRetentionEnabled = *fc.Retention.MetricRetentionEnabled
 	}
 	if fc.Retention.CleanupInterval != "" {
 		d, err := parseDurationExt(fc.Retention.CleanupInterval)

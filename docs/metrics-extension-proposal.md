@@ -1,11 +1,15 @@
 # Metrics ingestion & storage — extension proposal
 
 Branch: `metric-extension`
-Status: **Phase 1 implemented** (Gauge + Sum end-to-end: proto generation, domain
-model, migration 006, mapper, `WriteMetricsCommand`, metric ingress queue +
-metric batcher, dual gRPC services, config wiring, tests). Phases 2–3
-(Histogram/ExpHistogram/Summary queries, bucket normalization, exemplar
-queries) and the later-phase items below remain open.
+Status: **Phase 1 + Phase 2 implemented**. Phase 1: all five OTLP metric
+  types ingested end-to-end (proto generation, domain model, migration 006,
+  mapper, `WriteMetricsCommand`, metric ingress queue + metric batcher, dual
+  gRPC services, config wiring, tests). Phase 2: read-side queries
+  (migration 007 `metrics` + `metric_buckets` views, `internal/query`,
+  `metrics-query` CLI), histogram bucket normalization decision (keep JSON,
+  normalize via `json_each`), exemplar trace correlation, metric retention
+  (`PurgeMetricDataPointsCommand` + `MetricRetentionTask`), and a metrics
+  mode for `cmd/loadtest`.
 
 This document proposes extending the collector to ingest **OTLP Metrics**
 (application telemetry) and persist them in SQLite, reusing the existing
@@ -464,7 +468,7 @@ rows.
 
 ## 10. Phased delivery
 
-**Phase 1 — Gauge + Sum (the deliverable of this branch)**
+**Phase 1 — Gauge + Sum (delivered)**
 
 - Proto files committed + generated; metrics gRPC service registered.
 - `internal/model/metric.go` (Metric, MetricSeries, DataPoint, MetricBatch).
@@ -475,18 +479,29 @@ rows.
 - Tests: mapper unit tests, `sql_syntax_test` for migration 006, e2e test
   mirroring the logs e2e (export metrics → query back rows).
 
-**Phase 2 — Histogram**
+**Phase 2 — Histogram, queries, retention (delivered)**
 
-- `HistogramJSON` payload, `count/sum/min/max` columns populated;
-  mapper for `Histogram` data points; decide bucket normalization vs JSON.
+- Histogram/ExponentialHistogram/Summary ingest (payload columns populated;
+  buckets stay in `histogram_json` — **decision**: query-time normalization
+  via `json_each` in the `metric_buckets` view, no bucket table until real
+  aggregation requirements exist).
+- Read-side queries: migration 007 `metrics` + `metric_buckets` views,
+  `internal/query` package (series lookup by metric/service/scope, data
+  points in a time window via the `series_id + timestamp_ns` index, bucket
+  normalization, exemplar correlation), `cmd/metrics-query` CLI.
+- Exemplar querying: `ByExemplarTrace` matches `exemplars_json` structurally
+  via `json_each` for trace↔metric correlation.
+- Metric retention: `PurgeMetricDataPointsCommand` + `MetricRetentionTask`
+  (mirrors the log path; shared-resource orphan cleanup; config
+  `metric_retention_enabled` / `keep_metrics`).
+- Metrics loadtest: `cmd/loadtest -signal metrics` (gauge/sum/histogram mix
+  with exemplars) + `metrics_received_total` /
+  `metric_data_points_written_total` scrape comparison.
 
-**Phase 3 — ExponentialHistogram, Summary, Exemplars**
+**Later (explicitly out of scope)**
 
-- Remaining payload columns; exemplar query support; first read-side queries
-  (`WHERE metric.name = ... AND series attributes ... ORDER BY timestamp`).
-
-**Later (explicitly out of scope for now)**
-
+- Bucket normalization into a `metric_histogram_bucket` table (only when
+  aggregation over buckets is required).
 - Metric retention task in `internal/maintenance/tasks`; unified `scope` for
   logs (migrate `log_event.scope_name/version` to FK); PromQL/query API;
   downsampling; cardinality limits.

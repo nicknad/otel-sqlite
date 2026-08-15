@@ -21,6 +21,12 @@ type Config struct {
 	RetentionCleanupInterval time.Duration `yaml:"cleanup_interval"`
 	RetentionDeleteBatchSize int           `yaml:"delete_batch_size"`
 
+	// Metric retention config. The cleanup interval and delete batch size
+	// are shared with the log retention task (RetentionCleanupInterval /
+	// RetentionDeleteBatchSize).
+	MetricRetentionEnabled bool          `yaml:"-"`
+	RetentionKeepMetrics   time.Duration `yaml:"keep_metrics"`
+
 	// Checkpoint config.
 	CheckpointEnabled  bool          `yaml:"-"`
 	CheckpointInterval time.Duration `yaml:"interval"`
@@ -48,6 +54,8 @@ func DefaultConfig() *Config {
 		RetentionKeepLogs:        30 * 24 * time.Hour,
 		RetentionCleanupInterval: 24 * time.Hour,
 		RetentionDeleteBatchSize: 10000,
+		MetricRetentionEnabled:   true,
+		RetentionKeepMetrics:     30 * 24 * time.Hour,
 		CheckpointEnabled:        true,
 		CheckpointInterval:       24 * time.Hour,
 		CheckpointMode:           "PASSIVE",
@@ -70,6 +78,8 @@ func (c *Config) LoadFromEnv() (int, error) {
 		"RETENTION_KEEP_LOGS":         func(v string) error { return parseDuration(&c.RetentionKeepLogs, v) },
 		"RETENTION_CLEANUP_INTERVAL":  func(v string) error { return parseDuration(&c.RetentionCleanupInterval, v) },
 		"RETENTION_DELETE_BATCH_SIZE": func(v string) error { return parseInt(&c.RetentionDeleteBatchSize, v) },
+		"METRIC_RETENTION_ENABLED":    func(v string) error { return parseBool(&c.MetricRetentionEnabled, v) },
+		"RETENTION_KEEP_METRICS":      func(v string) error { return parseDuration(&c.RetentionKeepMetrics, v) },
 		"CHECKPOINT_ENABLED":          func(v string) error { return parseBool(&c.CheckpointEnabled, v) },
 		"CHECKPOINT_INTERVAL":         func(v string) error { return parseDuration(&c.CheckpointInterval, v) },
 		"CHECKPOINT_MODE":             func(v string) error { c.CheckpointMode = v; return nil },
@@ -111,6 +121,12 @@ func (c *Config) Validate() error {
 		}
 		if c.RetentionDeleteBatchSize <= 0 {
 			return fmt.Errorf("retention.delete_batch_size must be positive, got %d", c.RetentionDeleteBatchSize)
+		}
+	}
+
+	if c.MetricRetentionEnabled {
+		if c.RetentionKeepMetrics <= 0 {
+			return fmt.Errorf("retention.keep_metrics must be positive, got %s", c.RetentionKeepMetrics)
 		}
 	}
 
