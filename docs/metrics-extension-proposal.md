@@ -1,7 +1,11 @@
 # Metrics ingestion & storage — extension proposal
 
 Branch: `metric-extension`
-Status: proposal — no implementation yet
+Status: **Phase 1 implemented** (Gauge + Sum end-to-end: proto generation, domain
+model, migration 006, mapper, `WriteMetricsCommand`, metric ingress queue +
+metric batcher, dual gRPC services, config wiring, tests). Phases 2–3
+(Histogram/ExpHistogram/Summary queries, bucket normalization, exemplar
+queries) and the later-phase items below remain open.
 
 This document proposes extending the collector to ingest **OTLP Metrics**
 (application telemetry) and persist them in SQLite, reusing the existing

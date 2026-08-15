@@ -45,6 +45,11 @@ func allMigrations() []migration {
 			sql:         migration005SQL,
 			apply:       applyMigration005,
 		},
+		{
+			version:     "006",
+			description: "Metrics schema (scope, metric, metric_series, metric_data_point)",
+			sql:         migration006SQL,
+		},
 	}
 }
 
@@ -290,4 +295,64 @@ DROP INDEX IF EXISTS idx_log_attr_value_double;
 // transaction.
 const migration005SQL = `
 ALTER TABLE log_event ADD COLUMN attributes_json TEXT NOT NULL DEFAULT '{}';
+`
+
+// migration006SQL creates the metrics storage model (scope, metric,
+// metric_series, metric_data_point). Identical to
+// migrations/006_metrics.sql minus the schema_migrations DML, which is
+// handled by RunMigrations. All DDL is idempotent (IF NOT EXISTS).
+const migration006SQL = `
+CREATE TABLE IF NOT EXISTS scope (
+    id TEXT PRIMARY KEY,
+    resource_id TEXT NOT NULL,
+    name TEXT,
+    version TEXT,
+    schema_url TEXT,
+    FOREIGN KEY (resource_id) REFERENCES log_resource(id)
+);
+
+CREATE TABLE IF NOT EXISTS metric (
+    id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    unit TEXT,
+    type INTEGER NOT NULL,
+    is_monotonic INTEGER NOT NULL DEFAULT 0,
+    aggregation_temporality INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (scope_id) REFERENCES scope(id)
+);
+
+CREATE TABLE IF NOT EXISTS metric_series (
+    id TEXT PRIMARY KEY,
+    metric_id TEXT NOT NULL,
+    attributes_json TEXT NOT NULL,
+    FOREIGN KEY (metric_id) REFERENCES metric(id)
+);
+
+CREATE TABLE IF NOT EXISTS metric_data_point (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    series_id TEXT NOT NULL,
+    timestamp_ns INTEGER NOT NULL,
+    start_timestamp_ns INTEGER,
+    flags INTEGER NOT NULL DEFAULT 0,
+    double_value REAL,
+    int_value INTEGER,
+    count INTEGER,
+    sum REAL,
+    min REAL,
+    max REAL,
+    histogram_json TEXT,
+    exponential_histogram_json TEXT,
+    summary_json TEXT,
+    exemplars_json TEXT,
+    FOREIGN KEY (series_id) REFERENCES metric_series(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_metric_dp_series_time
+    ON metric_data_point(series_id, timestamp_ns);
+CREATE INDEX IF NOT EXISTS idx_metric_series_metric
+    ON metric_series(metric_id);
+CREATE INDEX IF NOT EXISTS idx_metric_scope
+    ON metric(scope_id);
 `

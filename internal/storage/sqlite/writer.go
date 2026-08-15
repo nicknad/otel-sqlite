@@ -24,6 +24,10 @@ import (
 var preparedStatementsSQL = []string{
 	sqlInsertResource,
 	sqlInsertEvent,
+	sqlInsertScope,
+	sqlInsertMetric,
+	sqlInsertSeries,
+	sqlInsertDataPoint,
 }
 
 // WriterConfig holds configuration for the SQLite writer.
@@ -74,6 +78,12 @@ type Writer struct {
 	// Process-local set of resource IDs successfully inserted. Only touched
 	// from the writer goroutine. Avoids repeated INSERT OR IGNORE probes.
 	seenResources map[string]struct{}
+
+	// Process-local dedup caches for the metric write path (scope, metric
+	// definition, series). Only touched from the writer goroutine.
+	seenScopes  map[string]struct{}
+	seenMetrics map[string]struct{}
+	seenSeries  map[string]struct{}
 
 	// Command queue for receiving commands
 	cmdQueue storage.CommandQueue
@@ -131,6 +141,9 @@ func NewWriter(cmdQueue storage.CommandQueue, config *WriterConfig) (*Writer, er
 		db:            db,
 		preparedStmts: preparedStmts,
 		seenResources: make(map[string]struct{}, 64),
+		seenScopes:    make(map[string]struct{}, 64),
+		seenMetrics:   make(map[string]struct{}, 64),
+		seenSeries:    make(map[string]struct{}, 64),
 		cmdQueue:      cmdQueue,
 		aMetrics:      config.Metrics,
 		stopped:       make(chan struct{}),
@@ -267,11 +280,19 @@ func (w *Writer) executeCommands(commands []storage.Command) {
 	}
 }
 
-// commandRecordCount returns the estimated number of log records a command
+// RecordCounter is implemented by write commands that represent a countable
+// number of records (log records or metric data points). The writer uses it
+// to split transactions by actual work, not by command count: a single OTLP
+// metrics request can carry tens of thousands of data points.
+type RecordCounter interface {
+	Size() int
+}
+
+// commandRecordCount returns the estimated number of records a command
 // represents, used for transaction splitting.
 func commandRecordCount(cmd storage.Command) int {
-	if wbc, ok := cmd.(*WriteBatchCommand); ok {
-		return wbc.Size()
+	if rc, ok := cmd.(RecordCounter); ok {
+		return rc.Size()
 	}
 	// Non-write commands (future maintenance ops) are counted as 1 record
 	// so they are never batched with other commands in a transaction.
@@ -315,12 +336,21 @@ func (w *Writer) executeTransaction(commands []storage.Command) {
 		return
 	}
 
-	// Inject pre-prepared statements and the process-local resource cache
-	// into WriteBatchCommand instances.
+	// Inject pre-prepared statements and the process-local dedup caches
+	// into write commands.
 	for _, cmd := range commands {
 		if wbc, ok := cmd.(*WriteBatchCommand); ok {
 			wbc.SetPreparedStatements(w.preparedStmts)
 			wbc.SetSeenResources(w.seenResources)
+		}
+		if wmc, ok := cmd.(*WriteMetricsCommand); ok {
+			wmc.SetPreparedStatements(w.preparedStmts)
+			wmc.SetSeenCaches(&MetricsSeenCaches{
+				Resources: w.seenResources,
+				Scopes:    w.seenScopes,
+				Metrics:   w.seenMetrics,
+				Series:    w.seenSeries,
+			})
 		}
 	}
 
@@ -348,19 +378,27 @@ func (w *Writer) executeTransaction(commands []storage.Command) {
 		return
 	}
 
-	// Update metrics for WriteBatchCommand executions.
-	var recordsInTransaction int
+	// Update metrics for write-command executions.
+	var logRecords, metricPoints int
 	for _, cmd := range commands {
-		if wbc, ok := cmd.(*WriteBatchCommand); ok {
-			recordsInTransaction += wbc.Size()
+		switch c := cmd.(type) {
+		case *WriteBatchCommand:
+			logRecords += c.Size()
+		case *WriteMetricsCommand:
+			metricPoints += c.Size()
 		}
 	}
 
-	w.totalRecordsWritten += int64(recordsInTransaction)
+	w.totalRecordsWritten += int64(logRecords + metricPoints)
 	w.batchesWritten += int64(executed)
 
 	if w.aMetrics != nil {
-		w.aMetrics.IncrementLogsWritten(recordsInTransaction)
+		if logRecords > 0 {
+			w.aMetrics.IncrementLogsWritten(logRecords)
+		}
+		if metricPoints > 0 {
+			w.aMetrics.IncrementMetricDataPointsWritten(metricPoints)
+		}
 		w.aMetrics.IncrementBatchesWritten()
 		duration := time.Since(startTime).Seconds()
 		w.aMetrics.RecordWriteLatency(duration)
@@ -512,7 +550,11 @@ func initPreparedStatements(db *sql.DB) (*PreparedStatements, error) {
 		stmts[i] = stmt
 	}
 	return &PreparedStatements{
-		InsertResource: stmts[0],
-		InsertEvent:    stmts[1],
+		InsertResource:  stmts[0],
+		InsertEvent:     stmts[1],
+		InsertScope:     stmts[2],
+		InsertMetric:    stmts[3],
+		InsertSeries:    stmts[4],
+		InsertDataPoint: stmts[5],
 	}, nil
 }

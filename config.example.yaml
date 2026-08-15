@@ -32,12 +32,23 @@ sqlite_path: "otel-logs.db"      # Path to SQLite database file
 ingress_queue_capacity: 10000   # Maximum number of batches in ingress queue
 batch_queue_capacity: 5000      # Maximum number of commands in batch queue
 
+# OTLP metric ingestion. When enabled (default), the collector accepts
+# ExportMetrics requests, maps them to series, and stores them in SQLite
+# (tables created by migration 006). These are application telemetry being
+# ingested — they are never exposed on the collector's Prometheus /metrics
+# endpoint, which reports collector self-telemetry only.
+metrics_enabled: true
+
 # Batcher configuration (groups records into WriteBatchCommand objects)
+# The same sizes/intervals apply to the metric batcher (counted in data
+# points rather than log records).
 batcher_batch_size: 500         # Number of log records per batch (batcher)
 batcher_flush_interval: "1s"    # Maximum time between batch flushes
 batcher_error_severity_threshold: "ERROR"  # Minimum severity sent to notifications
 
 # Writer configuration (groups commands into SQLite transactions)
+# WRITER_MAX_TRANSACTION_RECORDS counts records of either signal: log
+# records for WriteBatchCommand, data points for WriteMetricsCommand.
 writer_batch_size: 50           # Number of commands per transaction (writer)
 writer_flush_interval: "1s"     # Maximum time between transaction flushes
 writer_max_transaction_records: 10000  # Max records per SQLite transaction

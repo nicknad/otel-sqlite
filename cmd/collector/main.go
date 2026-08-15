@@ -47,8 +47,13 @@ type Application struct {
 	batcher      *batcher.Batcher
 	writer       *sqlite.Writer
 
-	// OTLP server
-	otlpServer *otlp.Server
+	// Metrics pipeline (OTLP metric ingestion)
+	metricIngressQueue ingest.MetricIngressQueue
+	metricBatcher      *batcher.MetricBatcher
+
+	// OTLP servers
+	otlpServer        *otlp.Server
+	otlpMetricsServer *otlp.MetricsServer
 
 	// Maintenance
 	maintenanceWorker  *maintenance.Worker
@@ -151,11 +156,20 @@ func (a *Application) initialize() error {
 	// Create queues
 	a.ingressQueue = ingest.NewIngressQueue(a.config.IngressQueueCapacity)
 	a.cmdQueue = storage.NewCommandQueue(a.config.BatchQueueCapacity)
+	if a.config.MetricsEnabled {
+		a.metricIngressQueue = ingest.NewMetricIngressQueue(a.config.IngressQueueCapacity)
+	}
 
-	// Create OTLP server with optional backpressure threshold
+	// Create OTLP servers with optional backpressure threshold
 	a.otlpServer = otlp.NewServer(a.ingressQueue, a.metrics)
+	if a.config.MetricsEnabled {
+		a.otlpMetricsServer = otlp.NewMetricsServer(a.metricIngressQueue, a.metrics)
+	}
 	if a.config.IngressQueueBackpressureThreshold > 0 {
 		a.otlpServer.SetBackpressureThreshold(a.config.IngressQueueBackpressureThreshold)
+		if a.otlpMetricsServer != nil {
+			a.otlpMetricsServer.SetBackpressureThreshold(a.config.IngressQueueBackpressureThreshold)
+		}
 		log.Printf("Backpressure threshold set to %.0f%% of ingress queue capacity",
 			a.config.IngressQueueBackpressureThreshold*100)
 	}
@@ -170,6 +184,19 @@ func (a *Application) initialize() error {
 	a.batcher.WithCommandFactory(func(batch *model.LogBatch) storage.Command {
 		return sqlite.NewWriteBatchCommand(batch)
 	})
+
+	// Create the metric batcher (wraps MetricBatch → WriteMetricsCommand,
+	// sends to the same command queue consumed by the SQLite writer).
+	if a.config.MetricsEnabled {
+		a.metricBatcher = batcher.NewMetricBatcher(a.metricIngressQueue, a.cmdQueue, &batcher.MetricBatcherConfig{
+			BatchSize:     a.config.BatcherBatchSize,
+			FlushInterval: a.config.BatcherFlushInterval,
+			Metrics:       a.metrics,
+		})
+		a.metricBatcher.WithCommandFactory(func(batch *model.MetricBatch) storage.Command {
+			return sqlite.NewWriteMetricsCommand(batch)
+		})
+	}
 
 	// Create SQLite writer (implements CommandExecutor)
 	writerConfig := &sqlite.WriterConfig{
@@ -215,6 +242,9 @@ func (a *Application) start() error {
 
 	// Start pipeline components
 	a.batcher.Start(context.Background())
+	if a.metricBatcher != nil {
+		a.metricBatcher.Start(context.Background())
+	}
 
 	// Start SQLite writer
 	a.writer.Start(context.Background())
@@ -233,7 +263,7 @@ func (a *Application) start() error {
 	log.Printf(
 		"pipeline config: ingress_queue=%d batch_queue=%d "+
 			"batcher_batch_size=%d batcher_flush=%s "+
-			"writer_batch_size=%d writer_flush=%s max_tx_records=%d",
+			"writer_batch_size=%d writer_flush=%s max_tx_records=%d metrics_enabled=%t",
 		a.config.IngressQueueCapacity,
 		a.config.BatchQueueCapacity,
 		a.config.BatcherBatchSize,
@@ -241,6 +271,7 @@ func (a *Application) start() error {
 		a.config.WriterBatchSize,
 		a.config.WriterFlushInterval,
 		a.config.WriterMaxTransactionRecords,
+		a.config.MetricsEnabled,
 	)
 
 	return nil
@@ -304,6 +335,9 @@ func (a *Application) startGRPCServer() error {
 
 	a.grpcServer = grpc.NewServer(grpcOpts...)
 	otlp.RegisterServer(a.grpcServer, a.otlpServer)
+	if a.otlpMetricsServer != nil {
+		otlp.RegisterMetricsServer(a.grpcServer, a.otlpMetricsServer)
+	}
 
 	go func() {
 		log.Printf("Starting gRPC server on %s", a.config.ListenAddress)
@@ -393,6 +427,9 @@ func (a *Application) cleanup() {
 
 	// Stop pipeline components
 	a.batcher.Stop()
+	if a.metricBatcher != nil {
+		a.metricBatcher.Stop()
+	}
 
 	// Stop maintenance worker
 	if a.maintenanceWorker != nil {
@@ -422,6 +459,9 @@ func (a *Application) cleanup() {
 	// Close queues
 	if a.ingressQueue != nil {
 		a.ingressQueue.Close()
+	}
+	if a.metricIngressQueue != nil {
+		a.metricIngressQueue.Close()
 	}
 	if a.cmdQueue != nil {
 		a.cmdQueue.Close()

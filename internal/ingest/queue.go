@@ -42,50 +42,37 @@ type IngressQueue interface {
 // Capacity is measured in batches, not individual records.
 func NewIngressQueue(capacity int) IngressQueue {
 	return &boundedIngressQueue{
-		ch: make(chan *model.LogBatch, capacity),
+		q: newBoundedQueue[*model.LogBatch](capacity),
 	}
 }
 
-// boundedIngressQueue is a channel-based implementation of IngressQueue.
+// boundedIngressQueue is a typed wrapper around the shared generic queue core.
 type boundedIngressQueue struct {
-	ch chan *model.LogBatch
+	q *boundedQueue[*model.LogBatch]
 }
 
 func (q *boundedIngressQueue) Send(ctx context.Context, batch *model.LogBatch) error {
-	select {
-	case q.ch <- batch:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return q.q.Send(ctx, batch)
 }
 
 func (q *boundedIngressQueue) Receive(ctx context.Context) (*model.LogBatch, error) {
-	select {
-	case batch, ok := <-q.ch:
-		if !ok {
-			return nil, ErrQueueClosed
-		}
-		return batch, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+	return q.q.Receive(ctx)
 }
 
 func (q *boundedIngressQueue) Close() {
-	close(q.ch)
+	q.q.Close()
 }
 
 func (q *boundedIngressQueue) Len() int {
-	return len(q.ch)
+	return q.q.Len()
 }
 
 func (q *boundedIngressQueue) Cap() int {
-	return cap(q.ch)
+	return q.q.Cap()
 }
 
 func (q *boundedIngressQueue) Chan() <-chan *model.LogBatch {
-	return q.ch
+	return q.q.Chan()
 }
 
 // ErrQueueClosed is returned when trying to receive from a closed queue.

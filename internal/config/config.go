@@ -24,6 +24,12 @@ type Config struct {
 	IngressQueueCapacity int `mapstructure:"ingress_queue_capacity"`
 	BatchQueueCapacity   int `mapstructure:"batch_queue_capacity"`
 
+	// MetricsEnabled enables OTLP metric ingestion. Metric data points are
+	// stored in SQLite (tables created by migration 006); they are never
+	// exposed on the collector's Prometheus /metrics endpoint. When disabled
+	// the metrics gRPC service returns Unavailable.
+	MetricsEnabled bool `mapstructure:"metrics_enabled"`
+
 	// Batcher configuration
 	BatcherBatchSize              int           `mapstructure:"batcher_batch_size"`
 	BatcherFlushInterval          time.Duration `mapstructure:"batcher_flush_interval"`
@@ -152,6 +158,7 @@ func DefaultConfig() *Config {
 		SQLitePath:                        "otel-logs.db",
 		IngressQueueCapacity:              10000,
 		BatchQueueCapacity:                5000,
+		MetricsEnabled:                    true,
 		BatcherBatchSize:                  500,
 		BatcherFlushInterval:              1 * time.Second,
 		BatcherErrorSeverityThreshold:     "ERROR",
@@ -202,6 +209,10 @@ var envBindings = []envBinding{
 	{
 		env: "INGRESS_QUEUE_CAPACITY", parse: parseInt,
 		apply: func(c *Config, v any) { c.IngressQueueCapacity = v.(int) },
+	},
+	{
+		env: "METRICS_ENABLED", parse: parseBool,
+		apply: func(c *Config, v any) { c.MetricsEnabled = v.(bool) },
 	},
 	{
 		env: "BATCH_QUEUE_CAPACITY", parse: parseInt,
