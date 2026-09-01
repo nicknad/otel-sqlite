@@ -1,45 +1,24 @@
-# lefthook configuration
-# https://github.com/evilmartians/lefthook
-
-commit-msg:
-  commands:
-    lint-commit:
-      run: echo "commit message ok"
+# Fast local mirrors of the CI quality gates (.forgejo/workflows/ci.yml).
+#
+# One-time setup per clone:
+#   lefthook install
+#
+# Deliberately kept fast so nobody disables them; the expensive gates
+# (cargo test --workspace, cargo deny check) run in CI only.
+#
+# Both rulesets only apply to Rust sources, so each job triggers on staged
+# *.rs files. Keep `run` scripts single-line and free of double quotes:
+# lefthook executes them via `sh -c "<script>"`, so inner double quotes
+# terminate the wrapper's quoting and corrupt the script.
 
 pre-commit:
-  parallel: false
-  commands:
-    tidy:
-      run: go mod tidy && git add go.mod go.sum
-      stage_fixed: true
-      skip:
-        - merge
-        - rebase
+  jobs:
+    - name: rustfmt
+      glob: ["*.rs"]
+      run: cargo fmt --all -- --check
 
-    lint-fix:
-      run: golangci-lint run --fix --timeout 2m
-      glob: "*.go"
-      stage_fixed: true
-
-    vet:
-      run: go vet ./...
-      glob: "*.go"
-
-pre-push:
-  parallel: false
-  commands:
-    full-lint:
-      run: golangci-lint run --timeout 5m
-
-    security:
-      run: |
-        which gosec >/dev/null 2>&1 || go install github.com/securego/gosec/v2/cmd/gosec@latest
-        # G202 excluded to match .golangci.yml: SQL fragments are fixed
-        # constants; dynamic input always goes through ? placeholders.
-        gosec -quiet -exclude=G104,G202,G304,G115 -exclude-dir internal/generated ./...
-
-    test:
-      run: CGO_ENABLED=1 go test -tags fts5 -count=1 -race -timeout 120s ./...
-
-    build:
-      run: CGO_ENABLED=1 go build -tags fts5 -o /dev/null ./cmd/...
+    # Semgrep is normally installed with `uv tool install semgrep`; skip
+    # gracefully when it is unavailable. CI always runs it.
+    - name: semgrep
+      glob: ["*.rs"]
+      run: "if command -v semgrep >/dev/null 2>&1; then semgrep scan --config .semgrep.yml --error {staged_files}; else echo 'semgrep not on PATH, skipping locally (enforced in CI)'; fi"

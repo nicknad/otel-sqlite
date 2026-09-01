@@ -1,0 +1,57 @@
+# Fuzzing harnesses for otel-sqlite, driven by cargo-fuzz / libFuzzer.
+#
+# libFuzzer is unsupported on windows-msvc hosts; all compilation and
+# execution happens inside the Linux image from docker/Dockerfile.fuzz:
+#
+#   docker compose -f docker/compose.fuzz.yml build
+#   docker compose -f docker/compose.fuzz.yml run --rm build
+#
+# This crate is deliberately NOT a member of the root workspace: it needs
+# a nightly toolchain (sanitizer coverage flags) and its own lockfile.
+# The empty [workspace] table below makes cargo treat it as a standalone
+# workspace root. Path dependencies still resolve their own workspace
+# (`[lints] workspace = true` etc.) against the repository root manifest.
+
+[package]
+name = "otel-sqlite-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+otel-sqlite-core = { path = "../crates/otel-sqlite-core" }
+otel-sqlite-ingress = { path = "../crates/otel-sqlite-ingress" }
+# `Message::decode` for raw-bytes fuzzing of the OTLP request types.
+prost = "0.14"
+# `export()` handlers are async (tonic service trait); a current-thread
+# runtime is enough because each fuzz iteration blocks on one call.
+tokio = { version = "1", default-features = false, features = ["rt"] }
+tonic = "0.14"
+
+[[bin]]
+name = "logs_ingress_export"
+path = "fuzz_targets/logs_ingress_export.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metrics_ingress_export"
+path = "fuzz_targets/metrics_ingress_export.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "core_batcher"
+path = "fuzz_targets/core_batcher.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

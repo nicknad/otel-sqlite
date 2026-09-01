@@ -1,0 +1,106 @@
+# Criterion benchmarks under constrained resources.
+#
+# Recommended regression tier: `bench2` (2 pinned cores, 1024 MB limit).
+#
+#   docker compose -f docker/compose.criterion.yml run --rm build     # unconstrained compile
+#   docker compose -f docker/compose.criterion.yml run --rm bench2    # recommended run
+#
+# Design notes:
+# * `cpuset` pins REAL CORES instead of `cpus` quotas. A CPU quota (CFS
+#   bandwidth) freezes tasks at 100ms period boundaries, which criterion
+#   reports as outliers; pinned cores degrade gracefully and honestly.
+# * 2 cores are the sweet spot: the pipeline has only 2-3 runnable threads
+#   (driver + batcher + writer). Measured on Docker Desktop/WSL2, 4 pinned
+#   cores were strictly worse than 2 (+27% to +54% medians, wider spread).
+# * Memory: measured peak RSS across the heaviest families is ~71 MiB; the
+#   1024 MB limit is ~14x headroom (256 MiB would also fit).
+# * Temp databases go to tmpfs via TMPDIR (tempfile honors it): stable WAL
+#   latencies, no Docker filesystem-layer noise, MB-scale footprint.
+# * The container target dir is separate (target-container/) so Linux artifacts
+#   never collide with host builds in target/.
+# * Validity by core count: single-threaded families (core/batching,
+#   ingress/conversion, uncontended queue round trips) are sound even on the
+#   1-core `bench` profile. Multi-threaded families (storage pipeline,
+#   concurrent queue, e2e) need bench2 or better - on fewer cores they measure
+#   thread timesharing as much as the component. Always baseline within the
+#   same environment, never vs native numbers.
+
+services:
+  build:
+    image: rust:1.89
+    working_dir: /work
+    environment:
+      CARGO_TARGET_DIR: /work/target-container
+    volumes:
+      - ..:/work
+      - criterion-cargo-registry:/usr/local/cargo/registry
+    # No CPU/memory constraints: compile once, fast.
+    command: cargo bench --no-run -p otel-sqlite-core -p otel-sqlite-ingress -p otel-sqlite-storage -p otel-sqlite-e2e
+
+  bench:
+    image: rust:1.89
+    working_dir: /work
+    depends_on:
+      build:
+        condition: service_completed_successfully
+    environment:
+      CARGO_TARGET_DIR: /work/target-container
+      TMPDIR: /tmp/bench-data
+    volumes:
+      - ..:/work
+      - criterion-cargo-registry:/usr/local/cargo/registry
+    tmpfs:
+      - /tmp/bench-data:size=256m
+    mem_limit: 1024m
+    cpuset: "0"
+    # Single-threaded demo family (valid on 1 CPU):
+    #   docker compose -f docker/compose.criterion.yml run --rm bench
+    # Or override the command for anything else:
+    #   docker compose -f docker/compose.criterion.yml run --rm bench cargo bench ...
+    command: >
+      cargo bench -p otel-sqlite-core --bench batching --
+      --noplot --warm-up-time 1 --measurement-time 5
+
+  # Regression-testing tiers: the pipeline families (storage, e2e, concurrent
+  # queue) need >= 2 cores so the writer thread is not starved by the driving
+  # thread's spin-waits. Command is passed via `docker compose run`:
+  #
+  #   docker compose -f docker/compose.criterion.yml run --rm bench2 \
+  #     cargo bench -p otel-sqlite-storage --bench inserts -- \
+  #     --noplot --warm-up-time 1 --measurement-time 3 --save-baseline cpu2
+  bench2:
+    image: rust:1.89
+    working_dir: /work
+    depends_on:
+      build:
+        condition: service_completed_successfully
+    environment:
+      CARGO_TARGET_DIR: /work/target-container
+      TMPDIR: /tmp/bench-data
+    volumes:
+      - ..:/work
+      - criterion-cargo-registry:/usr/local/cargo/registry
+    tmpfs:
+      - /tmp/bench-data:size=256m
+    mem_limit: 1024m
+    cpuset: "0,1"
+
+  bench4:
+    image: rust:1.89
+    working_dir: /work
+    depends_on:
+      build:
+        condition: service_completed_successfully
+    environment:
+      CARGO_TARGET_DIR: /work/target-container
+      TMPDIR: /tmp/bench-data
+    volumes:
+      - ..:/work
+      - criterion-cargo-registry:/usr/local/cargo/registry
+    tmpfs:
+      - /tmp/bench-data:size=256m
+    mem_limit: 1024m
+    cpuset: "0-3"
+
+volumes:
+  criterion-cargo-registry:

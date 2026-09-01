@@ -1,0 +1,180 @@
+# otel-sqlite on Kubernetes.
+#
+# SQLite is single-writer, so the workload is a StatefulSet with exactly one
+# replica (no HA by sharing a disk; horizontal scale is out of scope). The pod
+# owns a PersistentVolumeClaim for /data (the database + WAL), is probed for
+# health/readiness via the built-in gRPC healthcheck, drains gracefully on
+# termination, runs unprivileged with a read-only root filesystem, and is
+# restarted by the controller (restartPolicy: Always) when it dies — the
+# watchdog's "external supervisor".
+#
+#   kubectl create ns otel-sqlite
+#   kubectl -n otel-sqlite apply -f otel-sqlite.yaml
+#
+# Storage: adjust storageClassName/requests to your cluster. The default
+# volume mode (Filesystem) holds otel-logs.db + -wal + -shm.
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-sqlite
+  labels:
+    app: otel-sqlite
+spec:
+  selector:
+    app: otel-sqlite
+  ports:
+    - name: otlp
+      port: 4317
+      targetPort: otlp
+    - name: metrics
+      port: 8888
+      targetPort: metrics
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-sqlite-config
+data:
+  otel-sqlite.toml: |
+    listen_address = "0.0.0.0:4317"
+    metrics_address = "127.0.0.1:8888"
+    sqlite_path = "/data/otel-logs.db"
+    shutdown_timeout = "30s"
+
+    [durability]
+    mode = "commit"          # durable acks by default
+    synchronous = "normal"   # "full" for power-loss safety
+
+    [maintenance]
+    retention = "7d"         # per-signal windows supported (see README)
+    checkpoint_interval = "5m"
+
+    # [tls] and [auth] are configured per deployment; keep credentials in a
+    # Secret mounted read-only (see README "Security").
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: otel-sqlite-security
+type: Opaque
+# Replace these with real material. Tokens: one per line.
+stringData:
+  clients.txt: |
+    change-me-exporter-token
+  backup.key: ""   # 32 raw bytes when encrypting backups (openssl rand -out backup.key 32)
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: otel-sqlite
+  labels:
+    app: otel-sqlite
+spec:
+  serviceName: otel-sqlite
+  # Exactly one writer: never scale past 1 without an external replication
+  # story.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-sqlite
+  template:
+    metadata:
+      labels:
+        app: otel-sqlite
+    spec:
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # restartPolicy: Always (the pod default) — a dead pipeline is restarted
+      # by the controller, which is the restart behavior the watchdog expects.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: otel-sqlite
+          image: otel-sqlite:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: []
+          env:
+            - name: OTEL_SQLITE_CFG_PATH
+              value: /etc/otel-sqlite/otel-sqlite.toml
+            - name: RUST_LOG
+              value: info
+          ports:
+            - name: otlp
+              containerPort: 4317
+            - name: metrics
+              containerPort: 8888
+          # Readiness: NOT_SERVING while the pipeline drains or is unhealthy,
+          # so Services stop routing before downtime.
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/otel-sqlite", "healthcheck"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Liveness: a wedged/unhealthy pipeline eventually fails this and the
+          # controller restarts the pod (watchdog restarts are external).
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/otel-sqlite", "healthcheck"]
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Resource limits: requests define the pod's scheduling/CPU baseline;
+          # limits bound a runaway ingest. Tune CPU against your throughput.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /etc/otel-sqlite/otel-sqlite.toml
+              subPath: otel-sqlite.toml
+              readOnly: true
+            - name: security
+              mountPath: /etc/otel-sqlite/clients.txt
+              subPath: clients.txt
+              readOnly: true
+            # SQLite temp files under a read-only rootfs go here.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: otel-sqlite-config
+        - name: security
+          secret:
+            secretName: otel-sqlite-security
+            defaultMode: 0400
+        - name: tmp
+          emptyDir: {}
+  # Persistent storage for the database + WAL. This is the single copy of
+  # truth; backups are written to a separate volume by the CronJob.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+        # storageClassName: <your-cluster-class>

@@ -1,86 +1,24 @@
-# --- Go ---
-bin/
-*.exe
-*.so
-*.dll
-*.test
-*.out
+# Rust build outputs
+/target/
+/target-container/
+/target-container-fuzz/
 
-# Go workspace (multi-module)
-go.work
-go.work.sum
+# Fuzzing byproducts (corpus seeds may be committed deliberately;
+# crash artifacts and raw corpora are not)
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/Cargo.lock
 
-# Profiling and tracing (pprof, trace)
-*.prof
-*.trace
-*.pprof
-
-# GoLand / VS Code Go debug binaries
-__debug_bin*
-
-
-# --- Generated code ---
-internal/generated/
-
-# --- IDE ---
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-*.orig
-
-# --- OS ---
-.DS_Store
-Thumbs.db
-
-# --- Logs ---
-*.log
-
-# --- Database files ---
-# Default SQLite path: otel-logs.db
+# Runtime/dev artifacts: default sqlite DB and `otel-sqlite gen-certs`
+# output (never commit private keys)
 *.db
-*.db-wal
 *.db-shm
+*.db-wal
+*.pem
+*.key
 
-# --- User / runtime data ---
-/data/
-/tmp/
-*.pid
-
-# --- Build artifacts ---
-build/
-dist/
-collector
-loadtest
---help
-otel-sqlite
-.golangci.bck.yml
-loadtest-results/
-config-test.yaml
-
-# --- Docker ---
-.docker/
-
-# --- Environment / secrets ---
-.env
-.env.local
-.env.*.local
-.envrc
-.envrc.local
-
-# --- Config copies ---
-# Users might copy config.example.yaml -> config.yaml
-config.yaml
-
-# --- Coverage ---
-coverage.txt
-*.coverprofile
-*.cov
-
-# --- Test output ---
-test-output/
-
-# --- Go pkg/mod cache (if GOPATH lives in the repo) ---
-.go/
-*.db-journal
+# Local run outputs and IDE state
+/logs/
+/results/
+/.idea/

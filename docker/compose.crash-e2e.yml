@@ -1,0 +1,64 @@
+# Container-level crash/restart durability test.
+#
+# The `sidecar` runs the production sink against a named volume; the host
+# script docker/crash-e2e.sh kills it with `docker kill` (SIGKILL, no
+# cleanup) MID-LOAD, restarts it on the same volume, and validates that
+# every commit-mode-acknowledged record survived WAL replay.
+#
+#   docker/crash-e2e.sh
+#
+# The `loadgen` service runs `otel-sqlite-stack-crash`:
+#   * `load`     drives closed-loop OTLP load (requests in flight = durable
+#                ack waits) and writes an outcome manifest to /artifacts;
+#   * `validate` asserts each manifest against the shared database.
+# Both the load and validate phases use the same crash.rs logic as the
+# native crash test, so the two paths cannot drift.
+#
+# Resource profile: the sidecar keeps the documented 2-CPU / 512 MiB budget
+# used across the docker suite; loadgen runs free so it is never the
+# bottleneck.
+
+name: otel-sqlite-crash-e2e
+
+x-bench-image: &bench-image otel-sqlite-bench:latest
+
+services:
+  # ---------------------------------------------------------------------------
+  # System under test: production sink, killed and restarted mid-load.
+  # ---------------------------------------------------------------------------
+  sidecar:
+    image: *bench-image
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.benchmark
+    container_name: crash-e2e-sidecar
+    working_dir: /data
+    environment:
+      OTEL_SQLITE_CFG_PATH: /config/crash.toml
+      RUST_LOG: warn
+    volumes:
+      - crash-data:/data
+      - ./crash-e2e/crash.toml:/config/crash.toml:ro
+    restart: "no"
+    mem_limit: 512m
+    cpus: "2"
+    # Built-in gRPC HEALTHCHECK ships with the image.
+
+  # ---------------------------------------------------------------------------
+  # Driver: load generation + post-restart validation against the volume.
+  # ---------------------------------------------------------------------------
+  loadgen:
+    image: *bench-image
+    entrypoint: ["/usr/local/bin/otel-sqlite-stack-crash"]
+    environment:
+      RUST_LOG: warn
+    volumes:
+      - crash-data:/data
+      - crash-artifacts:/artifacts
+    depends_on:
+      sidecar:
+        condition: service_healthy
+
+volumes:
+  crash-data:
+  crash-artifacts:

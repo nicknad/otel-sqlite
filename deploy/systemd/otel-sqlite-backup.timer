@@ -1,0 +1,16 @@
+# Nightly schedule for otel-sqlite-backup.service.
+#
+# Persistent=true runs a missed backup after boot (useful for laptops/hosts
+# that are down at the scheduled time). RandomizedDelaySec spreads load so a
+# fleet of hosts does not back up simultaneously.
+
+[Unit]
+Description=Nightly otel-sqlite backup timer
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

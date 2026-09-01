@@ -1,0 +1,119 @@
+# Fuzzing environment: cargo-fuzz targets against the bind-mounted
+# workspace, mirroring the compose.criterion.yml workflow (build once,
+# then run constrained).
+#
+#   docker compose -f docker/compose.fuzz.yml build            # build image (nightly + cargo-fuzz)
+#   docker compose -f docker/compose.fuzz.yml run --rm build   # compile all fuzz targets
+#   docker compose -f docker/compose.fuzz.yml run --rm smoke-logs      # 2 min logs target
+#   docker compose -f docker/compose.fuzz.yml run --rm smoke-metrics   # 2 min metrics target
+#   docker compose -f docker/compose.fuzz.yml run --rm smoke-batcher   # 2 min batcher target
+#
+# Long runs / custom options: override the command after `run`
+# (everything after `--` goes to libFuzzer directly):
+#
+#   docker compose -f docker/compose.fuzz.yml run --rm smoke-logs \
+#       run logs_ingress_export -- -rss_limit_mb=2048 -max_total_time=21600
+#
+# Reproduce a crash artifact saved on the host:
+#
+#   docker compose -f docker/compose.fuzz.yml run --rm smoke-logs \
+#       run logs_ingress_export fuzz/artifacts/logs_ingress_export/crash-<sha>
+#
+# Design notes:
+# * Resource envelope: TWO CPUs are the default expected budget for every
+#   fuzz service (cpuset: "0,1" below), matching the WSL-native workflow
+#   in docker/fuzz-wsl.sh. Measured on that envelope (WSL2, 2 vCPUs,
+#   --debug-assertions): core_batcher ~3.6k exec/s @ 412 MB RSS,
+#   logs_ingress_export ~1.1k exec/s @ 75 MB, metrics_ingress_export
+#   ~1.3k exec/s @ 76 MB.
+# * Why Docker at all: libFuzzer needs a nightly compiler with sanitizer
+#   coverage; that toolchain is unsupported on windows-msvc hosts. The
+#   Linux image is also where CI will run these targets.
+# * Faster local loop: run the same targets NATIVELY in a WSL2 distro via
+#   docker/fuzz-wsl.sh (no 9P bind-mount penalty, target dir on ext4).
+#   Prefer this compose file only for CI-parity or hermetic reruns.
+# * Binaries are NOT baked into the image (unlike compose.benchmark.yml):
+#   targets rebuild from the bind-mounted workspace so code edits take
+#   effect immediately. Only toolchain changes require an image rebuild.
+# * CARGO_TARGET_DIR points at target-container-fuzz/ so nightly/fuzz
+#   artifacts never collide with host builds in target/ or the bench
+#   artifacts in target-container/.
+# * Corpus and crash artifacts land in fuzz/corpus/<target>/ and
+#   fuzz/artifacts/<target>/ inside the repository (persisted by the bind
+#   mount): minimized corpus entries can be committed directly, crashes
+#   become regression inputs.
+# * Memory: libFuzzer's own RSS cap is the binding constraint (-rss_limit_mb
+#   =2048); the container limit sits above it (2560 MB) so libFuzzer's OOM
+#   reporting — which snapshots the offending input — fires before the
+#   kernel kills the container.
+# * The ingress targets are pure decode->map->enqueue (no SQLite, no TCP),
+#   so they need no tmpfs and no service dependencies.
+
+name: otel-sqlite-fuzz
+
+services:
+  build:
+    image: otel-sqlite-fuzz:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.fuzz
+    working_dir: /work/fuzz
+    environment:
+      CARGO_TARGET_DIR: /work/target-container-fuzz
+    volumes:
+      - ..:/work
+      - fuzz-cargo-registry:/usr/local/cargo/registry
+    # No CPU/memory constraints: compile once, fast.
+    command: build --debug-assertions
+
+  smoke-logs:
+    image: otel-sqlite-fuzz:latest
+    depends_on:
+      build:
+        condition: service_completed_successfully
+    working_dir: /work/fuzz
+    environment:
+      CARGO_TARGET_DIR: /work/target-container-fuzz
+    volumes:
+      - ..:/work
+      - fuzz-cargo-registry:/usr/local/cargo/registry
+    mem_limit: 2560m
+    cpuset: "0,1"
+    # OTLP logs export: protobuf decode -> validation -> mapping -> enqueue.
+    command: run logs_ingress_export -- -rss_limit_mb=2048 -max_total_time=120
+
+  smoke-metrics:
+    image: otel-sqlite-fuzz:latest
+    depends_on:
+      build:
+        condition: service_completed_successfully
+    working_dir: /work/fuzz
+    environment:
+      CARGO_TARGET_DIR: /work/target-container-fuzz
+    volumes:
+      - ..:/work
+      - fuzz-cargo-registry:/usr/local/cargo/registry
+    mem_limit: 2560m
+    cpuset: "0,1"
+    # OTLP metrics export: widest conversion surface (all point types,
+    # exponential buckets, temporality fallbacks, width casts).
+    command: run metrics_ingress_export -- -rss_limit_mb=2048 -max_total_time=120
+
+  smoke-batcher:
+    image: otel-sqlite-fuzz:latest
+    depends_on:
+      build:
+        condition: service_completed_successfully
+    working_dir: /work/fuzz
+    environment:
+      CARGO_TARGET_DIR: /work/target-container-fuzz
+    volumes:
+      - ..:/work
+      - fuzz-cargo-registry:/usr/local/cargo/registry
+    mem_limit: 2560m
+    cpuset: "0,1"
+    # Pure core logic: InsertBatcher contract + model conversions.
+    command: run core_batcher -- -rss_limit_mb=2048 -max_total_time=120
+
+volumes:
+  fuzz-cargo-registry:

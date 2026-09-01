@@ -1,61 +1,80 @@
-# OTLP SQLite Collector Dockerfile
+# ------------------------------------------------------------
+# docker build \
+#   --build-arg REVISION="$(git rev-parse HEAD)" \
+#   --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+#   -t otel-sqlite:0.1.0 .
 
-# Build stage
-FROM golang:1.25-alpine AS builder
+# docker run --rm \
+#     -v otel-sqlite-data:/data \
+#     -p 4317:4317 \
+#     otel-sqlite
+# ------------------------------------------------------------
 
-# Install dependencies, including a C compiler required by go-sqlite3.
-RUN apk add --no-cache build-base
+FROM rust:1.89-bookworm AS builder
 WORKDIR /app
 
-# Copy go mod files
-COPY go.mod go.sum ./
-RUN go mod download
+# The workspace spans crates/ and tests/: both must exist for cargo to
+# resolve the member manifests before any target builds.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY tests ./tests
 
-# Copy source code
-COPY . .
+# Build only the application binary.
+RUN cargo build \
+    --release \
+    --locked \
+    -p otel-sqlite
 
-# Generate protobuf code (pinned versions match go.mod; the latest
-# protoc-gen-go-grpc requires Go 1.25+).
-RUN apk add --no-cache make protoc protobuf-dev && \
-    go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11 && \
-    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1 && \
-    make generate
 
-# Build application
-RUN CGO_ENABLED=1 GOOS=linux go build -tags fts5 -o /otel-collector ./cmd/collector
+# ------------------------------------------------------------
+# Runtime image
+# ------------------------------------------------------------
 
-# Runtime stage
-FROM alpine:3.19
+FROM debian:bookworm-slim AS runtime
 
-# Install ca-certificates for HTTPS, tzdata for timezones and sqlite for the CLI
-RUN apk --no-cache add ca-certificates tzdata sqlite
+ARG REVISION="unknown"
+ARG BUILD_DATE="unknown"
 
-# Copy binary
-COPY --from=builder /otel-collector /usr/local/bin/otel-collector
+LABEL org.opencontainers.image.title="otel-sqlite" \
+      org.opencontainers.image.description="OpenTelemetry collector sink with SQLite storage" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.source="https://codeberg.org/nicknad/otel-sqlite" \
+      org.opencontainers.image.licenses="MIT"
 
-# Copy example configuration as a reference
-COPY config.example.yaml /etc/otel-collector/config.example.yaml
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN addgroup -S otel && adduser -S -G otel otel
+RUN useradd \
+    --system \
+    --uid 10001 \
+    --create-home \
+    --shell /usr/sbin/nologin \
+    otel-sqlite
 
-# Create data directory owned by the non-root user so mounted named
-# volumes inherit the correct ownership.
-RUN mkdir -p /var/lib/otel-collector && chown -R otel:otel /var/lib/otel-collector
+COPY --from=builder \
+    /app/target/release/otel-sqlite \
+    /usr/local/bin/otel-sqlite
 
-# Set working directory
-WORKDIR /var/lib/otel-collector
+RUN mkdir -p /data \
+    && chown -R otel-sqlite:otel-sqlite /data
 
-USER otel
+VOLUME ["/data"]
 
-# Expose ports: 4317 = gRPC OTLP, 9090 = Prometheus metrics
-EXPOSE 4317
-EXPOSE 9090
+USER otel-sqlite
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -q --spider http://localhost:9090/health || exit 1
+ENV RUST_LOG=info
 
-# Entry point
-ENTRYPOINT ["/usr/local/bin/otel-collector"]
-CMD []
+# The database (and its WAL sidecars) must live inside the volume: /data is
+# the workdir so the relative default `otel-logs.db` resolves there.
+WORKDIR /data
+
+# Built-in gRPC health probe: no curl/bash exists in the slim image, the
+# binary speaks grpc.health.v1 for itself. SERVING only while writer and
+# batcher run; NOT_SERVING during drain.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
+    CMD ["/usr/local/bin/otel-sqlite", "healthcheck"]
+
+ENTRYPOINT ["/usr/local/bin/otel-sqlite"]

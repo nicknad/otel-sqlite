@@ -1,0 +1,78 @@
+# ------------------------------------------------------------
+# Benchmark image: contains BOTH the production server binary
+# and the E2E load/validation harness.
+#
+#   docker build \
+#     --build-arg REVISION="$(git rev-parse HEAD)" \
+#     -f docker/Dockerfile.benchmark -t otel-sqlite-bench:latest .
+#
+# Used by docker/compose.benchmark.yml. For authoritative SQLite
+# performance numbers prefer native Linux execution; see
+# docs/performance.md.
+# ------------------------------------------------------------
+
+FROM rust:1.89-bookworm AS builder
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY tests ./tests
+
+# Build the production binary AND the benchmark harness.
+RUN cargo build \
+    --release \
+    --locked \
+    -p otel-sqlite \
+    -p otel-sqlite-e2e
+
+# ------------------------------------------------------------
+# Runtime image
+# ------------------------------------------------------------
+
+FROM debian:bookworm-slim AS runtime
+
+ARG REVISION="unknown"
+
+LABEL org.opencontainers.image.title="otel-sqlite-benchmark" \
+      org.opencontainers.image.description="Production server + E2E benchmark harness" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.licenses="MIT"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/otel-sqlite /usr/local/bin/otel-sqlite
+COPY --from=builder /app/target/release/otel-sqlite-e2e /usr/local/bin/otel-sqlite-e2e
+COPY --from=builder /app/target/release/otel-sqlite-stack-verify /usr/local/bin/otel-sqlite-stack-verify
+COPY --from=builder /app/target/release/otel-sqlite-stack-crash /usr/local/bin/otel-sqlite-stack-crash
+
+RUN useradd \
+        --system \
+        --uid 10001 \
+        --create-home \
+        --shell /usr/sbin/nologin \
+        otel-sqlite \
+    && mkdir -p /data /results /artifacts \
+    && chown -R otel-sqlite:otel-sqlite /data /results /artifacts
+
+USER otel-sqlite
+
+ENV RUST_LOG=warn
+
+# gRPC liveness probe served by the production binary itself: runs the
+# standard `grpc.health.v1.Check` against the OTLP listener and exits 0 only
+# on SERVING (both pipeline threads alive). No curl/bash needed in the slim
+# runtime image - the server answers for itself. Override the probed endpoint
+# with OTEL_SQLITE_HEALTHCHECK_ENDPOINT when the listen port differs.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/otel-sqlite", "healthcheck"]
+
+# Default: run the production server against /data.
+WORKDIR /data
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
+    CMD ["/usr/local/bin/otel-sqlite", "healthcheck"]
+
+ENTRYPOINT ["/usr/local/bin/otel-sqlite"]

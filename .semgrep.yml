@@ -1,0 +1,93 @@
+# Semgrep rules for the otel-sqlite workspace.
+#
+# Run (Linux/macOS/WSL or CI):
+#   semgrep scan --config .semgrep.yml
+# Local setup: `uv tool install semgrep==1.175.0`.
+# Docker alternative:
+#   docker run --rm -v "${PWD}:/src" semgrep/semgrep semgrep --config .semgrep.yml /src
+# CI also runs this scan through the Forgejo workflow.
+
+rules:
+  - id: rust.dbg-macro
+    message: >
+      `dbg!` is a debugging leftover and must not be committed.
+      Remove it or replace with `tracing::debug!`.
+    languages: [rust]
+    severity: ERROR
+    patterns:
+      - pattern: dbg!(...)
+
+  - id: rust.todo-unimplemented
+    message: >
+      `todo!`/`unimplemented!` in production code paths aborts the process.
+      Track unfinished work in an issue instead.
+    languages: [rust]
+    severity: WARNING
+    patterns:
+      - pattern-either:
+          - pattern: todo!()
+          - pattern: unimplemented!()
+
+  - id: rust.unsafe-block
+    message: >
+      Direct `unsafe` block. This workspace denies unsafe outside
+      ingress/build.rs; justify with a `// SAFETY:` comment and an explicit
+      `#[allow(unsafe_code)]`, or remove it.
+    languages: [rust]
+    severity: WARNING
+    patterns:
+      - pattern: unsafe { ... }
+      - pattern-not-inside: |
+          #[allow(unsafe_code)]
+          fn $F(...) { ... }
+
+  # Note: `.unwrap()` discipline in production code is enforced by
+  # clippy (`unwrap_used` + per-crate `cfg_attr(test)` allowances), which
+  # understands #[cfg(test)] modules; a path-based Semgrep rule cannot.
+
+  - id: security.sql-format-string
+    message: >
+      SQL built with `format!` from dynamic values risks injection if any
+      input reaches the query text. Parameterize values with `?` placeholders
+      (`rusqlite::params!`) and keep only trusted identifiers in the format
+      string; add an inline justification comment if this call is safe.
+    languages: [rust]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command"
+      owasp: "A03:2021 - Injection"
+    patterns:
+      - pattern-either:
+          - pattern: $CONN.prepare(&format!($FMT, ...))
+          - pattern: $CONN.query(&format!($FMT, ...))
+          - pattern: $CONN.execute(&format!($FMT, ...))
+
+  - id: generic.hardcoded-secret
+    message: >
+      Possible hardcoded credential. Load secrets from configuration or the
+      environment instead of embedding them in source.
+    languages: [rust]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+    patterns:
+      - pattern-either:
+          - pattern: let $VAR = "$X";
+          - pattern: 'const $VAR: &str = "$X";'
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: (?i).*(password|passwd|secret|api_?key|token|credential).*
+
+  - id: rust.std-net-in-pipeline
+    message: >
+      Blocking std::net calls inside the async gRPC path stall the tokio
+      runtime. Use tokio::net equivalents.
+    languages: [rust]
+    severity: WARNING
+    paths:
+      include:
+        - "crates/otel-sqlite-ingress/src/**"
+    patterns:
+      - pattern-either:
+          - pattern: std::net::TcpStream::connect(...)
+          - pattern: std::net::TcpListener::bind(...)

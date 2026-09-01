@@ -1,0 +1,87 @@
+# Benchmark environment: production server + E2E harness, both from the
+# same benchmark image. The SQLite database lives on a shared volume so the
+# harness can validate persistence after the measurement window.
+#
+#   cd docker
+#   docker compose -f compose.benchmark.yml build
+#   docker compose -f compose.benchmark.yml run --rm benchmark \
+#       --scenario baseline --duration-secs 60 --output /results/results.json
+#
+# The `benchmark` service shares the data volume read-only-by-convention:
+# the harness opens the database read-only during validation.
+#
+# Database location lives in exactly ONE place (`x-db-path` below). It MUST
+# equal `<server working_dir>/<default sqlite_path>` because the production
+# binary only takes its path from cwd + built-in default
+# (`otel-logs.db`, see crates/otel-sqlite/src/config.rs); the harness's
+# `--db-path` anchors to the same value so the two can never drift apart.
+#
+# Startup ordering is health-gated: the image ships a HEALTHCHECK running
+# the binary's own `grpc.health.v1.Check` probe, and `benchmark` starts only
+# once the server reports SERVING.
+#
+# Resource-constrained profiling: the `otel-sqlite` service is capped at
+# 1 CPU / 700 MB (mem_limit + cpus are honoured by Compose v2 outside
+# swarm). Only the SERVER is limited - the load generator runs free so
+# results measure the pipeline, not the client. One core matches the
+# single-writer design's worst case; 700 MB leaves ample headroom above
+# the small SQLite page cache while still exposing allocation pressure.
+# Observe live usage with `docker stats otel-sqlite-bench-server`.
+# See docs/performance.md for scenario details and interpretation.
+
+name: otel-sqlite-benchmark
+
+x-db-path: &db-path /data/otel-logs.db
+
+services:
+  otel-sqlite:
+    image: otel-sqlite-bench:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.benchmark
+    container_name: otel-sqlite-bench-server
+    working_dir: /data
+    environment:
+      RUST_LOG: info
+    ports:
+      - "4317:4317"
+    volumes:
+      - bench-data:/data
+    restart: unless-stopped
+    mem_limit: 700m
+    cpus: "1"
+
+  benchmark:
+    image: otel-sqlite-bench:latest
+    depends_on:
+      otel-sqlite:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/otel-sqlite-e2e"]
+    # IMPORTANT: `docker compose run benchmark <args>` REPLACES this whole
+    # list - dropping --endpoint/--db-path and silently degrading the harness
+    # to embedded mode against loopback (it would benchmark itself, not the
+    # server under test). Override steps through the environment instead,
+    # substituted at config-parse time, so a bare
+    #   docker compose run --rm benchmark
+    # always targets the server container:
+    #   BENCH_SCENARIO=backpressure docker compose -f compose.benchmark.yml run --rm benchmark
+    command:
+      [
+        "--scenario", "${BENCH_SCENARIO:-baseline}",
+        "--endpoint", "${BENCH_ENDPOINT:-http://otel-sqlite:4317}",
+        "--db-path", *db-path,
+        "--warmup-secs", "${BENCH_WARMUP_SECS:-5}",
+        "--drain-timeout-secs", "${BENCH_DRAIN_TIMEOUT_SECS:-300}",
+        "--output", "${BENCH_OUTPUT:-/results/results.json}",
+      ]
+    volumes:
+      - bench-data:/data
+      - bench-results:/results
+    environment:
+      OTEL_SQLITE_BENCH_DOCKER: "1"
+      # Git revision of the code under test (set at build time ideally):
+      OTEL_SQLITE_BENCH_GIT_REV: ""
+
+volumes:
+  bench-data:
+  bench-results:

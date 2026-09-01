@@ -1,0 +1,115 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/otel-sqlite", "crates/otel-sqlite-core",
+    "crates/otel-sqlite-ingress", "crates/otel-sqlite-runtime",
+    "crates/otel-sqlite-storage", "crates/test-support", "tests/otel-sqlite-e2e"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "SQLite Sink for OTEL Logs/Metrics with batched Single-Writer-Queues"
+rust-version = "1.89.0"
+
+[workspace.dependencies]
+aes-gcm = "0.10"
+anyhow = "1"
+crossbeam-channel = "0.5"
+hex = "0.4"
+zeroize = "1"
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-stream = "0.1"
+thiserror = "2"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+toml = "0.9"
+hdrhistogram = "7"
+rand = "0.9"
+rcgen = "0.13"
+sha2 = "0.10"
+clap = { version = "4", features = ["derive"] }
+criterion = { version = "0.7", features = ["html_reports"] }
+# `gzip`: the OpenTelemetry Collector's OTLP exporter compresses with gzip
+# by default; without this feature the ingress answers `Unimplemented`
+# (permanent error) and the exporter drops the batch.
+tonic = { version = "0.14", features = ["tls-ring", "gzip"] }
+tonic-health = "0.14"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+otel-sqlite-core = { path = "crates/otel-sqlite-core", version = "0.1.0" }
+otel-sqlite-ingress = { path = "crates/otel-sqlite-ingress", version = "0.1.0" }
+otel-sqlite-runtime = { path = "crates/otel-sqlite-runtime", version = "0.1.0" }
+otel-sqlite-storage = { path = "crates/otel-sqlite-storage", version = "0.1.0" }
+otel-sqlite-test-support = { path = "crates/test-support", version = "0.1.0" }
+otel-sqlite-e2e = { path = "tests/otel-sqlite-e2e", version = "0.1.0" }
+
+# Lint policy shared by every crate via `[lints] workspace = true`.
+#
+# Policy:
+# * no `unsafe` outside the single justified block in ingress/build.rs,
+#   and even that must carry an explanatory `// SAFETY:` comment;
+# * clippy `all` + `pedantic` as the baseline signal;
+# * hard failures for debugging leftovers (`dbg!`, `todo!`, `unimplemented!`);
+# * `.unwrap()` is reserved for tests (allowed per-crate-root / per-test-file),
+#   production paths must handle or `.expect()` with a reason.
+[workspace.lints.rust]
+unsafe_code = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Internal API surface: `#[must_use]` suggestions on every getter are noise.
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+# Doc style: backtick formatting and per-panic/error sections are aspirational,
+# not enforced; the codebase documents behaviour in prose instead.
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# This pipeline intentionally converts raw OTLP counters/timestamps between
+# widths (nanos -> i64, counts -> f64 metrics); ranges are trusted upstream.
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_lossless = "allow"
+# OTLP request types are consumed by value by design (ownership into queues).
+needless_pass_by_value = "allow"
+# Long scenario/watchdog functions are kept whole for readability.
+too_many_lines = "allow"
+unwrap_used = "warn"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+undocumented_unsafe_blocks = "deny"
+print_stdout = "warn"
+print_stderr = "warn"
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.release]
+opt-level = 3
+debug = "line-tables-only"
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+incremental = false
+
+[profile.bench]
+inherits = "release"
+debug = true
+strip = "none"

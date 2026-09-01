@@ -1,0 +1,13 @@
+# Backend image for the otel-sqlite stack E2E: stdlib-only Python, no
+# runtime installs. Serves the reverse-proxied API and exports OTLP logs
+# to the collector; see backend.py.
+
+FROM python:3.13-alpine
+
+COPY backend.py /backend.py
+
+USER 10001
+
+EXPOSE 8080
+
+ENTRYPOINT ["python", "/backend.py"]

@@ -1,0 +1,113 @@
+# Daily online backup of the otel-sqlite StatefulSet database.
+#
+# Step-by-step setup guide: docs/operations/backup-kubernetes.md
+#
+# The CronJob pod mounts the SAME data PVC as the server pod and runs
+# `otel-sqlite backup` while the server keeps ingesting (the backup opens the
+# live database read-only). Because the data volume is ReadWriteOnce, the
+# CronJob pod is scheduled onto the node that hosts the volume; both pods
+# mount it concurrently, which SQLite WAL supports for a reader plus one
+# writer.
+#
+#   kubectl -n otel-sqlite apply -f otel-sqlite-backup-cronjob.yaml
+#
+# Restore (offline): stop the StatefulSet (kubectl scale --replicas=0), then
+# run the restore image mounting the backups volume, then scale back up.
+# See docs/operations/backup-restore.md.
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: otel-sqlite-backups
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 40Gi
+  # storageClassName: <your-cluster-class> — size for >= 2x the database and
+  # the retained backup window.
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: otel-sqlite-backup
+spec:
+  # Retain ~30 daily backups; --keep prunes older artifacts in the same run.
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # A failed backup retries a few times (backoffLimit), then the job fails
+      # — alert on failed jobs (Kubernetes job-failed alert) and on the
+      # CronJob status.
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: backup
+              image: otel-sqlite:0.1.0
+              imagePullPolicy: IfNotPresent
+              args:
+                - backup
+                - --db
+                - /data/otel-logs.db
+                - --out
+                - /backups
+                - --keep
+                - "30"
+              # Encrypted variant: pass --key-file with the Secret mounted at
+              # /keys/backup.key (a 32-byte key file). Keep the key OUT of the
+              # data PVC.
+              # - --key-file
+              # - /keys/backup.key
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: "1"
+                  memory: 1Gi
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+                  readOnly: true
+                - name: backups
+                  mountPath: /backups
+                # - name: key
+                #   mountPath: /keys
+                #   readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: otel-sqlite-data-otel-sqlite-0
+            - name: backups
+              persistentVolumeClaim:
+                claimName: otel-sqlite-backups
+            # - name: key
+            #   secret:
+            #     secretName: otel-sqlite-security
+            #     items:
+            #       - key: backup.key
+            #         path: backup.key
+            #     defaultMode: 0400
+            - name: tmp
+              emptyDir: {}

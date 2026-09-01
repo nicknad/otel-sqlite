@@ -1,0 +1,40 @@
+# ------------------------------------------------------------
+# Fuzzing image: nightly toolchain + cargo-fuzz (libFuzzer driver).
+#
+#   docker build -f docker/Dockerfile.fuzz -t otel-sqlite-fuzz:latest .
+#
+# Used by docker/compose.fuzz.yml. libFuzzer's sancov instrumentation
+# requires a nightly compiler and is unsupported on windows-msvc hosts,
+# so all fuzzing runs through this Linux image (Docker Desktop/WSL2).
+#
+# Unlike Dockerfile.benchmark this does NOT bake binaries in: fuzz
+# targets are rebuilt from the bind-mounted workspace on every run
+# (same workflow as compose.criterion.yml), so code edits take effect
+# without an image rebuild. Only toolchain changes need `docker build`.
+#
+# TOOLCHAIN is an ARG so a reproducible pin (e.g.
+# nightly-2026-07-01) can be baked for CI baselines; the default
+# tracks rolling nightly because cargo-fuzz regularly needs fresh
+# nightly features.
+# ------------------------------------------------------------
+
+FROM rust:1.89-bookworm
+
+ARG TOOLCHAIN=nightly
+
+RUN rustup toolchain install "${TOOLCHAIN}" \
+        --profile minimal \
+        --component llvm-tools-preview \
+    && rustup default "${TOOLCHAIN}" \
+    && cargo install cargo-fuzz --locked
+
+# Runs as root on purpose: the workspace is bind-mounted from the host
+# (matching compose.criterion.yml), and matching the bind mount owner
+# avoids permission churn on corpus/artifact directories written into
+# the repository tree.
+WORKDIR /work/fuzz
+
+# Default entrypoint keeps service commands short:
+#   docker compose ... run --rm build            -> cargo fuzz build ...
+#   docker compose ... run --rm smoke-logs run logs_ingress_export ...
+ENTRYPOINT ["cargo", "fuzz"]

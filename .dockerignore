@@ -1,0 +1,20 @@
+# Keep the Docker build context small: only manifests, crates, tests and
+# proto files are COPYed, but the whole context is uploaded to the daemon on
+# every build. Without this file, multi-GB target/ directories dominate the
+# upload.
+
+target/
+target-container/
+.git/
+.forgejo/
+.idea/
+.github/
+docs/
+results/
+logs/
+*.db
+*.db-shm
+*.db-wal
+docker/compose.*.yml
+Dockerfile
+docker/Dockerfile.benchmark
