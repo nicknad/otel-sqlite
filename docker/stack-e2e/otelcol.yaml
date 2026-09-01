@@ -1,0 +1,80 @@
+# OpenTelemetry Collector configuration for the stack E2E topology:
+#
+#   nginx access log (file) ─┐
+#   backend OTLP/HTTP JSON ──┴─> otelcol ──OTLP/gRPC──> otel-sqlite:4317
+#
+# Deliberately conservative for the restricted-compose profile:
+# * memory_limiter uses percentages so it adapts to the container cap
+#   (compose gives this service 256 MiB);
+# * batch keeps writes to the SQLite sink few and large.
+#
+# The filelog receiver reads the REAL access log file written by nginx
+# (`access-e2e.log`, see nginx.conf - deliberately NOT the default
+# `access.log`, which the nginx entrypoint symlinks to stdout).
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  filelog/nginx_access:
+    include:
+      - /var/log/nginx/access-e2e.log
+    start_at: beginning
+    poll_interval: 200ms
+    operators:
+      # Combined Log Format:
+      # addr - user [time] "METHOD target version" status bytes "referer" "ua"
+      - type: regex_parser
+        parse_from: body
+        regex: '^(?P<remote_addr>\S+) - (?P<remote_user>\S*) \[(?P<time_local>[^\]]+)\] "(?P<http_method>\S+) (?P<http_target>\S+) (?P<http_version>[^"]+)" (?P<status>\d{3}) (?P<bytes_sent>\d+)'
+        timestamp:
+          parse_from: attributes.time_local
+          layout_type: strptime
+          layout: '%d/%b/%Y:%H:%M:%S %z'
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+
+  batch:
+    timeout: 200ms
+    send_batch_size: 512
+
+exporters:
+  otlp/sqlite:
+    endpoint: otel-sqlite:4317
+    tls:
+      insecure: true
+    sending_queue:
+      enabled: true
+      queue_size: 2048
+
+service:
+  extensions:
+    - health_check
+  # Internal self-telemetry: logs only. (The legacy
+  # `service.telemetry.metrics.address` key was removed from recent
+  # collector versions; internal metrics now default to localhost:8888.)
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    logs:
+      receivers:
+        - otlp
+        - filelog/nginx_access
+      processors:
+        - memory_limiter
+        - batch
+      exporters:
+        - otlp/sqlite

@@ -1,0 +1,4 @@
+# Directories Semgrep should never scan.
+target/
+results/
+.idea/

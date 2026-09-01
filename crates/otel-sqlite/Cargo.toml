@@ -1,0 +1,33 @@
+[package]
+name = "otel-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+rcgen = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tonic = { version = "0.14", features = ["tls-ring"] }
+tonic-health = { workspace = true }
+toml = { workspace = true }
+otel-sqlite-core = { workspace = true }
+otel-sqlite-ingress = { workspace = true }
+otel-sqlite-runtime = { workspace = true }
+otel-sqlite-storage = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rusqlite = { workspace = true }
+otel-sqlite-e2e = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

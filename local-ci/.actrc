@@ -1,0 +1,20 @@
+# Local CI (act) configuration.
+#
+# Read from THIS directory: the wrapper scripts (`run.ps1` / `run.sh`) change
+# into this folder before invoking act so this file (and `.act.env`) is picked
+# up, then point act at the repository root with `-C ..`.
+
+# Runner image for `runs-on:` (host) jobs. `catthehacker/ubuntu:act-latest` is
+# the community-standard full-featured GitHub-runner image (git, docker CLI,
+# compose). The `container:` jobs in `.forgejo/workflows/ci.yml`
+# (rust:1.89-bookworm, semgrep/semgrep) use their own images regardless of
+# this mapping.
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+
+# Match the host CPU architecture. Apple Silicon / ARM64 hosts must use
+# linux/arm64 instead; Docker Desktop on x86 Windows keeps linux/amd64.
+--container-architecture linux/amd64
+
+# Local environment defaults (committed with safe values; edit locally or
+# copy `.act.env.example` over it for overrides).
+--env-file .act.env

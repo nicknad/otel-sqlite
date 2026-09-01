@@ -1,0 +1,23 @@
+# Crash/restart durability test config for the sidecar under
+# docker/compose.crash-e2e.yml.
+#
+# Durability is "commit" so a 2xx only goes out after the writer committed;
+# periodic maintenance is disabled so the WAL accumulates un-checkpointed
+# frames for a docker-kill to leave behind (restart must replay them).
+
+listen_address = "0.0.0.0:4317"
+sqlite_path = "/data/otel-logs.db"
+metrics_address = "off"
+shutdown_timeout = "20s"
+
+[durability]
+mode = "commit"
+synchronous = "normal"
+
+[maintenance]
+retention = "off"
+purge_interval = "off"
+checkpoint_interval = "off"
+optimize_interval = "off"
+vacuum_interval = "off"
+rebuild_fts_interval = "off"

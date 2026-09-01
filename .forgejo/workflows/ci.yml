@@ -1,0 +1,274 @@
+# Forgejo Actions CI (Codeberg).
+#
+# One-time repo setup on Codeberg:
+#   Settings -> Repository units -> enable "Actions".
+#
+# Runners are self-hosted/community-run: `runs-on:` must match a label that a
+# registered runner advertises for this account/repo. Codeberg runners often
+# use labels like `act-runner` rather than `ubuntu-latest`; adjust all jobs
+# if your runner differs.
+#
+# Runner requirements:
+# * The pure-Rust jobs (`lint-and-test`, `crash-recovery-release`,
+#   `e2e-benchmark`, `cargo-deny`) run inside a `rust:1.89-bookworm`
+#   container (pinned to the workspace `rust-version` 1.89.0; the production
+#   Dockerfile builds with the same image).
+# * The Docker jobs (`fuzz-smoke`, `fuzz-nightly`, `stack-e2e`,
+#   `crash-e2e-container`, `container-smoke`) must run on a runner with a
+#   working Docker daemon and `docker compose` — i.e. a bare host runner, NOT
+#   a `container:` job (docker-in-docker).
+# * `runs-on:` must match a label a registered runner advertises. Before
+#   releasing, verify the actual Forgejo runner labels (Codeberg community
+#   runners commonly advertise `act-runner`); adjust every job if yours
+#   differs from `ubuntu-latest`.
+#
+# Docs: https://forgejo.org/docs/latest/user/actions/
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly longer fuzzing run (cron in UTC).
+    - cron: "0 2 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Pure-Rust jobs (containerized runner)
+  # ---------------------------------------------------------------------------
+
+  lint-and-test:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.89-bookworm
+    steps:
+      - name: Install git (slim image prerequisite for checkout)
+        run: apt-get update -qq && apt-get install -y -qq git
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Lint (workspace lints, warnings denied)
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo clippy --workspace --all-targets
+
+      - name: Tests
+        # Includes the crash/restart suite against the DEV binary
+        # (CARGO_BIN_EXE) and the embedded e2e smoke test; the release-binary
+        # crash run is the dedicated `crash-recovery-release` job.
+        run: cargo test --workspace
+
+  crash-recovery-release:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.89-bookworm
+    steps:
+      - name: Install git (slim image prerequisite for checkout)
+        run: apt-get update -qq && apt-get install -y -qq git
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Build release binary
+        run: cargo build --release --locked -p otel-sqlite
+
+      # P0-2 release gate: crash durability + restart against the RELEASE
+      # binary (the dev-binary run already happened in lint-and-test).
+      - name: Crash/restart durability suite (release binary)
+        run: >
+          OTEL_SQLITE_CRASH_BIN=target/release/otel-sqlite
+          cargo test --release -p otel-sqlite --test crash_durability
+
+      # P1-1 release gate: backup/restore runbook against the RELEASE binary
+      # (online backup while ingesting, restore into a clean directory, restart
+      # and validate). The dev-binary run already happened in lint-and-test.
+      - name: Backup/restore suite (release binary)
+        run: >
+          OTEL_SQLITE_CRASH_BIN=target/release/otel-sqlite
+          cargo test --release -p otel-sqlite --test backup_restore
+
+  e2e-benchmark:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.89-bookworm
+    steps:
+      - name: Install git (slim image prerequisite for checkout)
+        run: apt-get update -qq && apt-get install -y -qq git
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Build harness
+        run: cargo build --release --locked -p otel-sqlite -p otel-sqlite-e2e
+
+      # Correctness gates: a scenario exits non-zero if any validation fails
+      # (missing/duplicate/rejected-present records). These are correctness
+      # runs, not benchmarks.
+      - name: Baseline correctness
+        run: >
+          cargo run --release -p otel-sqlite-e2e -- --scenario baseline
+          --duration-secs 20 --warmup-secs 2 --drain-timeout-secs 60
+
+      - name: Backpressure correctness (all-or-nothing UNAVAILABLE, zero duplicates)
+        run: >
+          cargo run --release -p otel-sqlite-e2e -- --scenario backpressure
+          --duration-secs 20 --warmup-secs 0 --drain-timeout-secs 60
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.89-bookworm
+    steps:
+      - name: Install git (slim image prerequisite for checkout)
+        run: apt-get update -qq && apt-get install -y -qq git
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Advisory + license + ban checks
+        # `cargo deny check` runs every configured check (licenses, advisories,
+        # bans, sources); the P0-5 gate requires at least licenses+advisories.
+        run: cargo deny check
+
+  semgrep:
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Scan with local rules
+        run: semgrep scan --config .semgrep.yml --error
+
+  # ---------------------------------------------------------------------------
+  # Docker jobs (host runner with a Docker daemon)
+  # ---------------------------------------------------------------------------
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build fuzz image
+        run: docker compose -f docker/compose.fuzz.yml build
+
+      - name: Compile all fuzz targets
+        run: docker compose -f docker/compose.fuzz.yml run --rm build
+
+      - name: Smoke logs target (2 min)
+        run: docker compose -f docker/compose.fuzz.yml run --rm smoke-logs
+
+      - name: Smoke metrics target (2 min)
+        run: docker compose -f docker/compose.fuzz.yml run --rm smoke-metrics
+
+      - name: Smoke batcher target (2 min)
+        run: docker compose -f docker/compose.fuzz.yml run --rm smoke-batcher
+
+  stack-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Full multi-container stack: nginx -> collector -> sink -> verify.
+      - name: Stack e2e (verify exit code is the verdict)
+        run: docker compose -f docker/compose.stack-e2e.yml up --build --exit-code-from verify
+
+  crash-e2e-container:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Container-level crash/restart: docker-kill the sidecar mid-load,
+      # restart on the same volume, assert no acknowledged loss.
+      - name: Container crash/restart durability
+        run: bash docker/crash-e2e.sh
+
+  # P0-5 release gate: the production image must build with --locked, start,
+  # report SERVING through its built-in gRPC healthcheck, run as the
+  # unprivileged otel-sqlite user, and create the database on the /data
+  # volume.
+  container-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Production container smoke (healthcheck, non-root, /data volume)
+        run: bash docker/container-smoke.sh
+
+  fuzz-nightly:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build fuzz image
+        run: docker compose -f docker/compose.fuzz.yml build
+
+      - name: Compile all fuzz targets
+        run: docker compose -f docker/compose.fuzz.yml run --rm build
+
+      - name: Long logs run (30 min)
+        run: >
+          docker compose -f docker/compose.fuzz.yml run --rm smoke-logs
+          run logs_ingress_export -- -rss_limit_mb=2048 -max_total_time=1800
+
+      - name: Long metrics run (30 min)
+        run: >
+          docker compose -f docker/compose.fuzz.yml run --rm smoke-metrics
+          run metrics_ingress_export -- -rss_limit_mb=2048 -max_total_time=1800
+
+      - name: Long batcher run (30 min)
+        run: >
+          docker compose -f docker/compose.fuzz.yml run --rm smoke-batcher
+          run core_batcher -- -rss_limit_mb=2048 -max_total_time=1800

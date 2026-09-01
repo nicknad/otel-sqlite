@@ -1,0 +1,55 @@
+# Nightly otel-sqlite online backup (systemd timer).
+#
+# Step-by-step setup guide: docs/operations/backup-systemd.md
+#
+# The backup runs as a SEPARATE process against the live database: it opens
+# the source read-only and copies a consistent snapshot through the Online
+# Backup API, so the running server never pauses. It then verifies the
+# snapshot (integrity, foreign keys, row counts) and prunes beyond --keep.
+#
+#   sudo cp otel-sqlite-backup.service otel-sqlite-backup.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now otel-sqlite-backup.timer
+#
+# Alerting: a failed backup exits non-zero; attach a separate unit to
+# OnFailure to page, or scrape for the timer's LastResult.
+
+[Unit]
+Description=Nightly otel-sqlite online backup
+
+[Service]
+Type=oneshot
+User=otel-sqlite
+Group=otel-sqlite
+# The backup only needs read access to /data and write access to /backups.
+# Keep the key (when encrypting) readable only by this user and OUT of the
+# data directory.
+WorkingDirectory=/backups
+Environment=OTEL_SQLITE_CFG_PATH=/etc/otel-sqlite/otel-sqlite.toml
+ExecStart=/usr/local/bin/otel-sqlite backup \
+    --db /data/otel-logs.db \
+    --out /backups \
+    --keep 30
+# Encrypted variant (AES-256-GCM, key must be exactly 32 bytes):
+# ExecStart=/usr/local/bin/otel-sqlite backup \
+#     --db /data/otel-logs.db \
+#     --out /backups \
+#     --key-file /etc/otel-sqlite/backup.key \
+#     --keep 30
+
+# Fail loudly so the timer reports the failure for alerting.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/backups
+# /data is read-only here: the backup never mutates the live database.
+ReadOnlyPaths=/data
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+PrivateDevices=yes
+
+# Disk capacity note: the snapshot is ~ the live database size. Budget at
+# least 2x the database size of free space on /backups and alert on the
+# volume filling (see docs/operations/backup-restore.md).

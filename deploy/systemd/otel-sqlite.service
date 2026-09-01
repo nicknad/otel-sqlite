@@ -1,0 +1,75 @@
+# otel-sqlite systemd unit.
+#
+# Persistent storage: /data must be on a dedicated disk or a bind mount with
+# enough free space (the database + WAL live there). Point the server at a
+# config file with OTEL_SQLITE_CFG_PATH.
+#
+#   sudo cp otel-sqlite.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now otel-sqlite
+#
+# Verify:   systemctl status otel-sqlite
+# Logs:     journalctl -u otel-sqlite -f
+# Stop:     systemctl stop otel-sqlite   (SIGTERM -> graceful drain, WAL truncate)
+
+[Unit]
+Description=OTLP SQLite collector (otel-sqlite)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The server user; the runtime image and these units agree on this name.
+User=otel-sqlite
+Group=otel-sqlite
+# WorkingDirectory is where the relative default database path lands. In
+# production point sqlite_path at /data/otel-logs.db explicitly.
+WorkingDirectory=/data
+Environment=OTEL_SQLITE_CFG_PATH=/etc/otel-sqlite/otel-sqlite.toml
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/otel-sqlite
+
+# Restart policy: restart on crash, but never on a clean stop (operator or
+# systemctl stop). The watchdog defers restarting to an external supervisor,
+# which is systemd here.
+Restart=on-failure
+RestartSec=5s
+
+# Graceful termination: SIGTERM triggers the in-process drain (health flips
+# NOT_SERVING, acknowledged records commit, final checkpoint truncates the
+# WAL). TimeoutStopSec must exceed the configured shutdown_timeout.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+SendSIGKILL=yes
+
+# Resources.
+LimitNOFILE=65536
+LimitCORE=0
+MemoryMax=2G
+CPUWeight=100
+
+# Hardening.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# /data (database + WAL) is the only writable path besides systemd-managed
+# dirs. TLS keys, tokens and the config live under /etc/otel-sqlite (read-only
+# from the service's perspective once deployed).
+ReadWritePaths=/data
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+# Health: the binary answers grpc.health.v1 itself; use it in a watchdog or
+# scrape /metrics for the health state. There is no separate health unit
+# because the process exits non-zero when it cannot serve — restart is the
+# recovery.
+
+[Install]
+WantedBy=multi-user.target
