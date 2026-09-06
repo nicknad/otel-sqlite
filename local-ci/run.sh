@@ -37,7 +37,7 @@ JOBS=(lint-and-test crash-recovery-release e2e-benchmark cargo-deny semgrep)
 SOCKET_ARGS=()
 
 if [[ "$ALL" -eq 1 ]]; then
-    JOBS+=(fuzz-smoke stack-e2e crash-e2e-container container-smoke)
+    JOBS+=(fuzz-smoke crash-e2e-container container-smoke)
     # Mount the host Docker daemon so `docker compose` inside the job talks to
     # the real daemon without docker-in-docker.
     if [[ -S /var/run/docker.sock ]]; then

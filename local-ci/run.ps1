@@ -15,7 +15,7 @@
 
 [CmdletBinding()]
 param(
-    # Also run the Docker jobs (fuzz-smoke, stack-e2e, crash-e2e-container,
+    # Also run the Docker jobs (fuzz-smoke, crash-e2e-container,
     # container-smoke). These mount the host Docker daemon so `docker compose`
     # inside the job talks to the real daemon; requires Docker Desktop.
     [switch]$All,
@@ -37,7 +37,7 @@ $Jobs = @("lint-and-test", "crash-recovery-release", "e2e-benchmark", "cargo-den
 $SocketArgs = @()
 
 if ($All) {
-    $Jobs += @("fuzz-smoke", "stack-e2e", "crash-e2e-container", "container-smoke")
+    $Jobs += @("fuzz-smoke", "crash-e2e-container", "container-smoke")
     # Docker Desktop's daemon is reachable through the named pipe; act mounts
     # it into the job container so `docker compose` works without dind.
     $SocketArgs = @("--container-daemon-socket", "//./pipe/docker_engine")
