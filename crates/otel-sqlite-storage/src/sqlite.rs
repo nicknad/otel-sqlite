@@ -10,24 +10,19 @@ pub(crate) fn open(path: &Path, synchronous: SyncMode) -> Result<Connection, Sto
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
+        let created = !parent.exists();
         std::fs::create_dir_all(parent)?;
+        // Sidecars inherit the directory's permissions at creation, so a
+        // world-accessible directory leaks telemetry regardless of the file
+        // modes enforced below.
+        crate::permissions::harden_database_dir(parent, created);
     }
 
-    let existed = path.exists();
     let conn = Connection::open(path)?;
 
-    // Telemetry often contains PII/secrets: the live database must be
-    // owner-only from creation, mirroring backup artifacts.
-    if let Err(error) = crate::permissions::restrict_permissions(path) {
-        tracing::warn!(
-            path = %path.display(),
-            %error,
-            "could not restrict database file permissions"
-        );
-    }
-    if existed {
-        crate::permissions::warn_if_world_readable(path, "sqlite database file");
-    }
+    // Telemetry often contains PII/secrets: the live database and its WAL
+    // sidecars must be owner-only from creation, mirroring backup artifacts.
+    crate::permissions::harden_database_files(path);
 
     let journal_mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
     tracing::debug!(journal_mode = journal_mode.as_str(), "sqlite journal mode");

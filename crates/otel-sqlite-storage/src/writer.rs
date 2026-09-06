@@ -79,6 +79,9 @@ fn run_inner(
         }
     };
     maintenance::checkpoint(&conn, CheckpointMode::Truncate)?;
+    // Sidecars materialize on first write, possibly after `sqlite::open`
+    // hardened the paths — repeat here now that they are known to exist.
+    crate::permissions::harden_database_files(&config.sqlite_path);
     tracing::info!(
         path = %config.sqlite_path.display(),
         synchronous = config.synchronous.as_str(),
