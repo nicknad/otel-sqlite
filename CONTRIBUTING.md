@@ -11,6 +11,7 @@ All of these must pass before a PR is merged (CI enforces the same):
 cargo clippy --workspace --all-targets   # zero findings; RUSTFLAGS=-D warnings in CI
 cargo test --workspace                   # all suites green
 cargo deny check                         # advisories, licenses, bans, sources
+cargo audit                              # RustSec advisories (requires cargo-audit >= 0.22.2)
 semgrep scan --config .semgrep.yml       # zero blocking findings
 ```
 
@@ -57,6 +58,16 @@ Configured in `deny.toml`: vulnerable/yanked dependencies fail, licenses are
 restricted to a permissive allow-list, duplicate dependencies are surfaced as
 warnings. Add new license IDs to the allow-list deliberately.
 
+### cargo-audit
+
+`cargo audit` scans `Cargo.lock` against the RustSec advisory database as a
+second opinion next to `cargo deny check advisories`. It requires
+`cargo-audit >= 0.22.2`: older releases (e.g. 0.21.x) cannot parse CVSS 4.0
+vectors now present in the advisory database and abort with a TOML parse
+error instead of scanning. Install/upgrade with
+`cargo install cargo-audit --locked --version 0.22.2`, then run `cargo audit`
+(a clean tree reports zero vulnerabilities).
+
 ### Semgrep
 
 Rules live in `.semgrep.yml`; generated code and build artifacts are excluded
@@ -78,6 +89,8 @@ The local and CI quality toolchain is:
 - `lefthook` for fast pre-commit formatting and Semgrep checks.
 - `uv` for installing the Semgrep CLI without modifying the project Python dependencies.
 - `cargo-deny` for dependency advisories, licenses, bans, and sources.
+- `cargo-audit >= 0.22.2` for RustSec advisory scans (older releases fail on
+  CVSS 4.0 entries).
 - Docker Compose for container, stack, and constrained performance tests.
 
 ## Testing expectations
