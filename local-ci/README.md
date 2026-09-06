@@ -4,7 +4,7 @@ Runs the repository's Forgejo workflow (`.forgejo/workflows/ci.yml`) **locally**
 with [act](https://github.com/nektos/act) — the same GitHub/Forgejo Actions
 interpreter the Forgejo runner uses, driven through your local Docker daemon.
 This is a release gate loop without pushing to the forge:
-validate formatting, clippy, tests, cargo-deny, semgrep, and (optionally) the
+validate formatting, clippy, tests, cargo-deny, cargo-audit, semgrep, and (optionally) the
 Docker jobs before a commit.
 
 ## Install act
@@ -28,7 +28,7 @@ are large; the first run downloads them).
 
 | Command | What it runs |
 |---|---|
-| `run.ps1` / `run.sh` | Release-gate jobs: `lint-and-test`, `crash-recovery-release`, `e2e-benchmark`, `cargo-deny`, `semgrep` — all in their own `container:` images. |
+| `run.ps1` / `run.sh` | Release-gate jobs: `lint-and-test`, `crash-recovery-release`, `e2e-benchmark`, `cargo-deny`, `cargo-audit`, `semgrep` — all in their own `container:` images. |
 | `... -All` / `--all` | Adds the Docker jobs: `fuzz-smoke`, `crash-e2e-container`, `container-smoke`. Mounts the host Docker daemon so `docker compose` inside the job works without docker-in-docker. |
 | `... -List` / `--list` | Lists the workflows act sees for the `push` event, then exits. |
 | `... -Act <path>` / `ACT=<path>` | Use a specific act binary. |

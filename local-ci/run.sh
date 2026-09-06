@@ -33,7 +33,7 @@ done
 
 # The release-gate jobs all run in their own `container:` images (rust /
 # semgrep) and need no Docker daemon inside the job container.
-JOBS=(lint-and-test crash-recovery-release e2e-benchmark cargo-deny semgrep)
+JOBS=(lint-and-test crash-recovery-release e2e-benchmark cargo-deny cargo-audit semgrep)
 SOCKET_ARGS=()
 
 if [[ "$ALL" -eq 1 ]]; then
