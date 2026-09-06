@@ -40,8 +40,8 @@ jobs:
       - name: Install git (slim image prerequisite for checkout)
         run: apt-get update -qq && apt-get install -y -qq git
 
-      - name: Install rustfmt (slim image omits it)
-        run: rustup component add rustfmt
+      - name: Install rustfmt + clippy (slim image omits them)
+        run: rustup component add rustfmt clippy
 
       - name: Check out repository
         uses: actions/checkout@v4
