@@ -111,7 +111,7 @@ fn insert_logs_inner(
             {
                 dropped += 1;
                 tracing::warn!(
-                    body = %record.body,
+                    body_preview = %super::sanitized_preview(&record.body),
                     timestamp_ns = record.time_unix_nano,
                     %error,
                     "poisonous log record quarantined (dropped); healthy rows keep committing"
