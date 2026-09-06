@@ -343,6 +343,12 @@ async fn writer_death_fails_pending_acks_with_unavailable() {
 /// channel closes (new requests fail with `UNAVAILABLE`), the watchdog halts,
 /// and the shutdown path closes the ledger so pending durable acks resolve
 /// instead of hanging.
+///
+/// The fault threshold is deliberately small (25 loop events): the fault must
+/// fire within the load window even on a slow CI runner, or the process never
+/// exits and the test hangs. (The writer-death test uses 15 commands for the
+/// same reason.) It still lets a healthy burst of records be acknowledged and
+/// validated as durable before the batcher dies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batcher_death_fails_pending_acks_with_unavailable() {
     let dir = tempfile::tempdir().expect("temp data dir");
@@ -350,7 +356,7 @@ async fn batcher_death_fails_pending_acks_with_unavailable() {
         CrashServerConfig::new(dir.path().to_path_buf(), free_port(), SyncMode::Normal);
     config.fast_watchdog = true;
     config.shutdown_timeout = Duration::from_secs(5);
-    let mut server = spawn_server(&config, &[("OTEL_SQLITE_FAULT_BATCHER_AFTER_N", "300")]);
+    let mut server = spawn_server(&config, &[("OTEL_SQLITE_FAULT_BATCHER_AFTER_N", "25")]);
 
     let mut params = LoadParams::new("fault-batcher");
     params.duration = Duration::from_secs(10);
