@@ -27,6 +27,11 @@ pub const DEFAULT_METRICS_ADDRESS: &str = "127.0.0.1:8888";
 pub const DEFAULT_INGEST_QUEUE_CAPACITY: usize = 50_000;
 pub const MAX_INGEST_QUEUE_CAPACITY: usize = 1_000_000;
 pub const MAX_GRPC_RECV_MSG_SIZE: usize = 256 * 1024 * 1024;
+/// Upper bound accepted for `grpc_max_concurrent_streams` (M5). Streams are
+/// the global inbound-parallelism multiplier, so values above this need an
+/// explicit code change — not just a config edit — as justification that the
+/// host has the memory headroom (`streams * grpc_max_recv_msg_size`).
+pub const MAX_GRPC_CONCURRENT_STREAMS: u32 = 1_024;
 pub const MAX_BATCH_RECORDS: usize = 100_000;
 pub const MAX_RECORDS_PER_REQUEST: usize = 1_000_000;
 /// Minimum accepted `max_db_bytes` quota: below 1 MiB the writer would evict
@@ -207,8 +212,18 @@ impl Config {
             "grpc_max_concurrent_streams",
             self.grpc_max_concurrent_streams,
             1,
-            10_000,
+            MAX_GRPC_CONCURRENT_STREAMS,
         )?;
+        // Very large wire budgets multiply by the stream count into gigabytes
+        // of worst-case inbound buffering; make sure operators raising them
+        // past these marks see the cost in the logs (startup only).
+        if self.grpc_max_recv_msg_size > 64 * 1024 * 1024 {
+            tracing::warn!(
+                grpc_max_recv_msg_size = self.grpc_max_recv_msg_size,
+                grpc_max_concurrent_streams = self.grpc_max_concurrent_streams,
+                "large grpc_max_recv_msg_size multiplies by the stream count into GiB-scale inbound buffering; raise host memory accordingly",
+            );
+        }
         validate_range(
             "max_records_per_request",
             self.max_records_per_request,
@@ -1395,6 +1410,13 @@ mod tests {
             "grpc_max_concurrent_streams",
             Config {
                 grpc_max_concurrent_streams: 0,
+                ..Config::default()
+            }
+        );
+        assert_invalid!(
+            "grpc_max_concurrent_streams",
+            Config {
+                grpc_max_concurrent_streams: MAX_GRPC_CONCURRENT_STREAMS + 1,
                 ..Config::default()
             }
         );

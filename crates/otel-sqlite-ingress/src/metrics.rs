@@ -86,13 +86,21 @@ impl MetricsIngress {
 
         // CPU-heavy proto→model conversion runs on the blocking pool so this
         // tokio worker stays free to serve other streams while a large
-        // request maps.
+        // request maps. Bounded by MAPPING_TIMEOUT like the logs path, so a
+        // hostile request fails retryably instead of pinning its slot.
         let resource_metrics = request.resource_metrics;
-        let work = tokio::task::spawn_blocking(move || {
-            let _span = tracing::info_span!("map").entered();
-            map_chunks(resource_metrics)
-        })
+        let work = tokio::time::timeout(
+            crate::config::MAPPING_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                let _span = tracing::info_span!("map").entered();
+                map_chunks(resource_metrics)
+            }),
+        )
         .await
+        .map_err(|_| {
+            ::metrics::counter!("otlp_mapping_timeout_total", "signal" => "metrics").increment(1);
+            Status::unavailable("metrics mapping timed out")
+        })?
         .map_err(|error| Status::internal(format!("metrics mapping task failed: {error}")))?
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
 

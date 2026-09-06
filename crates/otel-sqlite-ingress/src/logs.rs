@@ -88,13 +88,23 @@ impl LogsIngress {
 
         // CPU-heavy proto→model conversion (attribute cloning, canonical
         // JSON) runs on the blocking pool so this tokio worker stays free
-        // to serve other streams while a large request maps.
+        // to serve other streams while a large request maps. Bounded by
+        // MAPPING_TIMEOUT so one hostile request cannot hold its stream slot
+        // (and blocking thread) indefinitely; timeouts answer UNAVAILABLE so
+        // exporters retry.
         let resource_logs = request.resource_logs;
-        let work = tokio::task::spawn_blocking(move || {
-            let _span = tracing::info_span!("map").entered();
-            map_chunks(resource_logs)
-        })
+        let work = tokio::time::timeout(
+            crate::config::MAPPING_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                let _span = tracing::info_span!("map").entered();
+                map_chunks(resource_logs)
+            }),
+        )
         .await
+        .map_err(|_| {
+            ::metrics::counter!("otlp_mapping_timeout_total", "signal" => "logs").increment(1);
+            Status::unavailable("log mapping timed out")
+        })?
         .map_err(|error| Status::internal(format!("log mapping task failed: {error}")))?
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
 

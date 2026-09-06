@@ -29,8 +29,20 @@ pub struct AuthConfig {
 /// backwards compatibility (see `socket_addr`), but it is never the default.
 pub const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:4317";
 pub const DEFAULT_MAX_RECV_MSG_SIZE: usize = 16 * 1024 * 1024;
-pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 256;
+/// Default cap on concurrent gRPC streams. This is the global backstop on
+/// inbound parallelism: worst-case in-flight request bytes are roughly
+/// `max_concurrent_streams * max_recv_msg_size` (64 * 16 MiB = 1 GiB at the
+/// defaults, before JSON/FTS/fingerprint expansion), so raise it only
+/// together with memory headroom. Per-request CPU/alloc inside that budget
+/// is bounded separately by the per-record caps below plus the mapping
+/// timeout.
+pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 64;
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Upper bound on one proto→model mapping task (M5). A wedged or hostile
+/// mapping job must fail its RPC instead of holding a stream slot (and a
+/// `spawn_blocking` thread) forever; the handler answers `UNAVAILABLE` so
+/// exporters retry.
+pub const MAPPING_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_RECORDS_PER_REQUEST: usize = 100_000;
 /// Per-record attribute cap: bounds the `attributes`/`metadata`/`filtered_attributes`
 /// vectors that ride on a single log record or metric data point (resource and
