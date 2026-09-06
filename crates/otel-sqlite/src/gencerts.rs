@@ -196,7 +196,7 @@ fn restrict_key_file(path: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("restrict permissions on {}", path.display()))?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(windows)]
     {

@@ -5,9 +5,9 @@
 #
 # Runner requirements (GitHub-hosted `ubuntu-latest` covers all of these):
 # * The pure-Rust jobs (`lint-and-test`, `crash-recovery-release`,
-#   `e2e-benchmark`, `cargo-deny`, `cargo-audit`) run inside a `rust:1.89-bookworm`
-#   container (pinned to the workspace `rust-version` 1.89.0; the production
-#   Dockerfile builds with the same image).
+#   `e2e-benchmark`, `cargo-deny`, `cargo-audit`) run inside a `rust:1.98-slim-bookworm`
+#   container (matching the local dev toolchain; the workspace MSRV stays at
+#   `rust-version` 1.89.0 and the production Dockerfile still builds on 1.89).
 # * The Docker jobs (`fuzz-smoke`, `fuzz-nightly`, `crash-e2e-container`,
 #   `container-smoke`) run on the host runner, which provides a working Docker
 #   daemon and `docker compose`.
@@ -35,7 +35,7 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.89-bookworm
+      image: rust:1.98-slim-bookworm
     steps:
       - name: Install git (slim image prerequisite for checkout)
         run: apt-get update -qq && apt-get install -y -qq git
@@ -74,7 +74,7 @@ jobs:
   crash-recovery-release:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.89-bookworm
+      image: rust:1.98-slim-bookworm
     steps:
       - name: Install git (slim image prerequisite for checkout)
         run: apt-get update -qq && apt-get install -y -qq git
@@ -114,7 +114,7 @@ jobs:
   e2e-benchmark:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.89-bookworm
+      image: rust:1.98-slim-bookworm
     steps:
       - name: Install git (slim image prerequisite for checkout)
         run: apt-get update -qq && apt-get install -y -qq git
@@ -154,7 +154,7 @@ jobs:
   cargo-deny:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.89-bookworm
+      image: rust:1.98-slim-bookworm
     steps:
       - name: Install git (slim image prerequisite for checkout)
         run: apt-get update -qq && apt-get install -y -qq git
