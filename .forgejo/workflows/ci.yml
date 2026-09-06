@@ -184,7 +184,7 @@ jobs:
   cargo-audit:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.89-bookworm
+      image: rust:1.98-slim-bookworm
     steps:
       - name: Install git (slim image prerequisite for checkout)
         run: apt-get update -qq && apt-get install -y -qq git
