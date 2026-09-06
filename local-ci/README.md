@@ -16,8 +16,8 @@ Docker jobs before a commit.
 | Any (Go) | `go install github.com/nektos/act@latest` |
 
 You also need a **running Docker daemon** (Docker Desktop / dockerd). act pulls
-the runner images on first use (the `catthehacker` image and `rust:1.89-bookworm`
-are large; the first run downloads them).
+the runner images on first use (the `catthehacker` image and
+`rust:1.98-slim-bookworm` are large; the first run downloads them).
 
 ## Usage
 

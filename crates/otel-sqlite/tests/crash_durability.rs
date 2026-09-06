@@ -430,9 +430,7 @@ async fn clean_shutdown_is_graceful_and_serving_flips() {
             "server did not exit within 30s of SIGTERM"
         );
         let serving = healthcheck_reports_serving(&server.endpoint);
-        if serving {
-            panic!("health must never report SERVING after SIGTERM");
-        }
+        assert!(!serving, "health must never report SERVING after SIGTERM");
         observed_not_serving = true;
         std::thread::sleep(Duration::from_millis(50));
     };
