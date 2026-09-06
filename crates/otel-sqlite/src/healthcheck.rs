@@ -46,9 +46,13 @@ fn derive_healthcheck_endpoint(config: &Config) -> String {
     };
     let listen = config.listen_address.trim();
     // Dial side: a wildcard or all-interfaces bind is reachable via loopback.
+    // IPv6 forms included: `[::]:port` is the v6 wildcard just as `0.0.0.0:`
+    // is the v4 one, and a bare `:port` expands the same way.
     let host_port = if let Some(port) = listen.strip_prefix(':') {
         format!("127.0.0.1:{port}")
     } else if let Some(rest) = listen.strip_prefix("0.0.0.0:") {
+        format!("127.0.0.1:{rest}")
+    } else if let Some(rest) = listen.strip_prefix("[::]:") {
         format!("127.0.0.1:{rest}")
     } else {
         listen.to_owned()
@@ -69,12 +73,7 @@ fn build_probe_tls(config: &Config) -> Option<ProbeTls> {
     let ca_pem = std::fs::read(ca_path)
         .with_context(|| format!("read healthcheck CA {}", ca_path.display()))
         .ok()?;
-    let domain_name = derive_healthcheck_endpoint(config)
-        .trim_start_matches("https://")
-        .split(':')
-        .next()
-        .unwrap_or("localhost")
-        .to_owned();
+    let domain_name = healthcheck_domain_name(&derive_healthcheck_endpoint(config));
     let identity = if tls.client_ca.is_some() {
         let cert = std::fs::read(&tls.cert).ok()?;
         let key = std::fs::read(&tls.key).ok()?;
@@ -87,6 +86,28 @@ fn build_probe_tls(config: &Config) -> Option<ProbeTls> {
         domain_name,
         identity,
     })
+}
+
+/// Host part of a derived `http(s)://host:port` endpoint for TLS server-name
+/// verification. Bracket-aware so IPv6 loopbacks (`[::1]:4317` → `::1`)
+/// verify against their IP SAN instead of degrading to garbage (`[`) or the
+/// `localhost` fallback.
+fn healthcheck_domain_name(endpoint: &str) -> String {
+    let host_port = endpoint
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    if let Some(bracketed) = host_port.strip_prefix('[') {
+        return bracketed
+            .split(']')
+            .next()
+            .unwrap_or("localhost")
+            .to_owned();
+    }
+    host_port
+        .split(':')
+        .next()
+        .unwrap_or("localhost")
+        .to_owned()
 }
 
 async fn probe_health(
@@ -126,4 +147,62 @@ async fn probe_health(
         .context("health check rpc failed")?
         .into_inner();
     Ok(ServingStatus::try_from(response.status).unwrap_or(ServingStatus::Unknown))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with(listen_address: &str, tls: bool) -> Config {
+        Config {
+            listen_address: listen_address.to_owned(),
+            tls: tls.then(|| otel_sqlite_ingress::TlsConfig {
+                cert: "server.pem".into(),
+                key: "server.key".into(),
+                client_ca: None,
+            }),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn wildcard_binds_probe_loopback() {
+        for listen in [":4317", "0.0.0.0:4317", "[::]:4317"] {
+            assert_eq!(
+                derive_healthcheck_endpoint(&config_with(listen, false)),
+                "http://127.0.0.1:4317",
+                "listen {listen}"
+            );
+            assert_eq!(
+                derive_healthcheck_endpoint(&config_with(listen, true)),
+                "https://127.0.0.1:4317",
+                "listen {listen} with TLS"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_binds_probe_themselves() {
+        assert_eq!(
+            derive_healthcheck_endpoint(&config_with("127.0.0.1:4317", false)),
+            "http://127.0.0.1:4317"
+        );
+        assert_eq!(
+            derive_healthcheck_endpoint(&config_with("[::1]:4317", false)),
+            "http://[::1]:4317"
+        );
+    }
+
+    #[test]
+    fn domain_name_handles_ipv6_brackets() {
+        assert_eq!(
+            healthcheck_domain_name("https://127.0.0.1:4317"),
+            "127.0.0.1"
+        );
+        assert_eq!(healthcheck_domain_name("https://[::1]:4317"), "::1");
+        assert_eq!(
+            healthcheck_domain_name("https://otel.internal:4317"),
+            "otel.internal"
+        );
+    }
 }
