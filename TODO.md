@@ -87,10 +87,10 @@ is either a real (bounded) discrepancy or a test-coverage gap.
   admission gate (`ingress/src/lib.rs`), contradicting the "waits outside the
   gate" doc. Bounded, not a deadlock; either wait outside the gate or correct
   the doc comment.
-- [ ] **Default listen stance (S).** `listen_address` defaults to `:4317` which
-  binds all interfaces; only `metrics_address` defaults to loopback. Decide:
-  bind loopback by default, or keep all-interfaces and make the documented
-  stance + startup warning the contract.
+
+Closed: **default listen stance** — `listen_address` now defaults to
+`127.0.0.1:4317` (loopback); a non-loopback bind without `[tls]` still prints
+the loud startup warning in `main.rs`.
 
 ### Test coverage gaps
 

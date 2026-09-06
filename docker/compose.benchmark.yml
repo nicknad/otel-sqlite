@@ -43,9 +43,11 @@ services:
     working_dir: /data
     environment:
       RUST_LOG: info
+      OTEL_SQLITE_CFG_PATH: /config/otel-sqlite.toml
     ports:
       - "4317:4317"
     volumes:
+      - ./benchmark/otel-sqlite.toml:/config/otel-sqlite.toml:ro
       - bench-data:/data
     restart: unless-stopped
     mem_limit: 700m

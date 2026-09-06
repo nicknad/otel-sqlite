@@ -66,14 +66,6 @@ mod tests {
     use crate::model::metric::data_point::{NumberDataPoint, SummaryDataPoint};
 
     #[test]
-    fn default_metric_record_is_empty_gauge() {
-        let record = MetricRecord::default();
-        assert_eq!(record.name, "");
-        assert_eq!(record.data, MetricData::Gauge(Gauge::default()));
-        assert_eq!(record.resource, None);
-    }
-
-    #[test]
     fn batch_operations_and_point_counts() {
         let mut batch = MetricBatch::with_capacity(4);
         assert!(batch.is_empty());

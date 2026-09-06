@@ -98,7 +98,17 @@ fn run_inner(
             Ok(command) => {
                 ::metrics::counter!("storage_commands_total", "kind" => command.kind())
                     .increment(1);
-                execute(&mut conn, command, ledger, stats)?;
+                // Depth *after* dequeue approximates the backlog that heavy
+                // maintenance would stall behind it.
+                let backlog = receiver.len();
+                // Size quota precedes the insert so an over-budget database
+                // evicts its oldest rows before accepting new ones.
+                if command.record_count() > 0
+                    && let Some(quota) = config.max_db_bytes
+                {
+                    enforce_quota(&mut conn, &config.sqlite_path, quota, stats);
+                }
+                execute(&mut conn, command, ledger, stats, backlog)?;
                 commands_processed += 1;
                 if let Some(limit) = fault_after
                     && commands_processed >= limit
@@ -132,6 +142,7 @@ fn execute(
     command: WriteCommand,
     ledger: &CommitLedger,
     stats: &WriterStats,
+    queue_backlog: usize,
 ) -> Result<(), StorageError> {
     match command {
         WriteCommand::InsertLogs(batch) => {
@@ -187,7 +198,7 @@ fn execute(
             stats.mark_progress();
         }
         WriteCommand::Maintenance(operation) => {
-            run_maintenance(conn, operation)?;
+            run_maintenance(conn, operation, queue_backlog)?;
             stats.maintenance_runs.fetch_add(1, Ordering::Relaxed);
             stats.mark_progress();
         }
@@ -362,7 +373,25 @@ fn finish_salvage(
 fn run_maintenance(
     conn: &mut Connection,
     operation: MaintenanceOperation,
+    queue_backlog: usize,
 ) -> Result<(), StorageError> {
+    // Heavy operations (full-file VACUUM, full FTS rebuild, large prunes)
+    // stall the single writer for seconds on GB databases. When ingestion is
+    // waiting, defer them to the next scheduler interval instead of stalling
+    // it: the scheduler re-enqueues on its own cadence.
+    if queue_backlog > MAINTENANCE_PRESSURE_SKIP_DEPTH && is_heavy_maintenance(&operation) {
+        ::metrics::counter!(
+            "storage_maintenance_deferred_total",
+            "operation" => maintenance_label(&operation)
+        )
+        .increment(1);
+        tracing::warn!(
+            operation = maintenance_label(&operation),
+            queue_backlog,
+            "deferring heavy maintenance; ingestion backlog present"
+        );
+        return Ok(());
+    }
     match operation {
         MaintenanceOperation::Analyze => maintenance::analyze(conn),
         MaintenanceOperation::Vacuum => maintenance::vacuum(conn),
@@ -394,5 +423,65 @@ fn run_maintenance(
             }
             Ok(())
         }
+    }
+}
+
+/// Best-effort size-quota enforcement ahead of an insert batch.
+///
+/// Deliberately non-fatal: a quota-check failure (unreadable file, locked
+/// database) must not reject ingestion — the insert itself surfaces real
+/// backend trouble through the normal retry/salvage policy. Enforcement
+/// evicts oldest-first so newest telemetry survives an over-budget database.
+fn enforce_quota(
+    conn: &mut Connection,
+    db_path: &std::path::Path,
+    quota_bytes: u64,
+    stats: &WriterStats,
+) {
+    let size = std::fs::metadata(db_path).map_or(0, |metadata| metadata.len());
+    if size <= quota_bytes {
+        return;
+    }
+    match maintenance::enforce_size_quota(conn, db_path, quota_bytes) {
+        Ok(report) => {
+            ::metrics::counter!("storage_quota_enforcements_total").increment(1);
+            stats.mark_progress();
+            tracing::warn!(
+                quota_bytes,
+                bytes_before = report.bytes_before,
+                bytes_after = report.bytes_after,
+                log_events = report.log_events,
+                metric_points = report.metric_points,
+                "database over size quota; evicted oldest rows",
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "size-quota enforcement failed; proceeding with insert"
+            );
+        }
+    }
+}
+
+/// Backlog depth above which heavy maintenance defers to the next scheduler
+/// interval instead of stalling ingestion behind a seconds-long exclusive op.
+const MAINTENANCE_PRESSURE_SKIP_DEPTH: usize = 1_000;
+/// Whether `operation` can stall the single writer long enough to matter.
+/// `Analyze` and disabled prunes are cheap and always run.
+fn is_heavy_maintenance(operation: &MaintenanceOperation) -> bool {
+    match operation {
+        MaintenanceOperation::Vacuum | MaintenanceOperation::RebuildFts => true,
+        MaintenanceOperation::Prune(policy) => policy.is_enabled(),
+        MaintenanceOperation::Analyze => false,
+    }
+}
+
+fn maintenance_label(operation: &MaintenanceOperation) -> &'static str {
+    match operation {
+        MaintenanceOperation::Analyze => "analyze",
+        MaintenanceOperation::Vacuum => "vacuum",
+        MaintenanceOperation::RebuildFts => "rebuild_fts",
+        MaintenanceOperation::Prune(_) => "prune",
     }
 }

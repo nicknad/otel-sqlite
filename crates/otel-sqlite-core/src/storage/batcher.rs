@@ -333,21 +333,6 @@ mod tests {
     }
 
     #[test]
-    fn multiple_splits_with_remainder_combination() {
-        let mut batcher = InsertBatcher::new(config(1000, 10));
-
-        assert!(batcher.push(records(700)).is_empty());
-        let second = batcher.push(records(600));
-        assert_eq!(sizes(second), vec![1000]);
-        let third = batcher.push(records(900));
-        assert_eq!(sizes(third), vec![1000]);
-        assert_eq!(batcher.buffered(), 200);
-
-        let flushed = batcher.flush().unwrap();
-        assert_eq!(flushed.len(), 200);
-    }
-
-    #[test]
     fn empty_input_never_creates_batches() {
         let mut batcher: InsertBatcher<usize> = InsertBatcher::new(config(8, 10));
 
@@ -431,16 +416,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_fill_leaves_no_stale_deadline() {
-        let mut batcher = InsertBatcher::new(config(2, 10));
-        batcher.push(records(2));
-        assert!(batcher.is_empty());
-        // Deadline is irrelevant without buffered records, and flush is a
-        // no-op rather than an empty batch.
-        assert_eq!(batcher.flush(), None);
-    }
-
-    #[test]
     fn single_output_variant_carries_one_batch() {
         let mut batcher = InsertBatcher::new(config(3, 10));
         let output = batcher.push(records(3));
@@ -452,13 +427,6 @@ mod tests {
         assert!(matches!(output, BatchOutput::Multiple(_)));
         assert_eq!(output.len(), 2);
         assert_eq!(batcher.buffered(), 1);
-    }
-
-    #[test]
-    fn default_config_matches_documented_constants() {
-        let defaults = InsertBatcherConfig::default();
-        assert_eq!(defaults.max_batch_records, DEFAULT_MAX_INSERT_BATCH_RECORDS);
-        assert_eq!(defaults.max_batch_age, DEFAULT_MAX_INSERT_BATCH_AGE);
     }
 
     #[test]

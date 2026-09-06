@@ -33,6 +33,7 @@ fn storage_config(db_path: std::path::PathBuf) -> StorageConfig {
         command_queue_capacity: 16,
         // Retention is enforced by the maintenance worker's schedule here.
         retention: None,
+        max_db_bytes: None,
         synchronous: SyncMode::Normal,
         startup_timeout: otel_sqlite_storage::DEFAULT_STARTUP_TIMEOUT,
         shutdown_timeout: otel_sqlite_storage::DEFAULT_SHUTDOWN_TIMEOUT,

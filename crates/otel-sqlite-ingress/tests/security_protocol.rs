@@ -13,7 +13,11 @@
 //!   by the `TokenFileVault` unit tests in `auth.rs`, which drive the same
 //!   hot-reload logic the live interceptor uses — a 5 s reload interval makes
 //!   a second-long integration wait untenable, so those stay at unit level);
-//! * a client certificate signed by the WRONG CA is rejected;
+//! * a client certificate signed by the WRONG CA is rejected, and — when
+//!   mTLS is mandatory — a connection without any client certificate never
+//!   completes an export;
+//! * mTLS and bearer-token interception stack: a trusted identity still
+//!   needs a valid token (`Unauthenticated` otherwise);
 //! * plaintext h2c against a TLS listener never completes an export;
 //! * the gRPC health service stays unauthenticated while the OTLP services
 //!   stay guarded, and the statuses track the readiness source;
@@ -681,6 +685,83 @@ async fn client_certificate_signed_by_the_wrong_ca_is_rejected() {
     assert!(
         !succeeded,
         "a client certificate signed by an untrusted CA must never connect"
+    );
+
+    server.shutdown().await;
+}
+
+/// mTLS and bearer-token interception apply *together* on the production
+/// wiring: a trusted identity still needs a valid token, and a connection
+/// without any client certificate never completes an export.
+#[tokio::test]
+async fn mtls_and_bearer_token_guard_the_ingress_together() {
+    let pki = Pki::generate();
+    let tokens = token_file(pki.dir.path(), &["good-token"]);
+    let config = IngressConfig {
+        listen_address: format!("127.0.0.1:{}", free_loopback_port()),
+        durability_mode: DurabilityMode::Enqueue,
+        tls: Some(TlsConfig {
+            cert: pki.path("server.pem"),
+            key: pki.path("server.key"),
+            client_ca: Some(pki.path("ca.pem")),
+        }),
+        auth: Some(AuthConfig {
+            token_file: tokens.clone(),
+        }),
+        ..IngressConfig::default()
+    };
+    let (queue, receiver) = channel(64);
+    let server = boot(
+        config,
+        queue,
+        receiver,
+        Arc::new(CommitLedger::new()),
+        Arc::new(AlwaysServing),
+    )
+    .await;
+
+    let ca = TlsCertificate::from_pem(std::fs::read(pki.path("ca.pem")).unwrap());
+
+    // Trusted identity + valid token: accepted.
+    let channel = Channel::builder(uri_for(server.addr, true))
+        .tls_config(
+            ClientTlsConfig::new()
+                .ca_certificate(ca.clone())
+                .domain_name("localhost")
+                .identity(Identity::from_pem(
+                    std::fs::read(pki.path("client.pem")).unwrap(),
+                    std::fs::read(pki.path("client.key")).unwrap(),
+                )),
+        )
+        .unwrap()
+        .connect()
+        .await
+        .expect("mTLS client connects");
+    let mut client = LogsServiceClient::new(channel);
+    let response = client
+        .export(bearer("good-token", "mtls-ok"))
+        .await
+        .expect("valid identity + valid token accepted");
+    assert!(response.into_inner().partial_success.is_none());
+
+    // Same identity, invalid token: the token check still applies.
+    let status = client
+        .export(bearer("bad-token", "mtls-bad"))
+        .await
+        .expect_err("invalid token rejected even with a valid identity");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    // No client certificate at all: the server refuses the handshake.
+    let succeeded = export_over_tls(
+        server.addr,
+        ClientTlsConfig::new()
+            .ca_certificate(ca)
+            .domain_name("localhost"),
+    )
+    .await;
+    assert!(
+        !succeeded,
+        "connections without a client certificate must never export under mTLS"
     );
 
     server.shutdown().await;

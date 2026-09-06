@@ -1,0 +1,5 @@
+# Stack-e2e sink overlay: the sidecar must accept cross-container OTLP from
+# the collector (otelcol -> otel-sqlite:4317). Since H1 the built-in default
+# listen_address is loopback-only; a non-loopback bind is an explicit opt-in,
+# exactly as intended for a container network peer.
+listen_address = "0.0.0.0:4317"

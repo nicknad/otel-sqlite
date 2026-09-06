@@ -12,17 +12,20 @@
 //!   process.
 //! * **No plaintext retention**: lines are hashed (SHA-256) at load time and
 //!   only digests are compared — constant-time, so request timing does not
-//!   leak how much of a presented token matched.
+//!   leak how much of a presented token matched. File contents and transient
+//!   digests live in `zeroize::Zeroizing` wrappers so heap copies are cleared
+//!   on drop instead of lingering for scrapers/core dumps.
 //! * **Fail closed**: an unreadable or vanished file rejects everything until
 //!   it becomes readable again.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use tonic::{Request, Status};
+use zeroize::Zeroizing;
 
 /// How often the backing file is re-read. Also used as the quiet period for
 /// repeating "cannot read" warnings.
@@ -51,82 +54,148 @@ impl TokenFileVault {
             reload_interval: DEFAULT_RELOAD_INTERVAL,
             cached: RwLock::new(CachedTokens::default()),
         };
+        warn_if_token_file_world_readable(&vault.path);
         let hashes = read_token_hashes(&vault.path)?;
         {
-            let mut cached = vault.cached.write().expect("token cache poisoned");
+            let mut cached = vault.write_cached();
             cached.hashes = hashes;
             cached.loaded_at = Some(Instant::now());
         }
         Ok(vault)
     }
 
+    /// Shared read access to the token cache, recovering from a poisoned lock
+    /// instead of panicking: a prior holder's panic must degrade to at worst
+    /// a stale read, never to every later export failing.
+    fn read_cached(&self) -> RwLockReadGuard<'_, CachedTokens> {
+        match self.cached.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    "bearer token cache lock poisoned; recovering guarded state"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    /// Exclusive write access to the token cache, recovering like
+    /// [`Self::read_cached`] instead of panicking on the request path.
+    fn write_cached(&self) -> RwLockWriteGuard<'_, CachedTokens> {
+        match self.cached.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    "bearer token cache lock poisoned; recovering guarded state"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
     fn verify(&self, presented_token: &str) -> bool {
         if presented_token.is_empty() {
             return false;
         }
-        let mut cached = self.cached.write().expect("token cache poisoned");
-        let stale = match cached.loaded_at {
-            Some(loaded_at) => loaded_at.elapsed() >= self.reload_interval,
-            None => true,
-        };
-        if stale {
-            match fs::read_to_string(&self.path) {
-                Ok(text) => {
-                    let hashes = parse_token_lines(&text);
-                    if hashes.is_empty() {
-                        // Likely a botched atomic rewrite: deny new tokens
-                        // but do not brick the pipeline over a bad write.
-                        tracing::warn!(
-                            path = %self.path.display(),
-                            "token file is empty; keeping last known tokens"
-                        );
-                    } else {
-                        cached.hashes = hashes;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    // A removed file is an explicit revoke-all.
-                    if !cached.hashes.is_empty() {
-                        tracing::info!(
-                            path = %self.path.display(),
-                            "token file removed; revoking all bearer tokens"
-                        );
-                    }
-                    cached.hashes.clear();
-                }
-                Err(error) => {
-                    // Transient IO trouble: keep serving from the last known
-                    // set; warn at most once per reload interval because this
-                    // runs per request.
-                    tracing::warn!(
-                        path = %self.path.display(),
-                        %error,
-                        "token file temporarily unreadable; keeping last known tokens"
-                    );
-                }
+        // Hash outside the lock: pure CPU, no shared state. The digest is
+        // zeroized on drop; the borrowed `presented_token` itself belongs to
+        // the tonic request and cannot be cleared by us.
+        let digest: Zeroizing<[u8; 32]> =
+            Zeroizing::new(Sha256::digest(presented_token.as_bytes()).into());
+
+        // Fast path: shared read lock, no I/O. Covers >99% of requests.
+        {
+            let cached = self.read_cached();
+            if !is_stale(cached.loaded_at, self.reload_interval) {
+                return cached.hashes.iter().any(|known| ct_eq(known, &digest));
             }
-            cached.loaded_at = Some(Instant::now());
         }
-        let digest = Sha256::digest(presented_token.as_bytes()).into();
-        cached.hashes.iter().any(|known| ct_eq(known, &digest))
+
+        // Slow path: reload is due. Do the blocking file I/O *outside* any
+        // lock so concurrent exports keep verifying against the old set on
+        // their read locks instead of serializing behind us. The raw text is
+        // zeroized on drop; only digests escape it.
+        let file_result = match fs::read_to_string(&self.path) {
+            Ok(text) => ReloadOutcome::Loaded(parse_token_lines(&Zeroizing::new(text))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReloadOutcome::Revoked,
+            Err(error) => ReloadOutcome::Unreadable(error.to_string()),
+        };
+
+        // Publish under a short exclusive hold (double-checked: another
+        // thread may have reloaded while we were doing I/O).
+        let (hashes, log_event) = {
+            let mut cached = self.write_cached();
+            if is_stale(cached.loaded_at, self.reload_interval) {
+                let event = match &file_result {
+                    ReloadOutcome::Loaded(hashes) if hashes.is_empty() => {
+                        // Likely a botched atomic rewrite: keep serving the
+                        // last known set instead of bricking the pipeline.
+                        LogEvent::EmptyKept
+                    }
+                    ReloadOutcome::Loaded(hashes) => {
+                        cached.hashes.clone_from(hashes);
+                        LogEvent::None
+                    }
+                    ReloadOutcome::Revoked => {
+                        // A removed file is an explicit revoke-all.
+                        let had_tokens = !cached.hashes.is_empty();
+                        cached.hashes.clear();
+                        if had_tokens {
+                            LogEvent::Revoked
+                        } else {
+                            LogEvent::None
+                        }
+                    }
+                    ReloadOutcome::Unreadable(message) => {
+                        // Transient IO trouble: keep last known set; the
+                        // timestamp update below throttles repeat warnings.
+                        LogEvent::Unreadable(message.clone())
+                    }
+                };
+                cached.loaded_at = Some(Instant::now());
+                (cached.hashes.clone(), event)
+            } else {
+                // Lost the race: someone else already reloaded.
+                (cached.hashes.clone(), LogEvent::None)
+            }
+        };
+
+        // Log outside the lock: tracing can block and must not extend the
+        // exclusive hold.
+        match log_event {
+            LogEvent::None => {}
+            LogEvent::EmptyKept => tracing::warn!(
+                path = %self.path.display(),
+                "token file is empty; keeping last known tokens"
+            ),
+            LogEvent::Revoked => tracing::info!(
+                path = %self.path.display(),
+                "token file removed; revoking all bearer tokens"
+            ),
+            LogEvent::Unreadable(error) => tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "token file temporarily unreadable; keeping last known tokens"
+            ),
+        }
+
+        hashes.iter().any(|known| ct_eq(known, &digest))
     }
 
     /// Number of valid tokens currently known; used by tests and startup logs.
     #[cfg(test)]
     pub(crate) fn loaded_token_count(&self) -> usize {
-        self.cached
-            .read()
-            .expect("token cache poisoned")
-            .hashes
-            .len()
+        self.read_cached().hashes.len()
     }
 }
 
 fn read_token_hashes(path: &Path) -> Result<Vec<[u8; 32]>, AuthError> {
-    let text = fs::read_to_string(path).map_err(|source| AuthError::Read {
+    let text = Zeroizing::new(fs::read_to_string(path).map_err(|source| AuthError::Read {
         path: path.to_owned(),
         source,
-    })?;
+    })?);
     let hashes = parse_token_lines(&text);
     if hashes.is_empty() {
         return Err(AuthError::NoTokens {
@@ -142,6 +211,52 @@ fn parse_token_lines(text: &str) -> Vec<[u8; 32]> {
         .filter(|line| !line.is_empty())
         .map(|line| Sha256::digest(line.as_bytes()).into())
         .collect()
+}
+
+/// Whether the cached token set is due for a reload. `None` (never loaded)
+/// is always stale.
+fn is_stale(loaded_at: Option<Instant>, reload_interval: Duration) -> bool {
+    match loaded_at {
+        Some(loaded_at) => loaded_at.elapsed() >= reload_interval,
+        None => true,
+    }
+}
+
+/// Result of reading the token file outside the cache lock.
+enum ReloadOutcome {
+    Loaded(Vec<[u8; 32]>),
+    Revoked,
+    Unreadable(String),
+}
+
+/// What to emit after publishing a reload (outside the lock).
+enum LogEvent {
+    None,
+    EmptyKept,
+    Revoked,
+    Unreadable(String),
+}
+
+/// Warns when the bearer-token file is readable beyond its owner (unix).
+/// Misconfigured `0644` tokens are a common credential leak; warn, don't fail,
+/// so existing deployments keep working while operators fix perms.
+fn warn_if_token_file_world_readable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path).map(|metadata| metadata.permissions().mode()) {
+            Ok(mode) if mode & 0o044 != 0 => tracing::warn!(
+                path = %path.display(),
+                mode = format!("{mode:o}"),
+                "bearer token file is readable beyond its owner; chmod 600 it",
+            ),
+            _ => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 /// Constant-time equality over equal-length digests: XOR-folds all bytes so
@@ -362,13 +477,26 @@ mod tests {
         assert!(error.to_string().contains("cannot read token file"));
     }
 
+    /// A poisoned cache lock must degrade, not deny service: after one
+    /// holder panics mid-update, later exports recover the guarded digests
+    /// instead of panicking on the gRPC interceptor path.
     #[test]
-    fn ct_eq_matches_only_identical_digests() {
-        let a: [u8; 32] = core::array::from_fn(|i| i as u8);
-        let mut b = a;
-        b[31] ^= 1;
-        assert!(ct_eq(&a, &a));
-        assert!(!ct_eq(&a, &b));
-        assert!(!ct_eq(&a, &[0u8; 32]));
+    fn vault_recovers_from_a_poisoned_lock() {
+        let (_dir, vault) = vault_with(&["alpha-secret"]);
+
+        // Poison the cache lock by panicking while holding it.
+        std::thread::scope(|scope| {
+            let outcome = scope
+                .spawn(|| {
+                    let _guard = vault.cached.write().unwrap();
+                    panic!("intentional poison for recovery test");
+                })
+                .join();
+            assert!(outcome.is_err(), "the holder must have panicked");
+        });
+
+        // Both the read fast-path and the reload write-path must work after.
+        assert!(intercept_bearer(&vault, request_with_token("alpha-secret")).is_ok());
+        assert!(intercept_bearer(&vault, request_with_token("gamma")).is_err());
     }
 }

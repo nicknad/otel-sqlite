@@ -2,8 +2,18 @@
 
 use otel_sqlite_core::model::{Attribute, AttributeValue, Resource};
 
+use crate::error::IngressError;
 use crate::mapping::pb::common::v1::{AnyValue, KeyValue, any_value::Value as AnyValueKind};
 use crate::mapping::pb::resource::v1::Resource as ProtoResource;
+
+/// Maximum nesting depth for `ArrayValue`/`KvlistValue` structures (H3).
+///
+/// OTLP `AnyValue` is recursively defined; without a bound a single record
+/// carrying thousands of nested `ArrayValue(ArrayValue(...))` overflows the
+/// `spawn_blocking` worker stack and aborts the whole process (not just the
+/// RPC). Legitimate telemetry nests a handful of levels deep; 32 is generous
+/// while keeping stack use bounded (~32 frames of a small converter).
+pub(crate) const MAX_NESTING_DEPTH: usize = 32;
 
 /// Why a trace/span id present in the request cannot be mapped.
 ///
@@ -53,50 +63,106 @@ fn parse_id<const N: usize>(value: Vec<u8>) -> Result<Option<[u8; N]>, IdError> 
     Ok(Some(id))
 }
 
-pub(crate) fn attribute_value(value: AnyValue) -> AttributeValue {
+pub(crate) fn attribute_value(value: AnyValue) -> Result<AttributeValue, IngressError> {
+    attribute_value_with_depth(value, 0)
+}
+
+fn attribute_value_with_depth(
+    value: AnyValue,
+    depth: usize,
+) -> Result<AttributeValue, IngressError> {
     match value.value {
-        Some(AnyValueKind::StringValue(value)) => AttributeValue::String(value),
-        Some(AnyValueKind::IntValue(value)) => AttributeValue::Int(value),
-        Some(AnyValueKind::DoubleValue(value)) => AttributeValue::Double(value),
-        Some(AnyValueKind::BoolValue(value)) => AttributeValue::Bool(value),
-        Some(AnyValueKind::BytesValue(value)) => AttributeValue::Bytes(value),
+        Some(AnyValueKind::StringValue(value)) => Ok(AttributeValue::String(value)),
+        Some(AnyValueKind::IntValue(value)) => Ok(AttributeValue::Int(value)),
+        Some(AnyValueKind::DoubleValue(value)) => Ok(AttributeValue::Double(value)),
+        Some(AnyValueKind::BoolValue(value)) => Ok(AttributeValue::Bool(value)),
+        Some(AnyValueKind::BytesValue(value)) => Ok(AttributeValue::Bytes(value)),
         // Nested structures are preserved as model values; the canonical JSON
         // rendering is owned by the core model so ingress (structured bodies)
         // and storage (nested attribute values) persist byte-identical output.
+        // Depth is enforced before recursing so a hostile nesting chain fails
+        // as `INVALID_ARGUMENT` instead of overflowing the worker stack.
         Some(AnyValueKind::ArrayValue(array)) => {
-            AttributeValue::Array(array.values.into_iter().map(attribute_value).collect())
+            if depth >= MAX_NESTING_DEPTH {
+                return Err(IngressError::Mapping(format!(
+                    "attribute value exceeds maximum nesting depth of {MAX_NESTING_DEPTH}"
+                )));
+            }
+            array
+                .values
+                .into_iter()
+                .map(|nested| attribute_value_with_depth(nested, depth + 1))
+                .collect::<Result<Vec<_>, _>>()
+                .map(AttributeValue::Array)
         }
-        Some(AnyValueKind::KvlistValue(list)) => AttributeValue::Kvlist(
+        Some(AnyValueKind::KvlistValue(list)) => {
+            if depth >= MAX_NESTING_DEPTH {
+                return Err(IngressError::Mapping(format!(
+                    "attribute value exceeds maximum nesting depth of {MAX_NESTING_DEPTH}"
+                )));
+            }
             list.values
                 .into_iter()
-                .map(|KeyValue { key, value, .. }| Attribute {
-                    key,
-                    value: attribute_value(value.unwrap_or_default()),
+                .map(|KeyValue { key, value, .. }| {
+                    Ok(Attribute {
+                        key,
+                        value: attribute_value_with_depth(value.unwrap_or_default(), depth + 1)?,
+                    })
                 })
-                .collect(),
-        ),
+                .collect::<Result<Vec<_>, IngressError>>()
+                .map(AttributeValue::Kvlist)
+        }
         // Profiling-only `string_value_strindex` and empty AnyValues carry no
         // non-Profiling semantic content (per the proto); they map to null.
-        _ => AttributeValue::Null,
+        _ => Ok(AttributeValue::Null),
     }
 }
 
-pub(crate) fn attributes(values: Vec<KeyValue>) -> Vec<Attribute> {
+pub(crate) fn attributes(values: Vec<KeyValue>) -> Result<Vec<Attribute>, IngressError> {
     values
         .into_iter()
-        .map(|KeyValue { key, value, .. }| Attribute {
-            key,
-            value: attribute_value(value.unwrap_or_default()),
+        .map(|KeyValue { key, value, .. }| {
+            Ok(Attribute {
+                key,
+                value: attribute_value(value.unwrap_or_default())?,
+            })
         })
         .collect()
 }
 
-impl From<ProtoResource> for Resource {
-    fn from(value: ProtoResource) -> Self {
-        Self {
-            id: String::new(),
-            attributes: attributes(value.attributes),
-            schema_url: String::new(),
+/// Non-allocating depth probe over a borrowed `AnyValue`: returns the deepest
+/// nesting level without building any model values. Implemented iteratively
+/// with an explicit stack so the probe itself cannot overflow on hostile input
+/// (the converting path above is only reached after the request-level
+/// validator has already rejected over-deep payloads).
+pub(crate) fn any_value_depth(value: &AnyValue) -> usize {
+    let mut deepest = 0usize;
+    let mut stack: Vec<(&AnyValue, usize)> = vec![(value, 0)];
+    while let Some((current, depth)) = stack.pop() {
+        deepest = deepest.max(depth);
+        match &current.value {
+            Some(AnyValueKind::ArrayValue(array)) => {
+                for nested in &array.values {
+                    stack.push((nested, depth + 1));
+                }
+            }
+            Some(AnyValueKind::KvlistValue(list)) => {
+                for entry in &list.values {
+                    if let Some(nested) = entry.value.as_ref() {
+                        stack.push((nested, depth + 1));
+                    }
+                }
+            }
+            _ => {}
         }
     }
+    deepest
+}
+
+pub(crate) fn convert_resource(value: ProtoResource) -> Result<Resource, IngressError> {
+    Ok(Resource {
+        id: String::new(),
+        attributes: attributes(value.attributes)?,
+        schema_url: String::new(),
+    })
 }

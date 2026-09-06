@@ -180,16 +180,65 @@ fn sanitize_client_name(name: &str) -> Result<()> {
 
 fn write_pem(path: &Path, contents: &str) -> Result<()> {
     std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if path.extension().is_some_and(|ext| ext == "key") {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("restrict permissions on {}", path.display()))?;
-        }
+    if path.extension().is_some_and(|ext| ext == "key") {
+        restrict_key_file(path)?;
     }
     println!("wrote {}", path.display());
     Ok(())
+}
+
+/// Owner-only restriction for private keys: `0o600` on unix, `icacls`
+/// hardening on Windows (best-effort warn, never fails generation).
+#[allow(clippy::unnecessary_wraps)] // Windows/bare-metal arms always succeed by design
+fn restrict_key_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restrict permissions on {}", path.display()))?;
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        if user.is_empty() {
+            eprintln!(
+                "warning: cannot determine USERNAME; key {} may inherit permissive ACLs; restrict it manually",
+                path.display()
+            );
+            return Ok(());
+        }
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("{user}:F"))
+            .arg("*S-1-5-18:F")
+            .arg("*S-1-5-32-544:F")
+            .status();
+        match status {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => {
+                eprintln!(
+                    "warning: icacls exited {status} for {}; restrict key ACLs manually",
+                    path.display()
+                );
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: icacls unavailable ({error}); key {} may inherit permissive ACLs",
+                    path.display()
+                );
+                Ok(())
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

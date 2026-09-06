@@ -68,8 +68,18 @@ fn proto_record(seq: u64, attributes_per_record: usize) -> ProtoLogRecord {
         observed_time_unix_nano: 1_700_000_000_000_000_001 + seq,
         severity_number: SeverityNumber::Info as i32,
         severity_text: "INFO".to_owned(),
-        trace_id: vec![(seq & 0xff) as u8; 16],
-        span_id: vec![(seq & 0xff) as u8; 8],
+        // Never all-zeroes: OTLP mapping rejects all-zero trace and span ids,
+        // and seq=0 (used by the smallest sweep size) must stay a valid request.
+        trace_id: {
+            let mut id = vec![(seq & 0xff) as u8; 16];
+            id[0] |= 1;
+            id
+        },
+        span_id: {
+            let mut id = vec![(seq & 0xff) as u8; 8];
+            id[0] |= 1;
+            id
+        },
         body: Some(any(Value::StringValue(format!(
             "seq={seq} {BODY_TEMPLATE}"
         )))),

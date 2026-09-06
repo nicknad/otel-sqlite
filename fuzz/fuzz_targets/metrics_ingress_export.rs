@@ -11,7 +11,7 @@
 use std::sync::{Arc, LazyLock};
 
 use libfuzzer_sys::fuzz_target;
-use otel_sqlite_core::storage::{CommitLedger, IngestMessage};
+use otel_sqlite_core::storage::{CommitLedger, DurabilityMode, IngestMessage};
 use otel_sqlite_ingress::pb::collector::metrics::v1::{
     ExportMetricsServiceRequest, metrics_service_server::MetricsService,
 };
@@ -33,6 +33,11 @@ fuzz_target!(|data: &[u8]| {
     let (sender, receiver) = otel_sqlite_ingress::channel(16);
     let config = Arc::new(IngressConfig {
         max_records_per_request: 100_000,
+        // No storage pipeline runs inside the harness: in the default
+        // `Commit` mode every accepted request would wait forever on a
+        // durable-ack that never arrives. Acknowledge on enqueue instead so
+        // the decode->validate->map->enqueue surface is what is exercised.
+        durability_mode: DurabilityMode::Enqueue,
         ..IngressConfig::default()
     });
     let ingress = MetricsIngress::new(sender, config, Arc::new(CommitLedger::new()));

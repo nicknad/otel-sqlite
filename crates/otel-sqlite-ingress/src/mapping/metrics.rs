@@ -7,10 +7,13 @@ use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, MetricChunk};
 
 use crate::error::IngressError;
 
-use super::pb::common::v1::InstrumentationScope;
+use super::pb::common::v1::{AnyValue, InstrumentationScope, KeyValue};
 use super::pb::metrics::v1 as proto;
 use super::pb::metrics::v1::{ResourceMetrics, ScopeMetrics};
-use super::{Resource, attributes, parse_span_id, parse_trace_id};
+use super::{
+    MAX_NESTING_DEPTH, any_value_depth, attributes, convert_resource, parse_span_id, parse_trace_id,
+};
+use crate::config::IngressConfig;
 
 /// Fallible proto → model conversion of one `ResourceMetrics` group.
 ///
@@ -30,7 +33,7 @@ pub fn try_convert_batch(value: ResourceMetrics) -> Result<MetricBatch, IngressE
         .sum();
     let mut batch = MetricBatch::with_capacity(capacity);
 
-    let mut resource = resource.map(Resource::from);
+    let mut resource = resource.map(convert_resource).transpose()?;
     if let Some(resource) = &mut resource {
         resource.schema_url.clone_from(&schema_url);
     }
@@ -52,7 +55,7 @@ pub fn try_convert_batch(value: ResourceMetrics) -> Result<MetricBatch, IngressE
                  }| (name, version, attributes),
             )
             .unwrap_or_default();
-        let scope_attributes = attributes(scope_attributes);
+        let scope_attributes = attributes(scope_attributes)?;
         for metric in metrics {
             if let Some(record) = convert_metric(
                 metric,
@@ -77,6 +80,225 @@ pub(crate) fn count(resource_metrics: &[ResourceMetrics]) -> usize {
         .flat_map(|scope| scope.metrics.iter())
         .map(metric_point_count)
         .sum()
+}
+
+/// Pre-mapping size guard (H2): walks the borrowed request without allocating
+/// model values and rejects hostile shapes with `INVALID_ARGUMENT` *before*
+/// the blocking mapping task runs.
+///
+/// Checked per `IngressConfig` limits: attribute-vector lengths, key/value
+/// byte lengths, `AnyValue` nesting depth (non-recursive probe), bucket /
+/// quantile / exemplar counts. Exemplar id *validity* stays in
+/// `try_convert_batch`; this only bounds allocation/CPU.
+pub(crate) fn validate_request(
+    resource_metrics: &[ResourceMetrics],
+    limits: &IngressConfig,
+) -> Result<(), IngressError> {
+    for group in resource_metrics {
+        if let Some(resource) = group.resource.as_ref() {
+            check_attributes(&resource.attributes, limits, "resource.attributes")?;
+        }
+        for scope in &group.scope_metrics {
+            if let Some(s) = scope.scope.as_ref() {
+                check_attributes(&s.attributes, limits, "scope.attributes")?;
+                check_plain_string(&s.name, limits, "scope.name")?;
+                check_plain_string(&s.version, limits, "scope.version")?;
+            }
+            for metric in &scope.metrics {
+                check_plain_string(&metric.name, limits, "metric.name")?;
+                check_plain_string(&metric.description, limits, "metric.description")?;
+                check_plain_string(&metric.unit, limits, "metric.unit")?;
+                check_attributes(&metric.metadata, limits, "metric.metadata")?;
+                if let Some(data) = metric.data.as_ref() {
+                    check_data(data, limits)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_data(data: &proto::metric::Data, limits: &IngressConfig) -> Result<(), IngressError> {
+    use proto::metric::Data;
+    match data {
+        Data::Gauge(gauge) => {
+            for point in &gauge.data_points {
+                check_attributes(&point.attributes, limits, "point.attributes")?;
+                check_exemplars(&point.exemplars, limits)?;
+            }
+        }
+        Data::Sum(sum) => {
+            for point in &sum.data_points {
+                check_attributes(&point.attributes, limits, "point.attributes")?;
+                check_exemplars(&point.exemplars, limits)?;
+            }
+        }
+        Data::Histogram(histogram) => {
+            for point in &histogram.data_points {
+                check_attributes(&point.attributes, limits, "point.attributes")?;
+                check_exemplars(&point.exemplars, limits)?;
+                if point.bucket_counts.len() > limits.max_buckets_per_point {
+                    return Err(IngressError::Mapping(format!(
+                        "histogram bucket_counts holds {} entries, limit is {}",
+                        point.bucket_counts.len(),
+                        limits.max_buckets_per_point
+                    )));
+                }
+                if point.explicit_bounds.len() > limits.max_buckets_per_point {
+                    return Err(IngressError::Mapping(format!(
+                        "histogram explicit_bounds holds {} entries, limit is {}",
+                        point.explicit_bounds.len(),
+                        limits.max_buckets_per_point
+                    )));
+                }
+            }
+        }
+        Data::ExponentialHistogram(histogram) => {
+            for point in &histogram.data_points {
+                check_attributes(&point.attributes, limits, "point.attributes")?;
+                check_exemplars(&point.exemplars, limits)?;
+                for (what, buckets) in [
+                    ("positive", point.positive.as_ref()),
+                    ("negative", point.negative.as_ref()),
+                ] {
+                    if let Some(b) = buckets
+                        && b.bucket_counts.len() > limits.max_buckets_per_point
+                    {
+                        return Err(IngressError::Mapping(format!(
+                            "exponential histogram {what} holds {} buckets, limit is {}",
+                            b.bucket_counts.len(),
+                            limits.max_buckets_per_point
+                        )));
+                    }
+                }
+            }
+        }
+        Data::Summary(summary) => {
+            for point in &summary.data_points {
+                check_attributes(&point.attributes, limits, "point.attributes")?;
+                // No exemplars on Summary in the pinned proto; quantile count
+                // reuses the bucket bound (typical summaries carry <10).
+                if point.quantile_values.len() > limits.max_buckets_per_point {
+                    return Err(IngressError::Mapping(format!(
+                        "summary quantile_values holds {} entries, limit is {}",
+                        point.quantile_values.len(),
+                        limits.max_buckets_per_point
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_exemplars(values: &[proto::Exemplar], limits: &IngressConfig) -> Result<(), IngressError> {
+    if values.len() > limits.max_exemplars_per_point {
+        return Err(IngressError::Mapping(format!(
+            "point holds {} exemplars, limit is {}",
+            values.len(),
+            limits.max_exemplars_per_point
+        )));
+    }
+    for exemplar in values {
+        check_attributes(
+            &exemplar.filtered_attributes,
+            limits,
+            "exemplar.filtered_attributes",
+        )?;
+    }
+    Ok(())
+}
+
+fn check_attributes(
+    values: &[KeyValue],
+    limits: &IngressConfig,
+    what: &str,
+) -> Result<(), IngressError> {
+    if values.len() > limits.max_attributes_per_record {
+        return Err(IngressError::Mapping(format!(
+            "{what} holds {} attributes, limit is {}",
+            values.len(),
+            limits.max_attributes_per_record
+        )));
+    }
+    for entry in values {
+        if entry.key.len() > limits.max_attribute_key_bytes {
+            return Err(IngressError::Mapping(format!(
+                "{what} key exceeds {} bytes (limit {})",
+                entry.key.len(),
+                limits.max_attribute_key_bytes
+            )));
+        }
+        if let Some(value) = entry.value.as_ref() {
+            check_any_value(value, limits, what)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_any_value(
+    value: &AnyValue,
+    limits: &IngressConfig,
+    what: &str,
+) -> Result<(), IngressError> {
+    if any_value_depth(value) > MAX_NESTING_DEPTH {
+        return Err(IngressError::Mapping(format!(
+            "{what} exceeds maximum nesting depth of {MAX_NESTING_DEPTH}"
+        )));
+    }
+    let mut stack: Vec<&AnyValue> = vec![value];
+    while let Some(current) = stack.pop() {
+        match &current.value {
+            Some(super::AnyValueKind::StringValue(s)) => {
+                if s.len() > limits.max_attribute_value_bytes {
+                    return Err(IngressError::Mapping(format!(
+                        "{what} string value exceeds {} bytes (limit {})",
+                        s.len(),
+                        limits.max_attribute_value_bytes
+                    )));
+                }
+            }
+            Some(super::AnyValueKind::BytesValue(b)) => {
+                if b.len() > limits.max_attribute_value_bytes {
+                    return Err(IngressError::Mapping(format!(
+                        "{what} bytes value exceeds {} bytes (limit {})",
+                        b.len(),
+                        limits.max_attribute_value_bytes
+                    )));
+                }
+            }
+            Some(super::AnyValueKind::ArrayValue(array)) => {
+                stack.extend(array.values.iter());
+            }
+            Some(super::AnyValueKind::KvlistValue(list)) => {
+                for entry in &list.values {
+                    if entry.key.len() > limits.max_attribute_key_bytes {
+                        return Err(IngressError::Mapping(format!(
+                            "{what} nested key exceeds {} bytes (limit {})",
+                            entry.key.len(),
+                            limits.max_attribute_key_bytes
+                        )));
+                    }
+                    if let Some(nested) = entry.value.as_ref() {
+                        stack.push(nested);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_plain_string(value: &str, limits: &IngressConfig, what: &str) -> Result<(), IngressError> {
+    if value.len() > limits.max_attribute_value_bytes {
+        return Err(IngressError::Mapping(format!(
+            "{what} exceeds {} bytes (limit {})",
+            value.len(),
+            limits.max_attribute_value_bytes
+        )));
+    }
+    Ok(())
 }
 
 /// Maps an OTLP metrics export request into mapped metric chunks, one per
@@ -142,7 +364,7 @@ fn convert_metric(
             name,
             description,
             unit,
-            metadata: attributes(metadata),
+            metadata: attributes(metadata)?,
             data: convert_data(data)?,
             resource_id: String::new(),
             resource: None,
@@ -208,7 +430,7 @@ fn convert_data(value: proto::metric::Data) -> Result<MetricData, IngressError> 
                 .data_points
                 .into_iter()
                 .map(convert_summary_point)
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
         }),
     })
 }
@@ -247,7 +469,7 @@ fn exemplars(values: Vec<proto::Exemplar>) -> Result<Vec<Exemplar>, IngressError
         let span_id = parse_span_id(span_id)
             .map_err(|error| IngressError::Mapping(format!("invalid exemplar span id: {error}")))?;
         exemplars.push(Exemplar {
-            filtered_attributes: attributes(filtered_attributes),
+            filtered_attributes: attributes(filtered_attributes)?,
             time_unix_nano: time_unix_nano as i64,
             value: match value {
                 Some(proto::exemplar::Value::AsDouble(value)) => Some(NumberValue::Double(value)),
@@ -272,7 +494,7 @@ fn convert_number_point(value: proto::NumberDataPoint) -> Result<NumberDataPoint
     } = value;
 
     Ok(NumberDataPoint {
-        attributes: attributes(point_attributes),
+        attributes: attributes(point_attributes)?,
         start_time_unix_nano: start_time_unix_nano as i64,
         time_unix_nano: time_unix_nano as i64,
         value: value.map(number_value),
@@ -306,7 +528,7 @@ fn convert_histogram_point(
     } = value;
 
     Ok(HistogramDataPoint {
-        attributes: attributes(point_attributes),
+        attributes: attributes(point_attributes)?,
         start_time_unix_nano: start_time_unix_nano as i64,
         time_unix_nano: time_unix_nano as i64,
         count,
@@ -341,7 +563,7 @@ fn convert_exponential_histogram_point(
     } = value;
 
     Ok(ExponentialHistogramDataPoint {
-        attributes: attributes(point_attributes),
+        attributes: attributes(point_attributes)?,
         start_time_unix_nano: start_time_unix_nano as i64,
         time_unix_nano: time_unix_nano as i64,
         count,
@@ -369,7 +591,7 @@ fn convert_bucket(value: proto::exponential_histogram_data_point::Buckets) -> Ex
     }
 }
 
-fn convert_summary_point(value: proto::SummaryDataPoint) -> SummaryDataPoint {
+fn convert_summary_point(value: proto::SummaryDataPoint) -> Result<SummaryDataPoint, IngressError> {
     let proto::SummaryDataPoint {
         attributes: point_attributes,
         start_time_unix_nano,
@@ -380,8 +602,8 @@ fn convert_summary_point(value: proto::SummaryDataPoint) -> SummaryDataPoint {
         flags,
     } = value;
 
-    SummaryDataPoint {
-        attributes: attributes(point_attributes),
+    Ok(SummaryDataPoint {
+        attributes: attributes(point_attributes)?,
         start_time_unix_nano: start_time_unix_nano as i64,
         time_unix_nano: time_unix_nano as i64,
         count,
@@ -398,7 +620,7 @@ fn convert_summary_point(value: proto::SummaryDataPoint) -> SummaryDataPoint {
         // the model field stays for forward compatibility and the storage
         // column remains `NULL` for summary points.
         exemplars: Vec::new(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -407,7 +629,7 @@ fn convert_summary_point(value: proto::SummaryDataPoint) -> SummaryDataPoint {
 mod tests {
     use super::*;
     use crate::mapping::pb::common::v1::{
-        AnyValue, InstrumentationScope, KeyValue, any_value::Value,
+        AnyValue, ArrayValue, InstrumentationScope, KeyValue, any_value::Value,
     };
     use crate::mapping::pb::metrics::v1::{
         AggregationTemporality, Exemplar as ProtoExemplar,
@@ -905,5 +1127,200 @@ mod tests {
         assert!(map_chunks(vec![metric_with_exemplar(vec![8; 16], vec![1])]).is_err());
         assert!(map_chunks(vec![metric_with_exemplar(vec![0; 16], vec![])]).is_err());
         assert!(map_chunks(vec![metric_with_exemplar(vec![], vec![])]).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_histogram_bucket_and_bound_caps() {
+        let group = |data: proto::metric::Data| ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![metric("hist", data)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let limits = IngressConfig {
+            max_buckets_per_point: 3,
+            ..IngressConfig::default()
+        };
+
+        let big_counts = proto::metric::Data::Histogram(proto::Histogram {
+            data_points: vec![ProtoHistPoint {
+                bucket_counts: vec![1, 2, 3, 4],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(
+            validate_request(&[group(big_counts)], &limits).is_err(),
+            "bucket_counts above the cap must be rejected"
+        );
+
+        let big_bounds = proto::metric::Data::Histogram(proto::Histogram {
+            data_points: vec![ProtoHistPoint {
+                explicit_bounds: vec![0.1, 0.2, 0.3, 0.4],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(
+            validate_request(&[group(big_bounds)], &limits).is_err(),
+            "explicit_bounds above the cap must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_exponential_histogram_bucket_caps() {
+        let group = |data: proto::metric::Data| ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![metric("exp", data)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let limits = IngressConfig {
+            max_buckets_per_point: 2,
+            ..IngressConfig::default()
+        };
+
+        let over = proto::metric::Data::ExponentialHistogram(proto::ExponentialHistogram {
+            data_points: vec![ProtoExpPoint {
+                positive: Some(Buckets {
+                    bucket_counts: vec![1, 2, 3],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(
+            validate_request(&[group(over)], &limits).is_err(),
+            "positive buckets above the cap must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_summary_quantile_cap() {
+        let group = ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![metric(
+                    "summary",
+                    proto::metric::Data::Summary(proto::Summary {
+                        data_points: vec![ProtoSummaryPoint {
+                            quantile_values: (0..5)
+                                .map(|i| ValueAtQuantile {
+                                    quantile: i as f64 / 10.0,
+                                    value: 1.0,
+                                })
+                                .collect(),
+                            ..Default::default()
+                        }],
+                    }),
+                )],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let limits = IngressConfig {
+            max_buckets_per_point: 3,
+            ..IngressConfig::default()
+        };
+        assert!(
+            validate_request(&[group], &limits).is_err(),
+            "quantile_values above the cap must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_exemplar_count_cap() {
+        let group = ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![metric(
+                    "gauge",
+                    proto::metric::Data::Gauge(proto::Gauge {
+                        data_points: vec![ProtoNumberPoint {
+                            exemplars: (0..10).map(|_| example_exemplar()).collect(),
+                            ..Default::default()
+                        }],
+                    }),
+                )],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let limits = IngressConfig {
+            max_exemplars_per_point: 4,
+            ..IngressConfig::default()
+        };
+        assert!(
+            validate_request(&[group], &limits).is_err(),
+            "exemplar count above the cap must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_over_deep_attribute_nesting() {
+        let mut value = AnyValue {
+            value: Some(Value::StringValue("leaf".to_owned())),
+        };
+        for _ in 0..40 {
+            value = AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue {
+                    values: vec![value],
+                })),
+            };
+        }
+        let group = ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![metric(
+                    "gauge",
+                    proto::metric::Data::Gauge(proto::Gauge {
+                        data_points: vec![ProtoNumberPoint {
+                            attributes: vec![KeyValue {
+                                key: "deep".to_owned(),
+                                value: Some(value),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                    }),
+                )],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            validate_request(&[group], &IngressConfig::default()).is_err(),
+            "40 levels of nesting must exceed MAX_NESTING_DEPTH"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_bounded_shape() {
+        let group = ResourceMetrics {
+            resource: sample_resource(),
+            scope_metrics: vec![ScopeMetrics {
+                scope: Some(InstrumentationScope {
+                    name: "scope-m".to_owned(),
+                    version: "0.9.9".to_owned(),
+                    attributes: vec![KeyValue {
+                        key: "scope.tag".to_owned(),
+                        value: any(Value::StringValue("prod".to_owned())),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                metrics: vec![metric(
+                    "requests.total",
+                    proto::metric::Data::Sum(proto::Sum {
+                        data_points: vec![int_point(100, 7)],
+                        ..Default::default()
+                    }),
+                )],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        validate_request(&[group], &IngressConfig::default())
+            .expect("a bounded request passes validation");
     }
 }

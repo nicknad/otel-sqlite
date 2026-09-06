@@ -45,9 +45,11 @@ pub mod pb {
     }
 }
 
-pub(crate) use common::{attribute_value, attributes, parse_span_id, parse_trace_id};
+pub(crate) use common::{
+    MAX_NESTING_DEPTH, any_value_depth, attribute_value, attributes, convert_resource,
+    parse_span_id, parse_trace_id,
+};
 
 // Imported here so signal mapping modules can refer to them as
-// `super::AnyValue`, `super::AnyValueKind`, `super::Resource`.
-use otel_sqlite_core::model::Resource;
+// `super::AnyValue`, `super::AnyValueKind`.
 use pb::common::v1::{AnyValue, any_value::Value as AnyValueKind};
