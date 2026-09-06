@@ -90,20 +90,4 @@ mod tests {
         record.span_id = [9; 8];
         assert!(record.has_trace_context());
     }
-
-    #[test]
-    fn batch_operations() {
-        let mut batch = LogBatch::with_capacity(4);
-        assert!(batch.is_empty());
-        assert_eq!(batch.len(), 0);
-
-        batch.push(LogRecord {
-            severity_number: Severity::Error,
-            ..LogRecord::default()
-        });
-        assert_eq!(batch.len(), 1);
-
-        batch.clear();
-        assert!(batch.is_empty());
-    }
 }

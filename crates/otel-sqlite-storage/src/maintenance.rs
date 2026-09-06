@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use otel_sqlite_core::storage::{CheckpointMode, RetentionPolicy};
 use rusqlite::Connection;
 
@@ -47,13 +49,30 @@ pub(crate) fn checkpoint(conn: &Connection, mode: CheckpointMode) -> Result<(), 
     Ok(())
 }
 
+/// Rows deleted per prune transaction. Bounds WAL growth and lock hold time
+/// for large retention backlogs; a crash between batches resumes cleanly.
+const PRUNE_BATCH_ROWS: usize = 5_000;
+
 pub(crate) fn analyze(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch("ANALYZE;")?;
     Ok(())
 }
 
 pub(crate) fn vacuum(conn: &Connection) -> Result<(), StorageError> {
-    conn.execute_batch("VACUUM;")?;
+    // Prefer incremental vacuum: frees freelist pages without rewriting the
+    // entire file, so ingestion stalls for milliseconds, not seconds. Only
+    // effective when `auto_vacuum = INCREMENTAL` (set for new databases in
+    // `sqlite::open`); legacy databases convert once via a full VACUUM below
+    // and are incremental thereafter.
+    let auto_vacuum: i64 = conn
+        .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+        .unwrap_or(0);
+    if auto_vacuum == 2 {
+        conn.execute_batch("PRAGMA incremental_vacuum;")?;
+    } else {
+        tracing::info!("converting database to incremental auto-vacuum (one-time full VACUUM)");
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+    }
     Ok(())
 }
 
@@ -81,13 +100,16 @@ impl PruneReport {
 
 /// Deletes expired log events and metric data points according to the
 /// per-signal retention windows, then garbage-collects the dimension rows the
-/// deletions orphaned — all in one transaction.
+/// deletions orphaned.
+///
+/// Deletes run in bounded batches (one transaction per batch) so a large
+/// retention backlog never holds a single giant transaction open: each batch
+/// commits separately and a crash mid-prune resumes cleanly on the next
+/// interval. Orphan-dimension cleanup runs once at the end when anything was
+/// pruned.
 ///
 /// The `logs_fts_ad` trigger removes matching search-index rows together with
 /// each deleted event, so a prune can never leave stale search hits behind.
-/// Dimension cleanup (series → metric → scope → resource) only runs when
-/// something was actually pruned; because the whole pass is transactional,
-/// no partially-pruned state that could strand dimensions can ever commit.
 ///
 /// `now_unix_nano` is injected so callers control the cutoff clock.
 pub(crate) fn prune(
@@ -96,26 +118,50 @@ pub(crate) fn prune(
     now_unix_nano: i64,
 ) -> Result<PruneReport, StorageError> {
     let mut report = PruneReport::default();
-    let tx = conn.transaction()?;
 
     if let Some(window) = policy.logs {
-        report.log_events = tx.execute(
-            "DELETE FROM log_event WHERE timestamp_ns < ?1",
-            [retention_cutoff(now_unix_nano, window)],
-        )?;
+        let cutoff = retention_cutoff(now_unix_nano, window);
+        let batch = PRUNE_BATCH_ROWS as i64;
+        loop {
+            let tx = conn.transaction()?;
+            let deleted = tx.execute(
+                "DELETE FROM log_event WHERE id IN (
+                    SELECT id FROM log_event WHERE timestamp_ns < ?1 LIMIT ?2
+                 )",
+                rusqlite::params![cutoff, batch],
+            )?;
+            tx.commit()?;
+            report.log_events += deleted;
+            if deleted < PRUNE_BATCH_ROWS {
+                break;
+            }
+        }
     }
     if let Some(window) = policy.metrics {
-        report.metric_points = tx.execute(
-            "DELETE FROM metric_data_point WHERE timestamp_ns < ?1",
-            [retention_cutoff(now_unix_nano, window)],
-        )?;
+        let cutoff = retention_cutoff(now_unix_nano, window);
+        let batch = PRUNE_BATCH_ROWS as i64;
+        loop {
+            let tx = conn.transaction()?;
+            let deleted = tx.execute(
+                "DELETE FROM metric_data_point WHERE id IN (
+                    SELECT id FROM metric_data_point WHERE timestamp_ns < ?1 LIMIT ?2
+                 )",
+                rusqlite::params![cutoff, batch],
+            )?;
+            tx.commit()?;
+            report.metric_points += deleted;
+            if deleted < PRUNE_BATCH_ROWS {
+                break;
+            }
+        }
     }
 
     if report.total() > 0 {
+        let tx = conn.transaction()?;
         collect_orphan_dimensions(&tx, &mut report)?;
+        tx.commit()?;
     }
 
-    tx.commit()?;
     Ok(report)
 }
 
@@ -201,4 +247,94 @@ pub(crate) fn rebuild_fts(conn: &mut Connection) -> Result<usize, StorageError> 
 
     tracing::info!(indexed, "rebuilt log search index");
     Ok(indexed)
+}
+
+/// What one size-quota enforcement pass evicted.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuotaReport {
+    pub log_events: usize,
+    pub metric_points: usize,
+    pub dimensions_removed: usize,
+    /// File size before enforcement (bytes).
+    pub bytes_before: u64,
+    /// File size after enforcement (bytes).
+    pub bytes_after: u64,
+}
+
+/// Maximum eviction rounds per enforcement call. Each round deletes one
+/// bounded batch per signal plus orphan dimensions; the cap bounds how long
+/// one insert batch can stall behind quota enforcement.
+const MAX_QUOTA_ROUNDS: usize = 8;
+
+/// Enforces `quota_bytes` on the database file at `db_path`: while the file
+/// exceeds the quota, evicts the oldest rows first (size-based retention —
+///
+/// newest telemetry survives) in bounded batches, then reclaims freelist
+/// pages. Stops early once under quota or when nothing remains to evict.
+///
+/// Crash-safe: every batch commits separately, so a crash mid-enforcement
+/// resumes cleanly on the next insert.
+pub(crate) fn enforce_size_quota(
+    conn: &mut Connection,
+    db_path: &Path,
+    quota_bytes: u64,
+) -> Result<QuotaReport, StorageError> {
+    let mut report = QuotaReport {
+        bytes_before: file_size(db_path),
+        ..Default::default()
+    };
+    for _ in 0..MAX_QUOTA_ROUNDS {
+        if file_size(db_path) <= quota_bytes {
+            break;
+        }
+        let deleted = prune_oldest_batch(conn)?;
+        if deleted.0 + deleted.1 == 0 {
+            // Rows are gone but the file is still big: fragmented freelist.
+            // Reclaim it so the size check observes real usage.
+            conn.execute_batch("PRAGMA incremental_vacuum;")?;
+            break;
+        }
+        report.log_events += deleted.0;
+        report.metric_points += deleted.1;
+        report.dimensions_removed += deleted.2;
+    }
+    // One orphan-dimension sweep for everything evicted above (cheaper than
+    // per-batch when several rounds ran).
+    if report.log_events + report.metric_points > 0 {
+        let tx = conn.transaction()?;
+        let mut sweep = PruneReport::default();
+        collect_orphan_dimensions(&tx, &mut sweep)?;
+        tx.commit()?;
+        report.dimensions_removed += sweep.dimensions_removed();
+    }
+    report.bytes_after = file_size(db_path);
+    Ok(report)
+}
+
+/// Best-effort file size; missing/unreadable counts as zero so enforcement
+/// degrades to a no-op instead of failing the insert it guards.
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |metadata| metadata.len())
+}
+
+/// Deletes one bounded batch of the oldest rows per signal (oldest-first by
+/// event timestamp, using the existing timestamp indexes). Returns
+/// `(log_events, metric_points, dimensions)` deleted by this batch.
+fn prune_oldest_batch(conn: &mut Connection) -> Result<(usize, usize, usize), StorageError> {
+    let batch = PRUNE_BATCH_ROWS as i64;
+    let tx = conn.transaction()?;
+    let logs = tx.execute(
+        "DELETE FROM log_event WHERE id IN (
+            SELECT id FROM log_event ORDER BY timestamp_ns ASC LIMIT ?1
+         )",
+        [batch],
+    )?;
+    let metrics = tx.execute(
+        "DELETE FROM metric_data_point WHERE id IN (
+            SELECT id FROM metric_data_point ORDER BY timestamp_ns ASC LIMIT ?1
+         )",
+        [batch],
+    )?;
+    tx.commit()?;
+    Ok((logs, metrics, 0))
 }

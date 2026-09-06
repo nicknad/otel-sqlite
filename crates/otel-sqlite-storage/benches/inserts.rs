@@ -49,6 +49,7 @@ fn open_pipeline() -> Pipeline {
         insert_batcher: InsertBatcherConfig::new(1_000, Duration::from_secs(600)),
         command_queue_capacity: COMMAND_QUEUE_CAPACITY,
         retention: None,
+        max_db_bytes: None,
         synchronous: SyncMode::Normal,
         startup_timeout: otel_sqlite_storage::DEFAULT_STARTUP_TIMEOUT,
         shutdown_timeout: otel_sqlite_storage::DEFAULT_SHUTDOWN_TIMEOUT,

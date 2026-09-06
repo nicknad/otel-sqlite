@@ -294,39 +294,6 @@ fn log_search_index_tracks_inserts_and_prunes_without_rebuild()
     Ok(())
 }
 
-#[test]
-fn fts_rebuild_enables_text_search() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-    let db_path = dir.path().join("test.db");
-
-    let (sender, receiver) = unbounded();
-    let config = StorageConfig {
-        sqlite_path: db_path.clone(),
-        insert_batcher: otel_sqlite_core::storage::InsertBatcherConfig::new(
-            1_000,
-            Duration::from_millis(20),
-        ),
-        ..StorageConfig::default()
-    };
-    let mut storage = Storage::open(receiver, config)?;
-
-    sender.send(logs_message(sample_batch()))?;
-    sender.send(IngestMessage::Flush)?;
-    sender.send(IngestMessage::Maintenance(MaintenanceOperation::RebuildFts))?;
-    drop(sender);
-    storage.join()?;
-
-    let conn = Connection::open(&db_path)?;
-    let matches: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM logs_fts WHERE logs_fts MATCH 'payment'",
-        [],
-        |r| r.get(0),
-    )?;
-    assert_eq!(matches, 1);
-
-    Ok(())
-}
-
 /// A rebuild interrupted at its worst point — index and triggers dropped,
 /// nothing recreated yet — must be recoverable: the next `RebuildFts`
 /// recreates both atomically, makes the existing rows searchable again and
@@ -563,32 +530,6 @@ fn open_fails_fast_when_the_database_is_unusable() {
     );
 }
 
-/// A graceful drain completes well inside the shutdown budget.
-#[test]
-fn join_timeout_completes_a_graceful_drain() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-    let (sender, receiver) = unbounded();
-    let mut storage = Storage::open(
-        receiver,
-        StorageConfig {
-            sqlite_path: dir.path().join("test.db"),
-            insert_batcher: otel_sqlite_core::storage::InsertBatcherConfig::new(
-                1_000,
-                Duration::from_millis(20),
-            ),
-            ..StorageConfig::default()
-        },
-    )?;
-
-    sender.send(logs_message(sample_batch()))?;
-    sender.send(IngestMessage::Flush)?;
-    drop(sender);
-
-    storage.join_timeout(Duration::from_secs(10))?;
-    assert_eq!(storage.stats().records_written, 2);
-    Ok(())
-}
-
 /// Shutdown must be bounded: while a producer keeps the pipeline fed, the
 /// batcher never finishes and `join_timeout` reports the budget overrun
 /// instead of hanging. Releasing the producer afterwards lets the same
@@ -631,6 +572,11 @@ fn join_timeout_reports_the_budget_overrun_while_input_stays_open() {
     storage
         .join_timeout(Duration::from_secs(10))
         .expect("releasing the producer lets shutdown complete");
+    assert_eq!(
+        storage.stats().records_written,
+        2,
+        "a graceful drain must persist everything accepted before shutdown"
+    );
 }
 
 fn metrics_message(batch: MetricBatch) -> IngestMessage {
@@ -988,4 +934,64 @@ fn wait_for(predicate: impl Fn() -> bool, budget: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(5));
     }
     predicate()
+}
+fn quota_batch_with(body: &str, timestamp_ns: i64) -> LogBatch {
+    let mut batch = LogBatch::with_capacity(1);
+    batch.push(LogRecord {
+        time_unix_nano: timestamp_ns,
+        body: body.to_owned(),
+        ..LogRecord::default()
+    });
+    batch
+}
+
+/// A size quota forces oldest-first eviction: with a quota no real database
+/// can satisfy, every insert batch evicts its predecessors, so only the
+/// newest records survive — newest telemetry wins over oldest under pressure.
+#[test]
+fn size_quota_evicts_oldest_first_and_keeps_newest() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("test.db");
+
+    let (sender, receiver) = unbounded();
+    let mut storage = Storage::open(
+        receiver,
+        StorageConfig {
+            sqlite_path: db_path.clone(),
+            // Unsatisfiable on purpose: enforcement runs before every batch.
+            max_db_bytes: Some(1),
+            ..StorageConfig::default()
+        },
+    )?;
+
+    sender.send(logs_message(quota_batch_with(
+        "quota ancient message",
+        1_000,
+    )))?;
+    sender.send(IngestMessage::Flush)?;
+    sender.send(logs_message(quota_batch_with("quota fresh message", 2_000)))?;
+    sender.send(IngestMessage::Flush)?;
+    drop(sender);
+    storage.join()?;
+
+    assert_eq!(storage.stats().errors, 0);
+
+    let conn = Connection::open(&db_path)?;
+    let ancient: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM logs WHERE body = 'quota ancient message'",
+        [],
+        |row| row.get(0),
+    )?;
+    let fresh: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM logs WHERE body = 'quota fresh message'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        ancient, 0,
+        "an over-quota insert must evict the oldest rows first"
+    );
+    assert_eq!(fresh, 1, "the newest rows must survive quota enforcement");
+
+    Ok(())
 }

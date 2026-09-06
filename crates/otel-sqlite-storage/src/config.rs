@@ -28,6 +28,12 @@ pub struct StorageConfig {
     /// of dropping completed batches.
     pub command_queue_capacity: usize,
     pub retention: Option<Duration>,
+    /// Optional on-disk size quota in bytes (`None` = unbounded, the default).
+    /// When set, the writer checks the database file size before each insert
+    /// batch and evicts the oldest rows (size-based retention: newest survive)
+    /// until back under quota. Bounds disk growth from high-cardinality or
+    /// high-volume senders when time-based retention is `None` or too wide.
+    pub max_db_bytes: Option<u64>,
     /// SQLite `synchronous` level for the writer connection. `Normal` (the
     /// default) syncs WAL at checkpoints; `Full` fsyncs every commit.
     pub synchronous: SyncMode,
@@ -48,6 +54,7 @@ impl Default for StorageConfig {
             insert_batcher: InsertBatcherConfig::default(),
             command_queue_capacity: DEFAULT_COMMAND_QUEUE_CAPACITY,
             retention: None,
+            max_db_bytes: None,
             synchronous: SyncMode::default(),
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,

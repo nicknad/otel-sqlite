@@ -45,7 +45,9 @@ services:
     working_dir: /data
     environment:
       RUST_LOG: info
+      OTEL_SQLITE_CFG_PATH: /etc/otel-sqlite/otel-sqlite.toml
     volumes:
+      - ./stack-e2e/otel-sqlite.toml:/etc/otel-sqlite/otel-sqlite.toml:ro
       - stack-data:/data
     restart: unless-stopped
     mem_limit: 512m
