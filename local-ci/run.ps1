@@ -33,7 +33,7 @@ Set-Location $PSScriptRoot
 
 # The release-gate jobs all run in their own `container:` images (rust /
 # semgrep) and need no Docker daemon inside the job container.
-$Jobs = @("lint-and-test", "crash-recovery-release", "e2e-benchmark", "cargo-deny", "semgrep")
+$Jobs = @("lint-and-test", "crash-recovery-release", "e2e-benchmark", "cargo-deny", "cargo-audit", "semgrep")
 $SocketArgs = @()
 
 if ($All) {
