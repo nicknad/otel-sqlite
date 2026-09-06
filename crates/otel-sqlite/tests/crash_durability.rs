@@ -61,9 +61,35 @@ impl Drop for ServerProc {
 /// release build in CI), otherwise this package's own dev binary.
 fn binary_path() -> PathBuf {
     match std::env::var_os("OTEL_SQLITE_CRASH_BIN").filter(|value| !value.is_empty()) {
-        Some(path) => PathBuf::from(path),
+        Some(path) => resolve_override(PathBuf::from(path)),
         None => PathBuf::from(env!("CARGO_BIN_EXE_otel-sqlite")),
     }
+}
+
+/// Cargo runs test binaries with the working directory at the package root,
+/// while CI points `OTEL_SQLITE_CRASH_BIN` at a release build whose `target/`
+/// lives at the workspace root. Resolve a relative override by searching
+/// upward from the current directory for the first existing match (honoring
+/// the `.exe` suffix Windows executables carry).
+fn resolve_override(path: PathBuf) -> PathBuf {
+    if path.is_absolute() || path.exists() {
+        return path;
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for ancestor in cwd.ancestors() {
+        let candidate = ancestor.join(&path);
+        if candidate.exists() {
+            return candidate;
+        }
+        #[cfg(windows)]
+        {
+            let exe = candidate.with_extension("exe");
+            if exe.exists() {
+                return exe;
+            }
+        }
+    }
+    path
 }
 
 /// Deterministic workload shape shared by every crash scenario.

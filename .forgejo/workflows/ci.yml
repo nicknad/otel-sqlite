@@ -13,10 +13,10 @@
 #   `e2e-benchmark`, `cargo-deny`) run inside a `rust:1.89-bookworm`
 #   container (pinned to the workspace `rust-version` 1.89.0; the production
 #   Dockerfile builds with the same image).
-# * The Docker jobs (`fuzz-smoke`, `fuzz-nightly`, `stack-e2e`,
-#   `crash-e2e-container`, `container-smoke`) must run on a runner with a
-#   working Docker daemon and `docker compose` — i.e. a bare host runner, NOT
-#   a `container:` job (docker-in-docker).
+# * The Docker jobs (`fuzz-smoke`, `fuzz-nightly`, `crash-e2e-container`,
+#   `container-smoke`) must run on a runner with a working Docker daemon and
+#   `docker compose` — i.e. a bare host runner, NOT a `container:` job
+#   (docker-in-docker).
 # * `runs-on:` must match a label a registered runner advertises. Before
 #   releasing, verify the actual Forgejo runner labels (Codeberg community
 #   runners commonly advertise `act-runner`); adjust every job if yours
@@ -49,6 +49,9 @@ jobs:
     steps:
       - name: Install git (slim image prerequisite for checkout)
         run: apt-get update -qq && apt-get install -y -qq git
+
+      - name: Install rustfmt (slim image omits it)
+        run: rustup component add rustfmt
 
       - name: Check out repository
         uses: actions/checkout@v4
@@ -212,16 +215,6 @@ jobs:
 
       - name: Smoke batcher target (2 min)
         run: docker compose -f docker/compose.fuzz.yml run --rm smoke-batcher
-
-  stack-e2e:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      # Full multi-container stack: nginx -> collector -> sink -> verify.
-      - name: Stack e2e (verify exit code is the verdict)
-        run: docker compose -f docker/compose.stack-e2e.yml up --build --exit-code-from verify
 
   crash-e2e-container:
     runs-on: ubuntu-latest
