@@ -1096,6 +1096,7 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-health",
+ "tracing",
  "tracing-subscriber",
 ]
 
@@ -1158,6 +1159,7 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

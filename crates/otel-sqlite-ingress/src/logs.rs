@@ -7,7 +7,7 @@ use tonic::{Request, Response, Status};
 use crate::IngestSender;
 use crate::config::IngressConfig;
 use crate::enqueue::enqueue;
-use crate::mapping::logs::{count, map_chunks};
+use crate::mapping::logs::{count, map_chunks, validate_request};
 use crate::mapping::pb::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse, logs_service_server::LogsService,
 };
@@ -75,17 +75,28 @@ impl LogsIngress {
                     self.config.max_records_per_request
                 )));
             }
+            // Per-field caps (H2) + nesting depth (H3) before any allocation:
+            // a single record with millions of attributes/bytes must fail here,
+            // not inside the blocking mapping task.
+            validate_request(&request.resource_logs, &self.config)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
             total
         };
 
         ::metrics::counter!("otlp_records_received_total", "signal" => "logs")
             .increment(total as u64);
 
-        let work = {
+        // CPU-heavy proto→model conversion (attribute cloning, canonical
+        // JSON) runs on the blocking pool so this tokio worker stays free
+        // to serve other streams while a large request maps.
+        let resource_logs = request.resource_logs;
+        let work = tokio::task::spawn_blocking(move || {
             let _span = tracing::info_span!("map").entered();
-            map_chunks(request.resource_logs)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?
-        };
+            map_chunks(resource_logs)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("log mapping task failed: {error}")))?
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
 
         let outcome = {
             let _span = tracing::info_span!("enqueue").entered();

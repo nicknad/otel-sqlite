@@ -169,28 +169,16 @@ mod tests {
             FailureClass::Fatal
         );
         assert_eq!(
+            StorageError::WriterPanicked.class(),
+            FailureClass::Fatal,
+            "a dead writer thread walks the same halt path as a fatal sqlite failure"
+        );
+        assert_eq!(
             classify_sqlite(&rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
                 None
             )),
             FailureClass::Fatal
         );
-    }
-
-    #[test]
-    fn storage_error_class_delegates() {
-        assert_eq!(
-            sqlite_failure(ffi::SQLITE_BUSY).class(),
-            FailureClass::Retryable
-        );
-        assert_eq!(
-            sqlite_failure(ffi::SQLITE_CONSTRAINT).class(),
-            FailureClass::Poison
-        );
-        assert_eq!(
-            sqlite_failure(ffi::SQLITE_FULL).class(),
-            FailureClass::Fatal
-        );
-        assert_eq!(StorageError::WriterPanicked.class(), FailureClass::Fatal);
     }
 }

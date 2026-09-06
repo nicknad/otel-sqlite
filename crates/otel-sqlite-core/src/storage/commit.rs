@@ -27,6 +27,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -123,6 +124,20 @@ impl CommitLedger {
         self.next_ticket.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// Locks the ledger state, recovering from a poisoned mutex instead of
+    /// panicking. Poison means some previous holder panicked mid-update; the
+    /// guarded counters remain valid, and panicking here would convert that
+    /// one fault into a permanent denial of service — every later OTLP
+    /// export, writer commit and health poll funnels through this lock.
+    /// (This crate has no logging dependency; the original panic is already
+    /// visible in the panic log, so recovery itself stays silent.)
+    fn lock_inner(&self) -> MutexGuard<'_, Inner> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// Marks `ticket` as committed. Called by the writer after the
     /// transaction carrying the ticket's records has committed.
     pub fn complete(&self, ticket: u64) {
@@ -141,7 +156,7 @@ impl CommitLedger {
             return;
         }
         let watermark = {
-            let mut inner = self.inner.lock().expect("commit ledger poisoned");
+            let mut inner = self.lock_inner();
             if ticket == inner.committed_through + 1 {
                 inner.committed_through = ticket;
                 inner.last_advance_ms = monotonic_millis();
@@ -165,7 +180,7 @@ impl CommitLedger {
     /// [`CommitLedger::committed`] call resolves with [`CommitLedgerClosed`].
     pub fn close(&self) {
         let watermark = {
-            let mut inner = self.inner.lock().expect("commit ledger poisoned");
+            let mut inner = self.lock_inner();
             inner.closed = true;
             Watermark {
                 committed_through: inner.committed_through,
@@ -191,7 +206,7 @@ impl CommitLedger {
     /// via `outstanding_tickets` so a watchdog can raise the alarm.
     pub fn outstanding_tickets(&self) -> u64 {
         let issued = self.next_ticket.load(Ordering::Relaxed);
-        let inner = self.inner.lock().expect("commit ledger poisoned");
+        let inner = self.lock_inner();
         issued
             .saturating_sub(inner.committed_through)
             .saturating_sub(u64::try_from(inner.settled_above.len()).unwrap_or(u64::MAX))
@@ -203,10 +218,7 @@ impl CommitLedger {
     /// with [`CommitLedger::outstanding_tickets`] this distinguishes "no
     /// commits lately" from "the commit watermark is stuck".
     pub fn last_advance_ms(&self) -> u64 {
-        self.inner
-            .lock()
-            .expect("commit ledger poisoned")
-            .last_advance_ms
+        self.lock_inner().last_advance_ms
     }
 
     /// Waits until every record behind `ticket` is durably committed, or the
@@ -446,9 +458,28 @@ mod tests {
         );
     }
 
+    /// A poisoned mutex must degrade, not deadlock the pipeline: after one
+    /// holder panics mid-update, every later call recovers the guarded
+    /// counters instead of panicking on the OTLP hot path.
     #[test]
-    fn close_marks_every_snapshot() {
-        let ledger = CommitLedger::new();
+    fn ledger_recovers_from_a_poisoned_lock() {
+        let ledger = Arc::new(CommitLedger::new());
+        let ticket = ledger.issue();
+
+        // Poison the mutex by panicking while holding it on another thread.
+        let holder = Arc::clone(&ledger);
+        let outcome = std::thread::spawn(move || {
+            let _guard = holder.inner.lock().unwrap();
+            panic!("intentional poison for recovery test");
+        })
+        .join();
+        assert!(outcome.is_err(), "the holder thread must have panicked");
+
+        // All lock users must work afterwards instead of panicking.
+        ledger.complete(ticket);
+        assert_eq!(ledger.watermark().committed_through, ticket);
+        assert_eq!(ledger.outstanding_tickets(), 0);
+        let _ = ledger.last_advance_ms();
         ledger.close();
         assert!(ledger.watermark().closed);
     }

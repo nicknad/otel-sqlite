@@ -582,27 +582,26 @@ mod tests {
     }
 
     #[test]
-    fn healthy_pipeline_never_halts() {
-        let (halt_tx, mut halt_rx) = watch::channel(false);
-        let handle = Watchdog::new(FixedSource(running_sample()), config(), halt_tx).spawn();
+    fn watchdog_never_halts_when_healthy_or_halt_is_disabled() {
+        let assert_no_halt = |source: PipelineSample, halt_on_unhealthy: bool| {
+            let (halt_tx, mut halt_rx) = watch::channel(false);
+            let mut cfg = config();
+            cfg.halt_on_unhealthy = halt_on_unhealthy;
+            let handle = Watchdog::new(FixedSource(source), cfg, halt_tx).spawn();
 
-        std::thread::sleep(Duration::from_millis(120));
-        assert!(!handle.requested_halt());
-        assert!(!*halt_rx.borrow_and_update(), "no halt while healthy");
-        handle.stop().expect("clean stop");
-    }
+            std::thread::sleep(Duration::from_millis(120));
+            assert!(!handle.requested_halt());
+            assert!(
+                !*halt_rx.borrow_and_update(),
+                "no halt expected in this case"
+            );
+            handle.stop().expect("clean stop");
+        };
 
-    #[test]
-    fn halt_on_unhealthy_disabled_only_observes() {
-        let (halt_tx, mut halt_rx) = watch::channel(false);
-        let mut cfg = config();
-        cfg.halt_on_unhealthy = false;
-        let handle = Watchdog::new(FixedSource(stalled_sample()), cfg, halt_tx).spawn();
-
-        std::thread::sleep(Duration::from_millis(120));
-        assert!(!handle.requested_halt());
-        assert!(!*halt_rx.borrow_and_update(), "observation must not halt");
-        handle.stop().expect("clean stop");
+        // A healthy pipeline must never trigger the halt, even with halting enabled.
+        assert_no_halt(running_sample(), true);
+        // A stalled pipeline must only observe when halting is disabled.
+        assert_no_halt(stalled_sample(), false);
     }
 
     #[test]

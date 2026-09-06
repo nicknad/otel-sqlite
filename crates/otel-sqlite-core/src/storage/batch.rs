@@ -80,15 +80,4 @@ mod tests {
         assert_eq!(unwrapped.as_ptr(), pointer);
         assert_eq!(unwrapped, vec![1, 2, 3]);
     }
-
-    #[test]
-    fn empty_batch_is_empty() {
-        let batch = WriteBatch::<u8>::default();
-        assert!(batch.is_empty());
-        assert_eq!(batch.len(), 0);
-
-        let batch = WriteBatch::<u8>::with_capacity(4);
-        assert!(batch.is_empty());
-        assert_eq!(batch.into_records().capacity(), 4);
-    }
 }

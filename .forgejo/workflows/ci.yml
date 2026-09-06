@@ -148,12 +148,14 @@ jobs:
       # runs, not benchmarks.
       - name: Baseline correctness
         run: >
-          cargo run --release -p otel-sqlite-e2e -- --scenario baseline
+          cargo run --release -p otel-sqlite-e2e --bin otel-sqlite-e2e --
+          --scenario baseline
           --duration-secs 20 --warmup-secs 2 --drain-timeout-secs 60
 
       - name: Backpressure correctness (all-or-nothing UNAVAILABLE, zero duplicates)
         run: >
-          cargo run --release -p otel-sqlite-e2e -- --scenario backpressure
+          cargo run --release -p otel-sqlite-e2e --bin otel-sqlite-e2e --
+          --scenario backpressure
           --duration-secs 20 --warmup-secs 0 --drain-timeout-secs 60
 
   cargo-deny:

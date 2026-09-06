@@ -10,6 +10,7 @@ mod fault;
 mod maintenance;
 mod migration;
 mod origin_buffers;
+pub(crate) mod permissions;
 mod sqlite;
 mod stats;
 mod writer;
