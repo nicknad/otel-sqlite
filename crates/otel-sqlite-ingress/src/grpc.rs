@@ -148,18 +148,25 @@ async fn run(
 }
 
 /// Loads the server identity (and optional client CA) from disk.
+///
+/// Key material lives in `Zeroizing` buffers so our copies are cleared on
+/// drop. (The TLS stack necessarily retains its own copy for the server's
+/// lifetime; this bounds *our* heap residue, not rustls's.)
 fn server_tls_config(tls: &TlsConfig) -> Result<ServerTlsConfig, IngressError> {
     let read = |path: &std::path::Path| {
-        std::fs::read(path).map_err(|source| {
-            IngressError::Tls(format!("cannot read {}: {source}", path.display()))
-        })
+        std::fs::read(path)
+            .map(zeroize::Zeroizing::new)
+            .map_err(|source| {
+                IngressError::Tls(format!("cannot read {}: {source}", path.display()))
+            })
     };
     let cert = read(&tls.cert)?;
     let key = read(&tls.key)?;
-    let mut config = ServerTlsConfig::new().identity(Identity::from_pem(cert, key));
+    let mut config =
+        ServerTlsConfig::new().identity(Identity::from_pem(cert.as_slice(), key.as_slice()));
     if let Some(ca_path) = &tls.client_ca {
         let ca = read(ca_path)?;
-        config = config.client_ca_root(Certificate::from_pem(ca));
+        config = config.client_ca_root(Certificate::from_pem(ca.as_slice()));
     }
     Ok(config)
 }

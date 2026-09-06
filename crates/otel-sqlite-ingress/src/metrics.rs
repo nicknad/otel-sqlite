@@ -7,7 +7,7 @@ use tonic::{Request, Response, Status};
 use crate::IngestSender;
 use crate::config::IngressConfig;
 use crate::enqueue::enqueue;
-use crate::mapping::metrics::{count, map_chunks};
+use crate::mapping::metrics::{count, map_chunks, validate_request};
 use crate::mapping::pb::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
     metrics_service_server::MetricsService,
@@ -76,17 +76,25 @@ impl MetricsIngress {
                     self.config.max_records_per_request
                 )));
             }
+            validate_request(&request.resource_metrics, &self.config)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
             total
         };
 
         ::metrics::counter!("otlp_records_received_total", "signal" => "metrics")
             .increment(total as u64);
 
-        let work = {
+        // CPU-heavy proto→model conversion runs on the blocking pool so this
+        // tokio worker stays free to serve other streams while a large
+        // request maps.
+        let resource_metrics = request.resource_metrics;
+        let work = tokio::task::spawn_blocking(move || {
             let _span = tracing::info_span!("map").entered();
-            map_chunks(request.resource_metrics)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?
-        };
+            map_chunks(resource_metrics)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("metrics mapping task failed: {error}")))?
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
 
         let outcome = {
             let _span = tracing::info_span!("enqueue").entered();

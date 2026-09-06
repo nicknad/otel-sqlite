@@ -3,9 +3,13 @@ use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, LogChunk};
 
 use crate::error::IngressError;
 
-use super::pb::common::v1::{InstrumentationScope, KeyValue};
+use super::pb::common::v1::{AnyValue, InstrumentationScope, KeyValue};
 use super::pb::logs::v1::{LogRecord as ProtoLogRecord, ResourceLogs, ScopeLogs};
-use super::{attribute_value, attributes, parse_span_id, parse_trace_id};
+use super::{
+    MAX_NESTING_DEPTH, any_value_depth, attribute_value, attributes, convert_resource,
+    parse_span_id, parse_trace_id,
+};
+use crate::config::IngressConfig;
 
 /// Fallible proto → model conversion of one `ResourceLogs` group.
 ///
@@ -23,7 +27,7 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogBatch, IngressError> 
     let capacity: usize = scope_logs.iter().map(|scope| scope.log_records.len()).sum();
     let mut batch = LogBatch::with_capacity(capacity);
 
-    let mut resource = resource.map(super::Resource::from);
+    let mut resource = resource.map(convert_resource).transpose()?;
     if let Some(resource) = &mut resource {
         resource.schema_url.clone_from(&schema_url);
     }
@@ -45,7 +49,7 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogBatch, IngressError> 
                  }| (name, version, attributes),
             )
             .unwrap_or_default();
-        let scope_attributes = attributes(scope_attributes);
+        let scope_attributes = attributes(scope_attributes)?;
         for record in log_records {
             batch.push(convert_record(
                 record,
@@ -141,7 +145,7 @@ fn convert_record(
         .map_err(|error| IngressError::Mapping(format!("invalid trace id: {error}")))?;
     let span_id = parse_span_id(span_id)
         .map_err(|error| IngressError::Mapping(format!("invalid span id: {error}")))?;
-    let (body, body_json) = body_value(body);
+    let (body, body_json) = body_value(body)?;
 
     Ok(LogRecord {
         time_unix_nano: time_unix_nano as i64,
@@ -152,7 +156,7 @@ fn convert_record(
         span_id: span_id.unwrap_or([0; 8]),
         body,
         body_json,
-        attributes: attributes(record_attributes),
+        attributes: attributes(record_attributes)?,
         dropped_attributes_count,
         flags,
         event_name,
@@ -186,39 +190,209 @@ fn severity(value: i32) -> Severity {
 /// `body_json`, which the storage layer persists into the `body` column —
 /// the same canonical encoding as nested attribute values, so nothing is
 /// silently flattened to an empty string.
-fn body_value(value: Option<super::AnyValue>) -> (String, Option<String>) {
+///
+/// Depth-limited like `attribute_value`: over-deep bodies fail instead of
+/// overflowing the worker stack.
+fn body_value(value: Option<super::AnyValue>) -> Result<(String, Option<String>), IngressError> {
     match value.and_then(|any| any.value) {
-        Some(super::AnyValueKind::StringValue(value)) => (value, None),
-        Some(super::AnyValueKind::IntValue(value)) => (value.to_string(), None),
-        Some(super::AnyValueKind::DoubleValue(value)) => (value.to_string(), None),
-        Some(super::AnyValueKind::BoolValue(value)) => (value.to_string(), None),
+        Some(super::AnyValueKind::StringValue(value)) => Ok((value, None)),
+        Some(super::AnyValueKind::IntValue(value)) => Ok((value.to_string(), None)),
+        Some(super::AnyValueKind::DoubleValue(value)) => Ok((value.to_string(), None)),
+        Some(super::AnyValueKind::BoolValue(value)) => Ok((value.to_string(), None)),
         Some(super::AnyValueKind::BytesValue(value)) => {
-            (String::from_utf8_lossy(&value).into_owned(), None)
+            Ok((String::from_utf8_lossy(&value).into_owned(), None))
         }
-        Some(super::AnyValueKind::ArrayValue(values)) => (
-            String::new(),
-            Some(
-                AttributeValue::Array(values.values.into_iter().map(attribute_value).collect())
-                    .to_canonical_json(),
-            ),
-        ),
-        Some(super::AnyValueKind::KvlistValue(values)) => (
-            String::new(),
-            Some(
-                AttributeValue::Kvlist(
-                    values
-                        .values
-                        .into_iter()
-                        .map(|KeyValue { key, value, .. }| Attribute {
-                            key,
-                            value: attribute_value(value.unwrap_or_default()),
-                        })
-                        .collect(),
-                )
-                .to_canonical_json(),
-            ),
-        ),
-        _ => (String::new(), None),
+        Some(super::AnyValueKind::ArrayValue(values)) => {
+            let items = values
+                .values
+                .into_iter()
+                .map(attribute_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((
+                String::new(),
+                Some(AttributeValue::Array(items).to_canonical_json()),
+            ))
+        }
+        Some(super::AnyValueKind::KvlistValue(values)) => {
+            let items = values
+                .values
+                .into_iter()
+                .map(|KeyValue { key, value, .. }| {
+                    Ok(Attribute {
+                        key,
+                        value: attribute_value(value.unwrap_or_default())?,
+                    })
+                })
+                .collect::<Result<Vec<_>, IngressError>>()?;
+            Ok((
+                String::new(),
+                Some(AttributeValue::Kvlist(items).to_canonical_json()),
+            ))
+        }
+        _ => Ok((String::new(), None)),
+    }
+}
+
+/// Pre-mapping size guard (H2): walks the borrowed request without allocating
+/// model values and rejects hostile shapes with `INVALID_ARGUMENT` *before*
+/// the blocking mapping task runs.
+///
+/// Checked per `IngressConfig` limits: attribute-vector lengths, key/value
+/// byte lengths, scalar body bytes, and `AnyValue` nesting depth (via the
+/// non-recursive `any_value_depth` probe, so the check itself cannot overflow).
+/// Trace/span id *validity* stays in `try_convert_batch`; this only bounds
+/// allocation/CPU.
+pub(crate) fn validate_request(
+    resource_logs: &[ResourceLogs],
+    limits: &IngressConfig,
+) -> Result<(), IngressError> {
+    for group in resource_logs {
+        check_attributes(
+            group
+                .resource
+                .as_ref()
+                .map_or(&[], |r| r.attributes.as_slice()),
+            limits,
+            "resource.attributes",
+        )?;
+        for scope in &group.scope_logs {
+            if let Some(s) = scope.scope.as_ref() {
+                check_attributes(&s.attributes, limits, "scope.attributes")?;
+            }
+            for record in &scope.log_records {
+                check_attributes(&record.attributes, limits, "log.attributes")?;
+                check_plain_string(&record.severity_text, limits, "severity_text")?;
+                check_plain_string(&record.event_name, limits, "event_name")?;
+                if let Some(s) = scope.scope.as_ref() {
+                    check_plain_string(&s.name, limits, "scope.name")?;
+                    check_plain_string(&s.version, limits, "scope.version")?;
+                }
+                check_body(record.body.as_ref(), limits)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_attributes(
+    values: &[KeyValue],
+    limits: &IngressConfig,
+    what: &str,
+) -> Result<(), IngressError> {
+    if values.len() > limits.max_attributes_per_record {
+        return Err(IngressError::Mapping(format!(
+            "{what} holds {} attributes, limit is {}",
+            values.len(),
+            limits.max_attributes_per_record
+        )));
+    }
+    for entry in values {
+        if entry.key.len() > limits.max_attribute_key_bytes {
+            return Err(IngressError::Mapping(format!(
+                "{what} key exceeds {} bytes (limit {})",
+                entry.key.len(),
+                limits.max_attribute_key_bytes
+            )));
+        }
+        if let Some(value) = entry.value.as_ref() {
+            check_any_value(value, limits, what)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_any_value(
+    value: &AnyValue,
+    limits: &IngressConfig,
+    what: &str,
+) -> Result<(), IngressError> {
+    if any_value_depth(value) > MAX_NESTING_DEPTH {
+        return Err(IngressError::Mapping(format!(
+            "{what} exceeds maximum nesting depth of {MAX_NESTING_DEPTH}"
+        )));
+    }
+    // Iterative leaf-size walk (explicit stack: never recurses).
+    let mut stack: Vec<&AnyValue> = vec![value];
+    while let Some(current) = stack.pop() {
+        match &current.value {
+            Some(super::AnyValueKind::StringValue(s)) => {
+                if s.len() > limits.max_attribute_value_bytes {
+                    return Err(IngressError::Mapping(format!(
+                        "{what} string value exceeds {} bytes (limit {})",
+                        s.len(),
+                        limits.max_attribute_value_bytes
+                    )));
+                }
+            }
+            Some(super::AnyValueKind::BytesValue(b)) => {
+                if b.len() > limits.max_attribute_value_bytes {
+                    return Err(IngressError::Mapping(format!(
+                        "{what} bytes value exceeds {} bytes (limit {})",
+                        b.len(),
+                        limits.max_attribute_value_bytes
+                    )));
+                }
+            }
+            Some(super::AnyValueKind::ArrayValue(array)) => {
+                stack.extend(array.values.iter());
+            }
+            Some(super::AnyValueKind::KvlistValue(list)) => {
+                for entry in &list.values {
+                    if entry.key.len() > limits.max_attribute_key_bytes {
+                        return Err(IngressError::Mapping(format!(
+                            "{what} nested key exceeds {} bytes (limit {})",
+                            entry.key.len(),
+                            limits.max_attribute_key_bytes
+                        )));
+                    }
+                    if let Some(nested) = entry.value.as_ref() {
+                        stack.push(nested);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_plain_string(value: &str, limits: &IngressConfig, what: &str) -> Result<(), IngressError> {
+    if value.len() > limits.max_attribute_value_bytes {
+        return Err(IngressError::Mapping(format!(
+            "{what} exceeds {} bytes (limit {})",
+            value.len(),
+            limits.max_attribute_value_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn check_body(body: Option<&AnyValue>, limits: &IngressConfig) -> Result<(), IngressError> {
+    let Some(value) = body else { return Ok(()) };
+    match &value.value {
+        Some(super::AnyValueKind::StringValue(s)) => {
+            if s.len() > limits.max_body_bytes {
+                return Err(IngressError::Mapping(format!(
+                    "log body exceeds {} bytes (limit {})",
+                    s.len(),
+                    limits.max_body_bytes
+                )));
+            }
+            Ok(())
+        }
+        Some(super::AnyValueKind::BytesValue(b)) => {
+            if b.len() > limits.max_body_bytes {
+                return Err(IngressError::Mapping(format!(
+                    "log body exceeds {} bytes (limit {})",
+                    b.len(),
+                    limits.max_body_bytes
+                )));
+            }
+            Ok(())
+        }
+        // Structured bodies reuse the attribute byte/depth budget: leaves are
+        // attacker-controlled JSON that costs canonical-sort + FTS CPU.
+        _ => check_any_value(value, limits, "log.body"),
     }
 }
 
@@ -520,5 +694,148 @@ mod tests {
     fn empty_groups_produce_no_chunks() {
         let chunks = map_chunks(vec![ResourceLogs::default()]).expect("valid request");
         assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_too_many_attributes_per_record() {
+        let proto = ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![ProtoLogRecord {
+                    attributes: (0..100)
+                        .map(|i| KeyValue {
+                            key: format!("k{i}"),
+                            value: any(Value::IntValue(i as i64)),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let limits = IngressConfig {
+            max_attributes_per_record: 50,
+            ..IngressConfig::default()
+        };
+        let error =
+            validate_request(&[proto], &limits).expect_err("100 attributes must exceed the 50 cap");
+        assert!(error.to_string().contains("log.attributes"));
+    }
+
+    #[test]
+    fn validate_rejects_attribute_key_and_value_bytes() {
+        let long_key = KeyValue {
+            key: "x".repeat(700),
+            value: any(Value::IntValue(1)),
+            ..Default::default()
+        };
+        let long_value = KeyValue {
+            key: "k".to_owned(),
+            value: any(Value::StringValue("y".repeat(70_000))),
+            ..Default::default()
+        };
+        let limits = IngressConfig {
+            max_attribute_key_bytes: 512,
+            max_attribute_value_bytes: 4096,
+            ..IngressConfig::default()
+        };
+        let record = |attrs: Vec<KeyValue>| ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![ProtoLogRecord {
+                    attributes: attrs,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            validate_request(&[record(vec![long_key])], &limits).is_err(),
+            "over-long key must be rejected"
+        );
+        assert!(
+            validate_request(&[record(vec![long_value])], &limits).is_err(),
+            "over-long value must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_oversized_log_body() {
+        let proto = ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![ProtoLogRecord {
+                    body: any(Value::StringValue("z".repeat(2_000_000))),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let limits = IngressConfig {
+            max_body_bytes: 1024 * 1024,
+            ..IngressConfig::default()
+        };
+        assert!(
+            validate_request(&[proto], &limits).is_err(),
+            "2 MiB scalar body must exceed the 1 MiB cap"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_over_deep_attribute_nesting() {
+        // 40 levels of ArrayValue(ArrayValue(...)) around a leaf.
+        let mut value = AnyValue {
+            value: Some(Value::StringValue("leaf".to_owned())),
+        };
+        for _ in 0..40 {
+            value = AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue {
+                    values: vec![value],
+                })),
+            };
+        }
+        let proto = ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![ProtoLogRecord {
+                    attributes: vec![KeyValue {
+                        key: "deep".to_owned(),
+                        value: Some(value),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            validate_request(&[proto], &IngressConfig::default()).is_err(),
+            "40 levels of nesting must exceed MAX_NESTING_DEPTH"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_bounded_shape() {
+        let proto = ResourceLogs {
+            resource: sample_resource(),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "scope-a".to_owned(),
+                    version: "1.2.3".to_owned(),
+                    attributes: vec![KeyValue {
+                        key: "scope.tag".to_owned(),
+                        value: any(Value::StringValue("prod".to_owned())),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                log_records: vec![sample_record()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        validate_request(&[proto], &IngressConfig::default())
+            .expect("a bounded request passes validation");
     }
 }

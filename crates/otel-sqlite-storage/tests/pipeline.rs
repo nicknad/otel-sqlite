@@ -50,6 +50,7 @@ fn config(
         ),
         command_queue_capacity: 16,
         retention: None,
+        max_db_bytes: None,
         synchronous: SyncMode::Normal,
         startup_timeout: otel_sqlite_storage::DEFAULT_STARTUP_TIMEOUT,
         shutdown_timeout: otel_sqlite_storage::DEFAULT_SHUTDOWN_TIMEOUT,

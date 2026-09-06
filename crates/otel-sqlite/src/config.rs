@@ -4,9 +4,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use otel_sqlite_core::storage::{CheckpointMode, DurabilityMode, InsertBatcherConfig, SyncMode};
 use otel_sqlite_ingress::{
-    AuthConfig, DEFAULT_LISTEN_ADDRESS, DEFAULT_MAX_CONCURRENT_STREAMS,
+    AuthConfig, DEFAULT_LISTEN_ADDRESS, DEFAULT_MAX_ATTRIBUTE_KEY_BYTES,
+    DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES, DEFAULT_MAX_ATTRIBUTES_PER_RECORD, DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_MAX_BUCKETS_PER_POINT, DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_EXEMPLARS_PER_POINT,
     DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_MAX_RECV_MSG_SIZE, DEFAULT_SHUTDOWN_TIMEOUT,
-    IngressConfig, TlsConfig,
+    IngressConfig, MAX_ATTRIBUTE_KEY_BYTES, MAX_ATTRIBUTE_VALUE_BYTES, MAX_ATTRIBUTES_PER_RECORD,
+    MAX_BODY_BYTES, MAX_BUCKETS_PER_POINT, MAX_EXEMPLARS_PER_POINT, TlsConfig,
 };
 use otel_sqlite_runtime::{MaintenanceConfig, WatchdogConfig};
 use otel_sqlite_storage::StorageConfig;
@@ -26,6 +29,9 @@ pub const MAX_INGEST_QUEUE_CAPACITY: usize = 1_000_000;
 pub const MAX_GRPC_RECV_MSG_SIZE: usize = 256 * 1024 * 1024;
 pub const MAX_BATCH_RECORDS: usize = 100_000;
 pub const MAX_RECORDS_PER_REQUEST: usize = 1_000_000;
+/// Minimum accepted `max_db_bytes` quota: below 1 MiB the writer would evict
+/// on nearly every batch (a fresh migrated database already exceeds it).
+pub const MIN_DB_QUOTA_BYTES: u64 = 1024 * 1024;
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 pub const MAX_RETENTION: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
@@ -47,6 +53,23 @@ pub struct Config {
     pub grpc_max_recv_msg_size: usize,
     pub grpc_max_concurrent_streams: u32,
     pub max_records_per_request: usize,
+    /// Max attributes on one log record / metric point (H2). See ingress
+    /// `DEFAULT_MAX_ATTRIBUTES_PER_RECORD`.
+    pub max_attributes_per_record: usize,
+    /// Max bytes for one attribute key (H2).
+    pub max_attribute_key_bytes: usize,
+    /// Max bytes for one attribute string/bytes value (H2).
+    pub max_attribute_value_bytes: usize,
+    /// Max bytes for a scalar log body (H2).
+    pub max_body_bytes: usize,
+    /// Max bucket/explicit-bound/quantile entries on one histogram point (H2).
+    pub max_buckets_per_point: usize,
+    /// Max exemplars on one metric point (H2).
+    pub max_exemplars_per_point: usize,
+    /// Optional on-disk size quota for the SQLite database file, in bytes
+    /// (`None` = unbounded). When set, the storage writer evicts the oldest
+    /// rows before each insert batch once the file exceeds the quota.
+    pub max_db_bytes: Option<u64>,
     pub shutdown_timeout: Duration,
     /// Periodic maintenance schedule (purge/checkpoint/optimize/vacuum),
     /// executed by the maintenance worker through the shared command queue.
@@ -85,6 +108,13 @@ impl Default for Config {
             grpc_max_recv_msg_size: DEFAULT_MAX_RECV_MSG_SIZE,
             grpc_max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
             max_records_per_request: DEFAULT_MAX_RECORDS_PER_REQUEST,
+            max_attributes_per_record: DEFAULT_MAX_ATTRIBUTES_PER_RECORD,
+            max_attribute_key_bytes: DEFAULT_MAX_ATTRIBUTE_KEY_BYTES,
+            max_attribute_value_bytes: DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_buckets_per_point: DEFAULT_MAX_BUCKETS_PER_POINT,
+            max_exemplars_per_point: DEFAULT_MAX_EXEMPLARS_PER_POINT,
+            max_db_bytes: None,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             maintenance: MaintenanceConfig::default(),
             watchdog: WatchdogConfig::default(),
@@ -185,6 +215,42 @@ impl Config {
             1,
             MAX_RECORDS_PER_REQUEST,
         )?;
+        validate_range(
+            "max_attributes_per_record",
+            self.max_attributes_per_record,
+            1,
+            MAX_ATTRIBUTES_PER_RECORD,
+        )?;
+        validate_range(
+            "max_attribute_key_bytes",
+            self.max_attribute_key_bytes,
+            1,
+            MAX_ATTRIBUTE_KEY_BYTES,
+        )?;
+        validate_range(
+            "max_attribute_value_bytes",
+            self.max_attribute_value_bytes,
+            1,
+            MAX_ATTRIBUTE_VALUE_BYTES,
+        )?;
+        validate_range("max_body_bytes", self.max_body_bytes, 1, MAX_BODY_BYTES)?;
+        validate_range(
+            "max_buckets_per_point",
+            self.max_buckets_per_point,
+            1,
+            MAX_BUCKETS_PER_POINT,
+        )?;
+        validate_range(
+            "max_exemplars_per_point",
+            self.max_exemplars_per_point,
+            1,
+            MAX_EXEMPLARS_PER_POINT,
+        )?;
+        if let Some(quota) = self.max_db_bytes
+            && quota < MIN_DB_QUOTA_BYTES
+        {
+            bail!("max_db_bytes must be at least {MIN_DB_QUOTA_BYTES} bytes (1 MiB); got {quota}");
+        }
         validate_duration("batcher_max_batch_age", self.batcher_max_batch_age, false)?;
         validate_duration("shutdown_timeout", self.shutdown_timeout, false)?;
         validate_duration(
@@ -290,6 +356,7 @@ impl Config {
             "grpc_max_recv_msg_size": self.grpc_max_recv_msg_size,
             "grpc_max_concurrent_streams": self.grpc_max_concurrent_streams,
             "max_records_per_request": self.max_records_per_request,
+            "max_db_bytes": self.max_db_bytes,
             "shutdown_timeout_ms": self.shutdown_timeout.as_millis(),
             "durability_mode": format!("{:?}", self.durability_mode),
             "sqlite_synchronous": format!("{:?}", self.sqlite_synchronous),
@@ -310,6 +377,12 @@ impl Config {
             max_concurrent_streams: self.grpc_max_concurrent_streams,
             shutdown_timeout: self.shutdown_timeout,
             max_records_per_request: self.max_records_per_request,
+            max_attributes_per_record: self.max_attributes_per_record,
+            max_attribute_key_bytes: self.max_attribute_key_bytes,
+            max_attribute_value_bytes: self.max_attribute_value_bytes,
+            max_body_bytes: self.max_body_bytes,
+            max_buckets_per_point: self.max_buckets_per_point,
+            max_exemplars_per_point: self.max_exemplars_per_point,
             durability_mode: self.durability_mode,
             tls: self.tls.clone(),
             auth: self.auth.clone(),
@@ -325,6 +398,7 @@ impl Config {
             ),
             command_queue_capacity: self.command_queue_capacity,
             retention: None,
+            max_db_bytes: self.max_db_bytes,
             synchronous: self.sqlite_synchronous,
             startup_timeout: otel_sqlite_storage::DEFAULT_STARTUP_TIMEOUT,
             // One graceful-shutdown budget shared by the ingress drain
@@ -349,6 +423,13 @@ struct FileConfig {
     grpc_max_recv_msg_size: Option<usize>,
     grpc_max_concurrent_streams: Option<u32>,
     max_records_per_request: Option<usize>,
+    max_attributes_per_record: Option<usize>,
+    max_attribute_key_bytes: Option<usize>,
+    max_attribute_value_bytes: Option<usize>,
+    max_body_bytes: Option<usize>,
+    max_buckets_per_point: Option<usize>,
+    max_exemplars_per_point: Option<usize>,
+    max_db_bytes: Option<u64>,
     shutdown_timeout: Option<RawDuration>,
     maintenance: Option<MaintenanceSection>,
     watchdog: Option<WatchdogSection>,
@@ -389,6 +470,27 @@ impl FileConfig {
         }
         if let Some(value) = self.max_records_per_request {
             config.max_records_per_request = value;
+        }
+        if let Some(value) = self.max_attributes_per_record {
+            config.max_attributes_per_record = value;
+        }
+        if let Some(value) = self.max_attribute_key_bytes {
+            config.max_attribute_key_bytes = value;
+        }
+        if let Some(value) = self.max_attribute_value_bytes {
+            config.max_attribute_value_bytes = value;
+        }
+        if let Some(value) = self.max_body_bytes {
+            config.max_body_bytes = value;
+        }
+        if let Some(value) = self.max_buckets_per_point {
+            config.max_buckets_per_point = value;
+        }
+        if let Some(value) = self.max_exemplars_per_point {
+            config.max_exemplars_per_point = value;
+        }
+        if let Some(value) = self.max_db_bytes {
+            config.max_db_bytes = Some(value);
         }
         apply_required_duration(
             &mut config.shutdown_timeout,
@@ -545,7 +647,33 @@ fn readable_file(key: &str, path: &Path) -> Result<()> {
             path.display()
         )
     })?;
+    // Private keys and bearer tokens must not be world-readable; public certs
+    // are fine to skip. Warn (don't fail) to avoid breaking existing setups.
+    if matches!(key, "tls.key" | "auth.token_file") {
+        warn_if_world_readable(key, path);
+    }
     Ok(())
+}
+
+/// Best-effort permission warning for secret files (unix only).
+fn warn_if_world_readable(key: &str, path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path).map(|metadata| metadata.permissions().mode()) {
+            Ok(mode) if mode & 0o044 != 0 => tracing::warn!(
+                key,
+                path = %path.display(),
+                mode = format!("{mode:o}"),
+                "secret file is readable beyond its owner; chmod 600 it",
+            ),
+            _ => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (key, path);
+    }
 }
 
 /// `true` when `listen_address` resolves to a loopback-only socket. Used for
@@ -828,6 +956,11 @@ mod tests {
         let mut config = Config::default();
         file_config("").apply_to(&mut config).expect("applies");
         assert_eq!(config.listen_address, DEFAULT_LISTEN_ADDRESS);
+        assert!(
+            is_loopback_listen(&config.listen_address),
+            "default listen_address must be loopback-only (H1), got {}",
+            config.listen_address
+        );
         assert_eq!(config.sqlite_path, PathBuf::from("otel-logs.db"));
         assert_eq!(config.ingest_queue_capacity, DEFAULT_INGEST_QUEUE_CAPACITY);
         assert_eq!(
@@ -865,6 +998,12 @@ mod tests {
              grpc_max_recv_msg_size = 1024
              grpc_max_concurrent_streams = 8
              max_records_per_request = 777
+             max_attributes_per_record = 111
+             max_attribute_key_bytes = 222
+             max_attribute_value_bytes = 333
+             max_body_bytes = 444
+             max_buckets_per_point = 555
+             max_exemplars_per_point = 666
              shutdown_timeout = 90
             "#,
         )
@@ -879,7 +1018,34 @@ mod tests {
         assert_eq!(config.grpc_max_recv_msg_size, 1024);
         assert_eq!(config.grpc_max_concurrent_streams, 8);
         assert_eq!(config.max_records_per_request, 777);
+        assert_eq!(config.max_attributes_per_record, 111);
+        assert_eq!(config.max_attribute_key_bytes, 222);
+        assert_eq!(config.max_attribute_value_bytes, 333);
+        assert_eq!(config.max_body_bytes, 444);
+        assert_eq!(config.max_buckets_per_point, 555);
+        assert_eq!(config.max_exemplars_per_point, 666);
         assert_eq!(config.shutdown_timeout, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn size_quota_parses_validates_and_reaches_storage() {
+        let mut config = Config::default();
+        assert_eq!(config.max_db_bytes, None, "unbounded by default");
+        file_config("max_db_bytes = 1073741824\n")
+            .apply_to(&mut config)
+            .expect("applies");
+        assert_eq!(config.max_db_bytes, Some(1_073_741_824));
+        config.validate().expect("1 GiB quota is valid");
+        assert_eq!(config.storage_config().max_db_bytes, Some(1_073_741_824));
+        let dump = config.dump_json().expect("dumps");
+        assert!(dump.contains("max_db_bytes"), "dump must expose the quota");
+
+        // Below 1 MiB the writer would evict on nearly every batch: reject.
+        let tiny = Config {
+            max_db_bytes: Some(1024),
+            ..Config::default()
+        };
+        assert!(tiny.validate().is_err(), "sub-MiB quotas must be rejected");
     }
 
     #[test]
@@ -1236,6 +1402,48 @@ mod tests {
             "max_records_per_request",
             Config {
                 max_records_per_request: MAX_RECORDS_PER_REQUEST + 1,
+                ..Config::default()
+            }
+        );
+        assert_invalid!(
+            "max_attributes_per_record",
+            Config {
+                max_attributes_per_record: MAX_ATTRIBUTES_PER_RECORD + 1,
+                ..Config::default()
+            }
+        );
+        assert_invalid!(
+            "max_attribute_key_bytes",
+            Config {
+                max_attribute_key_bytes: MAX_ATTRIBUTE_KEY_BYTES + 1,
+                ..Config::default()
+            }
+        );
+        assert_invalid!(
+            "max_attribute_value_bytes",
+            Config {
+                max_attribute_value_bytes: MAX_ATTRIBUTE_VALUE_BYTES + 1,
+                ..Config::default()
+            }
+        );
+        assert_invalid!(
+            "max_body_bytes",
+            Config {
+                max_body_bytes: MAX_BODY_BYTES + 1,
+                ..Config::default()
+            }
+        );
+        assert_invalid!(
+            "max_buckets_per_point",
+            Config {
+                max_buckets_per_point: MAX_BUCKETS_PER_POINT + 1,
+                ..Config::default()
+            }
+        );
+        assert_invalid!(
+            "max_exemplars_per_point",
+            Config {
+                max_exemplars_per_point: MAX_EXEMPLARS_PER_POINT + 1,
                 ..Config::default()
             }
         );

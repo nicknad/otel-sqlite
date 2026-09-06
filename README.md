@@ -6,11 +6,11 @@ logs in SQLite.
 Pipeline: `gRPC ingress → bounded ingest queue (all-or-nothing admission) →
 insert batcher → bounded command queue → single SQLite writer (WAL)`.
 
-* Benchmarks & performance docs: [docs/performance.md](docs/performance.md)
+- Benchmarks & performance docs: [docs/performance.md](docs/performance.md)
   (`cargo run --release -p otel-sqlite-e2e -- --scenario baseline`)
-* Architecture, design contract & invariants: [docs/architecture.md](docs/architecture.md)
-* Open work & roadmap: [TODO.md](TODO.md)
-* Local CI (run `.forgejo/workflows/ci.yml` on your machine with `act`):
+- Architecture, design contract & invariants: [docs/architecture.md](docs/architecture.md)
+- Open work & roadmap: [TODO.md](TODO.md)
+- Local CI (run `.forgejo/workflows/ci.yml` on your machine with `act`):
   [local-ci/](local-ci/) (`.\local-ci\run.ps1` or `./local-ci/run.sh`)
 
 ## Project scope
@@ -68,7 +68,6 @@ silently turned into an unrelated value:
   `SummaryDataPoint` carries no exemplars in the pinned OTLP proto, so summary
   points persist no exemplar column data.
 
-
 ## Architecture
 
 The pipeline follows a strict **single-writer** design:
@@ -97,19 +96,10 @@ The maintenance worker runs on its own thread and owns scheduling only:
 - contains no SQL and holds no database connection — every statement lives in
   the storage writer.
 
-Guarantees:
-
-- at most one outstanding instance per operation (interval-gated scheduling);
-- best-effort under queue pressure: a full queue defers the operation and
-  retries after a controlled delay instead of blocking ingestion or dropping
-  the operation;
-- block-waits between deadlines (no busy loop) and stops cleanly on shutdown,
-  before the writer is drained.
-
 Frequencies are explicit in `MaintenanceConfig` and conservative by default:
 purge every 15 min, checkpoint every 5 min, `ANALYZE` twice a day, `VACUUM`
 once a day; retention is disabled unless configured. Retention windows are
-per signal — one uniform window covers logs *and* metrics:
+per signal — one uniform window covers logs _and_ metrics:
 
 ```toml
 [maintenance]
@@ -145,11 +135,11 @@ mode = "commit"        # "commit" (default) | "enqueue" (ack at ingest-queue ent
 synchronous = "normal" # SQLite synchronous pragma: "normal" | "full"
 ```
 
-* `"enqueue"` acknowledges as soon as records enter the bounded ingest queue:
+- `"enqueue"` acknowledges as soon as records enter the bounded ingest queue:
   lowest latency, but acknowledged records may be lost to a crash.
-* `synchronous = "full"` additionally fsyncs WAL on every commit, extending
+- `synchronous = "full"` additionally fsyncs WAL on every commit, extending
   the durability guarantee from application crashes to power failures.
-* If the writer or batcher dies before a ticket commits, pending requests
+- If the writer or batcher dies before a ticket commits, pending requests
   fail immediately with `UNAVAILABLE` (clients retry) instead of hanging.
 
 Backpressure is **all-or-nothing**. The ingress sender wraps the bounded
@@ -157,40 +147,14 @@ ingest queue in an **admission guard**: it reserves room for an entire
 request's chunks before any of them are enqueued, and every other producer
 (including control messages like Flush barriers) must pass the same gate, so
 no two requests can interleave. If the queue cannot fit the whole request, the
-server returns `UNAVAILABLE` and *nothing* is accepted — a retrying exporter
+server returns `UNAVAILABLE` and _nothing_ is accepted — a retrying exporter
 resends a request that was never partially applied, so duplicate telemetry is
 impossible even though log-event and data-point rows have no idempotency key.
 Rejected requests issue no commit tickets and never stall later commits.
 
-#### Crash durability & restart testing
-
-The durable-ack contract is proven under **real process death**, not just
-graceful shutdown:
-
-```sh
-# Native: spawn the binary, kill it mid-load (SIGKILL/TerminateProcess),
-# restart on the same database, assert no acknowledged loss.
-cargo test -p otel-sqlite --test crash_durability
-
-# Against the release build (the CI release gate):
-cargo build --release -p otel-sqlite
-OTEL_SQLITE_CRASH_BIN=target/release/otel-sqlite \
-    cargo test --release -p otel-sqlite --test crash_durability
-
-# Container: docker-kill the sidecar mid-load, restart, validate the volume.
-docker/crash-e2e.sh
-```
-
-The suite covers `synchronous = normal` and `full`, clean SIGTERM shutdown,
-and independent writer/batcher death. For the thread-level death tests, the
-storage crate ships inert-unless-set fault knobs
-(`OTEL_SQLITE_FAULT_WRITER_AFTER_N`, `OTEL_SQLITE_FAULT_BATCHER_AFTER_N`) that
-make the named thread exit through its real fatal path — never set them in
-production.
-
 ### Observability
 
-* **Prometheus `/metrics`** is served on `metrics_address`
+- **Prometheus `/metrics`** is served on `metrics_address`
   (default `127.0.0.1:8888`; set `"off"` in the TOML to disable). It exposes
   OTLP request/record counters and histograms, ingest/storage queue depths,
   batcher buffer occupancy, transaction durations, writer errors, drop
@@ -200,17 +164,17 @@ production.
   must scrape remotely. Do not point `metrics_address` at a routable
   interface without such a front; it carries no authentication of its own
   (`[tls]` applies only to the OTLP listener).
-* **gRPC health** (`grpc.health.v1.Check`/`Watch`) runs on the same port as
+- **gRPC health** (`grpc.health.v1.Check`/`Watch`) runs on the same port as
   OTLP. The overall status (empty service name) plus both OTLP services track
   pipeline evidence sampled every second: anything other than a running
-  writer *and* batcher reports `NOT_SERVING`, and shutdown flips to
+  writer _and_ batcher reports `NOT_SERVING`, and shutdown flips to
   `NOT_SERVING` before draining so load balancers stop routing.
-* **Startup readiness**: `Storage::open` blocks until the database is open and
+- **Startup readiness**: `Storage::open` blocks until the database is open and
   the schema migrated; a broken storage backend fails process startup instead
   of surfacing on first traffic.
-* **Failure policy** (`storage` writer): SQLite errors are classified per
-  batch — *transient* (`BUSY`/`LOCKED`) retries up to 4× with exponential
-  backoff; *poisonous* data errors (constraint violations, row-local binding
+- **Failure policy** (`storage` writer): SQLite errors are classified per
+  batch — _transient_ (`BUSY`/`LOCKED`) retries up to 4× with exponential
+  backoff; _poisonous_ data errors (constraint violations, row-local binding
   failures) trigger a salvage pass that commits healthy rows and
   drops-and-counts only the offending ones (`quarantined_records`,
   warn-logged per row); anything unknown or environmental (disk full, IO,
@@ -307,17 +271,17 @@ mode = "token"
 token_file = "/etc/otel-sqlite/clients.txt"   # one token per line, all valid
 ```
 
-* **mTLS**: clients must present a certificate signed by `client_ca`.
+- **mTLS**: clients must present a certificate signed by `client_ca`.
   Rotation = reissue a client cert from the CA (`gen-certs --client x`
   again); the CA itself stays stable for years.
-* **Tokens** travel as `authorization: Bearer <token>` headers, are stored
+- **Tokens** travel as `authorization: Bearer <token>` headers, are stored
   hashed (constant-time compare) and reloaded from disk every few seconds —
   rotate with zero downtime by appending a new line to `clients.txt`,
   migrating senders, then removing the old line. Deleting the file revokes
   everything immediately.
-* The gRPC health service deliberately stays unauthenticated so probes and
+- The gRPC health service deliberately stays unauthenticated so probes and
   load balancers work; under mTLS the built-in healthcheck authenticates
   with the server's own identity (its certificate carries both serverAuth
   and clientAuth).
-* Binding a non-loopback address without `[tls]` prints a loud warning at
+- Binding a non-loopback address without `[tls]` prints a loud warning at
   startup; `mode = "token"` without a readable token file refuses to start.

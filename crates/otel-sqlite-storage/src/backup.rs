@@ -15,11 +15,20 @@
 //! exclusively the writer's.
 //!
 //! Backup files may be optionally encrypted with AES-256-GCM (32-byte key
-//! file). An encrypted backup is a self-describing container:
+//! file). An encrypted backup is a self-describing container, versioned:
 //!
 //! ```text
-//! "OTSQBAK1" (8 bytes) || version (1 byte) || nonce (12 bytes) || ciphertext
+//! v1 (legacy, whole-file): "OTSQBAK1" (8) || 0x01 || nonce (12) || ciphertext
+//! v2 (streaming, current): "OTSQBAK1" (8) || 0x02 || base_nonce (12) || frames*
+//!   frame := u32 BE ciphertext_len || ciphertext (plaintext_chunk + 16 tag)
 //! ```
+//!
+//! v2 splits the plaintext into 64 KiB chunks, each encrypted under a unique
+//! nonce derived from `base_nonce` (`base[0..8] || counter BE`). Chunk order
+//! is authenticated by the nonce sequence: swapping frames fails verification
+//! because the decryptor derives the expected nonce from the frame index.
+//! `decrypt_to` accepts both versions; `encrypt_file` always writes v2 so
+//! GB-scale databases never load fully into RAM.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -36,11 +45,21 @@ use zeroize::Zeroizing;
 
 /// Magic bytes identifying an otel-sqlite encrypted backup file.
 pub const BACKUP_FILE_MAGIC: &[u8; 8] = b"OTSQBAK1";
-/// Current on-disk format version of an encrypted backup.
-pub const BACKUP_FILE_VERSION: u8 = 1;
+/// Legacy whole-file format version (kept for `decrypt_to` compatibility).
+pub const BACKUP_FILE_VERSION_V1: u8 = 1;
+/// Current on-disk format version of an encrypted backup (streaming chunks).
+pub const BACKUP_FILE_VERSION: u8 = 2;
 /// AES-256 requires a 32-byte key.
 pub const ENCRYPTION_KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
+/// Plaintext bytes per v2 streaming frame. 64 KiB bounds RAM to ~128 KiB
+/// (plaintext + ciphertext buffers) regardless of database size.
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+/// AES-GCM authentication tag length.
+const GCM_TAG_LEN: usize = 16;
+/// Maximum accepted v2 frame ciphertext length (one full chunk + tag).
+/// Caps allocation on corrupt `len` prefixes.
+const MAX_FRAME_CIPHERTEXT: usize = STREAM_CHUNK_BYTES + GCM_TAG_LEN;
 
 /// A backup engine failure. Kept separate from [`crate::StorageError`] because
 /// backups run outside the pipeline (CLI subcommands, cron/systemd timers) and
@@ -272,7 +291,7 @@ pub fn backup_to(source: &Path, dest: &Path) -> Result<BackupReport, BackupError
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode = DELETE;")?;
     }
-    restrict_permissions(dest)?;
+    crate::permissions::restrict_permissions(dest)?;
 
     let verify = verify(dest)?;
     if verify.integrity != "ok" {
@@ -341,7 +360,7 @@ pub fn restore_into(
     }
 
     fs::copy(&plain, &target)?;
-    restrict_permissions(&target)?;
+    crate::permissions::restrict_permissions(&target)?;
     let verified_after = verify(&target)?;
 
     Ok(RestoreReport {
@@ -458,63 +477,158 @@ fn read_key(path: &Path) -> Result<Zeroizing<Vec<u8>>, BackupError> {
     Ok(Zeroizing::new(bytes))
 }
 
-fn random_nonce() -> [u8; NONCE_LEN] {
+fn random_base_nonce() -> Result<[u8; NONCE_LEN], BackupError> {
     let mut nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng
         .try_fill_bytes(&mut nonce)
-        .expect("operating system random source must be available");
+        .map_err(|error| BackupError::Io(io::Error::other(error.to_string())))?;
+    Ok(nonce)
+}
+
+/// Derives the per-frame nonce for v2 chunk `counter`: `base[0..8]` preserved,
+/// last 4 bytes carry the big-endian frame index. Unique per frame, and frame
+/// reordering fails authentication because the decryptor expects the index.
+fn frame_nonce(base: &[u8; NONCE_LEN], counter: u32) -> [u8; NONCE_LEN] {
+    let mut nonce = *base;
+    nonce[NONCE_LEN - 4..].copy_from_slice(&counter.to_be_bytes());
     nonce
 }
 
 /// Encrypts a plaintext backup file into `out` with AES-256-GCM under the key
-/// in `key_path`. The output is self-describing:
-/// `magic || version || nonce || ciphertext`. `out` must not exist.
+/// in `key_path`, streaming in 64 KiB frames (v2 format, constant memory).
+/// `out` must not exist (created atomically with `create_new`).
 pub fn encrypt_file(plain: &Path, out: &Path, key_path: &Path) -> Result<(), BackupError> {
-    if out.exists() {
-        return Err(BackupError::DestinationExists(out.to_path_buf()));
-    }
     let key = read_key(key_path)?;
-    let nonce_bytes = random_nonce();
+    warn_if_key_world_readable(key_path);
+    let base_nonce = random_base_nonce()?;
     let cipher =
         Aes256Gcm::new_from_slice(key.as_slice()).expect("key length validated to 32 bytes");
-    let plaintext = fs::read(plain)?;
-    let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_ref())
-        .map_err(|_| BackupError::CorruptBackup("AES-GCM encryption failed".to_owned()))?;
 
-    let mut file = fs::File::create(out)?;
-    file.write_all(BACKUP_FILE_MAGIC)?;
-    file.write_all(&[BACKUP_FILE_VERSION])?;
-    file.write_all(&nonce_bytes)?;
-    file.write_all(&ciphertext)?;
-    file.sync_all()?;
-    drop(file);
-    restrict_permissions(out)?;
-    Ok(())
+    let mut input = fs::File::open(plain)?;
+    let out_file = fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(out)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                BackupError::DestinationExists(out.to_path_buf())
+            } else {
+                BackupError::Io(error)
+            }
+        })?;
+    let mut output = io::BufWriter::with_capacity(STREAM_CHUNK_BYTES + 1024, out_file);
+
+    let result: Result<u64, BackupError> = (|| {
+        output.write_all(BACKUP_FILE_MAGIC)?;
+        output.write_all(&[BACKUP_FILE_VERSION])?;
+        output.write_all(&base_nonce)?;
+
+        let mut plaintext = vec![0u8; STREAM_CHUNK_BYTES];
+        let mut counter: u32 = 0;
+        let mut total_frames: u64 = 0;
+        loop {
+            let read = input.read(&mut plaintext)?;
+            if read == 0 {
+                break;
+            }
+            let nonce = frame_nonce(&base_nonce, counter);
+            let ciphertext = cipher
+                .encrypt(Nonce::from_slice(&nonce), &plaintext[..read])
+                .map_err(|_| BackupError::CorruptBackup("AES-GCM encryption failed".to_owned()))?;
+            let len = u32::try_from(ciphertext.len()).map_err(|_| {
+                BackupError::CorruptBackup("encrypted frame exceeds u32 range".to_owned())
+            })?;
+            output.write_all(&len.to_be_bytes())?;
+            output.write_all(&ciphertext)?;
+            total_frames += 1;
+            counter = counter.checked_add(1).ok_or_else(|| {
+                BackupError::CorruptBackup("backup exceeds 256 TiB frame limit".to_owned())
+            })?;
+        }
+        output.flush()?;
+        Ok(total_frames)
+    })();
+
+    match result {
+        Ok(_) => {
+            let out_file = output
+                .into_inner()
+                .map_err(|error| BackupError::Io(error.into_error()))?;
+            out_file.sync_all()?;
+            drop(out_file);
+            crate::permissions::restrict_permissions(out)?;
+            Ok(())
+        }
+        Err(error) => {
+            drop(output);
+            let _ = fs::remove_file(out);
+            Err(error)
+        }
+    }
 }
 
 /// Decrypts an encrypted backup into `out` with the key in `key_path`.
-/// Authenticates the ciphertext: a wrong key or a corrupted file fails here,
-/// never after an operator already trusted the bytes.
+/// Authenticates chunk-by-chunk (v2) or whole-file (legacy v1): a wrong key
+/// or a corrupted file fails here and removes any partial `out`, never after
+/// an operator already trusted the bytes. Accepts both v1 and v2 artifacts.
 pub fn decrypt_to(encrypted: &Path, key_path: &Path, out: &Path) -> Result<(), BackupError> {
     let key = read_key(key_path)?;
-    let bytes = fs::read(encrypted)?;
-    if bytes.len() < BACKUP_FILE_MAGIC.len() + 1 + NONCE_LEN
-        || &bytes[..BACKUP_FILE_MAGIC.len()] != BACKUP_FILE_MAGIC
-    {
+    warn_if_key_world_readable(key_path);
+    let cipher =
+        Aes256Gcm::new_from_slice(key.as_slice()).expect("key length validated to 32 bytes");
+
+    let mut input = fs::File::open(encrypted)?;
+    let mut magic = [0u8; 8];
+    let mut version = [0u8; 1];
+    if read_exact_or_eof(&mut input, &mut magic)? != magic.len() || magic != *BACKUP_FILE_MAGIC {
         return Err(BackupError::CorruptBackup(
             "not an otel-sqlite encrypted backup (bad magic)".to_owned(),
         ));
     }
-    if bytes[BACKUP_FILE_MAGIC.len()] != BACKUP_FILE_VERSION {
-        return Err(BackupError::CorruptBackup(format!(
-            "unsupported backup file version {}",
-            bytes[BACKUP_FILE_MAGIC.len()]
-        )));
+    if read_exact_or_eof(&mut input, &mut version)? != 1 {
+        return Err(BackupError::CorruptBackup(
+            "truncated backup header (missing version)".to_owned(),
+        ));
     }
-    let (nonce, ciphertext) = bytes[BACKUP_FILE_MAGIC.len() + 1..].split_at(NONCE_LEN);
-    let cipher =
-        Aes256Gcm::new_from_slice(key.as_slice()).expect("key length validated to 32 bytes");
+
+    match version[0] {
+        BACKUP_FILE_VERSION_V1 => decrypt_v1_body(&mut input, &cipher, out),
+        BACKUP_FILE_VERSION => decrypt_v2_body(&mut input, &cipher, out),
+        other => Err(BackupError::CorruptBackup(format!(
+            "unsupported backup file version {other}"
+        ))),
+    }
+}
+
+/// Reads exactly `buf.len()` bytes unless EOF hits first; returns bytes read.
+fn read_exact_or_eof(file: &mut fs::File, buf: &mut [u8]) -> Result<usize, BackupError> {
+    let mut read_total = 0;
+    while read_total < buf.len() {
+        match file.read(&mut buf[read_total..]) {
+            Ok(0) => break,
+            Ok(read) => read_total += read,
+            Err(error) => return Err(BackupError::Io(error)),
+        }
+    }
+    Ok(read_total)
+}
+
+/// Legacy v1 body: `nonce (12) || ciphertext` covering the whole file.
+/// Kept for backward compatibility; loads the remainder into RAM because the
+/// single tag spans all bytes and cannot stream.
+fn decrypt_v1_body(
+    input: &mut fs::File,
+    cipher: &Aes256Gcm,
+    out: &Path,
+) -> Result<(), BackupError> {
+    let mut rest = Vec::new();
+    input.read_to_end(&mut rest)?;
+    if rest.len() < NONCE_LEN {
+        return Err(BackupError::CorruptBackup(
+            "truncated v1 backup (missing nonce)".to_owned(),
+        ));
+    }
+    let (nonce, ciphertext) = rest.split_at(NONCE_LEN);
     let plaintext = cipher
         .decrypt(Nonce::from_slice(nonce), ciphertext)
         .map_err(|_| {
@@ -523,27 +637,103 @@ pub fn decrypt_to(encrypted: &Path, key_path: &Path, out: &Path) -> Result<(), B
             )
         })?;
 
-    let mut file = fs::File::create(out)?;
-    file.write_all(&plaintext)?;
-    file.sync_all()?;
-    drop(file);
-    restrict_permissions(out)?;
-    Ok(())
+    match (|| -> Result<(), BackupError> {
+        let mut file = fs::File::create(out)?;
+        file.write_all(&plaintext)?;
+        file.sync_all()?;
+        Ok(())
+    })() {
+        Ok(()) => {
+            crate::permissions::restrict_permissions(out)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(out);
+            Err(error)
+        }
+    }
 }
 
-/// Restricts a backup artifact to owner-only read/write on unix. Windows
-/// relies on directory ACLs instead (documented in the runbook).
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<(), BackupError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
+/// v2 body: `base_nonce (12) || frames*`, streamed frame-by-frame with
+/// constant memory. Any tag failure or truncation removes partial `out`.
+fn decrypt_v2_body(
+    input: &mut fs::File,
+    cipher: &Aes256Gcm,
+    out: &Path,
+) -> Result<(), BackupError> {
+    let mut base = [0u8; NONCE_LEN];
+    if read_exact_or_eof(input, &mut base)? != NONCE_LEN {
+        return Err(BackupError::CorruptBackup(
+            "truncated v2 backup header (missing base nonce)".to_owned(),
+        ));
+    }
+
+    let out_file = fs::File::create(out).map_err(BackupError::Io)?;
+    let mut output = io::BufWriter::with_capacity(STREAM_CHUNK_BYTES + 1024, out_file);
+    let result: Result<(), BackupError> = (|| {
+        let mut counter: u32 = 0;
+        let mut len_buf = [0u8; 4];
+        loop {
+            let header_read = read_exact_or_eof(input, &mut len_buf)?;
+            if header_read == 0 {
+                break; // clean EOF at frame boundary
+            }
+            if header_read != len_buf.len() {
+                return Err(BackupError::CorruptBackup(
+                    "truncated frame length prefix".to_owned(),
+                ));
+            }
+            let frame_len = u32::from_be_bytes(len_buf) as usize;
+            if frame_len == 0 || frame_len > MAX_FRAME_CIPHERTEXT {
+                return Err(BackupError::CorruptBackup(format!(
+                    "corrupt frame length {frame_len}"
+                )));
+            }
+            let mut ciphertext = vec![0u8; frame_len];
+            if read_exact_or_eof(input, &mut ciphertext)? != frame_len {
+                return Err(BackupError::CorruptBackup(
+                    "truncated frame payload".to_owned(),
+                ));
+            }
+            let nonce = frame_nonce(&base, counter);
+            let plaintext = cipher
+                .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+                .map_err(|_| {
+                    BackupError::CorruptBackup(
+                        "authentication failed: wrong key or corrupted backup".to_owned(),
+                    )
+                })?;
+            output.write_all(&plaintext)?;
+            counter = counter.checked_add(1).ok_or_else(|| {
+                BackupError::CorruptBackup("backup exceeds 256 TiB frame limit".to_owned())
+            })?;
+        }
+        output.flush()?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            let out_file = output
+                .into_inner()
+                .map_err(|error| BackupError::Io(error.into_error()))?;
+            out_file.sync_all()?;
+            drop(out_file);
+            crate::permissions::restrict_permissions(out)?;
+            Ok(())
+        }
+        Err(error) => {
+            drop(output);
+            let _ = fs::remove_file(out);
+            Err(error)
+        }
+    }
 }
 
-#[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)] // mirrors the unix arm's signature for uniform call sites
-fn restrict_permissions(_path: &Path) -> Result<(), BackupError> {
-    Ok(())
+/// Warns when the encryption key file is readable beyond its owner.
+/// Keys are small; the check itself streams nothing.
+fn warn_if_key_world_readable(path: &Path) {
+    crate::permissions::warn_if_world_readable(path, "encryption key file");
 }
 
 /// Best-effort cleanup of a temporary decrypted file on every exit path.

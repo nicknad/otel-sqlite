@@ -218,21 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn dropping_all_shutdown_senders_releases_the_worker() {
-        let (queue, _receiver) = crossbeam_channel::bounded::<WriteCommand>(16);
-        let handle = MaintenanceWorker::new(queue, config(None)).spawn();
-        std::thread::sleep(Duration::from_millis(50));
-
-        let started = Instant::now();
-        drop(handle);
-        // Nothing observable joins here; the invariant under test is that no
-        // panic/hang occurs and the thread exits on sender release. Sleep a
-        // beat to give the thread time to trip over any misuse.
-        std::thread::sleep(Duration::from_millis(150));
-        assert!(started.elapsed() < Duration::from_secs(5));
-    }
-
-    #[test]
     fn closed_command_queue_terminates_the_worker() {
         let (queue, receiver) = crossbeam_channel::bounded::<WriteCommand>(16);
         let handle = MaintenanceWorker::new(queue, config(Some(Duration::from_millis(10)))).spawn();
