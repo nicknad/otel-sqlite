@@ -15,7 +15,7 @@ pub(crate) fn restrict_permissions(path: &Path) -> Result<(), BackupError> {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(windows)]
