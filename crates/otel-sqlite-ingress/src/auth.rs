@@ -15,8 +15,16 @@
 //!   leak how much of a presented token matched. File contents and transient
 //!   digests live in `zeroize::Zeroizing` wrappers so heap copies are cleared
 //!   on drop instead of lingering for scrapers/core dumps.
-//! * **Fail closed**: an unreadable or vanished file rejects everything until
-//!   it becomes readable again.
+//! * **Bounded parsing**: the file is read through a [`MAX_TOKEN_FILE_BYTES`]
+//!   cap, lines past [`MAX_TOKEN_LINE_BYTES`] are skipped, and files holding
+//!   more than [`MAX_TOKENS`] tokens are rejected, so a bloated token file
+//!   cannot OOM the ingress on its reload loop.
+//! * **Fail closed**: a removed file revokes everything immediately. A file
+//!   that stays unreadable, over-limit, or persistently empty fails closed
+//!   once [`MAX_STALE_TOKEN_AGE`] of grace has passed since the last good
+//!   reload — a single bad read (slow disk, mid-rewrite observation) keeps
+//!   serving the last known set, but an attacker pinning the file in a bad
+//!   state cannot defer revocation forever.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,10 +39,30 @@ use zeroize::Zeroizing;
 /// repeating "cannot read" warnings.
 const DEFAULT_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Maximum accepted token-file size in bytes (M3). The file is read through
+/// `take(MAX + 1)` and pre-checked via metadata, so a file grown past this —
+/// accidentally or maliciously — is rejected without ever buffering it fully.
+const MAX_TOKEN_FILE_BYTES: u64 = 1024 * 1024;
+/// Maximum tokens accepted from one file (M3). Past this the reload is
+/// rejected (startup fails instead), bounding per-reload hashing and the
+/// `hashes` clone held across the verify path.
+const MAX_TOKENS: usize = 10_000;
+/// Maximum bytes of one token line (M3). Longer lines are skipped: bearer
+/// tokens are short random strings, so an over-long line is garbage, not a
+/// credential anyone could type into an `authorization` header.
+const MAX_TOKEN_LINE_BYTES: usize = 4_096;
+/// Grace period for a stale token set (M3). While reloads keep failing
+/// (unreadable, over-limit) the last known set keeps serving; once no good
+/// reload has happened for this long, the vault fails closed (rejects
+/// everything) until the file reads cleanly again. Bounds how long an
+/// attacker holding the file in a bad state can defer a revocation.
+const MAX_STALE_TOKEN_AGE: Duration = Duration::from_secs(5 * 60);
+
 #[derive(Debug)]
 pub struct TokenFileVault {
     path: PathBuf,
     reload_interval: Duration,
+    max_stale_age: Duration,
     cached: RwLock<CachedTokens>,
 }
 
@@ -42,6 +70,13 @@ pub struct TokenFileVault {
 struct CachedTokens {
     loaded_at: Option<Instant>,
     hashes: Vec<[u8; 32]>,
+    /// When consecutive failing reloads started (`None` = last reload was
+    /// good). Compared against `max_stale_age` for fail-closed expiry.
+    unhealthy_since: Option<Instant>,
+    /// Consecutive reloads that observed an empty file. The first is treated
+    /// as a mid-rewrite observation (keep serving); a persistent empty file
+    /// revokes, matching `open` refusing an empty file at startup.
+    consecutive_empty: u32,
 }
 
 impl TokenFileVault {
@@ -52,6 +87,7 @@ impl TokenFileVault {
         let vault = Self {
             path: path.into(),
             reload_interval: DEFAULT_RELOAD_INTERVAL,
+            max_stale_age: MAX_STALE_TOKEN_AGE,
             cached: RwLock::new(CachedTokens::default()),
         };
         warn_if_token_file_world_readable(&vault.path);
@@ -117,10 +153,18 @@ impl TokenFileVault {
         // lock so concurrent exports keep verifying against the old set on
         // their read locks instead of serializing behind us. The raw text is
         // zeroized on drop; only digests escape it.
-        let file_result = match fs::read_to_string(&self.path) {
-            Ok(text) => ReloadOutcome::Loaded(parse_token_lines(&Zeroizing::new(text))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReloadOutcome::Revoked,
-            Err(error) => ReloadOutcome::Unreadable(error.to_string()),
+        let file_result = match read_token_file(&self.path) {
+            Ok(parsed) => ReloadOutcome::Loaded(parsed),
+            Err(LoadError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                ReloadOutcome::Revoked
+            }
+            Err(LoadError::Io(error)) => ReloadOutcome::Unreadable(error.to_string()),
+            Err(LoadError::TooLarge(bytes)) => ReloadOutcome::Invalid(format!(
+                "token file is {bytes} bytes, limit is {MAX_TOKEN_FILE_BYTES}"
+            )),
+            Err(LoadError::TooManyTokens(count)) => ReloadOutcome::Invalid(format!(
+                "token file holds {count} tokens, limit is {MAX_TOKENS}"
+            )),
         };
 
         // Publish under a short exclusive hold (double-checked: another
@@ -128,33 +172,65 @@ impl TokenFileVault {
         let (hashes, log_event) = {
             let mut cached = self.write_cached();
             if is_stale(cached.loaded_at, self.reload_interval) {
+                let now = Instant::now();
                 let event = match &file_result {
-                    ReloadOutcome::Loaded(hashes) if hashes.is_empty() => {
-                        // Likely a botched atomic rewrite: keep serving the
-                        // last known set instead of bricking the pipeline.
-                        LogEvent::EmptyKept
+                    ReloadOutcome::Loaded(parsed) if parsed.hashes.is_empty() => {
+                        cached.consecutive_empty += 1;
+                        if cached.consecutive_empty >= 2 {
+                            // Still empty on the next reload: not a rewrite
+                            // race but a real state — revoke, matching the
+                            // startup refusal of empty files.
+                            cached.hashes.clear();
+                            cached.unhealthy_since = None;
+                            LogEvent::EmptyRevoked
+                        } else {
+                            // Likely a botched atomic rewrite observed
+                            // mid-flight: keep serving the last known set
+                            // this once instead of bricking the pipeline.
+                            LogEvent::EmptyKept
+                        }
                     }
-                    ReloadOutcome::Loaded(hashes) => {
-                        cached.hashes.clone_from(hashes);
-                        LogEvent::None
+                    ReloadOutcome::Loaded(parsed) => {
+                        cached.hashes.clone_from(&parsed.hashes);
+                        cached.unhealthy_since = None;
+                        cached.consecutive_empty = 0;
+                        if parsed.skipped_long_lines > 0 {
+                            LogEvent::SkippedLong(parsed.skipped_long_lines)
+                        } else {
+                            LogEvent::None
+                        }
                     }
                     ReloadOutcome::Revoked => {
                         // A removed file is an explicit revoke-all.
                         let had_tokens = !cached.hashes.is_empty();
                         cached.hashes.clear();
+                        cached.unhealthy_since = None;
+                        cached.consecutive_empty = 0;
                         if had_tokens {
                             LogEvent::Revoked
                         } else {
                             LogEvent::None
                         }
                     }
-                    ReloadOutcome::Unreadable(message) => {
-                        // Transient IO trouble: keep last known set; the
-                        // timestamp update below throttles repeat warnings.
-                        LogEvent::Unreadable(message.clone())
+                    ReloadOutcome::Unreadable(message) | ReloadOutcome::Invalid(message) => {
+                        // Transient trouble (or an over-limit file): keep the
+                        // last known set, but only within the grace period —
+                        // past it, fail closed so a pinned-bad file cannot
+                        // defer revocation forever.
+                        let since = *cached.unhealthy_since.get_or_insert(now);
+                        if now.saturating_duration_since(since) >= self.max_stale_age {
+                            cached.hashes.clear();
+                            LogEvent::StaleExpired(message.clone())
+                        } else if matches!(file_result, ReloadOutcome::Invalid(_)) {
+                            LogEvent::Invalid(message.clone())
+                        } else {
+                            // The timestamp update below throttles repeat
+                            // warnings.
+                            LogEvent::Unreadable(message.clone())
+                        }
                     }
                 };
-                cached.loaded_at = Some(Instant::now());
+                cached.loaded_at = Some(now);
                 (cached.hashes.clone(), event)
             } else {
                 // Lost the race: someone else already reloaded.
@@ -168,16 +244,35 @@ impl TokenFileVault {
             LogEvent::None => {}
             LogEvent::EmptyKept => tracing::warn!(
                 path = %self.path.display(),
-                "token file is empty; keeping last known tokens"
+                "token file is empty; keeping last known tokens this once"
+            ),
+            LogEvent::EmptyRevoked => tracing::warn!(
+                path = %self.path.display(),
+                "token file is persistently empty; revoking all bearer tokens"
             ),
             LogEvent::Revoked => tracing::info!(
                 path = %self.path.display(),
                 "token file removed; revoking all bearer tokens"
             ),
+            LogEvent::SkippedLong(count) => tracing::warn!(
+                path = %self.path.display(),
+                count,
+                "token file holds over-long lines; skipped them"
+            ),
             LogEvent::Unreadable(error) => tracing::warn!(
                 path = %self.path.display(),
                 %error,
                 "token file temporarily unreadable; keeping last known tokens"
+            ),
+            LogEvent::Invalid(error) => tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "token file over limits; keeping last known tokens until the grace period expires"
+            ),
+            LogEvent::StaleExpired(error) => tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "token file unhealthy past the grace period; revoking all bearer tokens"
             ),
         }
 
@@ -192,25 +287,100 @@ impl TokenFileVault {
 }
 
 fn read_token_hashes(path: &Path) -> Result<Vec<[u8; 32]>, AuthError> {
-    let text = Zeroizing::new(fs::read_to_string(path).map_err(|source| AuthError::Read {
-        path: path.to_owned(),
-        source,
-    })?);
-    let hashes = parse_token_lines(&text);
-    if hashes.is_empty() {
-        return Err(AuthError::NoTokens {
+    match read_token_file(path) {
+        Ok(parsed) => {
+            if parsed.skipped_long_lines > 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    count = parsed.skipped_long_lines,
+                    "token file holds over-long lines; skipped them",
+                );
+            }
+            if parsed.hashes.is_empty() {
+                return Err(AuthError::NoTokens {
+                    path: path.to_owned(),
+                });
+            }
+            Ok(parsed.hashes)
+        }
+        Err(LoadError::Io(source)) => Err(AuthError::Read {
             path: path.to_owned(),
-        });
+            source,
+        }),
+        Err(LoadError::TooLarge(bytes)) => Err(AuthError::TooLarge {
+            path: path.to_owned(),
+            bytes,
+        }),
+        Err(LoadError::TooManyTokens(count)) => Err(AuthError::TooManyTokens {
+            path: path.to_owned(),
+            count,
+        }),
     }
-    Ok(hashes)
 }
 
-fn parse_token_lines(text: &str) -> Vec<[u8; 32]> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| Sha256::digest(line.as_bytes()).into())
-        .collect()
+/// What one bounded read of the token file produced.
+#[derive(Debug)]
+struct ParsedTokens {
+    hashes: Vec<[u8; 32]>,
+    skipped_long_lines: usize,
+}
+
+/// Why a token-file read failed. `Io` covers ordinary read failures (its
+/// `ErrorKind` tells a removed file apart from transient trouble); the other
+/// variants are the M3 size/count bounds.
+#[derive(Debug)]
+enum LoadError {
+    Io(std::io::Error),
+    TooLarge(u64),
+    TooManyTokens(usize),
+}
+
+/// Reads and parses the token file with hard resource bounds: the size is
+/// pre-checked via metadata *and* the read itself goes through
+/// `take(MAX + 1)`, so a file grown between the two (TOCTOU) still cannot
+/// buffer past the cap.
+fn read_token_file(path: &Path) -> Result<ParsedTokens, LoadError> {
+    use std::io::Read as _;
+
+    let file = fs::File::open(path).map_err(LoadError::Io)?;
+    let size = file.metadata().map_or(0, |m| m.len());
+    if size > MAX_TOKEN_FILE_BYTES {
+        return Err(LoadError::TooLarge(size));
+    }
+    let mut text = Zeroizing::new(String::new());
+    (&file)
+        .take(MAX_TOKEN_FILE_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(LoadError::Io)?;
+    if text.len() as u64 > MAX_TOKEN_FILE_BYTES {
+        return Err(LoadError::TooLarge(text.len() as u64));
+    }
+    parse_token_lines(&text)
+}
+
+fn parse_token_lines(text: &str) -> Result<ParsedTokens, LoadError> {
+    let mut hashes = Vec::new();
+    let mut skipped_long_lines = 0usize;
+    let mut total = 0usize;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if line.len() > MAX_TOKEN_LINE_BYTES {
+            skipped_long_lines += 1;
+            continue;
+        }
+        total += 1;
+        // Bound the hashing work itself: past the cap we only keep counting
+        // so the error reports the real size.
+        if hashes.len() < MAX_TOKENS {
+            hashes.push(Sha256::digest(line.as_bytes()).into());
+        }
+    }
+    if total > MAX_TOKENS {
+        return Err(LoadError::TooManyTokens(total));
+    }
+    Ok(ParsedTokens {
+        hashes,
+        skipped_long_lines,
+    })
 }
 
 /// Whether the cached token set is due for a reload. `None` (never loaded)
@@ -224,17 +394,22 @@ fn is_stale(loaded_at: Option<Instant>, reload_interval: Duration) -> bool {
 
 /// Result of reading the token file outside the cache lock.
 enum ReloadOutcome {
-    Loaded(Vec<[u8; 32]>),
+    Loaded(ParsedTokens),
     Revoked,
     Unreadable(String),
+    Invalid(String),
 }
 
 /// What to emit after publishing a reload (outside the lock).
 enum LogEvent {
     None,
     EmptyKept,
+    EmptyRevoked,
     Revoked,
+    SkippedLong(usize),
     Unreadable(String),
+    Invalid(String),
+    StaleExpired(String),
 }
 
 /// Warns when the bearer-token file is readable beyond its owner (unix).
@@ -278,6 +453,10 @@ pub enum AuthError {
     },
     #[error("token file {path:?} contains no tokens")]
     NoTokens { path: PathBuf },
+    #[error("token file {path:?} is too large ({bytes} bytes; limit is 1 MiB)")]
+    TooLarge { path: PathBuf, bytes: u64 },
+    #[error("token file {path:?} holds {count} tokens (limit is 10000)")]
+    TooManyTokens { path: PathBuf, count: usize },
 }
 
 /// Cloneable tonic [`Interceptor`](tonic::service::Interceptor) verifying
@@ -475,6 +654,102 @@ mod tests {
         let error =
             TokenFileVault::open(dir.path().join("does-not-exist.txt")).expect_err("must fail");
         assert!(error.to_string().contains("cannot read token file"));
+    }
+
+    #[test]
+    fn oversized_token_file_is_rejected_at_open() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("tokens.txt");
+        fs::write(&path, vec![b'a'; 1024 * 1024 + 1]).expect("write");
+        let error = TokenFileVault::open(&path).expect_err("over-limit file must fail fast");
+        assert!(
+            error.to_string().contains("too large"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn too_many_tokens_are_rejected_at_open() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("tokens.txt");
+        let mut file = fs::File::create(&path).expect("create");
+        for i in 0..10_001 {
+            writeln!(file, "token-{i}").expect("write");
+        }
+        drop(file);
+        let error = TokenFileVault::open(&path).expect_err("over-limit count must fail fast");
+        assert!(
+            error.to_string().contains("10000"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn over_long_lines_are_skipped_not_hashed() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("tokens.txt");
+        let long = "x".repeat(5_000);
+        write_tokens(&path, &["good-token", &long]);
+        let vault = TokenFileVault::open(&path).expect("one good line suffices");
+        assert_eq!(vault.loaded_token_count(), 1);
+        assert!(intercept_bearer(&vault, request_with_token("good-token")).is_ok());
+        assert!(intercept_bearer(&vault, request_with_token(&long)).is_err());
+    }
+
+    #[test]
+    fn persistently_empty_file_revokes_after_one_grace_reload() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("tokens.txt");
+        write_tokens(&path, &["keep-working"]);
+        let mut vault = TokenFileVault::open(&path).expect("open");
+        vault.reload_interval = Duration::ZERO;
+
+        assert!(intercept_bearer(&vault, request_with_token("keep-working")).is_ok());
+
+        // Truncated mid-rewrite: the first observation keeps serving.
+        fs::write(&path, "").expect("truncate");
+        assert!(
+            intercept_bearer(&vault, request_with_token("keep-working")).is_ok(),
+            "first empty observation is a possible rewrite race"
+        );
+
+        // Still empty on the next reload: not a race — revoke like startup.
+        assert!(
+            intercept_bearer(&vault, request_with_token("keep-working")).is_err(),
+            "persistently empty file must revoke"
+        );
+
+        // A rewritten file restores access without any restart.
+        write_tokens(&path, &["keep-working"]);
+        assert!(intercept_bearer(&vault, request_with_token("keep-working")).is_ok());
+    }
+
+    #[test]
+    fn unreadable_file_fails_closed_once_grace_expires() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("tokens.txt");
+        write_tokens(&path, &["keep-working"]);
+        let mut vault = TokenFileVault::open(&path).expect("open");
+        vault.reload_interval = Duration::ZERO;
+
+        // Swap the file for a directory: reads fail with a non-NotFound
+        // error on every platform, i.e. the transient-unreadable path.
+        fs::remove_file(&path).expect("remove");
+        fs::create_dir(&path).expect("mkdir");
+
+        // Within the grace period the last known set keeps serving.
+        assert!(intercept_bearer(&vault, request_with_token("keep-working")).is_ok());
+
+        // Past the grace period the vault fails closed instead of honoring
+        // stale tokens forever.
+        vault.max_stale_age = Duration::ZERO;
+        assert!(intercept_bearer(&vault, request_with_token("keep-working")).is_err());
+        assert!(intercept_bearer(&vault, request_with_token("anything")).is_err());
+
+        // A readable file again restores access without any restart.
+        fs::remove_dir(&path).expect("rmdir");
+        write_tokens(&path, &["keep-working"]);
+        assert!(intercept_bearer(&vault, request_with_token("keep-working")).is_ok());
     }
 
     /// A poisoned cache lock must degrade, not deny service: after one
