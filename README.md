@@ -283,5 +283,7 @@ token_file = "/etc/otel-sqlite/clients.txt"   # one token per line, all valid
   load balancers work; under mTLS the built-in healthcheck authenticates
   with the server's own identity (its certificate carries both serverAuth
   and clientAuth).
-- Binding a non-loopback address without `[tls]` prints a loud warning at
-  startup; `mode = "token"` without a readable token file refuses to start.
+- Binding a non-loopback address without `[tls]` refuses to start — configure
+  TLS, or only on an isolated network you trust set
+  `allow_insecure_remote = true`. `mode = "token"` without a readable token
+  file refuses to start.

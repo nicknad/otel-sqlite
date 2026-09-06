@@ -52,8 +52,20 @@ data:
     retention = "7d"         # per-signal windows supported (see README)
     checkpoint_interval = "5m"
 
-    # [tls] and [auth] are configured per deployment; keep credentials in a
-    # Secret mounted read-only (see README "Security").
+    # A non-loopback bind without [tls] refuses to start: mount a server
+    # identity below (recommended; bootstrap one with
+    # `otel-sqlite gen-certs`, keep the material in the otel-sqlite-security
+    # Secret mounted read-only) or — only on an isolated network you trust —
+    # set `allow_insecure_remote = true`.
+    #
+    # [tls]
+    # cert = "/etc/otel-sqlite-tls/server.pem"
+    # key = "/etc/otel-sqlite-tls/server.key"
+    # client_ca = "/etc/otel-sqlite-tls/ca.pem"   # presence enforces mTLS
+    #
+    # [auth]
+    # mode = "token"
+    # token_file = "/etc/otel-sqlite/clients.txt"   # one token per line
 
 ---
 apiVersion: v1

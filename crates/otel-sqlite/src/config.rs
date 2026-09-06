@@ -95,6 +95,11 @@ pub struct Config {
     /// Explicit opt-in for exposing the unauthenticated plain HTTP metrics
     /// endpoint beyond loopback. A reverse proxy is preferred in production.
     pub allow_remote_metrics: bool,
+    /// Explicit opt-in for binding a non-loopback `listen_address` without
+    /// `[tls]`. Telemetry and bearer tokens then travel in cleartext to
+    /// anyone on the path — prefer TLS (`otel-sqlite gen-certs`) and only
+    /// set this on an isolated network you trust.
+    pub allow_insecure_remote: bool,
     /// Server TLS material; `client_ca` present enables mandatory mTLS.
     pub tls: Option<TlsConfig>,
     /// Bearer-token auth; `Some` when `[auth] mode = "token"`.
@@ -127,6 +132,7 @@ impl Default for Config {
             sqlite_synchronous: SyncMode::default(),
             metrics_address: Some(DEFAULT_METRICS_ADDRESS.to_owned()),
             allow_remote_metrics: false,
+            allow_insecure_remote: false,
             tls: None,
             auth: None,
         }
@@ -183,6 +189,26 @@ impl Config {
             .with_context(|| format!("invalid listen_address `{}`", self.listen_address))?;
         if listen.port() == 0 {
             bail!("listen_address must use a non-zero port");
+        }
+        // Fail closed on cleartext exposure: a non-loopback bind without TLS
+        // lets anyone on the path read telemetry and bearer tokens (and
+        // inject their own). Bearer auth alone does not satisfy this — the
+        // token itself would travel in cleartext — so only a TLS identity or
+        // the explicit isolated-network opt-in gets past here.
+        if !is_loopback_listen(&self.listen_address) && self.tls.is_none() {
+            if !self.allow_insecure_remote {
+                bail!(
+                    "listen_address `{}` is non-loopback but no [tls] is configured; \
+                     telemetry and bearer tokens would travel in cleartext. Configure [tls] \
+                     (see `otel-sqlite gen-certs`) or set allow_insecure_remote = true only \
+                     for an isolated network you trust",
+                    self.listen_address
+                );
+            }
+            tracing::warn!(
+                listen_address = self.listen_address.as_str(),
+                "ingress binds a non-loopback address without TLS; traffic is cleartext",
+            );
         }
         validate_range(
             "ingest_queue_capacity",
@@ -377,6 +403,7 @@ impl Config {
             "sqlite_synchronous": format!("{:?}", self.sqlite_synchronous),
             "metrics_address": self.metrics_address,
             "allow_remote_metrics": self.allow_remote_metrics,
+            "allow_insecure_remote": self.allow_insecure_remote,
             "tls_configured": self.tls.is_some(),
             "auth_configured": self.auth.is_some(),
             "maintenance": format!("{:?}", self.maintenance),
@@ -451,6 +478,7 @@ struct FileConfig {
     durability: Option<DurabilitySection>,
     metrics_address: Option<String>,
     allow_remote_metrics: Option<bool>,
+    allow_insecure_remote: Option<bool>,
     tls: Option<TlsSection>,
     auth: Option<AuthSection>,
 }
@@ -527,6 +555,9 @@ impl FileConfig {
         }
         if let Some(value) = self.allow_remote_metrics {
             config.allow_remote_metrics = value;
+        }
+        if let Some(value) = self.allow_insecure_remote {
+            config.allow_insecure_remote = value;
         }
         if let Some(section) = self.tls {
             config.tls = Some(section.apply_to()?);
@@ -692,7 +723,7 @@ fn warn_if_world_readable(key: &str, path: &Path) {
 }
 
 /// `true` when `listen_address` resolves to a loopback-only socket. Used for
-/// the "plaintext on an exposed interface" startup warning.
+/// the cleartext-exposure startup gate in [`Config::validate`].
 pub fn is_loopback_listen(listen_address: &str) -> bool {
     expand_bind_address(listen_address)
         .parse::<std::net::SocketAddr>()
@@ -1551,6 +1582,57 @@ mod tests {
         assert!(dump.contains("\"max_records_per_request\": 321"));
         assert!(dump.contains("\"metrics_address\": null"));
         assert!(dump.contains("\"allow_remote_metrics\": false"));
+        assert!(dump.contains("\"allow_insecure_remote\": false"));
+    }
+
+    #[test]
+    fn non_loopback_listen_requires_tls_or_explicit_opt_in() {
+        // Loopback binds stay usable without TLS (the default).
+        Config {
+            listen_address: "127.0.0.1:4317".to_owned(),
+            ..Config::default()
+        }
+        .validate()
+        .expect("loopback without TLS is valid");
+
+        // A wildcard bind without TLS fails closed with a prescriptive error.
+        let error = Config {
+            listen_address: "0.0.0.0:4317".to_owned(),
+            ..Config::default()
+        }
+        .validate()
+        .expect_err("cleartext remote bind must fail");
+        assert!(
+            error.to_string().contains("allow_insecure_remote"),
+            "unexpected error: {error}"
+        );
+
+        // The explicit isolated-network opt-in restores the old behaviour.
+        Config {
+            listen_address: "0.0.0.0:4317".to_owned(),
+            allow_insecure_remote: true,
+            ..Config::default()
+        }
+        .validate()
+        .expect("explicit opt-in is valid");
+
+        // A TLS identity satisfies the gate without the opt-in.
+        let dir = tempfile::tempdir().expect("temp directory");
+        let cert = dir.path().join("server.pem");
+        let key = dir.path().join("server.key");
+        std::fs::write(&cert, "test").expect("write test file");
+        std::fs::write(&key, "test").expect("write test file");
+        Config {
+            listen_address: "0.0.0.0:4317".to_owned(),
+            tls: Some(TlsConfig {
+                cert,
+                key,
+                client_ca: None,
+            }),
+            ..Config::default()
+        }
+        .validate()
+        .expect("remote bind with TLS is valid");
     }
 
     #[test]
@@ -1599,6 +1681,7 @@ mod tests {
             listen_address = ":1234"
             sqlite_path = "/tmp/otel.db"
             shutdown_timeout = "45s"
+            allow_insecure_remote = true
 
             [maintenance]
             retention = "7d"
@@ -1610,6 +1693,7 @@ mod tests {
 
         let config = config.expect("valid config file");
         assert_eq!(config.listen_address, ":1234");
+        assert!(config.allow_insecure_remote);
         assert_eq!(config.sqlite_path, PathBuf::from("/tmp/otel.db"));
         assert_eq!(config.shutdown_timeout, Duration::from_secs(45));
         assert_eq!(
