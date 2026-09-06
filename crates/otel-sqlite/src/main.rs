@@ -122,15 +122,6 @@ async fn main() -> Result<()> {
     );
     let ingress_config = config.ingress_config();
 
-    if config.tls.is_none() && !config::is_loopback_listen(&config.listen_address) {
-        eprintln!(
-            "WARNING: ingress binds {} without TLS; anyone who can reach this port can \
-             inject telemetry. Configure [tls] (see `otel-sqlite gen-certs`) for encryption \
-             and [auth] mode = \"token\" for bearer-token authentication.",
-            config.listen_address
-        );
-    }
-
     match &config.metrics_address {
         Some(address) => {
             install_metrics_exporter(address)
