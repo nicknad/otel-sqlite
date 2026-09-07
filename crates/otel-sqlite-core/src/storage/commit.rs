@@ -132,7 +132,9 @@ impl CommitLedger {
     /// (This crate has no logging dependency; the original panic is already
     /// visible in the panic log, so recovery itself stays silent.)
     fn lock_inner(&self) -> MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Marks `ticket` as committed. Called by the writer after the
