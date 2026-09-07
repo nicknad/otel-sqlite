@@ -63,5 +63,5 @@ cd local-ci && act -C .. -W ../.forgejo/workflows lint-and-test -- -v
 - **First run is slow** (image pulls + a full release build of the workspace).
 - **Architecture**: `.actrc` pins `linux/amd64`; Apple Silicon / ARM hosts
   should switch that to `linux/arm64`.
-- **Secrets**: this workflow uses none; `actions/checkout@v4` works locally
+- **Secrets**: this workflow uses none; `actions/checkout@v5` works locally
   against the checked-out tree.
