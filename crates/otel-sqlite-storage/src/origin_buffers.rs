@@ -65,11 +65,11 @@ pub(crate) enum Emitted<T> {
 }
 
 impl<T> Emitted<T> {
-    pub(crate) fn from_batches(batches: Vec<(BatchOrigin, WriteBatch<T>, Vec<u64>)>) -> Self {
+    pub(crate) fn from_batches(mut batches: Vec<(BatchOrigin, WriteBatch<T>, Vec<u64>)>) -> Self {
         match batches.len() {
             0 => Self::Buffered,
             1 => {
-                let (origin, records, commit_seqs) = batches.into_iter().next().expect("one batch");
+                let (origin, records, commit_seqs) = batches.swap_remove(0);
                 Self::Single(Submission::new(origin, records, commit_seqs))
             }
             _ => Self::Multiple(
@@ -153,9 +153,15 @@ impl<T> OriginBuffers<T> {
             self.buffers.len() - 1
         };
 
+        let output = self.buffers[index].2.push(records);
+        if output.is_empty() {
+            if self.buffers[index].2.is_empty() {
+                self.buffers.remove(index);
+            }
+            return Emitted::Buffered;
+        }
         let claimed = self.buffers[index].1.iter().copied().collect::<Vec<_>>();
         let mut emitted = Vec::new();
-        let output = self.buffers[index].2.push(records);
         output.for_each(|batch| {
             emitted.push((origin.clone(), batch, claimed.clone()));
         });
@@ -168,23 +174,22 @@ impl<T> OriginBuffers<T> {
 
     /// Emits every expired partial batch (oldest deadline first).
     pub(crate) fn flush_expired(&mut self, now: Instant) -> Vec<Submission<T>> {
-        let mut submissions = Vec::new();
-        for (origin, tickets, batcher) in &mut self.buffers {
-            if let Some(records) = batcher.flush_if_expired(now) {
-                let claimed = tickets.iter().copied().collect::<Vec<_>>();
-                submissions.push(Submission::new(origin.clone(), records, claimed));
-            }
-        }
-        self.retain_active();
-        submissions
+        self.flush_with(|batcher| batcher.flush_if_expired(now))
     }
 
     /// Emits all partial batches unconditionally (barriers and shutdown), in
     /// first-seen origin order.
     pub(crate) fn flush_all(&mut self) -> Vec<Submission<T>> {
+        self.flush_with(InsertBatcher::flush)
+    }
+
+    fn flush_with(
+        &mut self,
+        mut flush_one: impl FnMut(&mut InsertBatcher<T>) -> Option<WriteBatch<T>>,
+    ) -> Vec<Submission<T>> {
         let mut submissions = Vec::new();
         for (origin, tickets, batcher) in &mut self.buffers {
-            if let Some(records) = batcher.flush() {
+            if let Some(records) = flush_one(batcher) {
                 let claimed = tickets.iter().copied().collect::<Vec<_>>();
                 submissions.push(Submission::new(origin.clone(), records, claimed));
             }

@@ -16,10 +16,10 @@ pub(crate) async fn run_healthcheck() -> Result<()> {
     // Config may be unreadable in exotic setups; fall back to plain defaults
     // so the probe still works for the common no-TLS case.
     let config = Config::from_env().unwrap_or_default();
-    let endpoint = match std::env::var("OTEL_SQLITE_HEALTHCHECK_ENDPOINT") {
-        Ok(endpoint) if !endpoint.trim().is_empty() => endpoint,
-        _ => derive_healthcheck_endpoint(&config),
-    };
+    let endpoint = std::env::var("OTEL_SQLITE_HEALTHCHECK_ENDPOINT")
+        .ok()
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .unwrap_or_else(|| derive_healthcheck_endpoint(&config));
     let tls = build_probe_tls(&config);
     let result = probe_health(&endpoint, tls.as_ref()).await;
     match result {
@@ -39,11 +39,7 @@ pub(crate) async fn run_healthcheck() -> Result<()> {
 }
 
 fn derive_healthcheck_endpoint(config: &Config) -> String {
-    let scheme = if config.tls.is_some() {
-        "https"
-    } else {
-        "http"
-    };
+    let scheme = config.tls.as_ref().map_or("http", |_| "https");
     let listen = config.listen_address.trim();
     // Dial side: a wildcard or all-interfaces bind is reachable via loopback.
     // IPv6 forms included: `[::]:port` is the v6 wildcard just as `0.0.0.0:`
@@ -100,13 +96,13 @@ fn healthcheck_domain_name(endpoint: &str) -> String {
         return bracketed
             .split(']')
             .next()
-            .unwrap_or("localhost")
+            .expect("str::split always yields one item")
             .to_owned();
     }
     host_port
         .split(':')
         .next()
-        .unwrap_or("localhost")
+        .expect("str::split always yields one item")
         .to_owned()
 }
 

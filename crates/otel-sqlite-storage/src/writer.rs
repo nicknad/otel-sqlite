@@ -106,7 +106,7 @@ fn run_inner(
                 let backlog = receiver.len();
                 // Size quota precedes the insert so an over-budget database
                 // evicts its oldest rows before accepting new ones.
-                if command.record_count() > 0
+                if command.record_count() != 0
                     && let Some(quota) = config.max_db_bytes
                 {
                     enforce_quota(&mut conn, &config.sqlite_path, quota, stats);
@@ -158,7 +158,6 @@ fn execute(
                 return Ok(());
             }
             stats.batches_received.fetch_add(1, Ordering::Relaxed);
-            let commit_seqs = batch.commit_seqs.clone();
             persist_with_policy(
                 conn,
                 stats,
@@ -168,8 +167,8 @@ fn execute(
             )?;
             // The batch is durable (fully or after salvage): release every
             // folded ticket.
-            for commit_seq in commit_seqs {
-                ledger.complete(commit_seq);
+            for commit_seq in &batch.commit_seqs {
+                ledger.complete(*commit_seq);
             }
         }
         WriteCommand::InsertMetrics(batch) => {
@@ -180,7 +179,6 @@ fn execute(
                 return Ok(());
             }
             stats.batches_received.fetch_add(1, Ordering::Relaxed);
-            let commit_seqs = batch.commit_seqs.clone();
             persist_with_policy(
                 conn,
                 stats,
@@ -188,8 +186,8 @@ fn execute(
                 |tx| command::insert_metrics(tx, &batch),
                 |tx| command::insert_metrics_tolerant(tx, &batch),
             )?;
-            for commit_seq in commit_seqs {
-                ledger.complete(commit_seq);
+            for commit_seq in &batch.commit_seqs {
+                ledger.complete(*commit_seq);
             }
         }
         // Order barrier only: every earlier insert command has already been
@@ -383,13 +381,14 @@ fn run_maintenance(
     // waiting, defer them to the next scheduler interval instead of stalling
     // it: the scheduler re-enqueues on its own cadence.
     if queue_backlog > MAINTENANCE_PRESSURE_SKIP_DEPTH && is_heavy_maintenance(&operation) {
+        let label = maintenance_label(&operation);
         ::metrics::counter!(
             "storage_maintenance_deferred_total",
-            "operation" => maintenance_label(&operation)
+            "operation" => label
         )
         .increment(1);
         tracing::warn!(
-            operation = maintenance_label(&operation),
+            operation = label,
             queue_backlog,
             "deferring heavy maintenance; ingestion backlog present"
         );
@@ -441,7 +440,7 @@ fn enforce_quota(
     quota_bytes: u64,
     stats: &WriterStats,
 ) {
-    let size = std::fs::metadata(db_path).map_or(0, |metadata| metadata.len());
+    let size = crate::maintenance::file_size(db_path);
     if size <= quota_bytes {
         return;
     }

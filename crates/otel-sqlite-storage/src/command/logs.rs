@@ -57,10 +57,14 @@ fn insert_logs_inner(
     // id in `scratch` survives them.
     let mut scratch = InsertScratch::new();
     let mut record_scratch = InsertScratch::new();
-    match &batch.origin.resource {
-        Some(resource) => resolve_resource(conn, resource, &mut scratch)?,
-        None => resolve_resource(conn, &Resource::default(), &mut scratch)?,
-    }
+    let default_resource;
+    let batch_resource = if let Some(resource) = &batch.origin.resource {
+        resource
+    } else {
+        default_resource = Resource::default();
+        &default_resource
+    };
+    resolve_resource(conn, batch_resource, &mut scratch)?;
 
     let mut statement = conn.prepare_cached(SQL_INSERT_LOG_EVENT)?;
     let mut written = 0u64;
@@ -82,7 +86,7 @@ fn insert_logs_inner(
         let body = record
             .body_json
             .as_deref()
-            .or_else(|| non_empty(record.body.as_str()));
+            .or(non_empty(record.body.as_str()));
 
         match statement.execute(params![
             resource_id,

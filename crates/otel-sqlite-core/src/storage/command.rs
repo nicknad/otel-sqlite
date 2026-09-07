@@ -12,7 +12,7 @@ use super::batch::WriteBatch;
 /// arbitrary incoming groups without ever attributing records to the wrong
 /// resource: batches with different origins are never merged into the same
 /// [`WriteBatch`].
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BatchOrigin {
     pub resource: Option<crate::model::Resource>,
     pub schema_url: String,
@@ -24,6 +24,12 @@ impl BatchOrigin {
             resource: None,
             schema_url: String::new(),
         }
+    }
+}
+
+impl Default for BatchOrigin {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -44,10 +50,6 @@ pub struct LogChunk {
 }
 
 impl LogChunk {
-    pub fn len(&self) -> usize {
-        self.records.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
@@ -63,10 +65,6 @@ pub struct MetricChunk {
 }
 
 impl MetricChunk {
-    pub fn len(&self) -> usize {
-        self.records.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }

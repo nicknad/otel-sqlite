@@ -45,7 +45,13 @@ CREATE TRIGGER logs_fts_ad AFTER DELETE ON log_event BEGIN
 END;";
 
 pub(crate) fn checkpoint(conn: &Connection, mode: CheckpointMode) -> Result<(), StorageError> {
-    conn.execute_batch(&format!("PRAGMA wal_checkpoint({});", mode.as_str()))?;
+    let sql = match mode {
+        CheckpointMode::Passive => "PRAGMA wal_checkpoint(PASSIVE);",
+        CheckpointMode::Full => "PRAGMA wal_checkpoint(FULL);",
+        CheckpointMode::Restart => "PRAGMA wal_checkpoint(RESTART);",
+        CheckpointMode::Truncate => "PRAGMA wal_checkpoint(TRUNCATE);",
+    };
+    conn.execute_batch(sql)?;
     Ok(())
 }
 
@@ -313,7 +319,7 @@ pub(crate) fn enforce_size_quota(
 
 /// Best-effort file size; missing/unreadable counts as zero so enforcement
 /// degrades to a no-op instead of failing the insert it guards.
-fn file_size(path: &Path) -> u64 {
+pub(crate) fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 

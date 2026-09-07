@@ -41,9 +41,7 @@ use crate::stats::BatcherStats;
 fn nearest_deadline(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> {
     match (first, second) {
         (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+        _ => first.or(second),
     }
 }
 

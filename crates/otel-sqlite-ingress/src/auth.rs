@@ -386,10 +386,7 @@ fn parse_token_lines(text: &str) -> Result<ParsedTokens, LoadError> {
 /// Whether the cached token set is due for a reload. `None` (never loaded)
 /// is always stale.
 fn is_stale(loaded_at: Option<Instant>, reload_interval: Duration) -> bool {
-    match loaded_at {
-        Some(loaded_at) => loaded_at.elapsed() >= reload_interval,
-        None => true,
-    }
+    loaded_at.is_none_or(|loaded_at| loaded_at.elapsed() >= reload_interval)
 }
 
 /// Result of reading the token file outside the cache lock.
@@ -419,13 +416,14 @@ fn warn_if_token_file_world_readable(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        match std::fs::metadata(path).map(|metadata| metadata.permissions().mode()) {
-            Ok(mode) if mode & 0o044 != 0 => tracing::warn!(
+        if let Ok(mode) = std::fs::metadata(path).map(|metadata| metadata.permissions().mode())
+            && mode & 0o044 != 0
+        {
+            tracing::warn!(
                 path = %path.display(),
                 mode = format!("{mode:o}"),
                 "bearer token file is readable beyond its owner; chmod 600 it",
-            ),
-            _ => {}
+            );
         }
     }
     #[cfg(not(unix))]
@@ -473,10 +471,10 @@ impl BearerInterceptor {
     /// Loads the token file eagerly; a `Some` path that cannot be read is a
     /// startup error. `None` disables authentication.
     pub fn new(token_file: Option<&Path>) -> Result<Self, AuthError> {
-        let vault = match token_file {
-            Some(path) => Some(Arc::new(TokenFileVault::open(path)?)),
-            None => None,
-        };
+        let vault = token_file
+            .map(TokenFileVault::open)
+            .transpose()?
+            .map(Arc::new);
         Ok(Self { vault })
     }
 }
@@ -519,10 +517,11 @@ fn bearer_token(metadata: &tonic::metadata::MetadataMap) -> Result<&str, Status>
     let (scheme, token) = value
         .split_once(' ')
         .ok_or_else(|| Status::unauthenticated("malformed authorization header"))?;
-    if !scheme.eq_ignore_ascii_case("bearer") || token.trim().is_empty() {
+    let token = token.trim();
+    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
         return Err(Status::unauthenticated("expected `Bearer <token>`"));
     }
-    Ok(token.trim())
+    Ok(token)
 }
 
 #[cfg(test)]

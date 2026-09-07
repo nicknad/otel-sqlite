@@ -436,9 +436,7 @@ fn convert_data(value: proto::metric::Data) -> Result<MetricData, IngressError> 
 }
 
 fn temporality(value: i32) -> Temporality {
-    if let Some(temporality) = Temporality::from_i32(value) {
-        temporality
-    } else {
+    Temporality::from_i32(value).unwrap_or_else(|| {
         // Forward-compatible unknown enum values are counted as an
         // explicit loss instead of being silently downgraded.
         ::metrics::counter!(
@@ -448,7 +446,7 @@ fn temporality(value: i32) -> Temporality {
         )
         .increment(1);
         Temporality::Unspecified
-    }
+    })
 }
 
 /// Converts OTLP exemplars, rejecting malformed trace/span ids rather than

@@ -23,8 +23,6 @@ pub(crate) const BATCHER_AFTER_N: &str = "OTEL_SQLITE_FAULT_BATCHER_AFTER_N";
 
 /// Parses a fault knob: `Some(limit)` when the env var is set to a positive
 /// integer, `None` otherwise (the safe default for every production run).
-/// Parses a fault knob: `Some(limit)` when the env var is set to a positive
-/// integer, `None` otherwise (the safe default for every production run).
 pub(crate) fn armed_after(env: &str) -> Option<u64> {
     parse_armed(std::env::var(env).ok())
 }

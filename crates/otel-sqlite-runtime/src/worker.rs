@@ -103,15 +103,12 @@ impl Drop for MaintenanceHandle {
 fn run(sink: Box<dyn CommandSink>, config: MaintenanceConfig, shutdown: Receiver<()>) {
     // The scheduler owns the schedule; derive the startup log count from it
     // instead of duplicating the enabled-operation rules here.
-    let enabled = {
-        let scheduler = Scheduler::new(config.clone(), Instant::now());
-        scheduler.enabled_task_count()
-    };
+    let mut scheduler = Scheduler::new(config, Instant::now());
+    let enabled = scheduler.enabled_task_count();
 
     tracing::info!(tasks = enabled, "maintenance worker started");
     ::metrics::gauge!("maintenance_worker_active").set(1.0);
 
-    let mut scheduler = Scheduler::new(config, Instant::now());
     loop {
         // Drain a shutdown requested while the previous cycle was running so
         // we never enqueue while shutdown is already pending.
@@ -144,10 +141,7 @@ fn run(sink: Box<dyn CommandSink>, config: MaintenanceConfig, shutdown: Receiver
 }
 
 fn shutdown_signalled(shutdown: &Receiver<()>) -> bool {
-    match shutdown.try_recv() {
-        Ok(()) | Err(TryRecvError::Disconnected) => true,
-        Err(TryRecvError::Empty) => false,
-    }
+    !matches!(shutdown.try_recv(), Err(TryRecvError::Empty))
 }
 
 #[cfg(test)]

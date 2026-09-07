@@ -10,7 +10,7 @@
 ///
 /// `T` is the record type (`LogRecord`, `MetricRecord`, ...). The batch owns
 /// its records outright so handing it over to a writer never copies payloads.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct WriteBatch<T> {
     records: Vec<T>,
 }
@@ -46,14 +46,6 @@ impl<T> WriteBatch<T> {
     /// Unwraps the batch, transferring ownership of all records.
     pub fn into_records(self) -> Vec<T> {
         self.records
-    }
-}
-
-impl<T> Default for WriteBatch<T> {
-    fn default() -> Self {
-        Self {
-            records: Vec::new(),
-        }
     }
 }
 

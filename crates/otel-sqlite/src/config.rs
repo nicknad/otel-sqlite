@@ -603,26 +603,21 @@ struct AuthSection {
 
 impl AuthSection {
     fn apply_to(self) -> Result<Option<AuthConfig>> {
-        let mode = match self.mode.as_deref() {
-            Some(value) => value.trim().to_ascii_lowercase(),
-            None => "none".to_owned(),
-        };
-        match mode.as_str() {
-            "none" => {
-                if self.token_file.is_some() {
-                    bail!("[auth] token_file is set but mode is \"none\"; remove one of them")
-                }
-                Ok(None)
+        let mode = self.mode.as_deref().map_or("none", str::trim);
+        if mode.eq_ignore_ascii_case("none") {
+            if self.token_file.is_some() {
+                bail!("[auth] token_file is set but mode is \"none\"; remove one of them")
             }
-            "token" => {
-                let file = self.token_file.as_deref().with_context(
-                    || "[auth] mode = \"token\" requires `token_file` (one bearer token per line)",
-                )?;
-                Ok(Some(AuthConfig {
-                    token_file: PathBuf::from(file),
-                }))
-            }
-            other => bail!("unknown [auth] mode `{other}` (expected none|token)"),
+            Ok(None)
+        } else if mode.eq_ignore_ascii_case("token") {
+            let file = self.token_file.as_deref().with_context(
+                || "[auth] mode = \"token\" requires `token_file` (one bearer token per line)",
+            )?;
+            Ok(Some(AuthConfig {
+                token_file: PathBuf::from(file),
+            }))
+        } else {
+            bail!("unknown [auth] mode `{mode}` (expected none|token)")
         }
     }
 }
@@ -642,10 +637,9 @@ pub fn expand_bind_address(address: &str) -> String {
 fn parse_optional_address(raw: &str, key: &str) -> Result<Option<String>> {
     let trimmed = raw.trim();
     if trimmed.is_empty()
-        || matches!(
-            trimmed.to_ascii_lowercase().as_str(),
-            "off" | "none" | "disabled"
-        )
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("disabled")
     {
         return Ok(None);
     }
@@ -676,9 +670,7 @@ fn validate_duration(key: &str, value: Duration, allow_zero: bool) -> Result<()>
 }
 
 fn validate_optional_duration(key: &str, value: Option<Duration>, maximum: Duration) -> Result<()> {
-    if let Some(value) = value
-        && (value.is_zero() || value > maximum)
-    {
+    if value.is_some_and(|value| value.is_zero() || value > maximum) {
         bail!(
             "config key `{key}` must be greater than 0 and no more than {maximum:?}; got {value:?}"
         );
@@ -706,14 +698,15 @@ fn warn_if_world_readable(key: &str, path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        match std::fs::metadata(path).map(|metadata| metadata.permissions().mode()) {
-            Ok(mode) if mode & 0o044 != 0 => tracing::warn!(
+        if let Ok(mode) = std::fs::metadata(path).map(|metadata| metadata.permissions().mode())
+            && mode & 0o044 != 0
+        {
+            tracing::warn!(
                 key,
                 path = %path.display(),
                 mode = format!("{mode:o}"),
                 "secret file is readable beyond its owner; chmod 600 it",
-            ),
-            _ => {}
+            );
         }
     }
     #[cfg(not(unix))]
@@ -816,21 +809,21 @@ enum RawRetention {
 }
 
 fn apply_retention(config: &mut MaintenanceConfig, raw: Option<RawRetention>) {
+    let Some(raw) = raw else { return };
     match raw {
-        Some(RawRetention::Uniform(RawDuration::Enabled(window))) => {
+        RawRetention::Uniform(RawDuration::Enabled(window)) => {
             config.retention = Some(window);
             config.metric_retention = Some(window);
         }
         // Explicit opt-out ("off") disables both signals at once.
-        Some(RawRetention::Uniform(RawDuration::Disabled)) => {
+        RawRetention::Uniform(RawDuration::Disabled) => {
             config.retention = None;
             config.metric_retention = None;
         }
-        Some(RawRetention::PerSignal { logs, metrics }) => {
+        RawRetention::PerSignal { logs, metrics } => {
             apply_optional_duration(&mut config.retention, logs);
             apply_optional_duration(&mut config.metric_retention, metrics);
         }
-        None => {}
     }
 }
 
@@ -893,10 +886,10 @@ impl RawDuration {
     fn parse(text: &str) -> std::result::Result<Self, String> {
         let trimmed = text.trim();
         if trimmed.is_empty()
-            || matches!(
-                trimmed.to_ascii_lowercase().as_str(),
-                "off" | "none" | "never" | "disabled"
-            )
+            || trimmed.eq_ignore_ascii_case("off")
+            || trimmed.eq_ignore_ascii_case("none")
+            || trimmed.eq_ignore_ascii_case("never")
+            || trimmed.eq_ignore_ascii_case("disabled")
         {
             return Ok(Self::Disabled);
         }
@@ -911,13 +904,41 @@ impl RawDuration {
         if amount < 0.0 {
             return Err(format!("duration `{text}` must not be negative"));
         }
-        let scale_secs = match unit.trim().to_ascii_lowercase().as_str() {
-            "ms" | "millis" | "millisecond" | "milliseconds" => 0.001,
-            "s" | "sec" | "secs" | "second" | "seconds" => 1.0,
-            "m" | "min" | "mins" | "minute" | "minutes" => 60.0,
-            "h" | "hr" | "hrs" | "hour" | "hours" => 3_600.0,
-            "d" | "day" | "days" => 86_400.0,
-            other => return Err(format!("unknown duration unit `{other}` in `{text}`")),
+        let unit = unit.trim();
+        let scale_secs = if unit.eq_ignore_ascii_case("ms")
+            || unit.eq_ignore_ascii_case("millis")
+            || unit.eq_ignore_ascii_case("millisecond")
+            || unit.eq_ignore_ascii_case("milliseconds")
+        {
+            0.001
+        } else if unit.eq_ignore_ascii_case("s")
+            || unit.eq_ignore_ascii_case("sec")
+            || unit.eq_ignore_ascii_case("secs")
+            || unit.eq_ignore_ascii_case("second")
+            || unit.eq_ignore_ascii_case("seconds")
+        {
+            1.0
+        } else if unit.eq_ignore_ascii_case("m")
+            || unit.eq_ignore_ascii_case("min")
+            || unit.eq_ignore_ascii_case("mins")
+            || unit.eq_ignore_ascii_case("minute")
+            || unit.eq_ignore_ascii_case("minutes")
+        {
+            60.0
+        } else if unit.eq_ignore_ascii_case("h")
+            || unit.eq_ignore_ascii_case("hr")
+            || unit.eq_ignore_ascii_case("hrs")
+            || unit.eq_ignore_ascii_case("hour")
+            || unit.eq_ignore_ascii_case("hours")
+        {
+            3_600.0
+        } else if unit.eq_ignore_ascii_case("d")
+            || unit.eq_ignore_ascii_case("day")
+            || unit.eq_ignore_ascii_case("days")
+        {
+            86_400.0
+        } else {
+            return Err(format!("unknown duration unit `{unit}` in `{text}`"));
         };
         Ok(Self::Enabled(Duration::from_millis(
             (amount * scale_secs * 1_000.0).round() as u64,
@@ -948,34 +969,39 @@ fn apply_required_duration(
     raw: Option<RawDuration>,
     key: &str,
 ) -> Result<()> {
+    let Some(raw) = raw else { return Ok(()) };
     match raw {
-        Some(RawDuration::Enabled(value)) => *target = value,
-        Some(RawDuration::Disabled) => {
+        RawDuration::Enabled(value) => *target = value,
+        RawDuration::Disabled => {
             bail!("config key `{key}` requires a duration; \"off\" is not accepted")
         }
-        None => {}
     }
     Ok(())
 }
 
 fn apply_optional_duration(target: &mut Option<Duration>, raw: Option<RawDuration>) {
+    let Some(raw) = raw else { return };
     match raw {
-        Some(RawDuration::Enabled(value)) => *target = Some(value),
+        RawDuration::Enabled(value) => *target = Some(value),
         // Explicit opt-out ("off") vs. missing key (keeps the default).
-        Some(RawDuration::Disabled) => *target = None,
-        None => {}
+        RawDuration::Disabled => *target = None,
     }
 }
 
 fn parse_checkpoint_mode(text: &str) -> Result<CheckpointMode> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "passive" => Ok(CheckpointMode::Passive),
-        "full" => Ok(CheckpointMode::Full),
-        "restart" => Ok(CheckpointMode::Restart),
-        "truncate" => Ok(CheckpointMode::Truncate),
-        other => {
-            bail!("unknown checkpoint_mode `{other}` (expected passive|full|restart|truncate)")
-        }
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("passive") {
+        Ok(CheckpointMode::Passive)
+    } else if trimmed.eq_ignore_ascii_case("full") {
+        Ok(CheckpointMode::Full)
+    } else if trimmed.eq_ignore_ascii_case("restart") {
+        Ok(CheckpointMode::Restart)
+    } else if trimmed.eq_ignore_ascii_case("truncate") {
+        Ok(CheckpointMode::Truncate)
+    } else {
+        bail!(
+            "unknown checkpoint_mode `{trimmed}` (expected passive|full|restart|truncate)"
+        )
     }
 }
 

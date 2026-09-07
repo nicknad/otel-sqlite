@@ -106,7 +106,7 @@ impl Task {
     }
 
     fn due(&self, now: Instant) -> bool {
-        self.interval.is_some() && self.next_due.is_some_and(|next_due| next_due <= now)
+        self.next_due.is_some_and(|next_due| next_due <= now)
     }
 
     /// Successful enqueue: the next instance of this operation may only be

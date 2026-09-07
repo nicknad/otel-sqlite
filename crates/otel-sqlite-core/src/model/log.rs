@@ -67,8 +67,4 @@ impl LogBatch {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
-
-    pub fn clear(&mut self) {
-        self.records.clear();
-    }
 }

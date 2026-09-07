@@ -150,8 +150,9 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     // progress rules: from evidence alone they are indistinguishable from
     // legitimate in-flight records, and a slow drain must degrade gracefully
     // rather than halt.
+    let pending = sample.pending_work();
     if sample.outstanding_tickets > 0
-        && sample.pending_work() == 0
+        && pending == 0
         && Duration::from_millis(sample.watermark_idle_ms) >= config.ack_stall_after
     {
         return Evaluation {
@@ -166,7 +167,6 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
         };
     }
 
-    let pending = sample.pending_work();
     if pending == 0 {
         // NO WORK: stale progress ages are expected and harmless.
         return Evaluation {
@@ -399,22 +399,19 @@ fn emit_metrics(sample: &PipelineSample, state: HealthState) {
 }
 
 fn log_transition(from: HealthState, to: HealthState, reason: &str) {
+    if from == HealthState::Healthy && to == HealthState::Healthy {
+        return;
+    }
     let detail = format!("health {from:?} -> {to:?}");
     match to {
         HealthState::Unhealthy => tracing::error!(reason, "{detail}"),
         HealthState::Degraded => tracing::warn!(reason, "{detail}"),
-        HealthState::Healthy if from != HealthState::Healthy => {
-            tracing::info!(reason, "{detail}");
-        }
-        HealthState::Healthy => {}
+        HealthState::Healthy => tracing::info!(reason, "{detail}"),
     }
 }
 
 fn shutdown_signalled(shutdown: &Receiver<()>) -> bool {
-    match shutdown.try_recv() {
-        Ok(()) | Err(TryRecvError::Disconnected) => true,
-        Err(TryRecvError::Empty) => false,
-    }
+    !matches!(shutdown.try_recv(), Err(TryRecvError::Empty))
 }
 
 #[cfg(test)]
