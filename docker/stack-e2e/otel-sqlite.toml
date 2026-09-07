@@ -3,3 +3,5 @@
 # listen_address is loopback-only; a non-loopback bind is an explicit opt-in,
 # exactly as intended for a container network peer.
 listen_address = "0.0.0.0:4317"
+# Isolated docker network: cross-container cleartext is intended here.
+allow_insecure_remote = true
