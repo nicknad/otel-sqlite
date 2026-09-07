@@ -7,6 +7,8 @@
 
 listen_address = "0.0.0.0:4317"
 sqlite_path = "/data/otel-logs.db"
+# Isolated docker network: cross-container cleartext is intended here.
+allow_insecure_remote = true
 metrics_address = "off"
 shutdown_timeout = "20s"
 
