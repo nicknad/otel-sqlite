@@ -47,10 +47,6 @@ impl MetricBatch {
         self.records.is_empty()
     }
 
-    pub fn clear(&mut self) {
-        self.records.clear();
-    }
-
     pub fn data_point_count(&self) -> usize {
         self.records
             .iter()
@@ -91,7 +87,7 @@ mod tests {
         assert_eq!(batch.len(), 2);
         assert_eq!(batch.data_point_count(), 3);
 
-        batch.clear();
+        batch.records.clear();
         assert!(batch.is_empty());
         assert_eq!(batch.data_point_count(), 0);
     }

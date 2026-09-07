@@ -147,18 +147,16 @@ fn server_sans(hosts: &[String]) -> Result<Vec<rcgen::SanType>> {
             ));
         }
     }
-    for fallback in ["localhost"] {
-        if !hosts.iter().any(|h| h == fallback) {
-            sans.push(rcgen::SanType::DnsName(
-                fallback
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("invalid DNS name `{fallback}`"))?,
-            ));
-        }
+    if !hosts.contains(&"localhost".to_owned()) {
+        sans.push(rcgen::SanType::DnsName(
+            "localhost"
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid DNS name `localhost`"))?,
+        ));
     }
     for ip in ["127.0.0.1", "::1"] {
         let ip: IpAddr = ip.parse().expect("literal IP");
-        if !hosts.iter().any(|h| h == &ip.to_string()) {
+        if !hosts.contains(&ip.to_string()) {
             sans.push(rcgen::SanType::IpAddress(ip));
         }
     }
@@ -171,11 +169,10 @@ fn sanitize_client_name(name: &str) -> Result<()> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         && !name.starts_with('.');
-    if ok {
-        Ok(())
-    } else {
+    if !ok {
         bail!("invalid client name `{name}` (use ASCII letters, digits, '-', '_', '.')")
     }
+    Ok(())
 }
 
 fn write_pem(path: &Path, contents: &str) -> Result<()> {
@@ -217,22 +214,21 @@ fn restrict_key_file(path: &Path) -> Result<()> {
             .arg("*S-1-5-32-544:F")
             .status();
         match status {
-            Ok(status) if status.success() => Ok(()),
+            Ok(status) if status.success() => {}
             Ok(status) => {
                 eprintln!(
                     "warning: icacls exited {status} for {}; restrict key ACLs manually",
                     path.display()
                 );
-                Ok(())
             }
             Err(error) => {
                 eprintln!(
                     "warning: icacls unavailable ({error}); key {} may inherit permissive ACLs",
                     path.display()
                 );
-                Ok(())
             }
         }
+        Ok(())
     }
     #[cfg(not(any(unix, windows)))]
     {

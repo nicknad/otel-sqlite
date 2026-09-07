@@ -61,10 +61,7 @@ async fn run(
 
     // TLS is transport-level; mTLS (client_ca present) additionally makes
     // every connection authenticate with a CA-signed client certificate.
-    let tls_config = match &config.tls {
-        Some(tls) => Some(server_tls_config(tls)?),
-        None => None,
-    };
+    let tls_config = config.tls.as_ref().map(server_tls_config).transpose()?;
 
     // Bearer-token auth guards the OTLP services only; the health service
     // below stays unauthenticated so probes and load balancers work. The

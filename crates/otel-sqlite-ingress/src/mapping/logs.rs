@@ -68,14 +68,9 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogBatch, IngressError> 
 pub(crate) fn count(resource_logs: &[ResourceLogs]) -> usize {
     resource_logs
         .iter()
-        .map(|resource| {
-            resource
-                .scope_logs
-                .iter()
-                .map(|scope| scope.log_records.len())
-                .sum::<usize>()
-        })
-        .sum()
+        .flat_map(|resource| resource.scope_logs.iter())
+        .flat_map(|scope| scope.log_records.iter())
+        .count()
 }
 
 /// Maps an OTLP export request into mapped log chunks, one per
@@ -152,8 +147,8 @@ fn convert_record(
         observed_time_unix_nano: observed_time_unix_nano as i64,
         severity_number: severity(severity_number),
         severity_text,
-        trace_id: trace_id.unwrap_or([0; 16]),
-        span_id: span_id.unwrap_or([0; 8]),
+        trace_id: trace_id.unwrap_or_default(),
+        span_id: span_id.unwrap_or_default(),
         body,
         body_json,
         attributes: attributes(record_attributes)?,
@@ -170,17 +165,18 @@ fn convert_record(
 }
 
 fn severity(value: i32) -> Severity {
-    if let Some(severity) = u8::try_from(value).ok().and_then(Severity::from_u8) {
-        severity
-    } else {
-        ::metrics::counter!(
-            "otlp_mapping_loss_total",
-            "signal" => "logs",
-            "reason" => "unknown_severity"
-        )
-        .increment(1);
-        Severity::Unspecified
-    }
+    u8::try_from(value)
+        .ok()
+        .and_then(Severity::from_u8)
+        .unwrap_or_else(|| {
+            ::metrics::counter!(
+                "otlp_mapping_loss_total",
+                "signal" => "logs",
+                "reason" => "unknown_severity"
+            )
+            .increment(1);
+            Severity::Unspecified
+        })
 }
 
 /// Maps the OTLP `AnyValue` body into its storage rendering.
@@ -256,17 +252,16 @@ pub(crate) fn validate_request(
             "resource.attributes",
         )?;
         for scope in &group.scope_logs {
-            if let Some(s) = scope.scope.as_ref() {
+            let scope_view = scope.scope.as_ref();
+            if let Some(s) = scope_view {
                 check_attributes(&s.attributes, limits, "scope.attributes")?;
+                check_plain_string(&s.name, limits, "scope.name")?;
+                check_plain_string(&s.version, limits, "scope.version")?;
             }
             for record in &scope.log_records {
                 check_attributes(&record.attributes, limits, "log.attributes")?;
                 check_plain_string(&record.severity_text, limits, "severity_text")?;
                 check_plain_string(&record.event_name, limits, "event_name")?;
-                if let Some(s) = scope.scope.as_ref() {
-                    check_plain_string(&s.name, limits, "scope.name")?;
-                    check_plain_string(&s.version, limits, "scope.version")?;
-                }
                 check_body(record.body.as_ref(), limits)?;
             }
         }

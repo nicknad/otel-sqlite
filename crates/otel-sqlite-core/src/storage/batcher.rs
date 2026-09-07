@@ -47,7 +47,7 @@ impl InsertBatcherConfig {
     /// is zero (a batch could then never make progress).
     pub const fn new(max_batch_records: usize, max_batch_age: Duration) -> Self {
         debug_assert!(
-            max_batch_records >= 1,
+            max_batch_records != 0,
             "max_batch_records must be at least 1"
         );
         Self {
@@ -131,7 +131,7 @@ impl<T> InsertBatcher<T> {
     /// Panics when `config.max_batch_records == 0`.
     pub fn new(config: InsertBatcherConfig) -> Self {
         assert!(
-            config.max_batch_records >= 1,
+            config.max_batch_records != 0,
             "InsertBatcher requires max_batch_records >= 1"
         );
         Self {
@@ -199,7 +199,7 @@ impl<T> InsertBatcher<T> {
 
         match ready.len() {
             0 => BatchOutput::Buffered,
-            1 => BatchOutput::Single(ready.pop().expect("single ready batch")),
+            1 => BatchOutput::Single(ready.swap_remove(0)),
             _ => BatchOutput::Multiple(ready),
         }
     }
@@ -233,7 +233,7 @@ impl<T> InsertBatcher<T> {
         let was_empty = self.buffer.is_empty();
         self.buffer.append(records);
         debug_assert!(records.is_empty());
-        if was_empty && !self.buffer.is_empty() {
+        if was_empty {
             self.deadline = Some(Instant::now() + self.config.max_batch_age);
         }
     }

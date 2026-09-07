@@ -205,11 +205,7 @@ pub fn verify(db_path: &Path) -> Result<VerifyReport, BackupError> {
         let rows: Vec<String> = statement
             .query_map([], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
-        if rows.len() == 1 {
-            rows[0].clone()
-        } else {
-            rows.join("; ")
-        }
+        rows.join("; ")
     };
 
     let foreign_key_violations: i64 = {

@@ -75,10 +75,14 @@ fn insert_metrics_inner(
     // Row-level serialization reuses this scratch across the whole batch.
     let mut scratch = InsertScratch::new();
 
-    match &batch.origin.resource {
-        Some(resource) => resolve_resource(conn, resource, &mut scratch)?,
-        None => resolve_resource(conn, &Resource::default(), &mut scratch)?,
-    }
+    let default_resource;
+    let batch_resource = if let Some(resource) = &batch.origin.resource {
+        resource
+    } else {
+        default_resource = Resource::default();
+        &default_resource
+    };
+    resolve_resource(conn, batch_resource, &mut scratch)?;
 
     // Prepared once per batch; `prepare_cached` lookups are not free.
     let mut series_statement = conn.prepare_cached(SQL_INSERT_SERIES)?;

@@ -132,10 +132,7 @@ impl CommitLedger {
     /// (This crate has no logging dependency; the original panic is already
     /// visible in the panic log, so recovery itself stays silent.)
     fn lock_inner(&self) -> MutexGuard<'_, Inner> {
-        match self.inner.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Marks `ticket` as committed. Called by the writer after the
@@ -209,7 +206,7 @@ impl CommitLedger {
         let inner = self.lock_inner();
         issued
             .saturating_sub(inner.committed_through)
-            .saturating_sub(u64::try_from(inner.settled_above.len()).unwrap_or(u64::MAX))
+            .saturating_sub(inner.settled_above.len() as u64)
     }
 
     /// Monotonic milliseconds of the last time the contiguous watermark
