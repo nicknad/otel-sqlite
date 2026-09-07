@@ -999,9 +999,7 @@ fn parse_checkpoint_mode(text: &str) -> Result<CheckpointMode> {
     } else if trimmed.eq_ignore_ascii_case("truncate") {
         Ok(CheckpointMode::Truncate)
     } else {
-        bail!(
-            "unknown checkpoint_mode `{trimmed}` (expected passive|full|restart|truncate)"
-        )
+        bail!("unknown checkpoint_mode `{trimmed}` (expected passive|full|restart|truncate)")
     }
 }
 

@@ -94,7 +94,9 @@ impl Storage {
         // Kept solely for `producer()`; dropped again by `join()` so the
         // graceful shutdown path (queue closes -> writer drains) still works.
         let producer_source = commands.clone();
-        let command_queue_capacity = commands.capacity().expect("bounded command queue has capacity");
+        let command_queue_capacity = commands
+            .capacity()
+            .expect("bounded command queue has capacity");
         let startup_timeout = config.startup_timeout;
 
         // The writer reports readiness once its database is open and the
