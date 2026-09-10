@@ -1,11 +1,11 @@
 # Container-level crash/restart durability test.
 #
 # The `sidecar` runs the production sink against a named volume; the host
-# script docker/crash-e2e.sh kills it with `docker kill` (SIGKILL, no
+# script tests/docker/crash-e2e.sh kills it with `docker kill` (SIGKILL, no
 # cleanup) MID-LOAD, restarts it on the same volume, and validates that
 # every commit-mode-acknowledged record survived WAL replay.
 #
-#   docker/crash-e2e.sh
+#   tests/docker/crash-e2e.sh
 #
 # The `loadgen` service runs `otel-sqlite-stack-crash`:
 #   * `load`     drives closed-loop OTLP load (requests in flight = durable
@@ -29,8 +29,8 @@ services:
   sidecar:
     image: *bench-image
     build:
-      context: ..
-      dockerfile: docker/Dockerfile.benchmark
+      context: ../..
+      dockerfile: tests/docker/Dockerfile.benchmark
     container_name: crash-e2e-sidecar
     working_dir: /data
     environment:

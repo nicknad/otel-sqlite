@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Container-level crash/restart durability test.
 #
-#   docker/crash-e2e.sh [--duration-secs N] [--kill-at-secs M]
+#   tests/docker/crash-e2e.sh [--duration-secs N] [--kill-at-secs M]
 #
-# Orchestrates docker/compose.crash-e2e.yml:
+# Orchestrates tests/docker/compose.crash-e2e.yml:
 #
 #   1. build the benchmark image (server + driver),
 #   2. start the sidecar and wait for the built-in HEALTHCHECK,
@@ -20,10 +20,10 @@
 
 set -euo pipefail
 
-# Locate the repo root (docker/crash-e2e.sh -> repo root).
+# Locate the repo root (tests/docker/crash-e2e.sh -> repo root).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-COMPOSE=(docker compose -f docker/compose.crash-e2e.yml)
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+COMPOSE=(docker compose -f tests/docker/compose.crash-e2e.yml)
 SIDECAR="crash-e2e-sidecar"
 ENDPOINT="http://sidecar:4317"
 

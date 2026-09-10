@@ -11,7 +11,7 @@ insert batcher → bounded command queue → single SQLite writer (WAL)`.
 - Architecture, design contract & invariants: [docs/architecture.md](docs/architecture.md)
 - Open work & roadmap: [TODO.md](TODO.md)
 - Local CI (run `.forgejo/workflows/ci.yml` on your machine with `act`):
-  [local-ci/](local-ci/) (`.\local-ci\run.ps1` or `./local-ci/run.sh`)
+  [tools/local-ci/](tools/local-ci/) (`.\tools\local-ci\run.ps1` or `./tools/local-ci/run.sh`)
 
 ## Project scope
 

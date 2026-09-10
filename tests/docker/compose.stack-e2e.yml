@@ -11,13 +11,13 @@
 #                                └──> explorer (read-only web UI)
 #
 # Run:
-#   docker compose -f docker/compose.stack-e2e.yml up --build \
+#   docker compose -f tests/docker/compose.stack-e2e.yml up --build \
 #       --exit-code-from verify
 #
 # The `verify` service drives HTTP traffic through nginx, then polls the
 # sink database until both sources (nginx filelog lines, backend OTLP
 # records) are persisted; its exit code is the stack verdict. Fresh state
-# per run: `docker compose -f docker/compose.stack-e2e.yml down -v`.
+# per run: `docker compose -f tests/docker/compose.stack-e2e.yml down -v`.
 #
 # Restricted-environment resource profile (Compose v2 honours cpus and
 # mem_limit outside swarm):
@@ -39,8 +39,8 @@ services:
   otel-sqlite:
     image: *bench-image
     build:
-      context: ..
-      dockerfile: docker/Dockerfile.benchmark
+      context: ../..
+      dockerfile: tests/docker/Dockerfile.benchmark
     container_name: stack-otel-sqlite
     working_dir: /data
     environment:
@@ -137,7 +137,7 @@ services:
   explorer:
     image: log-explorer:latest
     build:
-      context: ../../otel-sqlite-explorer
+      context: ../../../otel-sqlite-explorer
       dockerfile: Dockerfile
     container_name: stack-explorer
     # Image CMD is already "-db /data/otel-logs.db -addr :8080"; spelled out
@@ -160,8 +160,8 @@ services:
   verify:
     image: *bench-image
     build:
-      context: ..
-      dockerfile: docker/Dockerfile.benchmark
+      context: ../..
+      dockerfile: tests/docker/Dockerfile.benchmark
     container_name: stack-verify
     entrypoint: ["/usr/local/bin/otel-sqlite-stack-verify"]
     environment:

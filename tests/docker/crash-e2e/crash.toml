@@ -1,5 +1,5 @@
 # Crash/restart durability test config for the sidecar under
-# docker/compose.crash-e2e.yml.
+# tests/docker/compose.crash-e2e.yml.
 #
 # Durability is "commit" so a 2xx only goes out after the writer committed;
 # periodic maintenance is disabled so the WAL accumulates un-checkpointed

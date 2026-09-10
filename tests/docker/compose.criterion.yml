@@ -2,8 +2,8 @@
 #
 # Recommended regression tier: `bench2` (2 pinned cores, 1024 MB limit).
 #
-#   docker compose -f docker/compose.criterion.yml run --rm build     # unconstrained compile
-#   docker compose -f docker/compose.criterion.yml run --rm bench2    # recommended run
+#   docker compose -f tests/docker/compose.criterion.yml run --rm build     # unconstrained compile
+#   docker compose -f tests/docker/compose.criterion.yml run --rm bench2    # recommended run
 #
 # Design notes:
 # * `cpuset` pins REAL CORES instead of `cpus` quotas. A CPU quota (CFS
@@ -32,7 +32,7 @@ services:
     environment:
       CARGO_TARGET_DIR: /work/target-container
     volumes:
-      - ..:/work
+      - ../..:/work
       - criterion-cargo-registry:/usr/local/cargo/registry
     # No CPU/memory constraints: compile once, fast.
     command: cargo bench --no-run -p otel-sqlite-core -p otel-sqlite-ingress -p otel-sqlite-storage -p otel-sqlite-e2e
@@ -47,16 +47,16 @@ services:
       CARGO_TARGET_DIR: /work/target-container
       TMPDIR: /tmp/bench-data
     volumes:
-      - ..:/work
+      - ../..:/work
       - criterion-cargo-registry:/usr/local/cargo/registry
     tmpfs:
       - /tmp/bench-data:size=256m
     mem_limit: 1024m
     cpuset: "0"
     # Single-threaded demo family (valid on 1 CPU):
-    #   docker compose -f docker/compose.criterion.yml run --rm bench
+    #   docker compose -f tests/docker/compose.criterion.yml run --rm bench
     # Or override the command for anything else:
-    #   docker compose -f docker/compose.criterion.yml run --rm bench cargo bench ...
+    #   docker compose -f tests/docker/compose.criterion.yml run --rm bench cargo bench ...
     command: >
       cargo bench -p otel-sqlite-core --bench batching --
       --noplot --warm-up-time 1 --measurement-time 5
@@ -65,7 +65,7 @@ services:
   # queue) need >= 2 cores so the writer thread is not starved by the driving
   # thread's spin-waits. Command is passed via `docker compose run`:
   #
-  #   docker compose -f docker/compose.criterion.yml run --rm bench2 \
+  #   docker compose -f tests/docker/compose.criterion.yml run --rm bench2 \
   #     cargo bench -p otel-sqlite-storage --bench inserts -- \
   #     --noplot --warm-up-time 1 --measurement-time 3 --save-baseline cpu2
   bench2:
@@ -78,7 +78,7 @@ services:
       CARGO_TARGET_DIR: /work/target-container
       TMPDIR: /tmp/bench-data
     volumes:
-      - ..:/work
+      - ../..:/work
       - criterion-cargo-registry:/usr/local/cargo/registry
     tmpfs:
       - /tmp/bench-data:size=256m
@@ -95,7 +95,7 @@ services:
       CARGO_TARGET_DIR: /work/target-container
       TMPDIR: /tmp/bench-data
     volumes:
-      - ..:/work
+      - ../..:/work
       - criterion-cargo-registry:/usr/local/cargo/registry
     tmpfs:
       - /tmp/bench-data:size=256m

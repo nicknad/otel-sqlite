@@ -2,7 +2,7 @@
 # same benchmark image. The SQLite database lives on a shared volume so the
 # harness can validate persistence after the measurement window.
 #
-#   cd docker
+#   cd tests/docker
 #   docker compose -f compose.benchmark.yml build
 #   docker compose -f compose.benchmark.yml run --rm benchmark \
 #       --scenario baseline --duration-secs 60 --output /results/results.json
@@ -37,8 +37,8 @@ services:
   otel-sqlite:
     image: otel-sqlite-bench:latest
     build:
-      context: ..
-      dockerfile: docker/Dockerfile.benchmark
+      context: ../..
+      dockerfile: tests/docker/Dockerfile.benchmark
     container_name: otel-sqlite-bench-server
     working_dir: /data
     environment:

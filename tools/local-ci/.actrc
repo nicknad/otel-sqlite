@@ -2,7 +2,7 @@
 #
 # Read from THIS directory: the wrapper scripts (`run.ps1` / `run.sh`) change
 # into this folder before invoking act so this file (and `.act.env`) is picked
-# up, then point act at the repository root with `-C ..`.
+# up, then point act at the repository root with `-C ../..`.
 
 # Runner image for `runs-on:` (host) jobs. `catthehacker/ubuntu:act-latest` is
 # the community-standard full-featured GitHub-runner image (git, docker CLI,

@@ -69,7 +69,7 @@ silence it for functional smoke runs.
 ```bash
 docker build \
   --build-arg REVISION="$(git rev-parse HEAD)" \
-  -f docker/Dockerfile.benchmark \
+  -f tests/docker/Dockerfile.benchmark \
   -t otel-sqlite-bench:latest .
 ```
 
@@ -78,7 +78,7 @@ The image contains both binaries (`otel-sqlite`, `otel-sqlite-e2e`).
 ## 3. Running Docker benchmarks
 
 ```bash
-cd docker
+cd tests/docker
 docker compose -f compose.benchmark.yml build
 docker compose -f compose.benchmark.yml up -d otel-sqlite
 docker compose -f compose.benchmark.yml run --rm benchmark
@@ -236,13 +236,13 @@ while the offered load never approached writer saturation.
 **Reproduce:**
 
 ```sh
-docker compose -f docker/compose.criterion.yml run --rm build \
+docker compose -f tests/docker/compose.criterion.yml run --rm build \
     cargo build --release -p otel-sqlite-e2e
-docker compose -f docker/compose.criterion.yml run --rm \
+docker compose -f tests/docker/compose.criterion.yml run --rm \
     -e OTEL_SQLITE_E2E_SYNC=normal bench2 \
     cargo run --release -p otel-sqlite-e2e -- --scenario baseline \
     --output results/bench2-sync-normal.json
-docker compose -f docker/compose.criterion.yml run --rm \
+docker compose -f tests/docker/compose.criterion.yml run --rm \
     -e OTEL_SQLITE_E2E_SYNC=full bench2 \
     cargo run --release -p otel-sqlite-e2e -- --scenario baseline \
     --output results/bench2-sync-full.json
@@ -344,12 +344,12 @@ Methodology notes:
 
 ### Running in a constrained container
 
-`docker/compose.criterion.yml` provides ready-made profiles. Compile once
+`tests/docker/compose.criterion.yml` provides ready-made profiles. Compile once
 without constraints, then measure inside the constrained container:
 
 ```bash
-docker compose -f docker/compose.criterion.yml run --rm build     # unconstrained compile
-docker compose -f docker/compose.criterion.yml run --rm bench2    # recommended tier (see below)
+docker compose -f tests/docker/compose.criterion.yml run --rm build     # unconstrained compile
+docker compose -f tests/docker/compose.criterion.yml run --rm bench2    # recommended tier (see below)
 ```
 
 #### Recommended setup for regression gating: `bench2`

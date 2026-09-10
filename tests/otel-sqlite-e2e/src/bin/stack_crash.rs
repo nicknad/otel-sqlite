@@ -1,6 +1,6 @@
 //! otel-sqlite-stack-crash: container-level crash/restart durability driver.
 //!
-//! Orchestrated by `docker/crash-e2e.sh` against `docker/compose.crash-e2e.yml`:
+//! Orchestrated by `tests/docker/crash-e2e.sh` against `tests/docker/compose.crash-e2e.yml`:
 //!
 //! ```text
 //!   1. `load`     -- drives OTLP load against the sidecar for a fixed

@@ -5,10 +5,10 @@
 # read, then invokes `act -C <repo-root> -W <repo>/.forgejo/workflows`.
 #
 # Usage (PowerShell):
-#   .\local-ci\run.ps1            # release-gate jobs (containerized, no dind)
-#   .\local-ci\run.ps1 -All       # + docker jobs (needs host Docker daemon)
-#   .\local-ci\run.ps1 -List      # list the workflows act would run
-#   .\local-ci\run.ps1 -Act path\to\act.exe   # custom act binary
+#   .\tools\local-ci\run.ps1            # release-gate jobs (containerized, no dind)
+#   .\tools\local-ci\run.ps1 -All       # + docker jobs (needs host Docker daemon)
+#   .\tools\local-ci\run.ps1 -List      # list the workflows act would run
+#   .\tools\local-ci\run.ps1 -Act path\to\act.exe   # custom act binary
 #
 # Prerequisites: Docker Desktop running and the `act` binary on PATH
 # (install: `winget install nektos.act` or scoop/choco).
@@ -26,9 +26,9 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-$Repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$Repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 
-# Change into local-ci so `.actrc` and `.act.env` are picked up by act.
+# Change into tools/local-ci so `.actrc` and `.act.env` are picked up by act.
 Set-Location $PSScriptRoot
 
 # The release-gate jobs all run in their own `container:` images (rust /

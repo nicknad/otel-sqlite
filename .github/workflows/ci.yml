@@ -212,19 +212,19 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Build fuzz image
-        run: docker compose -f docker/compose.fuzz.yml build
+        run: docker compose -f tests/docker/compose.fuzz.yml build
 
       - name: Compile all fuzz targets
-        run: docker compose -f docker/compose.fuzz.yml run --rm build
+        run: docker compose -f tests/docker/compose.fuzz.yml run --rm build
 
       - name: Smoke logs target (2 min)
-        run: docker compose -f docker/compose.fuzz.yml run --rm smoke-logs
+        run: docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-logs
 
       - name: Smoke metrics target (2 min)
-        run: docker compose -f docker/compose.fuzz.yml run --rm smoke-metrics
+        run: docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-metrics
 
       - name: Smoke batcher target (2 min)
-        run: docker compose -f docker/compose.fuzz.yml run --rm smoke-batcher
+        run: docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-batcher
 
   crash-e2e-container:
     runs-on: ubuntu-latest
@@ -235,7 +235,7 @@ jobs:
       # Container-level crash/restart: docker-kill the sidecar mid-load,
       # restart on the same volume, assert no acknowledged loss.
       - name: Container crash/restart durability
-        run: bash docker/crash-e2e.sh
+        run: bash tests/docker/crash-e2e.sh
 
   # P0-5 release gate: the production image must build with --locked, start,
   # report SERVING through its built-in gRPC healthcheck, run as the
@@ -248,7 +248,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Production container smoke (healthcheck, non-root, /data volume)
-        run: bash docker/container-smoke.sh
+        run: bash tests/docker/container-smoke.sh
 
   fuzz-nightly:
     runs-on: ubuntu-latest
@@ -258,22 +258,22 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Build fuzz image
-        run: docker compose -f docker/compose.fuzz.yml build
+        run: docker compose -f tests/docker/compose.fuzz.yml build
 
       - name: Compile all fuzz targets
-        run: docker compose -f docker/compose.fuzz.yml run --rm build
+        run: docker compose -f tests/docker/compose.fuzz.yml run --rm build
 
       - name: Long logs run (30 min)
         run: >
-          docker compose -f docker/compose.fuzz.yml run --rm smoke-logs
+          docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-logs
           run logs_ingress_export -- -rss_limit_mb=2048 -max_total_time=1800
 
       - name: Long metrics run (30 min)
         run: >
-          docker compose -f docker/compose.fuzz.yml run --rm smoke-metrics
+          docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-metrics
           run metrics_ingress_export -- -rss_limit_mb=2048 -max_total_time=1800
 
       - name: Long batcher run (30 min)
         run: >
-          docker compose -f docker/compose.fuzz.yml run --rm smoke-batcher
+          docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-batcher
           run core_batcher -- -rss_limit_mb=2048 -max_total_time=1800
