@@ -1,5 +1,5 @@
 //! otel-sqlite-stack-verify: end-to-end verifier for the full container
-//! stack in `docker/compose.stack-e2e.yml`:
+//! stack in `tests/docker/compose.stack-e2e.yml`:
 //!
 //! ```text
 //!   verify --HTTP--> nginx (frontend + reverse proxy)

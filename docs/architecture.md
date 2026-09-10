@@ -124,7 +124,7 @@ env-gated fault knobs (`OTEL_SQLITE_FAULT_WRITER_AFTER_N` /
 `OTEL_SQLITE_FAULT_BATCHER_AFTER_N` in `storage/src/fault.rs`) that make the
 thread exit via its real fatal path — clearing liveness, closing the ledger
 (writer), and letting the watchdog halt ingestion. A container-level test
-(`docker/crash-e2e.sh`) docker-kills the sidecar mid-load and restarts on the
+(`tests/docker/crash-e2e.sh`) docker-kills the sidecar mid-load and restarts on the
 same volume. The embedded harness remains useful for fast correctness tests but
 cannot model process death accurately.
 

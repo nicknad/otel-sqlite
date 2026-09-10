@@ -15,13 +15,13 @@ path = "src/lib.rs"
 name = "otel-sqlite-e2e"
 path = "src/main.rs"
 
-# Verifier for the full container stack (docker/compose.stack-e2e.yml):
+# Verifier for the full container stack (tests/docker/compose.stack-e2e.yml):
 # drives HTTP traffic through nginx/backend/otelcol and asserts persistence.
 [[bin]]
 name = "otel-sqlite-stack-verify"
 path = "src/bin/stack_verify.rs"
 
-# Crash/restart durability driver for docker/compose.crash-e2e.yml: drives
+# Crash/restart durability driver for tests/docker/compose.crash-e2e.yml: drives
 # OTLP load against the sidecar, writes outcome manifests, validates them
 # after a docker-kill + restart. Shares crash.rs with the native test.
 [[bin]]

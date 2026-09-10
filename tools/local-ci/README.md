@@ -22,8 +22,8 @@ the runner images on first use (the `catthehacker` image and
 ## Usage
 
 ```text
-.\local-ci\run.ps1              # Windows PowerShell
-./local-ci/run.sh               # WSL / Linux / macOS
+.\tools\local-ci\run.ps1              # Windows PowerShell
+./tools/local-ci/run.sh               # WSL / Linux / macOS
 ```
 
 | Command | What it runs |
@@ -37,7 +37,7 @@ Targeted runs: pass extra act flags after the job list, or call act directly
 from this directory (`.actrc` is read here), e.g.:
 
 ```bash
-cd local-ci && act -C .. -W ../.forgejo/workflows lint-and-test -- -v
+cd tools/local-ci && act -C ../.. -W .forgejo/workflows lint-and-test -- -v
 ```
 
 ## What this configuration does

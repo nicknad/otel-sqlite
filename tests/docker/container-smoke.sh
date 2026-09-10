@@ -13,7 +13,7 @@
 #
 # Run from the repository root:
 #
-#   bash docker/container-smoke.sh
+#   bash tests/docker/container-smoke.sh
 #
 # The container and its named volume are removed on exit, so repeated local
 # runs are safe. The script's exit code is the verdict.
@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IMAGE="otel-sqlite-smoke:latest"
 NAME="otel-sqlite-smoke-$$"
 VOLUME="otel-sqlite-smoke-data-$$"

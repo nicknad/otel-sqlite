@@ -1,9 +1,9 @@
 # ------------------------------------------------------------
 # Fuzzing image: nightly toolchain + cargo-fuzz (libFuzzer driver).
 #
-#   docker build -f docker/Dockerfile.fuzz -t otel-sqlite-fuzz:latest .
+#   docker build -f tests/docker/Dockerfile.fuzz -t otel-sqlite-fuzz:latest .
 #
-# Used by docker/compose.fuzz.yml. libFuzzer's sancov instrumentation
+# Used by tests/docker/compose.fuzz.yml. libFuzzer's sancov instrumentation
 # requires a nightly compiler and is unsupported on windows-msvc hosts,
 # so all fuzzing runs through this Linux image (Docker Desktop/WSL2).
 #

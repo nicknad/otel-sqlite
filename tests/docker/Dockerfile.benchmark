@@ -4,9 +4,9 @@
 #
 #   docker build \
 #     --build-arg REVISION="$(git rev-parse HEAD)" \
-#     -f docker/Dockerfile.benchmark -t otel-sqlite-bench:latest .
+#     -f tests/docker/Dockerfile.benchmark -t otel-sqlite-bench:latest .
 #
-# Used by docker/compose.benchmark.yml. For authoritative SQLite
+# Used by tests/docker/compose.benchmark.yml. For authoritative SQLite
 # performance numbers prefer native Linux execution; see
 # docs/performance.md.
 # ------------------------------------------------------------

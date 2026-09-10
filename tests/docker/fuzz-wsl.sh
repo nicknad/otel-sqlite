@@ -4,20 +4,20 @@
 #
 # Run from PowerShell, with the repo as current directory:
 #
-#   wsl -d Debian -e bash docker/fuzz-wsl.sh setup        # one-time toolchain bootstrap
-#   wsl -d Debian -e bash docker/fuzz-wsl.sh build        # compile all fuzz targets
-#   wsl -d Debian -e bash docker/fuzz-wsl.sh smoke-logs   # 120 s OTLP logs target
-#   wsl -d Debian -e bash docker/fuzz-wsl.sh smoke-metrics
-#   wsl -d Debian -e bash docker/fuzz-wsl.sh smoke-batcher
+#   wsl -d Debian -e bash tests/docker/fuzz-wsl.sh setup        # one-time toolchain bootstrap
+#   wsl -d Debian -e bash tests/docker/fuzz-wsl.sh build        # compile all fuzz targets
+#   wsl -d Debian -e bash tests/docker/fuzz-wsl.sh smoke-logs   # 120 s OTLP logs target
+#   wsl -d Debian -e bash tests/docker/fuzz-wsl.sh smoke-metrics
+#   wsl -d Debian -e bash tests/docker/fuzz-wsl.sh smoke-batcher
 #
 # Arbitrary runs / libFuzzer flags:
 #
-#   wsl -d Debian -e bash docker/fuzz-wsl.sh run logs_ingress_export -max_total_time=21600
-#   wsl -d Debian -e bash docker/fuzz-wsl.sh run logs_ingress_export fuzz/artifacts/logs_ingress_export/crash-<sha>
+#   wsl -d Debian -e bash tests/docker/fuzz-wsl.sh run logs_ingress_export -max_total_time=21600
+#   wsl -d Debian -e bash tests/docker/fuzz-wsl.sh run logs_ingress_export fuzz/artifacts/logs_ingress_export/crash-<sha>
 #
 # Design notes:
 # * Resource envelope: TWO CPUs are the default expected budget for fuzzing
-#   (matches docker/compose.fuzz.yml, which pins cpuset "0,1"). Verified
+#   (matches tests/docker/compose.fuzz.yml, which pins cpuset "0,1"). Verified
 #   on a 2-vCPU WSL2 VM with --debug-assertions:
 #     core_batcher           ~3.6k exec/s   rss ~412 MB
 #     logs_ingress_export    ~1.1k exec/s   rss ~75 MB
@@ -35,14 +35,14 @@
 # * Toolchain is installed per-user (rustup in $HOME): no sudo required.
 #   libFuzzer's C++ runtime is compiled with clang++, which Debian ships;
 #   g++/build-essential are NOT needed.
-# * The exact same targets run in docker/compose.fuzz.yml; prefer that
+# * The exact same targets run in tests/docker/compose.fuzz.yml; prefer that
 #   for CI-parity or when reproducing an environment from scratch. Use
 #   this script for day-to-day speed.
 # ------------------------------------------------------------
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FUZZ_DIR="${REPO_ROOT}/fuzz"
 
 if [[ -z "${WSL_DISTRO_NAME:-}" ]] && ! grep -qi microsoft /proc/version 2>/dev/null; then

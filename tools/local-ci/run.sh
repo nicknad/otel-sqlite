@@ -6,10 +6,10 @@
 # `act -C <repo-root> -W <repo>/.forgejo/workflows`.
 #
 # Usage (WSL / Linux / macOS):
-#   ./local-ci/run.sh            # release-gate jobs (containerized, no dind)
-#   ./local-ci/run.sh --all      # + docker jobs (needs host Docker daemon)
-#   ./local-ci/run.sh --list     # list the workflows act would run
-#   ACT=path/to/act ./local-ci/run.sh   # custom act binary
+#   ./tools/local-ci/run.sh            # release-gate jobs (containerized, no dind)
+#   ./tools/local-ci/run.sh --all      # + docker jobs (needs host Docker daemon)
+#   ./tools/local-ci/run.sh --list     # list the workflows act would run
+#   ACT=path/to/act ./tools/local-ci/run.sh   # custom act binary
 #
 # Prerequisites: a running Docker daemon and the `act` binary on PATH
 # (install: `brew install act`, `go install github.com/nektos/act@latest`,
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
-REPO="$(cd .. && pwd)"
+REPO="$(cd ../.. && pwd)"
 ACT="${ACT:-act}"
 
 ALL=0
