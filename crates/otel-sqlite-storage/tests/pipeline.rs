@@ -49,7 +49,6 @@ fn config(
             Duration::from_millis(max_batch_age_ms),
         ),
         command_queue_capacity: 16,
-        retention: None,
         max_db_bytes: None,
         synchronous: SyncMode::Normal,
         startup_timeout: otel_sqlite_storage::DEFAULT_STARTUP_TIMEOUT,

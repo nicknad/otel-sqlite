@@ -40,7 +40,7 @@ pub const MIN_DB_QUOTA_BYTES: u64 = 1024 * 1024;
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 pub const MAX_RETENTION: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Config {
     pub listen_address: String,
     pub sqlite_path: PathBuf,
@@ -148,12 +148,15 @@ impl Config {
     /// omitted keys keep their defaults, recursively through the
     /// `[maintenance]` and `[watchdog]` sections.
     pub fn from_env() -> Result<Self> {
-        let result = match Self::env_config_path() {
-            Some(path) => Self::from_file(&path),
-            None => Ok(Self::default()),
-        }?;
-        result.validate()?;
-        Ok(result)
+        // `from_file` validates before returning; the defaults path must do
+        // the same, so validation runs exactly once per path.
+        if let Some(path) = Self::env_config_path() {
+            Self::from_file(&path)
+        } else {
+            let config = Self::default();
+            config.validate()?;
+            Ok(config)
+        }
     }
 
     /// Config file path from the environment, `None` when unset or empty.
@@ -292,13 +295,9 @@ impl Config {
         {
             bail!("max_db_bytes must be at least {MIN_DB_QUOTA_BYTES} bytes (1 MiB); got {quota}");
         }
-        validate_duration("batcher_max_batch_age", self.batcher_max_batch_age, false)?;
-        validate_duration("shutdown_timeout", self.shutdown_timeout, false)?;
-        validate_duration(
-            "maintenance.retry_delay",
-            self.maintenance.retry_delay,
-            false,
-        )?;
+        validate_duration("batcher_max_batch_age", self.batcher_max_batch_age)?;
+        validate_duration("shutdown_timeout", self.shutdown_timeout)?;
+        validate_duration("maintenance.retry_delay", self.maintenance.retry_delay)?;
         validate_optional_duration(
             "maintenance.retention",
             self.maintenance.retention,
@@ -334,22 +333,10 @@ impl Config {
             self.maintenance.rebuild_fts_interval,
             MAX_RETENTION,
         )?;
-        validate_duration("watchdog.tick_interval", self.watchdog.tick_interval, false)?;
-        validate_duration(
-            "watchdog.degraded_after",
-            self.watchdog.degraded_after,
-            false,
-        )?;
-        validate_duration(
-            "watchdog.unhealthy_after",
-            self.watchdog.unhealthy_after,
-            false,
-        )?;
-        validate_duration(
-            "watchdog.ack_stall_after",
-            self.watchdog.ack_stall_after,
-            false,
-        )?;
+        validate_duration("watchdog.tick_interval", self.watchdog.tick_interval)?;
+        validate_duration("watchdog.degraded_after", self.watchdog.degraded_after)?;
+        validate_duration("watchdog.unhealthy_after", self.watchdog.unhealthy_after)?;
+        validate_duration("watchdog.ack_stall_after", self.watchdog.ack_stall_after)?;
         if self.watchdog.degraded_after >= self.watchdog.unhealthy_after {
             bail!("watchdog.degraded_after must be less than unhealthy_after");
         }
@@ -439,7 +426,6 @@ impl Config {
                 self.batcher_max_batch_age,
             ),
             command_queue_capacity: self.command_queue_capacity,
-            retention: None,
             max_db_bytes: self.max_db_bytes,
             synchronous: self.sqlite_synchronous,
             startup_timeout: otel_sqlite_storage::DEFAULT_STARTUP_TIMEOUT,
@@ -659,11 +645,10 @@ where
     Ok(())
 }
 
-fn validate_duration(key: &str, value: Duration, allow_zero: bool) -> Result<()> {
-    if (!allow_zero && value.is_zero()) || value > MAX_TIMEOUT {
-        let minimum = if allow_zero { "0" } else { "greater than 0" };
+fn validate_duration(key: &str, value: Duration) -> Result<()> {
+    if value.is_zero() || value > MAX_TIMEOUT {
         bail!(
-            "config key `{key}` must be {minimum} and no more than {MAX_TIMEOUT:?}; got {value:?}"
+            "config key `{key}` must be greater than 0 and no more than {MAX_TIMEOUT:?}; got {value:?}"
         );
     }
     Ok(())
@@ -901,9 +886,6 @@ impl RawDuration {
             .trim()
             .parse()
             .map_err(|_| format!("duration `{text}` does not start with a number"))?;
-        if amount < 0.0 {
-            return Err(format!("duration `{text}` must not be negative"));
-        }
         let unit = unit.trim();
         let scale_secs = if unit.eq_ignore_ascii_case("ms")
             || unit.eq_ignore_ascii_case("millis")

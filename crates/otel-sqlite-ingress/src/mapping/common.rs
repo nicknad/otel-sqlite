@@ -2,6 +2,7 @@
 
 use otel_sqlite_core::model::{Attribute, AttributeValue, Resource};
 
+use crate::config::IngressConfig;
 use crate::error::IngressError;
 use crate::mapping::pb::common::v1::{AnyValue, KeyValue, any_value::Value as AnyValueKind};
 use crate::mapping::pb::resource::v1::Resource as ProtoResource;
@@ -157,6 +158,103 @@ pub(crate) fn any_value_depth(value: &AnyValue) -> usize {
         }
     }
     deepest
+}
+
+pub(crate) fn check_attributes(
+    values: &[KeyValue],
+    limits: &IngressConfig,
+    what: &str,
+) -> Result<(), IngressError> {
+    if values.len() > limits.max_attributes_per_record {
+        return Err(IngressError::Mapping(format!(
+            "{what} holds {} attributes, limit is {}",
+            values.len(),
+            limits.max_attributes_per_record
+        )));
+    }
+    for entry in values {
+        if entry.key.len() > limits.max_attribute_key_bytes {
+            return Err(IngressError::Mapping(format!(
+                "{what} key exceeds {} bytes (limit {})",
+                entry.key.len(),
+                limits.max_attribute_key_bytes
+            )));
+        }
+        if let Some(value) = entry.value.as_ref() {
+            check_any_value(value, limits, what)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_any_value(
+    value: &AnyValue,
+    limits: &IngressConfig,
+    what: &str,
+) -> Result<(), IngressError> {
+    if any_value_depth(value) > MAX_NESTING_DEPTH {
+        return Err(IngressError::Mapping(format!(
+            "{what} exceeds maximum nesting depth of {MAX_NESTING_DEPTH}"
+        )));
+    }
+    // Iterative leaf-size walk (explicit stack: never recurses).
+    let mut stack: Vec<&AnyValue> = vec![value];
+    while let Some(current) = stack.pop() {
+        match &current.value {
+            Some(AnyValueKind::StringValue(s)) => {
+                if s.len() > limits.max_attribute_value_bytes {
+                    return Err(IngressError::Mapping(format!(
+                        "{what} string value exceeds {} bytes (limit {})",
+                        s.len(),
+                        limits.max_attribute_value_bytes
+                    )));
+                }
+            }
+            Some(AnyValueKind::BytesValue(b)) => {
+                if b.len() > limits.max_attribute_value_bytes {
+                    return Err(IngressError::Mapping(format!(
+                        "{what} bytes value exceeds {} bytes (limit {})",
+                        b.len(),
+                        limits.max_attribute_value_bytes
+                    )));
+                }
+            }
+            Some(AnyValueKind::ArrayValue(array)) => {
+                stack.extend(array.values.iter());
+            }
+            Some(AnyValueKind::KvlistValue(list)) => {
+                for entry in &list.values {
+                    if entry.key.len() > limits.max_attribute_key_bytes {
+                        return Err(IngressError::Mapping(format!(
+                            "{what} nested key exceeds {} bytes (limit {})",
+                            entry.key.len(),
+                            limits.max_attribute_key_bytes
+                        )));
+                    }
+                    if let Some(nested) = entry.value.as_ref() {
+                        stack.push(nested);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_plain_string(
+    value: &str,
+    limits: &IngressConfig,
+    what: &str,
+) -> Result<(), IngressError> {
+    if value.len() > limits.max_attribute_value_bytes {
+        return Err(IngressError::Mapping(format!(
+            "{what} exceeds {} bytes (limit {})",
+            value.len(),
+            limits.max_attribute_value_bytes
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn convert_resource(value: ProtoResource) -> Result<Resource, IngressError> {

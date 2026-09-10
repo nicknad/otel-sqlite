@@ -85,7 +85,6 @@ pub mod production_defaults {
             sqlite_path,
             insert_batcher: InsertBatcherConfig::new(MAX_BATCH_RECORDS, MAX_BATCH_AGE),
             command_queue_capacity: COMMAND_QUEUE_CAPACITY,
-            retention: None,
             max_db_bytes: None,
             synchronous: sync_mode(),
             startup_timeout: otel_sqlite_storage::DEFAULT_STARTUP_TIMEOUT,

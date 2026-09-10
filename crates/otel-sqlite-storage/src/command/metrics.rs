@@ -204,6 +204,30 @@ fn exemplars_param<'a>(exemplars: &[Exemplar], out: &'a mut String) -> Option<&'
     Some(out.as_str())
 }
 
+/// Classifies one data-point insert: counts it written, quarantines a
+/// poisonous row when `tolerant` (warn + drop), or fails the batch.
+fn handle_point_result(
+    result: Result<usize, rusqlite::Error>,
+    tolerant: bool,
+    timestamp_ns: i64,
+    written: &mut u64,
+    dropped: &mut u64,
+) -> Result<(), StorageError> {
+    match result {
+        Ok(_) => *written += 1,
+        Err(error) if tolerant && crate::error::classify_sqlite(&error) == FailureClass::Poison => {
+            *dropped += 1;
+            tracing::warn!(
+                timestamp_ns,
+                %error,
+                "poisonous metric data point quarantined (dropped); healthy points keep committing"
+            );
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 /// Writes gauge/sum data points. The metric id is read from
 /// `scratch.metric_id`; the per-point series id and attribute/payload JSON
 /// land in the remaining scratch buffers, reused across points.
@@ -232,36 +256,29 @@ fn write_number_points(
         };
         let exemplars = exemplars_param(&point.exemplars, &mut scratch.exemplars_json);
 
-        match point_statement.execute(params![
-            &*scratch.series_id,
+        handle_point_result(
+            point_statement.execute(params![
+                &*scratch.series_id,
+                point.time_unix_nano,
+                point.start_time_unix_nano,
+                point.flags,
+                value_double,
+                value_int,
+                None::<i64>,
+                None::<f64>,
+                None::<f64>,
+                None::<f64>,
+                0,
+                None::<String>,
+                None::<String>,
+                None::<String>,
+                exemplars,
+            ]),
+            tolerant,
             point.time_unix_nano,
-            point.start_time_unix_nano,
-            point.flags,
-            value_double,
-            value_int,
-            None::<i64>,
-            None::<f64>,
-            None::<f64>,
-            None::<f64>,
-            0,
-            None::<String>,
-            None::<String>,
-            None::<String>,
-            exemplars,
-        ]) {
-            Ok(_) => written += 1,
-            Err(error)
-                if tolerant && crate::error::classify_sqlite(&error) == FailureClass::Poison =>
-            {
-                dropped += 1;
-                tracing::warn!(
-                    timestamp_ns = point.time_unix_nano,
-                    %error,
-                    "poisonous metric data point quarantined (dropped); healthy points keep committing"
-                );
-            }
-            Err(error) => return Err(error.into()),
-        }
+            &mut written,
+            &mut dropped,
+        )?;
     }
     Ok((written, dropped))
 }
@@ -295,36 +312,29 @@ fn write_histogram_points(
         );
         let exemplars = exemplars_param(&point.exemplars, &mut scratch.exemplars_json);
 
-        match point_statement.execute(params![
-            &*scratch.series_id,
+        handle_point_result(
+            point_statement.execute(params![
+                &*scratch.series_id,
+                point.time_unix_nano,
+                point.start_time_unix_nano,
+                point.flags,
+                None::<f64>,
+                None::<i64>,
+                i64::try_from(point.count).ok(),
+                point.sum,
+                point.min,
+                point.max,
+                0,
+                &*scratch.json,
+                None::<String>,
+                None::<String>,
+                exemplars,
+            ]),
+            tolerant,
             point.time_unix_nano,
-            point.start_time_unix_nano,
-            point.flags,
-            None::<f64>,
-            None::<i64>,
-            i64::try_from(point.count).ok(),
-            point.sum,
-            point.min,
-            point.max,
-            0,
-            &*scratch.json,
-            None::<String>,
-            None::<String>,
-            exemplars,
-        ]) {
-            Ok(_) => written += 1,
-            Err(error)
-                if tolerant && crate::error::classify_sqlite(&error) == FailureClass::Poison =>
-            {
-                dropped += 1;
-                tracing::warn!(
-                    timestamp_ns = point.time_unix_nano,
-                    %error,
-                    "poisonous metric data point quarantined (dropped); healthy points keep committing"
-                );
-            }
-            Err(error) => return Err(error.into()),
-        }
+            &mut written,
+            &mut dropped,
+        )?;
     }
     Ok((written, dropped))
 }
@@ -361,36 +371,29 @@ fn write_exponential_points(
         );
         let exemplars = exemplars_param(&point.exemplars, &mut scratch.exemplars_json);
 
-        match point_statement.execute(params![
-            &*scratch.series_id,
+        handle_point_result(
+            point_statement.execute(params![
+                &*scratch.series_id,
+                point.time_unix_nano,
+                point.start_time_unix_nano,
+                point.flags,
+                None::<f64>,
+                None::<i64>,
+                i64::try_from(point.count).ok(),
+                point.sum,
+                point.min,
+                point.max,
+                0,
+                None::<String>,
+                &*scratch.json,
+                None::<String>,
+                exemplars,
+            ]),
+            tolerant,
             point.time_unix_nano,
-            point.start_time_unix_nano,
-            point.flags,
-            None::<f64>,
-            None::<i64>,
-            i64::try_from(point.count).ok(),
-            point.sum,
-            point.min,
-            point.max,
-            0,
-            None::<String>,
-            &*scratch.json,
-            None::<String>,
-            exemplars,
-        ]) {
-            Ok(_) => written += 1,
-            Err(error)
-                if tolerant && crate::error::classify_sqlite(&error) == FailureClass::Poison =>
-            {
-                dropped += 1;
-                tracing::warn!(
-                    timestamp_ns = point.time_unix_nano,
-                    %error,
-                    "poisonous metric data point quarantined (dropped); healthy points keep committing"
-                );
-            }
-            Err(error) => return Err(error.into()),
-        }
+            &mut written,
+            &mut dropped,
+        )?;
     }
     Ok((written, dropped))
 }
@@ -425,36 +428,29 @@ fn write_summary_points(
         );
         let exemplars = exemplars_param(&point.exemplars, &mut scratch.exemplars_json);
 
-        match point_statement.execute(params![
-            &*scratch.series_id,
+        handle_point_result(
+            point_statement.execute(params![
+                &*scratch.series_id,
+                point.time_unix_nano,
+                point.start_time_unix_nano,
+                point.flags,
+                None::<f64>,
+                None::<i64>,
+                i64::try_from(point.count).ok(),
+                Some(point.sum),
+                None::<f64>,
+                None::<f64>,
+                0,
+                None::<String>,
+                None::<String>,
+                &*scratch.json,
+                exemplars,
+            ]),
+            tolerant,
             point.time_unix_nano,
-            point.start_time_unix_nano,
-            point.flags,
-            None::<f64>,
-            None::<i64>,
-            i64::try_from(point.count).ok(),
-            Some(point.sum),
-            None::<f64>,
-            None::<f64>,
-            0,
-            None::<String>,
-            None::<String>,
-            &*scratch.json,
-            exemplars,
-        ]) {
-            Ok(_) => written += 1,
-            Err(error)
-                if tolerant && crate::error::classify_sqlite(&error) == FailureClass::Poison =>
-            {
-                dropped += 1;
-                tracing::warn!(
-                    timestamp_ns = point.time_unix_nano,
-                    %error,
-                    "poisonous metric data point quarantined (dropped); healthy points keep committing"
-                );
-            }
-            Err(error) => return Err(error.into()),
-        }
+            &mut written,
+            &mut dropped,
+        )?;
     }
     Ok((written, dropped))
 }

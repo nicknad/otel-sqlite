@@ -28,7 +28,7 @@ const DEFAULT_BACKUP_DIR: &str = "backups";
 /// Default number of backups retained per directory after a successful run.
 const DEFAULT_KEEP: usize = 30;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BackupArgs {
     pub db: PathBuf,
     pub out_dir: PathBuf,
@@ -37,7 +37,7 @@ pub struct BackupArgs {
     pub json: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RestoreArgs {
     pub backup: PathBuf,
     pub dir: PathBuf,
@@ -45,7 +45,7 @@ pub struct RestoreArgs {
     pub json: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VerifyArgs {
     pub db: PathBuf,
     pub json: bool,

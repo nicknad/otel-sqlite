@@ -399,9 +399,6 @@ fn emit_metrics(sample: &PipelineSample, state: HealthState) {
 }
 
 fn log_transition(from: HealthState, to: HealthState, reason: &str) {
-    if from == HealthState::Healthy && to == HealthState::Healthy {
-        return;
-    }
     let detail = format!("health {from:?} -> {to:?}");
     match to {
         HealthState::Unhealthy => tracing::error!(reason, "{detail}"),

@@ -488,11 +488,6 @@ impl tonic::service::Interceptor for BearerInterceptor {
     }
 }
 
-/// Convenience constructor mirroring [`BearerInterceptor::new`].
-pub fn bearer_interceptor(token_file: Option<&Path>) -> Result<BearerInterceptor, AuthError> {
-    BearerInterceptor::new(token_file)
-}
-
 /// Extracts and verifies the `authorization` header of an incoming request.
 ///
 /// Used as a tonic interceptor on the OTLP services only — the health service

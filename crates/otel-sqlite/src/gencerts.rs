@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 /// One parsed command line for the subcommand.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct GenCertsArgs {
     pub hosts: Vec<String>,
     pub clients: Vec<String>,

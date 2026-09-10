@@ -31,7 +31,10 @@ pub(crate) fn classify_sqlite(error: &rusqlite::Error) -> FailureClass {
     match error {
         rusqlite::Error::SqliteFailure(failure, _) => match failure.code {
             Code::DatabaseBusy | Code::DatabaseLocked => FailureClass::Retryable,
-            code if is_constraint_code(code) => FailureClass::Poison,
+            // libsqlite3-sys exposes only the primary result code; the
+            // specific violated constraint lives in the extended code, which
+            // we do not need for classification purposes.
+            Code::ConstraintViolation => FailureClass::Poison,
             _ => FailureClass::Fatal,
         },
         // Data-driven binding failures are row-local: salvage can drop just
@@ -40,13 +43,6 @@ pub(crate) fn classify_sqlite(error: &rusqlite::Error) -> FailureClass {
         // Everything else is a defect in our own statement/usage — halt.
         _ => FailureClass::Fatal,
     }
-}
-
-fn is_constraint_code(code: rusqlite::ffi::ErrorCode) -> bool {
-    // libsqlite3-sys exposes only the primary result code; the specific
-    // violated constraint lives in the extended code, which we do not need
-    // for classification purposes.
-    code == rusqlite::ffi::ErrorCode::ConstraintViolation
 }
 
 impl StorageError {

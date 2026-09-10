@@ -1,42 +1,5 @@
-use std::fmt;
-
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[repr(u8)]
-pub enum ValueType {
-    #[default]
-    Null = 0,
-    String = 1,
-    Int = 2,
-    Double = 3,
-    Bool = 4,
-    Bytes = 5,
-    Array = 6,
-    Kvlist = 7,
-}
-
-impl ValueType {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Null => "null",
-            Self::String => "string",
-            Self::Int => "int",
-            Self::Double => "double",
-            Self::Bool => "bool",
-            Self::Bytes => "bytes",
-            Self::Array => "array",
-            Self::Kvlist => "kvlist",
-        }
-    }
-}
-
-impl fmt::Display for ValueType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum AttributeValue {
@@ -52,19 +15,6 @@ pub enum AttributeValue {
 }
 
 impl AttributeValue {
-    pub fn value_type(&self) -> ValueType {
-        match self {
-            Self::Null => ValueType::Null,
-            Self::String(_) => ValueType::String,
-            Self::Int(_) => ValueType::Int,
-            Self::Double(_) => ValueType::Double,
-            Self::Bool(_) => ValueType::Bool,
-            Self::Bytes(_) => ValueType::Bytes,
-            Self::Array(_) => ValueType::Array,
-            Self::Kvlist(_) => ValueType::Kvlist,
-        }
-    }
-
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(value) => Some(value),
@@ -79,37 +29,9 @@ impl AttributeValue {
         }
     }
 
-    pub fn as_double(&self) -> Option<f64> {
-        match self {
-            Self::Double(value) => Some(*value),
-            _ => None,
-        }
-    }
-
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(value) => Some(*value),
-            _ => None,
-        }
-    }
-
-    pub fn as_bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::Bytes(value) => Some(value),
-            _ => None,
-        }
-    }
-
-    pub fn as_array(&self) -> Option<&[AttributeValue]> {
-        match self {
-            Self::Array(value) => Some(value),
-            _ => None,
-        }
-    }
-
-    pub fn as_kvlist(&self) -> Option<&[Attribute]> {
-        match self {
-            Self::Kvlist(value) => Some(value),
             _ => None,
         }
     }
