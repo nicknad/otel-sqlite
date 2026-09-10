@@ -7,11 +7,12 @@ use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, MetricChunk};
 
 use crate::error::IngressError;
 
-use super::pb::common::v1::{AnyValue, InstrumentationScope, KeyValue};
+use super::pb::common::v1::InstrumentationScope;
 use super::pb::metrics::v1 as proto;
 use super::pb::metrics::v1::{ResourceMetrics, ScopeMetrics};
 use super::{
-    MAX_NESTING_DEPTH, any_value_depth, attributes, convert_resource, parse_span_id, parse_trace_id,
+    attributes, check_attributes, check_plain_string, convert_resource, parse_span_id,
+    parse_trace_id,
 };
 use crate::config::IngressConfig;
 
@@ -27,10 +28,10 @@ pub fn try_convert_batch(value: ResourceMetrics) -> Result<MetricBatch, IngressE
         schema_url,
     } = value;
 
-    let capacity: usize = scope_metrics
-        .iter()
-        .map(|scope| scope.metrics.iter().map(metric_point_count).sum::<usize>())
-        .sum();
+    // `MetricBatch` holds one record per metric (not per data point), so size
+    // the reservation by metric count; counting points would over-reserve by
+    // the points-per-metric factor.
+    let capacity: usize = scope_metrics.iter().map(|scope| scope.metrics.len()).sum();
     let mut batch = MetricBatch::with_capacity(capacity);
 
     let mut resource = resource.map(convert_resource).transpose()?;
@@ -205,98 +206,6 @@ fn check_exemplars(values: &[proto::Exemplar], limits: &IngressConfig) -> Result
             limits,
             "exemplar.filtered_attributes",
         )?;
-    }
-    Ok(())
-}
-
-fn check_attributes(
-    values: &[KeyValue],
-    limits: &IngressConfig,
-    what: &str,
-) -> Result<(), IngressError> {
-    if values.len() > limits.max_attributes_per_record {
-        return Err(IngressError::Mapping(format!(
-            "{what} holds {} attributes, limit is {}",
-            values.len(),
-            limits.max_attributes_per_record
-        )));
-    }
-    for entry in values {
-        if entry.key.len() > limits.max_attribute_key_bytes {
-            return Err(IngressError::Mapping(format!(
-                "{what} key exceeds {} bytes (limit {})",
-                entry.key.len(),
-                limits.max_attribute_key_bytes
-            )));
-        }
-        if let Some(value) = entry.value.as_ref() {
-            check_any_value(value, limits, what)?;
-        }
-    }
-    Ok(())
-}
-
-fn check_any_value(
-    value: &AnyValue,
-    limits: &IngressConfig,
-    what: &str,
-) -> Result<(), IngressError> {
-    if any_value_depth(value) > MAX_NESTING_DEPTH {
-        return Err(IngressError::Mapping(format!(
-            "{what} exceeds maximum nesting depth of {MAX_NESTING_DEPTH}"
-        )));
-    }
-    let mut stack: Vec<&AnyValue> = vec![value];
-    while let Some(current) = stack.pop() {
-        match &current.value {
-            Some(super::AnyValueKind::StringValue(s)) => {
-                if s.len() > limits.max_attribute_value_bytes {
-                    return Err(IngressError::Mapping(format!(
-                        "{what} string value exceeds {} bytes (limit {})",
-                        s.len(),
-                        limits.max_attribute_value_bytes
-                    )));
-                }
-            }
-            Some(super::AnyValueKind::BytesValue(b)) => {
-                if b.len() > limits.max_attribute_value_bytes {
-                    return Err(IngressError::Mapping(format!(
-                        "{what} bytes value exceeds {} bytes (limit {})",
-                        b.len(),
-                        limits.max_attribute_value_bytes
-                    )));
-                }
-            }
-            Some(super::AnyValueKind::ArrayValue(array)) => {
-                stack.extend(array.values.iter());
-            }
-            Some(super::AnyValueKind::KvlistValue(list)) => {
-                for entry in &list.values {
-                    if entry.key.len() > limits.max_attribute_key_bytes {
-                        return Err(IngressError::Mapping(format!(
-                            "{what} nested key exceeds {} bytes (limit {})",
-                            entry.key.len(),
-                            limits.max_attribute_key_bytes
-                        )));
-                    }
-                    if let Some(nested) = entry.value.as_ref() {
-                        stack.push(nested);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn check_plain_string(value: &str, limits: &IngressConfig, what: &str) -> Result<(), IngressError> {
-    if value.len() > limits.max_attribute_value_bytes {
-        return Err(IngressError::Mapping(format!(
-            "{what} exceeds {} bytes (limit {})",
-            value.len(),
-            limits.max_attribute_value_bytes
-        )));
     }
     Ok(())
 }

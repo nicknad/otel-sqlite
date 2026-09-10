@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 use otel_sqlite_core::storage::IngestMessage;
 
-pub use auth::{AuthError, BearerInterceptor, TokenFileVault, bearer_interceptor};
+pub use auth::{AuthError, BearerInterceptor, TokenFileVault};
 pub use config::{
     AuthConfig, DEFAULT_LISTEN_ADDRESS, DEFAULT_MAX_ATTRIBUTE_KEY_BYTES,
     DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES, DEFAULT_MAX_ATTRIBUTES_PER_RECORD, DEFAULT_MAX_BODY_BYTES,
@@ -137,11 +137,6 @@ impl IngestSender {
         self.inner.is_empty()
     }
 
-    /// Maximum number of messages the channel can hold.
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
     /// Reserves room for `n` messages, or rejects the whole reservation.
     ///
     /// On success the returned guard holds the admission gate until dropped,
@@ -191,8 +186,7 @@ impl IngestSender {
     /// always draining), so it never blocks a concurrent
     /// [`IngestSender::reserve`]. Only fails with
     /// [`SendFailure::Disconnected`] when the storage side is gone.
-    pub fn send(&self, message: IngestMessage) -> Result<(), SendFailure> {
-        let mut message = message;
+    pub fn send(&self, mut message: IngestMessage) -> Result<(), SendFailure> {
         loop {
             let _gate = self
                 .admission
@@ -219,11 +213,10 @@ impl IngestSender {
     /// side is gone.
     pub fn send_timeout(
         &self,
-        message: IngestMessage,
+        mut message: IngestMessage,
         timeout: Duration,
     ) -> Result<(), SendTimeoutFailure> {
         let deadline = Instant::now() + timeout;
-        let mut message = message;
         loop {
             let _gate = self
                 .admission

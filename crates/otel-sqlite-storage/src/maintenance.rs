@@ -260,7 +260,6 @@ pub(crate) fn rebuild_fts(conn: &mut Connection) -> Result<usize, StorageError> 
 pub(crate) struct QuotaReport {
     pub log_events: usize,
     pub metric_points: usize,
-    pub dimensions_removed: usize,
     /// File size before enforcement (bytes).
     pub bytes_before: u64,
     /// File size after enforcement (bytes).
@@ -302,7 +301,6 @@ pub(crate) fn enforce_size_quota(
         }
         report.log_events += deleted.0;
         report.metric_points += deleted.1;
-        report.dimensions_removed += deleted.2;
     }
     // One orphan-dimension sweep for everything evicted above (cheaper than
     // per-batch when several rounds ran).
@@ -311,7 +309,6 @@ pub(crate) fn enforce_size_quota(
         let mut sweep = PruneReport::default();
         collect_orphan_dimensions(&tx, &mut sweep)?;
         tx.commit()?;
-        report.dimensions_removed += sweep.dimensions_removed();
     }
     report.bytes_after = file_size(db_path);
     Ok(report)
@@ -325,8 +322,8 @@ pub(crate) fn file_size(path: &Path) -> u64 {
 
 /// Deletes one bounded batch of the oldest rows per signal (oldest-first by
 /// event timestamp, using the existing timestamp indexes). Returns
-/// `(log_events, metric_points, dimensions)` deleted by this batch.
-fn prune_oldest_batch(conn: &mut Connection) -> Result<(usize, usize, usize), StorageError> {
+/// `(log_events, metric_points)` deleted by this batch.
+fn prune_oldest_batch(conn: &mut Connection) -> Result<(usize, usize), StorageError> {
     let batch = PRUNE_BATCH_ROWS as i64;
     let tx = conn.transaction()?;
     let logs = tx.execute(
@@ -342,5 +339,5 @@ fn prune_oldest_batch(conn: &mut Connection) -> Result<(usize, usize, usize), St
         [batch],
     )?;
     tx.commit()?;
-    Ok((logs, metrics, 0))
+    Ok((logs, metrics))
 }

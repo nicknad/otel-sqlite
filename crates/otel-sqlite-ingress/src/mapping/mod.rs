@@ -46,8 +46,8 @@ pub mod pb {
 }
 
 pub(crate) use common::{
-    MAX_NESTING_DEPTH, any_value_depth, attribute_value, attributes, convert_resource,
-    parse_span_id, parse_trace_id,
+    attribute_value, attributes, check_any_value, check_attributes, check_plain_string,
+    convert_resource, parse_span_id, parse_trace_id,
 };
 
 // Imported here so signal mapping modules can refer to them as

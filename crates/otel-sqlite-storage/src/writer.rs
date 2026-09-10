@@ -380,8 +380,9 @@ fn run_maintenance(
     // stall the single writer for seconds on GB databases. When ingestion is
     // waiting, defer them to the next scheduler interval instead of stalling
     // it: the scheduler re-enqueues on its own cadence.
-    if queue_backlog > MAINTENANCE_PRESSURE_SKIP_DEPTH && is_heavy_maintenance(&operation) {
-        let label = maintenance_label(&operation);
+    if queue_backlog > MAINTENANCE_PRESSURE_SKIP_DEPTH
+        && let Some(label) = heavy_maintenance_label(&operation)
+    {
         ::metrics::counter!(
             "storage_maintenance_deferred_total",
             "operation" => label
@@ -469,21 +470,13 @@ fn enforce_quota(
 /// Backlog depth above which heavy maintenance defers to the next scheduler
 /// interval instead of stalling ingestion behind a seconds-long exclusive op.
 const MAINTENANCE_PRESSURE_SKIP_DEPTH: usize = 1_000;
-/// Whether `operation` can stall the single writer long enough to matter.
-/// `Analyze` and disabled prunes are cheap and always run.
-fn is_heavy_maintenance(operation: &MaintenanceOperation) -> bool {
+/// Label of an operation heavy enough to defer under ingestion pressure, or
+/// `None` when it is cheap and should always run (`Analyze`, disabled prunes).
+fn heavy_maintenance_label(operation: &MaintenanceOperation) -> Option<&'static str> {
     match operation {
-        MaintenanceOperation::Vacuum | MaintenanceOperation::RebuildFts => true,
-        MaintenanceOperation::Prune(policy) => policy.is_enabled(),
-        MaintenanceOperation::Analyze => false,
-    }
-}
-
-fn maintenance_label(operation: &MaintenanceOperation) -> &'static str {
-    match operation {
-        MaintenanceOperation::Analyze => "analyze",
-        MaintenanceOperation::Vacuum => "vacuum",
-        MaintenanceOperation::RebuildFts => "rebuild_fts",
-        MaintenanceOperation::Prune(_) => "prune",
+        MaintenanceOperation::Vacuum => Some("vacuum"),
+        MaintenanceOperation::RebuildFts => Some("rebuild_fts"),
+        MaintenanceOperation::Prune(policy) if policy.is_enabled() => Some("prune"),
+        MaintenanceOperation::Prune(_) | MaintenanceOperation::Analyze => None,
     }
 }

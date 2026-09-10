@@ -4,7 +4,7 @@ pub mod metric;
 pub mod resource;
 pub mod severity;
 
-pub use attribute::{Attribute, AttributeValue, ValueType};
+pub use attribute::{Attribute, AttributeValue};
 pub use log::{LogBatch, LogRecord};
 pub use metric::{
     Exemplar, ExponentialBucket, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge,
@@ -42,19 +42,15 @@ mod tests {
     }
 
     #[test]
-    fn attribute_value_types_and_accessors() {
+    fn attribute_value_accessors() {
         let value = AttributeValue::from(42_i64);
-        assert_eq!(value.value_type(), ValueType::Int);
-        assert_eq!(ValueType::Int.as_str(), "int");
         assert_eq!(value.as_int(), Some(42));
         assert_eq!(value.as_str(), None);
 
         let text = AttributeValue::from("api");
-        assert_eq!(text.value_type(), ValueType::String);
-        assert_eq!(ValueType::String.as_str(), "string");
         assert_eq!(text.as_str(), Some("api"));
 
-        assert_eq!(AttributeValue::default().value_type(), ValueType::Null);
+        assert_eq!(AttributeValue::default(), AttributeValue::Null);
     }
 
     #[test]

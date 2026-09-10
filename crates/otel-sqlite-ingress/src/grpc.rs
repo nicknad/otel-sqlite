@@ -16,6 +16,7 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 use crate::IngestSender;
 use crate::ServingCheck;
+use crate::auth::BearerInterceptor;
 use crate::config::{IngressConfig, TlsConfig};
 use crate::error::IngressError;
 use crate::health::{new_health, spawn_health_monitor};
@@ -23,7 +24,7 @@ use crate::logs::LogsIngress;
 use crate::mapping::pb::collector::logs::v1::logs_service_server::LogsServiceServer;
 use crate::mapping::pb::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
 use crate::metrics::MetricsIngress;
-use crate::shutdown::shutdown_signal;
+use crate::shutdown::{shutdown_signal, wait_for_halt};
 
 pub async fn serve(
     config: IngressConfig,
@@ -68,7 +69,7 @@ async fn run(
     // interceptor is always installed (no-op without a token file) so both
     // services keep one concrete type.
     let auth_interceptor =
-        crate::auth::bearer_interceptor(config.auth.as_ref().map(|auth| auth.token_file.as_path()))
+        BearerInterceptor::new(config.auth.as_ref().map(|auth| auth.token_file.as_path()))
             .map_err(|error| IngressError::Auth(error.to_string()))?;
 
     let logs_service = tonic::codegen::InterceptedService::new(
@@ -168,11 +169,4 @@ fn server_tls_config(tls: &TlsConfig) -> Result<ServerTlsConfig, IngressError> {
     Ok(config)
 }
 
-/// Resolves when the watched flag becomes `true`, or the sender is dropped.
-async fn wait_for_halt(halt: &mut watch::Receiver<bool>) {
-    loop {
-        if halt.changed().await.is_err() || *halt.borrow_and_update() {
-            break;
-        }
-    }
-}
+// `wait_for_halt` is defined in `shutdown` and shared with `health`.

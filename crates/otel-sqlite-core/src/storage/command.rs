@@ -12,25 +12,10 @@ use super::batch::WriteBatch;
 /// arbitrary incoming groups without ever attributing records to the wrong
 /// resource: batches with different origins are never merged into the same
 /// [`WriteBatch`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct BatchOrigin {
     pub resource: Option<crate::model::Resource>,
     pub schema_url: String,
-}
-
-impl BatchOrigin {
-    pub const fn new() -> Self {
-        Self {
-            resource: None,
-            schema_url: String::new(),
-        }
-    }
-}
-
-impl Default for BatchOrigin {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// One mapped group of log records plus its origin, as handed from ingress to
@@ -325,7 +310,7 @@ mod tests {
         assert_eq!(logs.kind(), "insert_logs");
 
         let metrics = WriteCommand::InsertMetrics(MetricWriteBatch {
-            origin: BatchOrigin::new(),
+            origin: BatchOrigin::default(),
             records: WriteBatch::from_vec(vec![MetricRecord::default()]),
             commit_seqs: vec![9],
         });

@@ -242,11 +242,11 @@ impl Serialize for ExemplarDoc<'_> {
             },
         )?;
         if let Some(span_id) = &exemplar.span_id {
-            map.serialize_entry("span_id", &hex_encode(span_id))?;
+            map.serialize_entry("span_id", &hex::encode(span_id))?;
         }
         map.serialize_entry("time_unix_nano", &exemplar.time_unix_nano)?;
         if let Some(trace_id) = &exemplar.trace_id {
-            map.serialize_entry("trace_id", &hex_encode(trace_id))?;
+            map.serialize_entry("trace_id", &hex::encode(trace_id))?;
         }
         match &exemplar.value {
             Some(NumberValue::Int(value)) => map.serialize_entry("value", value)?,
@@ -294,16 +294,6 @@ impl Serialize for Floats<'_> {
         }
         seq.end()
     }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-
-    let mut hex = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
 }
 
 #[cfg(test)]

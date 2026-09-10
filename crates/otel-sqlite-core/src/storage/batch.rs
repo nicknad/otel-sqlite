@@ -16,13 +16,6 @@ pub struct WriteBatch<T> {
 }
 
 impl<T> WriteBatch<T> {
-    /// Creates an empty batch with room for `capacity` records.
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            records: Vec::with_capacity(capacity),
-        }
-    }
-
     /// Wraps an existing vector without copying or reallocating.
     pub fn from_vec(records: Vec<T>) -> Self {
         Self { records }
@@ -46,12 +39,6 @@ impl<T> WriteBatch<T> {
     /// Unwraps the batch, transferring ownership of all records.
     pub fn into_records(self) -> Vec<T> {
         self.records
-    }
-}
-
-impl<T> From<Vec<T>> for WriteBatch<T> {
-    fn from(records: Vec<T>) -> Self {
-        Self::from_vec(records)
     }
 }
 

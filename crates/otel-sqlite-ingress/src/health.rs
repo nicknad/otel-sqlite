@@ -20,6 +20,7 @@ use tonic_health::pb::health_server::{Health, HealthServer};
 use tonic_health::server::HealthReporter;
 
 use crate::ServingCheck;
+use crate::shutdown::wait_for_halt;
 
 const OVERALL_SERVICE_NAME: &str = "";
 const LOGS_SERVICE_NAME: &str = "opentelemetry.proto.collector.logs.v1.LogsService";
@@ -75,14 +76,6 @@ pub(crate) fn spawn_health_monitor(
             }
         }
     });
-}
-
-async fn wait_for_halt(halted: &mut watch::Receiver<bool>) {
-    loop {
-        if halted.changed().await.is_err() || *halted.borrow_and_update() {
-            return;
-        }
-    }
 }
 
 #[cfg(test)]

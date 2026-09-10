@@ -27,7 +27,6 @@ pub struct StorageConfig {
     /// SQLite writer. A full queue applies backpressure to ingestion instead
     /// of dropping completed batches.
     pub command_queue_capacity: usize,
-    pub retention: Option<Duration>,
     /// Optional on-disk size quota in bytes (`None` = unbounded, the default).
     /// When set, the writer checks the database file size before each insert
     /// batch and evicts the oldest rows (size-based retention: newest survive)
@@ -53,7 +52,6 @@ impl Default for StorageConfig {
             sqlite_path: std::path::PathBuf::from("otel-logs.db"),
             insert_batcher: InsertBatcherConfig::default(),
             command_queue_capacity: DEFAULT_COMMAND_QUEUE_CAPACITY,
-            retention: None,
             max_db_bytes: None,
             synchronous: SyncMode::default(),
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
