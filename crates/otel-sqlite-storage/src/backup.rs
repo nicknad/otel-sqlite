@@ -98,10 +98,6 @@ pub enum BackupError {
 pub struct RowCounts {
     pub log_events: i64,
     pub log_resources: i64,
-    pub metric_points: i64,
-    pub metric_series: i64,
-    pub metrics: i64,
-    pub scopes: i64,
     pub fts_rows: i64,
 }
 
@@ -205,10 +201,6 @@ fn row_counts(conn: &Connection) -> Result<Option<RowCounts>, BackupError> {
     Ok(Some(RowCounts {
         log_events: count("SELECT COUNT(*) FROM log_event")?,
         log_resources: count("SELECT COUNT(*) FROM log_resource")?,
-        metric_points: count("SELECT COUNT(*) FROM metric_data_point")?,
-        metric_series: count("SELECT COUNT(*) FROM metric_series")?,
-        metrics: count("SELECT COUNT(*) FROM metric")?,
-        scopes: count("SELECT COUNT(*) FROM scope")?,
         fts_rows: count("SELECT COUNT(*) FROM logs_fts")?,
     }))
 }

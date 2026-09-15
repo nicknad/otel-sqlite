@@ -181,27 +181,6 @@ fn execute(
                 ledger.complete(*commit_seq);
             }
         }
-        WriteCommand::InsertMetrics(batch) => {
-            if batch.records.is_empty() {
-                for commit_seq in &batch.commit_seqs {
-                    ledger.void(*commit_seq);
-                }
-                return Ok(());
-            }
-            stats.batches_received.fetch_add(1, Ordering::Relaxed);
-            persist_with_policy(
-                conn,
-                stats,
-                "metrics",
-                |tx| command::insert_metrics(tx, &batch),
-                |tx| command::insert_metrics_tolerant(tx, &batch),
-            )?;
-            for commit_seq in &batch.commit_seqs {
-                ledger.complete(*commit_seq);
-            }
-        }
-        // Order barrier only: every earlier insert command has already been
-        // committed by the time this is received (single FIFO consumer).
         WriteCommand::Flush => {}
         WriteCommand::Checkpoint(mode) => {
             let _maintenance = stats.maintenance_guard();
@@ -423,19 +402,10 @@ fn run_maintenance(
             if report.total() > 0 {
                 ::metrics::counter!("storage_records_pruned_total", "table" => "log_event")
                     .increment(report.log_events as u64);
-                ::metrics::counter!(
-                    "storage_records_pruned_total",
-                    "table" => "metric_data_point"
-                )
-                .increment(report.metric_points as u64);
                 ::metrics::counter!("storage_dimensions_pruned_total")
                     .increment(report.dimensions_removed() as u64);
                 tracing::info!(
                     log_events = report.log_events,
-                    metric_points = report.metric_points,
-                    orphaned_series = report.metric_series,
-                    orphaned_metrics = report.metrics,
-                    orphaned_scopes = report.scopes,
                     orphaned_resources = report.resources,
                     "retention prune applied"
                 );
@@ -470,7 +440,6 @@ fn enforce_quota(
                 bytes_before = report.bytes_before,
                 bytes_after = report.bytes_after,
                 log_events = report.log_events,
-                metric_points = report.metric_points,
                 "database over size quota; evicted oldest rows",
             );
         }

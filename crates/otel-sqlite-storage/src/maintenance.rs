@@ -112,27 +112,22 @@ fn incremental_vacuum(conn: &Connection) -> Result<(), StorageError> {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PruneReport {
     pub log_events: usize,
-    pub metric_points: usize,
     /// Dimension rows orphaned by the prune and garbage-collected with it.
-    pub metric_series: usize,
-    pub metrics: usize,
-    pub scopes: usize,
     pub resources: usize,
 }
 
 impl PruneReport {
     pub(crate) const fn total(&self) -> usize {
-        self.log_events + self.metric_points
+        self.log_events
     }
 
     pub(crate) const fn dimensions_removed(&self) -> usize {
-        self.metric_series + self.metrics + self.scopes + self.resources
+        self.resources
     }
 }
 
-/// Deletes expired log events and metric data points according to the
-/// per-signal retention windows, then garbage-collects the dimension rows the
-/// deletions orphaned.
+/// Deletes expired log events according to the retention window, then
+/// garbage-collects the resource rows the deletions orphaned.
 ///
 /// Deletes run in bounded batches (one transaction per batch) so a large
 /// retention backlog never holds a single giant transaction open: each batch
@@ -169,24 +164,6 @@ pub(crate) fn prune(
             }
         }
     }
-    if let Some(window) = policy.metrics {
-        let cutoff = retention_cutoff(now_unix_nano, window);
-        let batch = PRUNE_BATCH_ROWS as i64;
-        loop {
-            let tx = conn.transaction()?;
-            let deleted = tx.execute(
-                "DELETE FROM metric_data_point WHERE id IN (
-                    SELECT id FROM metric_data_point WHERE timestamp_ns < ?1 LIMIT ?2
-                 )",
-                rusqlite::params![cutoff, batch],
-            )?;
-            tx.commit()?;
-            report.metric_points += deleted;
-            if deleted < PRUNE_BATCH_ROWS {
-                break;
-            }
-        }
-    }
 
     if report.total() > 0 {
         let tx = conn.transaction()?;
@@ -202,40 +179,16 @@ fn retention_cutoff(now_unix_nano: i64, window: std::time::Duration) -> i64 {
     now_unix_nano.saturating_sub(i64::try_from(window.as_nanos()).unwrap_or(i64::MAX))
 }
 
-/// Removes rows that lost their last child to a prune. Order matters:
-/// children first, so every later step sees the graph after the previous
-/// removal. All probes hit existing indexes (`series_id`, `metric_id`,
-/// `scope_id`, `resource_id` leading columns), keeping the scans cheap even
-/// on large dimension tables. Resources are shared between logs and metrics,
-/// so both reference directions must be checked before dropping one.
+/// Removes rows that lost their last child to a prune. All probes hit
+/// existing indexes (`resource_id` leading columns), keeping the scans cheap
+/// even on large dimension tables.
 fn collect_orphan_dimensions(
     tx: &rusqlite::Transaction<'_>,
     report: &mut PruneReport,
 ) -> Result<(), StorageError> {
-    report.metric_series = tx.execute(
-        "DELETE FROM metric_series WHERE NOT EXISTS (
-            SELECT 1 FROM metric_data_point WHERE series_id = metric_series.id
-         )",
-        [],
-    )?;
-    report.metrics = tx.execute(
-        "DELETE FROM metric WHERE NOT EXISTS (
-            SELECT 1 FROM metric_series WHERE metric_id = metric.id
-         )",
-        [],
-    )?;
-    report.scopes = tx.execute(
-        "DELETE FROM scope WHERE NOT EXISTS (
-            SELECT 1 FROM metric WHERE scope_id = scope.id
-         )",
-        [],
-    )?;
     report.resources = tx.execute(
         "DELETE FROM log_resource WHERE NOT EXISTS (
             SELECT 1 FROM log_event WHERE resource_id = log_resource.id
-         )
-         AND NOT EXISTS (
-            SELECT 1 FROM scope WHERE resource_id = log_resource.id
          )",
         [],
     )?;
@@ -285,7 +238,6 @@ pub(crate) fn rebuild_fts(conn: &mut Connection) -> Result<usize, StorageError> 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QuotaReport {
     pub log_events: usize,
-    pub metric_points: usize,
     /// File size before enforcement (bytes).
     pub bytes_before: u64,
     /// File size after enforcement (bytes).
@@ -332,9 +284,8 @@ pub(crate) fn enforce_size_quota(
             break;
         }
         let deleted = prune_oldest_batch(conn)?;
-        report.log_events += deleted.0;
-        report.metric_points += deleted.1;
-        if deleted.0 + deleted.1 == 0 {
+        report.log_events += deleted;
+        if deleted == 0 {
             // Nothing left to evict: the remaining bytes are schema/freelist
             // that cannot be reclaimed further.
             break;
@@ -354,7 +305,7 @@ pub(crate) fn enforce_size_quota(
     }
     // One orphan-dimension sweep for everything evicted above (cheaper than
     // per-batch when several rounds ran).
-    if report.log_events + report.metric_points > 0 {
+    if report.log_events > 0 {
         let tx = conn.transaction()?;
         let mut sweep = PruneReport::default();
         collect_orphan_dimensions(&tx, &mut sweep)?;
@@ -400,10 +351,10 @@ pub(crate) fn database_bytes(db_path: &Path) -> u64 {
     file_size(db_path).saturating_add(file_size(&wal_path(db_path)))
 }
 
-/// Deletes one bounded batch of the oldest rows per signal (oldest-first by
-/// event timestamp, using the existing timestamp indexes). Returns
-/// `(log_events, metric_points)` deleted by this batch.
-fn prune_oldest_batch(conn: &mut Connection) -> Result<(usize, usize), StorageError> {
+/// Deletes one bounded batch of the oldest log events (oldest-first by event
+/// timestamp, using the existing timestamp index). Returns the number of
+/// events deleted by this batch.
+fn prune_oldest_batch(conn: &mut Connection) -> Result<usize, StorageError> {
     let batch = PRUNE_BATCH_ROWS as i64;
     let tx = conn.transaction()?;
     let logs = tx.execute(
@@ -412,14 +363,8 @@ fn prune_oldest_batch(conn: &mut Connection) -> Result<(usize, usize), StorageEr
          )",
         [batch],
     )?;
-    let metrics = tx.execute(
-        "DELETE FROM metric_data_point WHERE id IN (
-            SELECT id FROM metric_data_point ORDER BY timestamp_ns ASC LIMIT ?1
-         )",
-        [batch],
-    )?;
     tx.commit()?;
-    Ok((logs, metrics))
+    Ok(logs)
 }
 
 #[cfg(test)]

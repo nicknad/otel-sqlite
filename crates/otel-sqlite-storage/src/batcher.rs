@@ -29,21 +29,14 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender};
-use otel_sqlite_core::model::{LogRecord, MetricRecord};
+use otel_sqlite_core::model::LogRecord;
 use otel_sqlite_core::storage::{
-    CommitLedger, IngestMessage, InsertBatcherConfig, LogWriteBatch, MetricWriteBatch, WriteCommand,
+    CommitLedger, IngestMessage, InsertBatcherConfig, LogWriteBatch, WriteCommand,
 };
 
 use crate::fault;
 use crate::origin_buffers::{OriginBuffers, Submission};
 use crate::stats::BatcherStats;
-
-fn nearest_deadline(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> {
-    match (first, second) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        _ => first.or(second),
-    }
-}
 
 enum Event {
     Message(IngestMessage),
@@ -85,7 +78,6 @@ pub(crate) fn run(
         armed: true,
     };
     let mut logs = OriginBuffers::<LogRecord>::new(config);
-    let mut metrics = OriginBuffers::<MetricRecord>::new(config);
 
     let fault_after = fault::armed_after(fault::BATCHER_AFTER_N);
     let mut events_processed = 0u64;
@@ -107,9 +99,9 @@ pub(crate) fn run(
             );
             break;
         }
-        stats.observe_buffered(logs.buffered(), metrics.buffered());
+        stats.observe_buffered(logs.buffered());
 
-        let event = match nearest_deadline(logs.deadline(), metrics.deadline()) {
+        let event = match logs.deadline() {
             Some(deadline) => {
                 match input.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(message) => Event::Message(message),
@@ -140,55 +132,37 @@ pub(crate) fn run(
                     alive &= submit_log_batch(&commands, submission, stats);
                 });
             }
-            Event::Message(IngestMessage::Metrics(chunk)) => {
-                if chunk.is_empty() {
-                    ledger.void(chunk.commit_seq);
-                    continue;
-                }
-                stats.chunks_ingested.fetch_add(1, Ordering::Relaxed);
-                stats.mark_progress();
-
-                let outcome = metrics.push(chunk.origin, chunk.records, chunk.commit_seq);
-                outcome.for_each(|submission| {
-                    alive &= submit_metric_batch(&commands, submission, stats);
-                });
-            }
             Event::Message(IngestMessage::Flush) => {
                 // Barrier semantics: hand over the partial batches first so
                 // everything ingested before this point is persisted before
                 // the barrier reaches the writer.
-                flush_buffers(&mut logs, &mut metrics, &commands, stats, &mut alive);
+                flush_buffers(&mut logs, &commands, stats, &mut alive);
                 if alive {
                     alive = submit(&commands, WriteCommand::Flush, stats);
                 }
             }
             Event::Message(IngestMessage::Checkpoint(mode)) => {
-                flush_buffers(&mut logs, &mut metrics, &commands, stats, &mut alive);
+                flush_buffers(&mut logs, &commands, stats, &mut alive);
                 if alive {
                     alive = submit(&commands, WriteCommand::Checkpoint(mode), stats);
                 }
             }
             Event::Message(IngestMessage::Maintenance(operation)) => {
-                flush_buffers(&mut logs, &mut metrics, &commands, stats, &mut alive);
+                flush_buffers(&mut logs, &commands, stats, &mut alive);
                 if alive {
                     alive = submit(&commands, WriteCommand::Maintenance(operation), stats);
                 }
             }
             Event::Timer => {
                 let now = Instant::now();
-                let expired_logs = logs.flush_expired(now);
-                let expired_metrics = metrics.flush_expired(now);
-                let expired = expired_logs.len() + expired_metrics.len();
-                if expired > 0 {
+                let expired = logs.flush_expired(now);
+                if !expired.is_empty() {
                     stats
                         .timer_flushes
-                        .fetch_add(expired as u64, Ordering::Relaxed);
+                        .fetch_add(expired.len() as u64, Ordering::Relaxed);
                 }
-                for submission in expired_logs {
+                for submission in expired {
                     alive &= submit_log_batch(&commands, submission, stats);
-                }
-                for submission in expired_metrics {
-                    alive &= submit_metric_batch(&commands, submission, stats);
                 }
             }
             Event::Disconnected => break,
@@ -198,7 +172,7 @@ pub(crate) fn run(
     if alive {
         // Input closed: flush every partial batch so no buffered record is
         // lost, then close the command queue so the writer can drain and exit.
-        flush_buffers(&mut logs, &mut metrics, &commands, stats, &mut alive);
+        flush_buffers(&mut logs, &commands, stats, &mut alive);
     }
     if alive {
         // The writer is still draining and closes the ledger itself at exit.
@@ -214,7 +188,7 @@ pub(crate) fn run(
         close_ledger.armed = false;
     }
 
-    stats.observe_buffered(0, 0);
+    stats.observe_buffered(0);
     drop(commands);
 }
 
@@ -237,16 +211,12 @@ impl Drop for CloseLedgerOnDrop<'_> {
 /// barriers and shutdown loses nothing.
 fn flush_buffers(
     logs: &mut OriginBuffers<LogRecord>,
-    metrics: &mut OriginBuffers<MetricRecord>,
     commands: &Sender<WriteCommand>,
     stats: &BatcherStats,
     alive: &mut bool,
 ) {
     for submission in logs.flush_all() {
         *alive &= submit_log_batch(commands, submission, stats);
-    }
-    for submission in metrics.flush_all() {
-        *alive &= submit_metric_batch(commands, submission, stats);
     }
 }
 
@@ -284,26 +254,6 @@ fn submit_log_batch(
         stats.batches_emitted.fetch_add(1, Ordering::Relaxed);
         stats.mark_progress();
         ::metrics::counter!("insert_batcher_batches_emitted_total", "signal" => "logs")
-            .increment(1);
-    }
-    submitted
-}
-
-fn submit_metric_batch(
-    commands: &Sender<WriteCommand>,
-    submission: Submission<MetricRecord>,
-    stats: &BatcherStats,
-) -> bool {
-    let command = WriteCommand::InsertMetrics(MetricWriteBatch {
-        origin: submission.origin,
-        records: submission.records,
-        commit_seqs: submission.commit_seqs,
-    });
-    let submitted = submit(commands, command, stats);
-    if submitted {
-        stats.batches_emitted.fetch_add(1, Ordering::Relaxed);
-        stats.mark_progress();
-        ::metrics::counter!("insert_batcher_batches_emitted_total", "signal" => "metrics")
             .increment(1);
     }
     submitted

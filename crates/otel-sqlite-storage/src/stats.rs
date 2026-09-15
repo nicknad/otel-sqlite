@@ -152,10 +152,9 @@ impl BatcherStats {
         RunningGuard::new(&self.running)
     }
 
-    pub(crate) fn observe_buffered(&self, logs: usize, metrics: usize) {
-        let total = logs + metrics;
-        self.buffered_records.store(total, Ordering::Relaxed);
-        ::metrics::gauge!("insert_batcher_buffered_records").set(total as f64);
+    pub(crate) fn observe_buffered(&self, buffered: usize) {
+        self.buffered_records.store(buffered, Ordering::Relaxed);
+        ::metrics::gauge!("insert_batcher_buffered_records").set(buffered as f64);
     }
 }
 

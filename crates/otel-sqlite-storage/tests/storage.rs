@@ -4,12 +4,9 @@
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::unbounded;
-use otel_sqlite_core::model::{
-    Attribute, AttributeValue, Exemplar, HistogramDataPoint, LogBatch, LogRecord, MetricBatch,
-    MetricData, MetricRecord, NumberDataPoint, NumberValue, Resource, Severity, Sum, Temporality,
-};
+use otel_sqlite_core::model::{Attribute, AttributeValue, LogBatch, LogRecord, Resource, Severity};
 use otel_sqlite_core::storage::{
-    BatchOrigin, IngestMessage, LogChunk, MaintenanceOperation, MetricChunk, RetentionPolicy,
+    BatchOrigin, IngestMessage, LogChunk, MaintenanceOperation, RetentionPolicy,
 };
 use otel_sqlite_storage::{Storage, StorageConfig, StorageError};
 use rusqlite::Connection;
@@ -60,89 +57,6 @@ fn sample_batch() -> LogBatch {
     });
 
     batch
-}
-
-fn sample_metrics() -> MetricBatch {
-    let mut batch = MetricBatch::with_capacity(3);
-    batch.resource = Some(Resource::new(vec![("service.name", "checkout").into()]));
-
-    let mut gauge_point = NumberDataPoint {
-        start_time_unix_nano: 100,
-        time_unix_nano: 200,
-        value: Some(NumberValue::Int(42)),
-        ..NumberDataPoint::default()
-    };
-    gauge_point.attributes.push(Attribute {
-        key: "host".to_owned(),
-        value: AttributeValue::from("node-1"),
-    });
-    push_metric(
-        &mut batch,
-        "cpu.usage",
-        "",
-        "1",
-        MetricData::Gauge(otel_sqlite_core::model::Gauge {
-            data_points: vec![gauge_point],
-        }),
-    );
-
-    let histogram = otel_sqlite_core::model::Histogram {
-        data_points: vec![HistogramDataPoint {
-            start_time_unix_nano: 100,
-            time_unix_nano: 300,
-            count: 4,
-            sum: Some(10.5),
-            bucket_counts: vec![1, 2, 1],
-            explicit_bounds: vec![5.0, 10.0],
-            min: Some(1.0),
-            max: Some(9.0),
-            ..HistogramDataPoint::default()
-        }],
-        aggregation_temporality: Temporality::Cumulative,
-    };
-    push_metric(
-        &mut batch,
-        "rpc.duration",
-        "duration",
-        "ms",
-        MetricData::Histogram(histogram),
-    );
-
-    push_metric(
-        &mut batch,
-        "bytes.sent",
-        "",
-        "By",
-        MetricData::Sum(Sum {
-            data_points: vec![NumberDataPoint {
-                start_time_unix_nano: 100,
-                time_unix_nano: 250,
-                value: Some(NumberValue::Double(2.5)),
-                ..NumberDataPoint::default()
-            }],
-            aggregation_temporality: Temporality::Delta,
-            is_monotonic: true,
-        }),
-    );
-
-    batch
-}
-
-fn push_metric(
-    batch: &mut MetricBatch,
-    name: &str,
-    description: &str,
-    unit: &str,
-    data: MetricData,
-) {
-    batch.push(otel_sqlite_core::model::MetricRecord {
-        name: name.to_owned(),
-        description: description.to_owned(),
-        unit: unit.to_owned(),
-        data,
-        scope_name: "otel-sqlite-test".to_owned(),
-        ..otel_sqlite_core::model::MetricRecord::default()
-    });
 }
 
 #[test]
@@ -373,197 +287,6 @@ fn rebuild_fts_heals_a_crashed_rebuild() -> Result<(), Box<dyn std::error::Error
 }
 
 #[test]
-fn writes_normalized_metric_hierarchy() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-    let db_path = dir.path().join("test.db");
-
-    let (sender, receiver) = unbounded();
-    let config = StorageConfig {
-        sqlite_path: db_path.clone(),
-        insert_batcher: otel_sqlite_core::storage::InsertBatcherConfig::new(
-            1_000,
-            Duration::from_millis(20),
-        ),
-        ..StorageConfig::default()
-    };
-    let mut storage = Storage::open(receiver, config)?;
-
-    sender.send(IngestMessage::Metrics(
-        otel_sqlite_core::storage::MetricChunk {
-            origin: BatchOrigin::default(),
-            records: sample_metrics().records,
-            commit_seq: 0,
-        },
-    ))?;
-    sender.send(IngestMessage::Flush)?;
-    drop(sender);
-    storage.join()?;
-
-    let conn = Connection::open(&db_path)?;
-
-    let resources: i64 = conn.query_row("SELECT COUNT(*) FROM log_resource", [], |r| r.get(0))?;
-    let scopes: i64 = conn.query_row("SELECT COUNT(*) FROM scope", [], |r| r.get(0))?;
-    let metrics: i64 = conn.query_row("SELECT COUNT(*) FROM metric", [], |r| r.get(0))?;
-    let series: i64 = conn.query_row("SELECT COUNT(*) FROM metric_series", [], |r| r.get(0))?;
-    let points: i64 = conn.query_row("SELECT COUNT(*) FROM metric_data_point", [], |r| r.get(0))?;
-
-    assert_eq!(resources, 1);
-    assert_eq!(scopes, 1);
-    assert_eq!(metrics, 3);
-    assert_eq!(series, 3, "gauge series + histogram series + sum series");
-    assert_eq!(points, 3);
-
-    let monotonic_sum: i64 = conn.query_row(
-        "SELECT m.is_monotonic FROM metrics v JOIN metric m ON m.id = v.metric_id WHERE v.metric_name = 'bytes.sent'",
-        [],
-        |r| r.get(0),
-    )?;
-    assert_eq!(monotonic_sum, 1);
-
-    let double_only: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM metric_data_point WHERE double_value IS NOT NULL AND int_value IS NOT NULL",
-        [],
-        |r| r.get(0),
-    )?;
-    assert_eq!(double_only, 0);
-
-    let int_gauge: Option<i64> = conn.query_row(
-        "SELECT int_value FROM metrics WHERE metric_name = 'cpu.usage'",
-        [],
-        |r| r.get(0),
-    )?;
-    assert_eq!(int_gauge, Some(42));
-
-    let buckets: i64 = conn.query_row(
-        "SELECT COUNT(*)
-         FROM metric_buckets b
-         JOIN metric_series ms ON ms.id = b.series_id
-         JOIN metric m ON m.id = ms.metric_id
-         WHERE m.name = 'rpc.duration'",
-        [],
-        |r| r.get(0),
-    )?;
-    assert_eq!(buckets, 3, "one row per bound match + the +Inf bucket");
-
-    Ok(())
-}
-
-/// OTLP counts are `u64` while the column is `i64`. A count past `i64::MAX`
-/// must be quarantined as a row-local poison — never silently written as
-/// NULL — and the batch must still commit.
-#[test]
-fn oversized_metric_count_is_quarantined_not_persisted_as_null()
--> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-    let db_path = dir.path().join("overflow.db");
-
-    let (sender, receiver) = unbounded();
-    let mut storage = Storage::open(
-        receiver,
-        StorageConfig {
-            sqlite_path: db_path.clone(),
-            ..StorageConfig::default()
-        },
-    )?;
-
-    let mut batch = MetricBatch::with_capacity(1);
-    batch.resource = Some(Resource::new(vec![("service.name", "checkout").into()]));
-    push_metric(
-        &mut batch,
-        "oversized.histogram",
-        "",
-        "1",
-        MetricData::Histogram(otel_sqlite_core::model::Histogram {
-            data_points: vec![HistogramDataPoint {
-                time_unix_nano: 100,
-                count: u64::MAX,
-                bucket_counts: vec![1],
-                explicit_bounds: vec![1.0],
-                ..HistogramDataPoint::default()
-            }],
-            aggregation_temporality: Temporality::Cumulative,
-        }),
-    );
-
-    sender.send(metrics_message(batch))?;
-    sender.send(IngestMessage::Flush)?;
-    drop(sender);
-    storage.join()?;
-
-    let stats = storage.stats();
-    assert_eq!(
-        stats.quarantined_records, 1,
-        "the overflowing point must be quarantined"
-    );
-    assert_eq!(stats.records_written, 0);
-    assert_eq!(stats.errors, 1, "the failed strict attempt is accounted");
-
-    let conn = Connection::open(&db_path)?;
-    let null_counts: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM metric_data_point WHERE count IS NULL",
-        [],
-        |r| r.get(0),
-    )?;
-    assert_eq!(null_counts, 0, "no NULL count row may reach the database");
-
-    Ok(())
-}
-
-/// A metric record carrying its own resource must attribute its scope
-/// dimensions to that resource, symmetric with log records; the batch origin
-/// only supplies the fallback.
-#[test]
-fn record_level_metric_resource_overrides_the_batch_origin()
--> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-    let db_path = dir.path().join("metric-resource.db");
-
-    let (sender, receiver) = unbounded();
-    let mut storage = Storage::open(
-        receiver,
-        StorageConfig {
-            sqlite_path: db_path.clone(),
-            ..StorageConfig::default()
-        },
-    )?;
-
-    let mut batch = MetricBatch::with_capacity(1);
-    batch.resource = Some(Resource::new(vec![("service.name", "batch-svc").into()]));
-    push_metric(
-        &mut batch,
-        "host.metric",
-        "",
-        "1",
-        MetricData::Gauge(otel_sqlite_core::model::Gauge {
-            data_points: vec![NumberDataPoint {
-                time_unix_nano: 100,
-                value: Some(NumberValue::Int(1)),
-                ..NumberDataPoint::default()
-            }],
-        }),
-    );
-    batch.records[0].resource = Some(Resource::new(vec![("service.name", "record-svc").into()]));
-
-    sender.send(metrics_message(batch))?;
-    sender.send(IngestMessage::Flush)?;
-    drop(sender);
-    storage.join()?;
-
-    let conn = Connection::open(&db_path)?;
-    let service: String = conn.query_row(
-        "SELECT lr.service_name FROM scope s JOIN log_resource lr ON lr.id = s.resource_id",
-        [],
-        |r| r.get(0),
-    )?;
-    assert_eq!(
-        service, "record-svc",
-        "the record-level resource must win over the batch origin"
-    );
-
-    Ok(())
-}
-
-#[test]
 fn health_probe_reports_liveness_and_progress() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let (sender, receiver) = unbounded();
@@ -724,44 +447,12 @@ fn join_timeout_reports_the_budget_overrun_while_input_stays_open() {
     );
 }
 
-fn metrics_message(batch: MetricBatch) -> IngestMessage {
-    IngestMessage::Metrics(MetricChunk {
-        origin: BatchOrigin {
-            resource: batch.resource,
-            schema_url: batch.schema_url,
-        },
-        records: batch.records,
-        commit_seq: 0,
-    })
-}
-
-/// One gauge point on its own resource/scope/metric/series chain.
-fn single_point_batch(service_name: &str, metric_name: &str, time_unix_nano: i64) -> MetricBatch {
-    let mut batch = MetricBatch::with_capacity(1);
-    batch.resource = Some(Resource::new(vec![("service.name", service_name).into()]));
-    push_metric(
-        &mut batch,
-        metric_name,
-        "",
-        "1",
-        MetricData::Gauge(otel_sqlite_core::model::Gauge {
-            data_points: vec![NumberDataPoint {
-                time_unix_nano,
-                value: Some(NumberValue::Int(1)),
-                ..NumberDataPoint::default()
-            }],
-        }),
-    );
-    batch
-}
-
-/// A uniform retention prune must age out log events
-/// *and* metric data points together, garbage-collect the dimensions their
-/// deletion orphans (series → metric → scope → resource), and leave the
+/// A uniform retention prune must age out log events,
+/// garbage-collect the resource rows their deletion orphans, and leave the
 /// search index with no ghosts of the pruned events — while every fresh row
-/// and the dimension chain that still references it survives untouched.
+/// and the resource it references survives untouched.
 #[test]
-fn retention_prunes_metrics_collects_orphans_and_leaves_no_fts_ghosts()
+fn retention_prunes_logs_collects_orphans_and_leaves_no_fts_ghosts()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("test.db");
@@ -803,26 +494,16 @@ fn retention_prunes_metrics_collects_orphans_and_leaves_no_fts_ghosts()
 
     sender.send(logs_message(old_logs))?;
     sender.send(logs_message(fresh_logs))?;
-    sender.send(metrics_message(single_point_batch(
-        "svc-old",
-        "stale.metric",
-        ancient,
-    )))?;
-    sender.send(metrics_message(single_point_batch(
-        "svc-live",
-        "live.metric",
-        now,
-    )))?;
     sender.send(IngestMessage::Flush)?;
     assert!(
         wait_for(
-            || storage.stats().records_written >= 4,
+            || storage.stats().records_written >= 2,
             Duration::from_secs(5)
         ),
-        "all four records must reach SQLite before the prune runs"
+        "both records must reach SQLite before the prune runs"
     );
 
-    // Uniform window: prunes both signals; everything from ~1970 expires.
+    // Everything from ~1970 expires in the uniform window.
     sender.send(IngestMessage::Maintenance(MaintenanceOperation::Prune(
         RetentionPolicy::new(Duration::from_secs(1)),
     )))?;
@@ -849,32 +530,11 @@ fn retention_prunes_metrics_collects_orphans_and_leaves_no_fts_ghosts()
         1,
         "fresh log events must survive"
     );
-    assert_eq!(
-        scalar("SELECT COUNT(*) FROM metric_data_point"),
-        1,
-        "only the fresh metric data point must survive"
-    );
-
-    // Dimension GC: the stale chain is fully orphaned by the point deletion.
-    assert_eq!(
-        scalar("SELECT COUNT(*) FROM metric_series"),
-        1,
-        "the orphaned series must be collected"
-    );
-    assert_eq!(
-        scalar("SELECT COUNT(*) FROM metric"),
-        1,
-        "the orphaned metric definition must be collected"
-    );
-    assert_eq!(
-        scalar("SELECT COUNT(*) FROM scope"),
-        1,
-        "the orphaned scope must be collected"
-    );
+    // Dimension GC: the pruned event's resource is fully orphaned.
     assert_eq!(
         scalar("SELECT COUNT(*) FROM log_resource"),
         1,
-        "the resource of the pruned chain (logs + metrics gone) must be collected"
+        "the resource of the pruned event must be collected"
     );
     let surviving_service: String =
         conn.query_row("SELECT service_name FROM log_resource", [], |r| r.get(0))?;
@@ -902,8 +562,8 @@ fn retention_prunes_metrics_collects_orphans_and_leaves_no_fts_ghosts()
 
 /// P0-3 conformance: supported input fields must reach the database
 /// byte-identically to their canonical JSON rendering — structured bodies,
-/// nested attribute values, scope attributes/schema URLs, exemplars and metric
-/// metadata are never flattened, discarded or silently converted.
+/// nested attribute values, and scope attributes/schema URLs are never
+/// flattened, discarded or silently converted.
 #[test]
 fn mapping_fidelity_persists_canonical_structured_values() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -957,46 +617,6 @@ fn mapping_fidelity_persists_canonical_structured_values() -> Result<(), Box<dyn
     });
     sender.send(logs_message(log_batch))?;
 
-    // --- metrics: exemplars, metadata, scope attrs/schema URL ---
-    let mut metric_batch = MetricBatch::with_capacity(1);
-    metric_batch.resource = Some(Resource::new(vec![("service.name", "checkout").into()]));
-    metric_batch.schema_url = "https://example.test/schemas/metrics".to_owned();
-    metric_batch.push(MetricRecord {
-        name: "requests.total".to_owned(),
-        description: "count".to_owned(),
-        unit: "1".to_owned(),
-        metadata: vec![Attribute {
-            key: "unit.origin".to_owned(),
-            value: AttributeValue::String("prometheus".to_owned()),
-        }],
-        data: MetricData::Gauge(otel_sqlite_core::model::Gauge {
-            data_points: vec![NumberDataPoint {
-                time_unix_nano: 200,
-                value: Some(NumberValue::Int(42)),
-                exemplars: vec![Exemplar {
-                    filtered_attributes: vec![Attribute {
-                        key: "z".to_owned(),
-                        value: AttributeValue::Bool(true),
-                    }],
-                    time_unix_nano: 150,
-                    value: Some(NumberValue::Double(0.5)),
-                    trace_id: Some([8; 16]),
-                    span_id: Some([9; 8]),
-                }],
-                ..NumberDataPoint::default()
-            }],
-        }),
-        scope_name: "scope-m".to_owned(),
-        scope_version: "0.9.9".to_owned(),
-        scope_attributes: vec![Attribute {
-            key: "scope.tag".to_owned(),
-            value: AttributeValue::String("prod".to_owned()),
-        }],
-        scope_schema_url: "https://example.test/schemas/metrics/scope".to_owned(),
-        ..MetricRecord::default()
-    });
-    sender.send(metrics_message(metric_batch))?;
-
     sender.send(IngestMessage::Flush)?;
     drop(sender);
     storage.join()?;
@@ -1032,38 +652,6 @@ fn mapping_fidelity_persists_canonical_structured_values() -> Result<(), Box<dyn
         |r| r.get(0),
     )?;
     assert_eq!(scope_schema_url, "https://example.test/schemas/logs/scope");
-
-    // Exemplars reach exemplars_json with sorted field order and hex ids.
-    let exemplars_json: String =
-        conn.query_row("SELECT exemplars_json FROM metric_data_point", [], |r| {
-            r.get(0)
-        })?;
-    assert_eq!(
-        exemplars_json,
-        concat!(
-            r#"[{"filtered_attributes":{"z":true},"#,
-            r#""span_id":"0909090909090909","#,
-            r#""time_unix_nano":150,"#,
-            r#""trace_id":"08080808080808080808080808080808","#,
-            r#""value":0.5}]"#
-        )
-    );
-
-    // Metric metadata and scope metadata reach the shared dimension tables.
-    let metadata_json: String =
-        conn.query_row("SELECT metadata_json FROM metric", [], |r| r.get(0))?;
-    assert_eq!(metadata_json, r#"{"unit.origin":"prometheus"}"#);
-
-    let scope_attributes_json: String =
-        conn.query_row("SELECT attributes_json FROM scope", [], |r| r.get(0))?;
-    assert_eq!(scope_attributes_json, r#"{"scope.tag":"prod"}"#);
-
-    let scope_schema_url: String =
-        conn.query_row("SELECT schema_url FROM scope", [], |r| r.get(0))?;
-    assert_eq!(
-        scope_schema_url,
-        "https://example.test/schemas/metrics/scope"
-    );
 
     Ok(())
 }
@@ -1137,76 +725,6 @@ fn size_quota_evicts_oldest_first_and_keeps_newest() -> Result<(), Box<dyn std::
         "an over-quota insert must evict the oldest rows first"
     );
     assert_eq!(fresh, 1, "the newest rows must survive quota enforcement");
-
-    Ok(())
-}
-
-/// A delta and a cumulative Sum with the same descriptor are distinct
-/// metrics: temporality and monotonicity are part of metric identity, so both
-/// must persist instead of the second being quarantined by the uniqueness
-/// constraint.
-#[test]
-fn same_descriptor_different_temporality_are_distinct_metrics()
--> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-    let db_path = dir.path().join("metric-identity.db");
-
-    let (sender, receiver) = unbounded();
-    let mut storage = Storage::open(
-        receiver,
-        StorageConfig {
-            sqlite_path: db_path.clone(),
-            ..StorageConfig::default()
-        },
-    )?;
-
-    let batch = |temporality: Temporality, is_monotonic: bool, value: i64, time: i64| {
-        let mut batch = MetricBatch::with_capacity(1);
-        batch.resource = Some(Resource::new(vec![("service.name", "checkout").into()]));
-        push_metric(
-            &mut batch,
-            "http.requests",
-            "requests",
-            "1",
-            MetricData::Sum(Sum {
-                data_points: vec![NumberDataPoint {
-                    start_time_unix_nano: 100,
-                    time_unix_nano: time,
-                    value: Some(NumberValue::Int(value)),
-                    ..NumberDataPoint::default()
-                }],
-                aggregation_temporality: temporality,
-                is_monotonic,
-            }),
-        );
-        batch
-    };
-
-    sender.send(metrics_message(batch(Temporality::Delta, true, 10, 1_000)))?;
-    sender.send(metrics_message(batch(
-        Temporality::Cumulative,
-        true,
-        20,
-        2_000,
-    )))?;
-    sender.send(IngestMessage::Flush)?;
-    drop(sender);
-    storage.join()?;
-
-    assert_eq!(storage.stats().errors, 0);
-    assert_eq!(
-        storage.stats().quarantined_records,
-        0,
-        "distinct temporality must not be quarantined as a uniqueness violation"
-    );
-
-    let conn = Connection::open(&db_path)?;
-    let metrics: i64 = conn.query_row("SELECT COUNT(*) FROM metric", [], |row| row.get(0))?;
-    let points: i64 = conn.query_row("SELECT COUNT(*) FROM metric_data_point", [], |row| {
-        row.get(0)
-    })?;
-    assert_eq!(metrics, 2, "delta and cumulative sums must be two metrics");
-    assert_eq!(points, 2, "both data points must persist");
 
     Ok(())
 }

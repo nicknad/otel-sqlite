@@ -1,7 +1,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::model::{LogRecord, MetricRecord};
+use crate::model::LogRecord;
 
 use super::batch::WriteBatch;
 
@@ -40,27 +40,12 @@ impl LogChunk {
     }
 }
 
-/// One mapped group of metric records plus its origin. See [`LogChunk`] for
-/// the meaning of `commit_seq`.
-#[derive(Debug)]
-pub struct MetricChunk {
-    pub origin: BatchOrigin,
-    pub records: Vec<MetricRecord>,
-    pub commit_seq: u64,
-}
-
-impl MetricChunk {
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
-    }
-}
-
 /// Input side of the ingestion pipeline: one item on the FIFO stream between
 /// ingress and the storage-owned insert batcher.
 ///
-/// Most items are payloads — mapped records ([`LogChunk`]/[`MetricChunk`])
-/// that the batcher absorbs into sized [`WriteBatch`]es; their boundaries are
-/// *not* SQLite transaction boundaries. The remaining items are barriers
+/// Most items are payloads — mapped records (`LogChunk`) that the batcher
+/// absorbs into sized [`WriteBatch`]es; their boundaries are *not* SQLite
+/// transaction boundaries. The remaining items are barriers
 /// (`Flush`, `Checkpoint`, `Maintenance`): instructions the batcher executes
 /// in stream order. Both kinds must share one stream because barriers derive
 /// their ordering guarantee from interleaving with the payloads they bracket.
@@ -68,8 +53,6 @@ impl MetricChunk {
 pub enum IngestMessage {
     /// Mapped log records plus their origin; a payload for the batcher.
     Logs(LogChunk),
-    /// Mapped metric records plus their origin; a payload for the batcher.
-    Metrics(MetricChunk),
     /// Order barrier: the batcher first flushes its partial buffers, then
     /// forwards this, so everything ingested before it reaches SQLite before
     /// anything ingested afterwards is observed.
@@ -84,7 +67,6 @@ impl IngestMessage {
     pub fn set_commit_seq(&mut self, commit_seq: u64) {
         match self {
             Self::Logs(chunk) => chunk.commit_seq = commit_seq,
-            Self::Metrics(chunk) => chunk.commit_seq = commit_seq,
             Self::Flush | Self::Checkpoint(_) | Self::Maintenance(_) => {}
         }
     }
@@ -93,7 +75,6 @@ impl IngestMessage {
     pub const fn commit_seq(&self) -> Option<u64> {
         match self {
             Self::Logs(chunk) => Some(chunk.commit_seq),
-            Self::Metrics(chunk) => Some(chunk.commit_seq),
             Self::Flush | Self::Checkpoint(_) | Self::Maintenance(_) => None,
         }
     }
@@ -113,22 +94,12 @@ pub struct LogWriteBatch {
     pub commit_seqs: Vec<u64>,
 }
 
-/// A storage-ready batch of metric records with its origin. See
-/// [`LogWriteBatch`] for the meaning of `commit_seqs`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MetricWriteBatch {
-    pub origin: BatchOrigin,
-    pub records: WriteBatch<MetricRecord>,
-    pub commit_seqs: Vec<u64>,
-}
-
 /// Commands consumed by the single SQLite writer. Insert variants carry fully
 /// formed storage batches produced by the insert batcher; the writer persists
 /// each of them in exactly one transaction without further accumulation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WriteCommand {
     InsertLogs(LogWriteBatch),
-    InsertMetrics(MetricWriteBatch),
     Flush,
     Checkpoint(CheckpointMode),
     Maintenance(MaintenanceOperation),
@@ -139,7 +110,6 @@ impl WriteCommand {
     pub fn record_count(&self) -> usize {
         match self {
             Self::InsertLogs(batch) => batch.records.len(),
-            Self::InsertMetrics(batch) => batch.records.len(),
             _ => 0,
         }
     }
@@ -150,7 +120,6 @@ impl WriteCommand {
     pub fn commit_seqs(&self) -> &[u64] {
         match self {
             Self::InsertLogs(batch) => &batch.commit_seqs,
-            Self::InsertMetrics(batch) => &batch.commit_seqs,
             Self::Flush | Self::Checkpoint(_) | Self::Maintenance(_) => &[],
         }
     }
@@ -159,12 +128,10 @@ impl WriteCommand {
     /// always valid.
     ///
     /// # Errors
-    /// Returns [`CommandError::EmptyBatch`] for an empty `InsertLogs` or
-    /// `InsertMetrics` batch.
+    /// Returns [`CommandError::EmptyBatch`] for an empty `InsertLogs` batch.
     pub fn validate(&self) -> CommandResult<()> {
         match self {
             Self::InsertLogs(batch) if batch.records.is_empty() => Err(CommandError::EmptyBatch),
-            Self::InsertMetrics(batch) if batch.records.is_empty() => Err(CommandError::EmptyBatch),
             _ => Ok(()),
         }
     }
@@ -172,7 +139,6 @@ impl WriteCommand {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::InsertLogs(_) => "insert_logs",
-            Self::InsertMetrics(_) => "insert_metrics",
             Self::Flush => "flush",
             Self::Checkpoint(_) => "checkpoint",
             Self::Maintenance(_) => "maintenance",
@@ -291,7 +257,7 @@ pub type CommandResult<T> = Result<T, CommandError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MetricRecord, Resource};
+    use crate::model::Resource;
 
     fn sample_log_write(records: usize) -> LogWriteBatch {
         LogWriteBatch {
@@ -308,13 +274,6 @@ mod tests {
     fn command_kinds() {
         let logs = WriteCommand::InsertLogs(sample_log_write(1));
         assert_eq!(logs.kind(), "insert_logs");
-
-        let metrics = WriteCommand::InsertMetrics(MetricWriteBatch {
-            origin: BatchOrigin::default(),
-            records: WriteBatch::from_vec(vec![MetricRecord::default()]),
-            commit_seqs: vec![9],
-        });
-        assert_eq!(metrics.kind(), "insert_metrics");
 
         assert_eq!(WriteCommand::Flush.kind(), "flush");
         assert_eq!(
@@ -404,13 +363,6 @@ mod tests {
         assert_eq!(logs.commit_seq(), Some(0));
         logs.set_commit_seq(42);
         assert_eq!(logs.commit_seq(), Some(42));
-
-        let metrics = IngestMessage::Metrics(MetricChunk {
-            origin: BatchOrigin::default(),
-            records: vec![MetricRecord::default()],
-            commit_seq: 5,
-        });
-        assert_eq!(metrics.commit_seq(), Some(5));
 
         // Barriers carry no records, so they have no ticket.
         let mut flush = IngestMessage::Flush;

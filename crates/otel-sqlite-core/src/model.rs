@@ -1,16 +1,10 @@
 pub mod attribute;
 pub mod log;
-pub mod metric;
 pub mod resource;
 pub mod severity;
 
 pub use attribute::{Attribute, AttributeValue};
 pub use log::{LogBatch, LogRecord};
-pub use metric::{
-    Exemplar, ExponentialBucket, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge,
-    Histogram, HistogramDataPoint, MetricBatch, MetricData, MetricRecord, NumberDataPoint,
-    NumberValue, QuantileValue, Sum, Summary, SummaryDataPoint, Temporality,
-};
 pub use resource::Resource;
 pub use severity::Severity;
 

@@ -27,9 +27,7 @@
 use std::time::Duration;
 
 use crossbeam_channel::TrySendError;
-use otel_sqlite_core::model::{
-    Gauge, LogRecord, MetricData, MetricRecord, NumberDataPoint, NumberValue, Resource, Severity,
-};
+use otel_sqlite_core::model::{LogRecord, Resource, Severity};
 use otel_sqlite_core::storage::{
     BatchOrigin, IngestMessage, InsertBatcherConfig, LogChunk, SyncMode,
 };
@@ -80,88 +78,6 @@ fn logs_chunk(first_seq: i64, count: usize) -> IngestMessage {
         records,
         commit_seq: 0,
     })
-}
-
-/// A poison data point (CHECK start<=timestamp violated) must not kill the
-/// pipeline: the strict pass fails, the salvage pass commits healthy points,
-/// the offending ones are counted as quarantined, and the writer keeps
-/// serving subsequent traffic.
-#[test]
-fn poison_metric_point_is_quarantined_and_healthy_rows_survive() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("poison.db");
-
-    let (sender, receiver) = crossbeam_channel::bounded(4);
-    let mut storage = Storage::open(receiver, config(db_path.clone(), 64, 60_000)).unwrap();
-    let ledger = storage.commit_ledger();
-
-    let good = NumberDataPoint {
-        start_time_unix_nano: 100,
-        time_unix_nano: 200,
-        value: Some(NumberValue::Int(7)),
-        ..NumberDataPoint::default()
-    };
-    // CHECK (start_timestamp_ns <= timestamp_ns) violated on purpose.
-    let poison = NumberDataPoint {
-        start_time_unix_nano: 900,
-        time_unix_nano: 200,
-        value: Some(NumberValue::Int(8)),
-        ..NumberDataPoint::default()
-    };
-
-    let record = MetricRecord {
-        name: "poison.test".to_owned(),
-        scope_name: "scope".to_owned(),
-        data: MetricData::Gauge(Gauge {
-            data_points: vec![poison, good],
-        }),
-        ..MetricRecord::default()
-    };
-
-    let ticket = ledger.issue();
-    sender
-        .send(IngestMessage::Metrics(
-            otel_sqlite_core::storage::MetricChunk {
-                origin: BatchOrigin::default(),
-                records: vec![record],
-                commit_seq: ticket,
-            },
-        ))
-        .unwrap();
-    sender.send(IngestMessage::Flush).unwrap();
-
-    assert!(
-        wait_until(Duration::from_secs(5), || storage.stats().records_written
-            == 1),
-        "the healthy point must be persisted by the salvage pass"
-    );
-    let stats = storage.stats();
-    assert_eq!(stats.quarantined_records, 1, "the poison point is counted");
-    assert_eq!(stats.errors, 1, "the failed strict attempt is accounted");
-    assert_eq!(ledger.watermark().committed_through, ticket);
-
-    // The writer survived: subsequent traffic still flows.
-    let follow_up_chunk = logs_chunk(0, 3);
-    sender.send(follow_up_chunk).unwrap();
-    sender.send(IngestMessage::Flush).unwrap();
-    assert!(
-        wait_until(Duration::from_secs(5), || storage.stats().records_written
-            == 4),
-        "writer must keep serving after a salvage"
-    );
-
-    drop(sender);
-    storage.join().unwrap();
-
-    let conn = open_readonly(&db_path);
-    assert_eq!(row_count(&conn), 3, "only log rows + healthy metric remain");
-    let metrics_left: i64 = conn
-        .query_row("SELECT COUNT(*) FROM metric_data_point", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        metrics_left, 1,
-        "exactly the healthy point survives; the poison point was dropped"
-    );
 }
 
 /// Unwraps the payload message built by [`logs_chunk`], so durability tickets

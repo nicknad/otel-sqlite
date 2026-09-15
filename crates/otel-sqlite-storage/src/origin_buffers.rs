@@ -28,8 +28,7 @@ use otel_sqlite_core::storage::{BatchOrigin, InsertBatcher, InsertBatcherConfig,
 /// Batches produced by one origin buffer, paired with the origin shared by
 /// all records inside them and every durability ticket they carry. This is
 /// the driver-side counterpart of the core [`WriteBatch`]: same records,
-/// plus the metadata needed to build a `LogWriteBatch`/`MetricWriteBatch`
-/// command.
+/// plus the metadata needed to build a `LogWriteBatch` command.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Submission<T> {
     pub(crate) origin: BatchOrigin,
