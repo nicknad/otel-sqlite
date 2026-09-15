@@ -91,9 +91,6 @@ fuzz_target!(|data: &[u8]| {
                 assert!(!chunk.records.is_empty());
                 drained_records += chunk.records.len();
             }
-            IngestMessage::Metrics(_) => {
-                panic!("logs handler must never enqueue metric chunks")
-            }
             // Control commands carry no records and are never produced by
             // OTLP handlers; tolerated for exhaustiveness.
             IngestMessage::Flush | IngestMessage::Checkpoint(_) | IngestMessage::Maintenance(_) => {}
