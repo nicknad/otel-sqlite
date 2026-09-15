@@ -52,7 +52,7 @@ pub use batcher::{
 };
 pub use command::{
     BatchOrigin, CheckpointMode, CommandError, CommandResult, IngestMessage, LogChunk,
-    LogWriteBatch, MaintenanceOperation, RetentionPolicy, WriteCommand,
+    LogWriteBatch, MaintenanceOperation, WriteCommand,
 };
 pub use commit::{CommitLedger, CommitLedgerClosed, Watermark};
 pub use durability::{DurabilityMode, SyncMode};

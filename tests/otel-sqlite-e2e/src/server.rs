@@ -71,8 +71,6 @@ pub mod benchmark_profile {
             max_attribute_key_bytes: 256,               // production 512
             max_attribute_value_bytes: 4096,            // production 64 KiB
             max_body_bytes: 65536,                      // production 1 MiB
-            max_buckets_per_point: 160,                 // production 10_000
-            max_exemplars_per_point: 32,                // production 100
             max_scope_metadata_expansion_bytes: DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES,
             durability_mode: DurabilityMode::Commit,
             tls: None,

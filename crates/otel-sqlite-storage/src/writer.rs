@@ -394,11 +394,11 @@ fn run_maintenance(
         MaintenanceOperation::Analyze => maintenance::analyze(conn)?,
         MaintenanceOperation::Vacuum => maintenance::vacuum(conn)?,
         MaintenanceOperation::RebuildFts => maintenance::rebuild_fts(conn).map(|_| ())?,
-        MaintenanceOperation::Prune(policy) => {
-            if !policy.is_enabled() {
+        MaintenanceOperation::Prune(window) => {
+            if window.is_none() {
                 return Ok(false);
             }
-            let report = maintenance::prune(conn, &policy, unix_nano_now())?;
+            let report = maintenance::prune(conn, window, unix_nano_now())?;
             if report.total() > 0 {
                 ::metrics::counter!("storage_records_pruned_total", "table" => "log_event")
                     .increment(report.log_events as u64);
@@ -461,8 +461,8 @@ fn heavy_maintenance_label(operation: &MaintenanceOperation) -> Option<&'static 
     match operation {
         MaintenanceOperation::Vacuum => Some("vacuum"),
         MaintenanceOperation::RebuildFts => Some("rebuild_fts"),
-        MaintenanceOperation::Prune(policy) if policy.is_enabled() => Some("prune"),
-        MaintenanceOperation::Prune(_) | MaintenanceOperation::Analyze => None,
+        MaintenanceOperation::Prune(Some(_)) => Some("prune"),
+        MaintenanceOperation::Prune(None) | MaintenanceOperation::Analyze => None,
     }
 }
 

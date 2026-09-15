@@ -42,7 +42,6 @@ fn storage_config(db_path: std::path::PathBuf) -> StorageConfig {
 fn maintenance_config() -> MaintenanceConfig {
     MaintenanceConfig {
         retention: Some(Duration::from_secs(3_600)), // 1 hour
-        metric_retention: None,
         purge_interval: Some(Duration::from_millis(50)),
         checkpoint_interval: None,
         checkpoint_mode: otel_sqlite_core::storage::CheckpointMode::Passive,

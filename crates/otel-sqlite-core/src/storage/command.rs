@@ -188,53 +188,13 @@ pub enum MaintenanceOperation {
     Analyze,
     Vacuum,
     RebuildFts,
-    Prune(RetentionPolicy),
-}
-
-/// Per-signal retention windows for a prune command. Each signal is pruned
-/// independently; `None` leaves that signal untouched, so a policy may retain
-/// metrics for a year while pruning week-old logs.
-///
-/// The SQLite writer interprets the windows at execution time (cutoff =
-/// now − window), so a long-queued prune never deletes data newer than the
-/// configured window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct RetentionPolicy {
-    /// Log-event retention window; `None` disables log pruning.
-    pub logs: Option<Duration>,
-    /// Metric data-point retention window; `None` disables metric pruning.
-    pub metrics: Option<Duration>,
-}
-
-impl RetentionPolicy {
-    /// One uniform window applied to every signal.
-    pub const fn new(older_than: Duration) -> Self {
-        Self {
-            logs: Some(older_than),
-            metrics: Some(older_than),
-        }
-    }
-
-    /// Prune only log events.
-    pub const fn logs_only(older_than: Duration) -> Self {
-        Self {
-            logs: Some(older_than),
-            metrics: None,
-        }
-    }
-
-    /// Prune only metric data points.
-    pub const fn metrics_only(older_than: Duration) -> Self {
-        Self {
-            logs: None,
-            metrics: Some(older_than),
-        }
-    }
-
-    /// Whether this policy prunes anything at all.
-    pub const fn is_enabled(&self) -> bool {
-        self.logs.is_some() || self.metrics.is_some()
-    }
+    /// Age-based prune of log events; `None` disables the prune for this
+    /// command.
+    ///
+    /// The SQLite writer interprets the window at execution time (cutoff =
+    /// now − window), so a long-queued prune never deletes data newer than
+    /// the configured window.
+    Prune(Option<Duration>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,26 +291,6 @@ mod tests {
         assert_eq!(CheckpointMode::from_u8(4), None);
         assert_eq!(CheckpointMode::Full.to_string(), "FULL");
         assert_eq!(CheckpointMode::default(), CheckpointMode::Passive);
-    }
-
-    #[test]
-    fn retention_policy_windows_are_per_signal() {
-        let uniform = RetentionPolicy::new(Duration::from_secs(60));
-        assert_eq!(uniform.logs, Some(Duration::from_secs(60)));
-        assert_eq!(uniform.metrics, Some(Duration::from_secs(60)));
-        assert!(uniform.is_enabled());
-
-        let logs = RetentionPolicy::logs_only(Duration::from_secs(30));
-        assert_eq!(logs.logs, Some(Duration::from_secs(30)));
-        assert_eq!(logs.metrics, None);
-        assert!(logs.is_enabled());
-
-        let metrics = RetentionPolicy::metrics_only(Duration::from_secs(90));
-        assert_eq!(metrics.logs, None);
-        assert_eq!(metrics.metrics, Some(Duration::from_secs(90)));
-        assert!(metrics.is_enabled());
-
-        assert!(!RetentionPolicy::default().is_enabled());
     }
 
     #[test]

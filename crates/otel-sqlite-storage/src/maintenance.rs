@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use otel_sqlite_core::storage::{CheckpointMode, RetentionPolicy};
+use otel_sqlite_core::storage::CheckpointMode;
 use rusqlite::Connection;
 
 use crate::error::StorageError;
@@ -141,12 +141,12 @@ impl PruneReport {
 /// `now_unix_nano` is injected so callers control the cutoff clock.
 pub(crate) fn prune(
     conn: &mut Connection,
-    policy: &RetentionPolicy,
+    window: Option<std::time::Duration>,
     now_unix_nano: i64,
 ) -> Result<PruneReport, StorageError> {
     let mut report = PruneReport::default();
 
-    if let Some(window) = policy.logs {
+    if let Some(window) = window {
         let cutoff = retention_cutoff(now_unix_nano, window);
         let batch = PRUNE_BATCH_ROWS as i64;
         loop {

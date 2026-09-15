@@ -5,9 +5,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::unbounded;
 use otel_sqlite_core::model::{Attribute, AttributeValue, LogBatch, LogRecord, Resource, Severity};
-use otel_sqlite_core::storage::{
-    BatchOrigin, IngestMessage, LogChunk, MaintenanceOperation, RetentionPolicy,
-};
+use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, LogChunk, MaintenanceOperation};
 use otel_sqlite_storage::{Storage, StorageConfig, StorageError};
 use rusqlite::Connection;
 
@@ -187,7 +185,7 @@ fn log_search_index_tracks_inserts_and_prunes_without_rebuild()
         // The sample records carry epoch timestamps, so any retention
         // window covers them.
         sender.send(IngestMessage::Maintenance(MaintenanceOperation::Prune(
-            otel_sqlite_core::storage::RetentionPolicy::new(Duration::from_secs(1)),
+            Some(Duration::from_secs(1)),
         )))?;
         sender.send(IngestMessage::Flush)?;
         drop(sender);
@@ -505,7 +503,7 @@ fn retention_prunes_logs_collects_orphans_and_leaves_no_fts_ghosts()
 
     // Everything from ~1970 expires in the uniform window.
     sender.send(IngestMessage::Maintenance(MaintenanceOperation::Prune(
-        RetentionPolicy::new(Duration::from_secs(1)),
+        Some(Duration::from_secs(1)),
     )))?;
     sender.send(IngestMessage::Flush)?;
     drop(sender);

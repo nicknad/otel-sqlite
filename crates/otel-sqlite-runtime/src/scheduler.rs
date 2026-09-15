@@ -18,7 +18,7 @@
 
 use std::time::{Duration, Instant};
 
-use otel_sqlite_core::storage::{MaintenanceOperation, RetentionPolicy, WriteCommand};
+use otel_sqlite_core::storage::{MaintenanceOperation, WriteCommand};
 
 use crate::config::MaintenanceConfig;
 use crate::sink::{CommandSink, EnqueueError};
@@ -53,12 +53,7 @@ impl Operation {
     /// SQLite writer.
     fn build(self, config: &MaintenanceConfig) -> WriteCommand {
         match self {
-            Self::Purge => {
-                WriteCommand::Maintenance(MaintenanceOperation::Prune(RetentionPolicy {
-                    logs: config.retention,
-                    metrics: config.metric_retention,
-                }))
-            }
+            Self::Purge => WriteCommand::Maintenance(MaintenanceOperation::Prune(config.retention)),
             Self::Checkpoint => WriteCommand::Checkpoint(config.checkpoint_mode),
             Self::Optimize => WriteCommand::Maintenance(MaintenanceOperation::Analyze),
             Self::Vacuum => WriteCommand::Maintenance(MaintenanceOperation::Vacuum),
@@ -229,13 +224,10 @@ impl Scheduler {
     }
 }
 
-/// Purge cadence: enabled when at least one signal has a retention window.
-/// The enqueued prune command carries whichever windows are set, so a single
-/// periodic task covers logs and metrics together.
+/// Purge cadence: enabled when a retention window is set. The enqueued prune
+/// command carries that window; `None` never schedules.
 fn purge_interval(config: &MaintenanceConfig) -> Option<Duration> {
-    if config.retention.is_none() && config.metric_retention.is_none() {
-        return None;
-    }
+    config.retention?;
     config.purge_interval
 }
 
@@ -244,9 +236,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use otel_sqlite_core::storage::{
-        CheckpointMode, MaintenanceOperation, RetentionPolicy, WriteCommand,
-    };
+    use otel_sqlite_core::storage::{CheckpointMode, MaintenanceOperation, WriteCommand};
 
     use super::*;
     use crate::sink::CommandSink;
@@ -329,17 +319,14 @@ mod tests {
         let report = scheduler.tick(base + Duration::from_secs(1), &sink);
         assert_eq!(report.scheduled, 1);
         assert_eq!(sink.kinds(), vec!["maintenance"]);
-        let WriteCommand::Maintenance(MaintenanceOperation::Prune(policy)) = &sink.commands()[0]
+        let WriteCommand::Maintenance(MaintenanceOperation::Prune(window)) = &sink.commands()[0]
         else {
             panic!("expected a prune command");
         };
         assert_eq!(
-            policy,
-            &RetentionPolicy {
-                logs: Some(Duration::from_secs(3_600)),
-                metrics: None,
-            },
-            "logs-only retention must produce a logs-only prune"
+            window,
+            &Some(Duration::from_secs(3_600)),
+            "the configured retention window must ride on the prune command"
         );
     }
 
@@ -498,7 +485,6 @@ mod tests {
     fn built_commands_carry_configured_parameters() {
         let cfg = MaintenanceConfig {
             retention: Some(Duration::from_secs(90)),
-            metric_retention: Some(Duration::from_secs(180)),
             purge_interval: Some(Duration::from_secs(1)),
             checkpoint_mode: CheckpointMode::Restart,
             checkpoint_interval: Some(Duration::from_secs(1)),
@@ -516,10 +502,7 @@ mod tests {
 
         assert!(
             commands.contains(&WriteCommand::Maintenance(MaintenanceOperation::Prune(
-                RetentionPolicy {
-                    logs: Some(Duration::from_secs(90)),
-                    metrics: Some(Duration::from_secs(180)),
-                }
+                Some(Duration::from_secs(90))
             )))
         );
         assert!(commands.contains(&WriteCommand::Checkpoint(CheckpointMode::Restart)));
@@ -529,41 +512,9 @@ mod tests {
     }
 
     #[test]
-    fn metric_only_retention_schedules_a_metric_only_prune() {
-        let cfg = MaintenanceConfig {
-            retention: None,
-            metric_retention: Some(Duration::from_secs(120)),
-            purge_interval: Some(Duration::from_secs(10)),
-            ..MaintenanceConfig::default()
-        };
-        let base = Instant::now();
-        let mut scheduler = Scheduler::new(cfg, base);
-        let sink = RecordingSink::accepting();
-
-        assert!(
-            scheduler.is_due(Operation::Purge, base + Duration::from_secs(10)),
-            "metric retention alone must enable the purge task"
-        );
-        scheduler.tick(base + Duration::from_secs(10), &sink);
-
-        let WriteCommand::Maintenance(MaintenanceOperation::Prune(policy)) = &sink.commands()[0]
-        else {
-            panic!("expected a prune command");
-        };
-        assert_eq!(
-            policy,
-            &RetentionPolicy {
-                logs: None,
-                metrics: Some(Duration::from_secs(120)),
-            }
-        );
-    }
-
-    #[test]
     fn rebuild_fts_follows_its_own_schedule() {
         let cfg = MaintenanceConfig {
             retention: None,
-            metric_retention: None,
             purge_interval: None,
             checkpoint_interval: None,
             optimize_interval: None,
