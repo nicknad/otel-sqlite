@@ -118,7 +118,7 @@ fn writes_logs_deduplicates_resources() -> Result<(), Box<dyn std::error::Error>
         [],
         |r| r.get(0),
     )?;
-    assert_eq!(migration, "004");
+    assert_eq!(migration, "005");
 
     Ok(())
 }
