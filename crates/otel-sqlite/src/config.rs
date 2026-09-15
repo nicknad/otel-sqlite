@@ -6,11 +6,10 @@ use otel_sqlite_core::storage::{CheckpointMode, DurabilityMode, InsertBatcherCon
 use otel_sqlite_ingress::{
     AuthConfig, DEFAULT_LISTEN_ADDRESS, DEFAULT_MAX_ATTRIBUTE_KEY_BYTES,
     DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES, DEFAULT_MAX_ATTRIBUTES_PER_RECORD, DEFAULT_MAX_BODY_BYTES,
-    DEFAULT_MAX_BUCKETS_PER_POINT, DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_EXEMPLARS_PER_POINT,
-    DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_MAX_RECV_MSG_SIZE,
+    DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_MAX_RECV_MSG_SIZE,
     DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES, DEFAULT_SHUTDOWN_TIMEOUT, IngressConfig,
     MAX_ATTRIBUTE_KEY_BYTES, MAX_ATTRIBUTE_VALUE_BYTES, MAX_ATTRIBUTES_PER_RECORD, MAX_BODY_BYTES,
-    MAX_BUCKETS_PER_POINT, MAX_EXEMPLARS_PER_POINT, MAX_SCOPE_METADATA_EXPANSION_BYTES, TlsConfig,
+    MAX_SCOPE_METADATA_EXPANSION_BYTES, TlsConfig,
 };
 use otel_sqlite_runtime::{MaintenanceConfig, WatchdogConfig};
 use otel_sqlite_storage::StorageConfig;
@@ -66,10 +65,6 @@ pub struct Config {
     pub max_attribute_value_bytes: usize,
     /// Max bytes for a scalar log body (H2).
     pub max_body_bytes: usize,
-    /// Max bucket/explicit-bound/quantile entries on one histogram point (H2).
-    pub max_buckets_per_point: usize,
-    /// Max exemplars on one metric point (H2).
-    pub max_exemplars_per_point: usize,
     /// Aggregate scope-metadata expansion budget per request (C1): scope
     /// metadata bytes multiplied by member records. See ingress
     /// `DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES`.
@@ -126,8 +121,6 @@ impl Default for Config {
             max_attribute_key_bytes: DEFAULT_MAX_ATTRIBUTE_KEY_BYTES,
             max_attribute_value_bytes: DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-            max_buckets_per_point: DEFAULT_MAX_BUCKETS_PER_POINT,
-            max_exemplars_per_point: DEFAULT_MAX_EXEMPLARS_PER_POINT,
             max_scope_metadata_expansion_bytes: DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES,
             max_db_bytes: None,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
@@ -284,18 +277,6 @@ impl Config {
         )?;
         validate_range("max_body_bytes", self.max_body_bytes, 1, MAX_BODY_BYTES)?;
         validate_range(
-            "max_buckets_per_point",
-            self.max_buckets_per_point,
-            1,
-            MAX_BUCKETS_PER_POINT,
-        )?;
-        validate_range(
-            "max_exemplars_per_point",
-            self.max_exemplars_per_point,
-            1,
-            MAX_EXEMPLARS_PER_POINT,
-        )?;
-        validate_range(
             "max_scope_metadata_expansion_bytes",
             self.max_scope_metadata_expansion_bytes,
             1024,
@@ -312,11 +293,6 @@ impl Config {
         validate_optional_duration(
             "maintenance.retention",
             self.maintenance.retention,
-            MAX_RETENTION,
-        )?;
-        validate_optional_duration(
-            "maintenance.metric_retention",
-            self.maintenance.metric_retention,
             MAX_RETENTION,
         )?;
         validate_optional_duration(
@@ -406,8 +382,6 @@ impl Config {
             "max_attribute_key_bytes": self.max_attribute_key_bytes,
             "max_attribute_value_bytes": self.max_attribute_value_bytes,
             "max_body_bytes": self.max_body_bytes,
-            "max_buckets_per_point": self.max_buckets_per_point,
-            "max_exemplars_per_point": self.max_exemplars_per_point,
             "max_scope_metadata_expansion_bytes": self.max_scope_metadata_expansion_bytes,
             "max_db_bytes": self.max_db_bytes,
             "shutdown_timeout_ms": self.shutdown_timeout.as_millis(),
@@ -435,8 +409,6 @@ impl Config {
             max_attribute_key_bytes: self.max_attribute_key_bytes,
             max_attribute_value_bytes: self.max_attribute_value_bytes,
             max_body_bytes: self.max_body_bytes,
-            max_buckets_per_point: self.max_buckets_per_point,
-            max_exemplars_per_point: self.max_exemplars_per_point,
             max_scope_metadata_expansion_bytes: self.max_scope_metadata_expansion_bytes,
             durability_mode: self.durability_mode,
             tls: self.tls.clone(),
@@ -469,7 +441,6 @@ fn maintenance_dump(config: &MaintenanceConfig) -> serde_json::Value {
     let ms = |duration: &Option<Duration>| duration.map(|value| value.as_millis());
     serde_json::json!({
         "retention_ms": ms(&config.retention),
-        "metric_retention_ms": ms(&config.metric_retention),
         "purge_interval_ms": ms(&config.purge_interval),
         "checkpoint_interval_ms": ms(&config.checkpoint_interval),
         "checkpoint_mode": format!("{:?}", config.checkpoint_mode),
@@ -526,8 +497,6 @@ struct FileConfig {
     max_attribute_key_bytes: Option<usize>,
     max_attribute_value_bytes: Option<usize>,
     max_body_bytes: Option<usize>,
-    max_buckets_per_point: Option<usize>,
-    max_exemplars_per_point: Option<usize>,
     max_scope_metadata_expansion_bytes: Option<usize>,
     max_db_bytes: Option<u64>,
     shutdown_timeout: Option<RawDuration>,
@@ -583,12 +552,6 @@ impl FileConfig {
         }
         if let Some(value) = self.max_body_bytes {
             config.max_body_bytes = value;
-        }
-        if let Some(value) = self.max_buckets_per_point {
-            config.max_buckets_per_point = value;
-        }
-        if let Some(value) = self.max_exemplars_per_point {
-            config.max_exemplars_per_point = value;
         }
         if let Some(value) = self.max_scope_metadata_expansion_bytes {
             config.max_scope_metadata_expansion_bytes = value;
@@ -851,57 +814,57 @@ impl MaintenanceSection {
     }
 }
 
-/// Retention windows as written in the config file.
+/// Retention window as written in the config file.
 ///
-/// One uniform window applies to every signal:
+/// One uniform window covers log events:
 ///
 /// ```toml
 /// [maintenance]
 /// retention = "7d"
 /// ```
 ///
-/// Alternatively, per-signal windows prune each signal on its own schedule;
-/// keys left out keep their current value (default or previously applied):
+/// Alternatively, the table form names the signal explicitly:
 ///
 /// ```toml
 /// [maintenance.retention]
 /// logs = "7d"
-/// metrics = "24h"
 /// ```
 ///
 /// The raw TOML value is resolved in [`apply_retention`] so an unknown key in
 /// the table form (`metris = "24h"`) produces a named error instead of an
-/// untagged-enum type mismatch.
-#[derive(Debug, Clone, Copy, Deserialize)]
+/// untagged-enum type mismatch. The retired `metrics` key is rejected with an
+/// explicit explanation.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PerSignalRetention {
+struct RetentionSection {
     logs: Option<RawDuration>,
-    metrics: Option<RawDuration>,
+    /// Removed together with the OTLP metrics signal; only accepted here to
+    /// emit a targeted error instead of a generic unknown-field message.
+    metrics: Option<toml::Value>,
 }
 
 fn apply_retention(config: &mut MaintenanceConfig, raw: Option<toml::Value>) -> Result<()> {
     let Some(raw) = raw else { return Ok(()) };
     if matches!(raw, toml::Value::Table(_)) {
-        let per_signal: PerSignalRetention = raw.try_into().map_err(|error| {
+        let retention: RetentionSection = raw.try_into().map_err(|error| {
             anyhow::anyhow!("invalid [maintenance.retention] settings: {error}")
         })?;
-        apply_optional_duration(&mut config.retention, per_signal.logs);
-        apply_optional_duration(&mut config.metric_retention, per_signal.metrics);
+        if retention.metrics.is_some() {
+            bail!(
+                "maintenance.retention.metrics is no longer supported: the OTLP metrics \
+                 signal was removed; use `logs` (or a single uniform window) instead"
+            );
+        }
+        apply_optional_duration(&mut config.retention, retention.logs);
         return Ok(());
     }
     let window = RawDuration::deserialize(raw)
         .map_err(|error| anyhow::anyhow!("invalid retention window: {error}"))?;
-    match window {
-        RawDuration::Enabled(window) => {
-            config.retention = Some(window);
-            config.metric_retention = Some(window);
-        }
-        // Explicit opt-out ("off") disables both signals at once.
-        RawDuration::Disabled => {
-            config.retention = None;
-            config.metric_retention = None;
-        }
-    }
+    config.retention = match window {
+        RawDuration::Enabled(window) => Some(window),
+        // Explicit opt-out ("off") disables purging.
+        RawDuration::Disabled => None,
+    };
     Ok(())
 }
 
@@ -1153,8 +1116,6 @@ mod tests {
              max_attribute_key_bytes = 222
              max_attribute_value_bytes = 333
              max_body_bytes = 444
-             max_buckets_per_point = 555
-             max_exemplars_per_point = 666
              max_scope_metadata_expansion_bytes = 8192
              shutdown_timeout = 90
             "#,
@@ -1174,8 +1135,6 @@ mod tests {
         assert_eq!(config.max_attribute_key_bytes, 222);
         assert_eq!(config.max_attribute_value_bytes, 333);
         assert_eq!(config.max_body_bytes, 444);
-        assert_eq!(config.max_buckets_per_point, 555);
-        assert_eq!(config.max_exemplars_per_point, 666);
         assert_eq!(config.max_scope_metadata_expansion_bytes, 8192);
         assert_eq!(config.shutdown_timeout, Duration::from_secs(90));
     }
@@ -1244,11 +1203,6 @@ mod tests {
             config.maintenance.retention,
             Some(Duration::from_secs(7 * 24 * 3_600))
         );
-        // A uniform retention window covers both signals.
-        assert_eq!(
-            config.maintenance.metric_retention,
-            Some(Duration::from_secs(7 * 24 * 3_600))
-        );
         assert_eq!(config.maintenance.vacuum_interval, None);
         // Untouched siblings keep their defaults.
         assert_eq!(
@@ -1265,69 +1219,53 @@ mod tests {
     }
 
     #[test]
-    fn retention_accepts_uniform_and_per_signal_forms() {
-        // Uniform: one window for every signal (also accepts bare seconds).
+    fn retention_accepts_uniform_and_table_forms() {
+        // Uniform: one window (also accepts bare seconds).
         let mut config = Config::default();
         file_config("[maintenance]\nretention = 60")
             .apply_to(&mut config)
             .expect("applies");
         assert_eq!(config.maintenance.retention, Some(Duration::from_secs(60)));
-        assert_eq!(
-            config.maintenance.metric_retention,
-            Some(Duration::from_secs(60))
-        );
 
-        // Per-signal table: each signal gets its own window.
+        // Table form with the explicit `logs` key.
         let mut config = Config::default();
-        file_config(
-            r#"
-            [maintenance.retention]
-            logs = "7d"
-            metrics = "24h"
-            "#,
-        )
-        .apply_to(&mut config)
-        .expect("applies");
+        file_config("[maintenance.retention]\nlogs = \"7d\"")
+            .apply_to(&mut config)
+            .expect("applies");
         assert_eq!(
             config.maintenance.retention,
             Some(Duration::from_secs(7 * 86_400))
         );
-        assert_eq!(
-            config.maintenance.metric_retention,
-            Some(Duration::from_secs(86_400))
-        );
 
-        // Per-signal table with only one key: the other keeps its default.
-        let mut config = Config::default();
-        file_config("[maintenance.retention]\nmetrics = \"1h\"")
-            .apply_to(&mut config)
-            .expect("applies");
-        assert_eq!(config.maintenance.retention, None);
-        assert_eq!(
-            config.maintenance.metric_retention,
-            Some(Duration::from_secs(3_600))
-        );
-
-        // Explicit opt-out disables both signals at once.
+        // Explicit opt-out disables purging.
         let mut config = Config::default();
         file_config("[maintenance]\nretention = \"off\"")
             .apply_to(&mut config)
             .expect("applies");
         assert_eq!(config.maintenance.retention, None);
-        assert_eq!(config.maintenance.metric_retention, None);
 
         // Inline-table form is equivalent to the section form.
         let mut config = Config::default();
-        file_config("[maintenance]\nretention = { logs = \"1d\", metrics = \"2d\" }")
+        file_config("[maintenance]\nretention = { logs = \"1d\" }")
             .apply_to(&mut config)
             .expect("applies");
         assert_eq!(
             config.maintenance.retention,
             Some(Duration::from_secs(86_400))
         );
-        assert_eq!(
-            config.maintenance.metric_retention,
-            Some(Duration::from_secs(2 * 86_400))
+
+        // The retired metrics key fails with a targeted error.
+        let file = toml::from_str::<FileConfig>("[maintenance.retention]\nmetrics = \"24h\"")
+            .expect("raw TOML parses into the file mirror");
+        let mut config = Config::default();
+        let error = file
+            .apply_to(&mut config)
+            .expect_err("metrics retention must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("OTLP metrics signal was removed"),
+            "error must explain the removal: {error}"
         );
     }
 
@@ -1604,20 +1542,6 @@ mod tests {
             "max_body_bytes",
             Config {
                 max_body_bytes: MAX_BODY_BYTES + 1,
-                ..Config::default()
-            }
-        );
-        assert_invalid!(
-            "max_buckets_per_point",
-            Config {
-                max_buckets_per_point: MAX_BUCKETS_PER_POINT + 1,
-                ..Config::default()
-            }
-        );
-        assert_invalid!(
-            "max_exemplars_per_point",
-            Config {
-                max_exemplars_per_point: MAX_EXEMPLARS_PER_POINT + 1,
                 ..Config::default()
             }
         );

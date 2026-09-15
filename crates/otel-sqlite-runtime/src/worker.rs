@@ -149,7 +149,7 @@ fn shutdown_signalled(shutdown: &Receiver<()>) -> bool {
 mod tests {
     use std::time::Duration;
 
-    use otel_sqlite_core::storage::{MaintenanceOperation, RetentionPolicy, WriteCommand};
+    use otel_sqlite_core::storage::{MaintenanceOperation, WriteCommand};
     use otel_sqlite_test_support::wait_until;
 
     use super::*;
@@ -158,7 +158,6 @@ mod tests {
     fn config(purge_interval: Option<Duration>) -> MaintenanceConfig {
         MaintenanceConfig {
             retention: Some(Duration::from_secs(60)),
-            metric_retention: None,
             purge_interval,
             checkpoint_interval: None,
             checkpoint_mode: otel_sqlite_core::storage::CheckpointMode::Passive,
@@ -191,10 +190,7 @@ mod tests {
             })
             .collect();
         assert!(!prunes.is_empty());
-        assert_eq!(
-            prunes[0],
-            RetentionPolicy::logs_only(Duration::from_secs(60))
-        );
+        assert_eq!(prunes[0], Some(Duration::from_secs(60)));
     }
 
     #[test]

@@ -16,16 +16,10 @@ pub struct MaintenanceConfig {
     /// Retention window for log events. Older rows are deleted by the writer
     /// when it executes a prune command; the worker never touches data.
     ///
-    /// `None` disables log purging entirely.
+    /// `None` disables purging entirely.
     pub retention: Option<Duration>,
-    /// Retention window for metric data points; pruned on the same schedule
-    /// as logs, with orphaned series/metrics/scopes/resources collected in
-    /// the same transaction.
-    ///
-    /// `None` disables metric purging entirely (metrics then grow unbounded).
-    pub metric_retention: Option<Duration>,
-    /// How often a retention purge command is enqueued (for both signals).
-    /// Ignored while both retention windows are `None`.
+    /// How often a retention purge command is enqueued. Ignored while
+    /// `retention` is `None`.
     pub purge_interval: Option<Duration>,
     /// How often a WAL checkpoint command is enqueued.
     ///
@@ -57,7 +51,6 @@ impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
             retention: None,
-            metric_retention: None,
             purge_interval: Some(Duration::from_secs(15 * 60)),
             checkpoint_interval: Some(Duration::from_secs(5 * 60)),
             checkpoint_mode: CheckpointMode::Passive,

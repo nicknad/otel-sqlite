@@ -66,11 +66,6 @@ pub const DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES: usize = 64 * 1024;
 /// Structured bodies (`ArrayValue`/`KvlistValue`) are bounded by the attribute
 /// byte bounds plus `MAX_NESTING_DEPTH` instead.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
-/// Max `bucket_counts`/`explicit_bounds`/`quantile_values` entries on one
-/// histogram-family data point (also covers each exponential-bucket side).
-pub const DEFAULT_MAX_BUCKETS_PER_POINT: usize = 10_000;
-/// Max exemplars attached to one metric data point.
-pub const DEFAULT_MAX_EXEMPLARS_PER_POINT: usize = 100;
 /// Aggregate scope-metadata expansion budget per request: the estimated model
 /// bytes of one `ScopeLogs`/`ScopeMetrics` metadata block (name + version +
 /// schema URL + attributes) multiplied by the number of member records.
@@ -89,8 +84,6 @@ pub const MAX_ATTRIBUTES_PER_RECORD: usize = 100_000;
 pub const MAX_ATTRIBUTE_KEY_BYTES: usize = 16_384;
 pub const MAX_ATTRIBUTE_VALUE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_BUCKETS_PER_POINT: usize = 1_000_000;
-pub const MAX_EXEMPLARS_PER_POINT: usize = 10_000;
 pub const MAX_SCOPE_METADATA_EXPANSION_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -108,10 +101,6 @@ pub struct IngressConfig {
     pub max_attribute_value_bytes: usize,
     /// See `DEFAULT_MAX_BODY_BYTES`.
     pub max_body_bytes: usize,
-    /// See `DEFAULT_MAX_BUCKETS_PER_POINT`.
-    pub max_buckets_per_point: usize,
-    /// See `DEFAULT_MAX_EXEMPLARS_PER_POINT`.
-    pub max_exemplars_per_point: usize,
     /// See `DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES`.
     pub max_scope_metadata_expansion_bytes: usize,
     /// When to acknowledge OTLP export requests. `Commit` (the default)
@@ -135,8 +124,6 @@ impl Default for IngressConfig {
             max_attribute_key_bytes: DEFAULT_MAX_ATTRIBUTE_KEY_BYTES,
             max_attribute_value_bytes: DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-            max_buckets_per_point: DEFAULT_MAX_BUCKETS_PER_POINT,
-            max_exemplars_per_point: DEFAULT_MAX_EXEMPLARS_PER_POINT,
             max_scope_metadata_expansion_bytes: DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES,
             durability_mode: DurabilityMode::default(),
             tls: None,

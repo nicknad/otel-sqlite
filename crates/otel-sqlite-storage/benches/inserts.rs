@@ -24,7 +24,7 @@ use crossbeam_channel::Sender;
 use otel_sqlite_core::model::{AttributeValue, LogRecord, Severity};
 use otel_sqlite_core::storage::{
     BatchOrigin, CheckpointMode, IngestMessage, InsertBatcherConfig, LogChunk, LogWriteBatch,
-    MaintenanceOperation, RetentionPolicy, SyncMode, WriteBatch, WriteCommand,
+    MaintenanceOperation, SyncMode, WriteBatch, WriteCommand,
 };
 use otel_sqlite_core::unix_nano_now;
 use otel_sqlite_storage::{Storage, StorageConfig};
@@ -295,9 +295,9 @@ fn bench_prune(c: &mut Criterion) {
                 pipeline
                     .producer
                     .send(WriteCommand::Maintenance(MaintenanceOperation::Prune(
-                        // Logs-only: this benchmark measures the log-event
-                        // deletion path specifically.
-                        RetentionPolicy::logs_only(Duration::from_secs(3_600)),
+                        // Age-based deletion of the log-event rows prepared
+                        // above.
+                        Some(Duration::from_secs(3_600)),
                     )))
                     .expect("writer alive");
                 wait_maintenance_run(&pipeline.storage, runs);
