@@ -40,7 +40,7 @@ ARG REVISION="unknown"
 ARG BUILD_DATE="unknown"
 
 LABEL org.opencontainers.image.title="otel-sqlite" \
-      org.opencontainers.image.description="OpenTelemetry collector sink with SQLite storage" \
+      org.opencontainers.image.description="OpenTelemetry OTLP sink with SQLite storage" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.source="https://codeberg.org/nicknad/otel-sqlite" \

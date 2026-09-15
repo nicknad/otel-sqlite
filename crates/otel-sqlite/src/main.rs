@@ -69,7 +69,7 @@ fn install_metrics_exporter(address: &str) -> Result<()> {
 
 fn print_usage() {
     println!(
-        "otel-sqlite - OTLP/gRPC to SQLite collector
+        "otel-sqlite - OTLP/gRPC to SQLite sink
 
 Usage:
   otel-sqlite [COMMAND] [OPTIONS]

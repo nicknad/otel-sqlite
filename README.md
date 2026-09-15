@@ -1,7 +1,7 @@
-# OTLP SQLite Collector
+# OTLP SQLite Sink
 
-A small OpenTelemetry log collector that receives OTLP over gRPC and stores
-logs in SQLite.
+A small OpenTelemetry log sink that receives OTLP over gRPC and stores
+logs in SQLite. It terminates the pipeline — nothing is forwarded downstream.
 
 Pipeline: `gRPC ingress → bounded ingest queue (all-or-nothing admission) →
 insert batcher → bounded command queue → single SQLite writer (WAL)`.
