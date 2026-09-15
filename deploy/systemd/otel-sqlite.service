@@ -13,7 +13,7 @@
 # Stop:     systemctl stop otel-sqlite   (SIGTERM -> graceful drain, WAL truncate)
 
 [Unit]
-Description=OTLP SQLite collector (otel-sqlite)
+Description=OTLP SQLite sink (otel-sqlite)
 After=network-online.target
 Wants=network-online.target
 
