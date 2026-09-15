@@ -25,8 +25,14 @@ confidence-threshold = 0.93
 
 [advisories]
 version = 2
-# Vulnerable dependency versions fail CI; unmaintained/unsound are surfaced
-# as warnings for triage.
+# Advisories v2 already errors on vulnerable, unmaintained and unsound
+# advisories (and deprecated the old per-category warn levels); the explicit
+# settings below pin that intent. `all` covers transitive dependencies too, so
+# downgrading to `workspace` would be a deliberate relaxation. Any accepted
+# finding must be added to `ignore` with a justification.
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
 ignore = [
     #"RUSTSEC-0000-0000",
 ]

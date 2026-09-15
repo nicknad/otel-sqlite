@@ -44,6 +44,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FUZZ_DIR="${REPO_ROOT}/fuzz"
+# Pinned cargo-fuzz release (matches tests/docker/Dockerfile.fuzz); override
+# with CARGO_FUZZ_VERSION when deliberately bumping the tool.
+CARGO_FUZZ_VERSION="${CARGO_FUZZ_VERSION:-0.13.2}"
 
 if [[ -z "${WSL_DISTRO_NAME:-}" ]] && ! grep -qi microsoft /proc/version 2>/dev/null; then
     echo "error: this script targets a WSL2 distro (got: $(uname -a))" >&2
@@ -80,8 +83,8 @@ setup() {
     fi
 
     if ! command -v cargo-fuzz >/dev/null 2>&1; then
-        echo "==> installing cargo-fuzz"
-        cargo install cargo-fuzz --locked
+        echo "==> installing cargo-fuzz ${CARGO_FUZZ_VERSION}"
+        cargo install cargo-fuzz --locked --version "${CARGO_FUZZ_VERSION}"
     fi
 
     if ! command -v clang++ >/dev/null 2>&1; then

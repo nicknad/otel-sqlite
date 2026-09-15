@@ -11,16 +11,17 @@ use super::pb::common::v1::InstrumentationScope;
 use super::pb::metrics::v1 as proto;
 use super::pb::metrics::v1::{ResourceMetrics, ScopeMetrics};
 use super::{
-    attributes, check_attributes, check_plain_string, convert_resource, parse_span_id,
-    parse_trace_id,
+    attributes, check_attributes, check_plain_string, check_scope_expansion, convert_resource,
+    parse_span_id, parse_trace_id, scope_metadata_bytes, timestamp,
 };
 use crate::config::IngressConfig;
 
 /// Fallible proto → model conversion of one `ResourceMetrics` group.
 ///
-/// Preserves exemplars, metric metadata, scope attributes and schema URLs;
-/// malformed exemplar trace/span ids reject the whole request instead of
-/// being silently dropped (all-or-nothing, matching P0-1).
+/// Preserves exemplars, metric metadata, scope attributes and schema URLs.
+/// Mapping only fails for shape/byte/depth bounds; present-but-invalid
+/// exemplar trace/span ids are zeroed and counted (`otlp_mapping_loss_total`)
+/// rather than rejecting the request, per the OTLP spec's SHOULD.
 pub fn try_convert_batch(value: ResourceMetrics) -> Result<MetricBatch, IngressError> {
     let ResourceMetrics {
         resource,
@@ -34,7 +35,9 @@ pub fn try_convert_batch(value: ResourceMetrics) -> Result<MetricBatch, IngressE
     let capacity: usize = scope_metrics.iter().map(|scope| scope.metrics.len()).sum();
     let mut batch = MetricBatch::with_capacity(capacity);
 
-    let mut resource = resource.map(convert_resource).transpose()?;
+    let mut resource = resource
+        .map(|value| convert_resource(value, "metrics"))
+        .transpose()?;
     if let Some(resource) = &mut resource {
         resource.schema_url.clone_from(&schema_url);
     }
@@ -56,7 +59,7 @@ pub fn try_convert_batch(value: ResourceMetrics) -> Result<MetricBatch, IngressE
                  }| (name, version, attributes),
             )
             .unwrap_or_default();
-        let scope_attributes = attributes(scope_attributes)?;
+        let scope_attributes = attributes(scope_attributes, "metrics")?;
         for metric in metrics {
             if let Some(record) = convert_metric(
                 metric,
@@ -100,11 +103,19 @@ pub(crate) fn validate_request(
             check_attributes(&resource.attributes, limits, "resource.attributes")?;
         }
         for scope in &group.scope_metrics {
-            if let Some(s) = scope.scope.as_ref() {
+            let scope_view = scope.scope.as_ref();
+            if let Some(s) = scope_view {
                 check_attributes(&s.attributes, limits, "scope.attributes")?;
                 check_plain_string(&s.name, limits, "scope.name")?;
                 check_plain_string(&s.version, limits, "scope.version")?;
             }
+            check_plain_string(&scope.schema_url, limits, "scope.schema_url")?;
+            check_scope_expansion(
+                scope_metadata_bytes(scope_view, &scope.schema_url),
+                scope.metrics.len(),
+                limits,
+                "metric",
+            )?;
             for metric in &scope.metrics {
                 check_plain_string(&metric.name, limits, "metric.name")?;
                 check_plain_string(&metric.description, limits, "metric.description")?;
@@ -213,8 +224,8 @@ fn check_exemplars(values: &[proto::Exemplar], limits: &IngressConfig) -> Result
 /// Maps an OTLP metrics export request into mapped metric chunks, one per
 /// `ResourceMetrics` group. Grouping/splitting policy belongs to the storage
 /// insert batcher; records move into chunks by ownership transfer. Mapping is
-/// fallible: a malformed exemplar trace/span id fails the whole request
-/// before anything is enqueued.
+/// fallible only for shape/byte/depth bounds; invalid exemplar trace/span ids
+/// are zeroed and counted, not a request failure.
 pub(crate) fn map_chunks(
     resource_metrics: Vec<ResourceMetrics>,
 ) -> Result<Vec<(u64, IngestMessage)>, IngressError> {
@@ -244,8 +255,8 @@ pub(crate) fn map_chunks(
                     schema_url,
                 },
                 records,
-                // No durability ledger exists yet; chunks start unstamped
-                // and are stamped later once ticketing lands.
+                // The enqueue path stamps every accepted chunk with its
+                // durability ticket before handing it to the queue.
                 commit_seq: 0,
             }),
         ));
@@ -268,12 +279,12 @@ fn convert_metric(
         data,
     } = value;
 
-    match data {
-        Some(data) => Ok(Some(MetricRecord {
+    if let Some(data) = data {
+        Ok(Some(MetricRecord {
             name,
             description,
             unit,
-            metadata: attributes(metadata)?,
+            metadata: attributes(metadata, "metrics")?,
             data: convert_data(data)?,
             resource_id: String::new(),
             resource: None,
@@ -281,8 +292,17 @@ fn convert_metric(
             scope_version: scope_version.to_owned(),
             scope_attributes: scope_attributes.to_vec(),
             scope_schema_url: scope_schema_url.to_owned(),
-        })),
-        None => Ok(None),
+        }))
+    } else {
+        // A metric without any data carries nothing to store; count the
+        // drop so silent sender bugs are visible in metrics.
+        ::metrics::counter!(
+            "otlp_mapping_loss_total",
+            "signal" => "metrics",
+            "reason" => "missing_data"
+        )
+        .increment(1);
+        Ok(None)
     }
 }
 
@@ -358,8 +378,8 @@ fn temporality(value: i32) -> Temporality {
     })
 }
 
-/// Converts OTLP exemplars, rejecting malformed trace/span ids rather than
-/// silently dropping the trace context of a sampled measurement.
+/// Converts OTLP exemplars; present-but-invalid trace/span ids are zeroed and
+/// counted rather than dropping the whole sampled measurement.
 fn exemplars(values: Vec<proto::Exemplar>) -> Result<Vec<Exemplar>, IngressError> {
     let mut exemplars = Vec::with_capacity(values.len());
     for exemplar in values {
@@ -370,14 +390,11 @@ fn exemplars(values: Vec<proto::Exemplar>) -> Result<Vec<Exemplar>, IngressError
             span_id,
             trace_id,
         } = exemplar;
-        let trace_id = parse_trace_id(trace_id).map_err(|error| {
-            IngressError::Mapping(format!("invalid exemplar trace id: {error}"))
-        })?;
-        let span_id = parse_span_id(span_id)
-            .map_err(|error| IngressError::Mapping(format!("invalid exemplar span id: {error}")))?;
+        let trace_id = parse_trace_id(trace_id).into_id("metrics", "invalid_trace_id");
+        let span_id = parse_span_id(span_id).into_id("metrics", "invalid_span_id");
         exemplars.push(Exemplar {
-            filtered_attributes: attributes(filtered_attributes)?,
-            time_unix_nano: time_unix_nano as i64,
+            filtered_attributes: attributes(filtered_attributes, "metrics")?,
+            time_unix_nano: timestamp(time_unix_nano, "metrics"),
             value: match value {
                 Some(proto::exemplar::Value::AsDouble(value)) => Some(NumberValue::Double(value)),
                 Some(proto::exemplar::Value::AsInt(value)) => Some(NumberValue::Int(value)),
@@ -401,9 +418,9 @@ fn convert_number_point(value: proto::NumberDataPoint) -> Result<NumberDataPoint
     } = value;
 
     Ok(NumberDataPoint {
-        attributes: attributes(point_attributes)?,
-        start_time_unix_nano: start_time_unix_nano as i64,
-        time_unix_nano: time_unix_nano as i64,
+        attributes: attributes(point_attributes, "metrics")?,
+        start_time_unix_nano: timestamp(start_time_unix_nano, "metrics"),
+        time_unix_nano: timestamp(time_unix_nano, "metrics"),
         value: value.map(number_value),
         flags,
         exemplars: exemplars(point_exemplars)?,
@@ -435,9 +452,9 @@ fn convert_histogram_point(
     } = value;
 
     Ok(HistogramDataPoint {
-        attributes: attributes(point_attributes)?,
-        start_time_unix_nano: start_time_unix_nano as i64,
-        time_unix_nano: time_unix_nano as i64,
+        attributes: attributes(point_attributes, "metrics")?,
+        start_time_unix_nano: timestamp(start_time_unix_nano, "metrics"),
+        time_unix_nano: timestamp(time_unix_nano, "metrics"),
         count,
         sum,
         bucket_counts,
@@ -470,9 +487,9 @@ fn convert_exponential_histogram_point(
     } = value;
 
     Ok(ExponentialHistogramDataPoint {
-        attributes: attributes(point_attributes)?,
-        start_time_unix_nano: start_time_unix_nano as i64,
-        time_unix_nano: time_unix_nano as i64,
+        attributes: attributes(point_attributes, "metrics")?,
+        start_time_unix_nano: timestamp(start_time_unix_nano, "metrics"),
+        time_unix_nano: timestamp(time_unix_nano, "metrics"),
         count,
         sum,
         scale,
@@ -510,9 +527,9 @@ fn convert_summary_point(value: proto::SummaryDataPoint) -> Result<SummaryDataPo
     } = value;
 
     Ok(SummaryDataPoint {
-        attributes: attributes(point_attributes)?,
-        start_time_unix_nano: start_time_unix_nano as i64,
-        time_unix_nano: time_unix_nano as i64,
+        attributes: attributes(point_attributes, "metrics")?,
+        start_time_unix_nano: timestamp(start_time_unix_nano, "metrics"),
+        time_unix_nano: timestamp(time_unix_nano, "metrics"),
         count,
         sum,
         quantile_values: quantile_values
@@ -1006,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malformed_exemplar_ids() {
+    fn invalid_exemplar_ids_are_zeroed_not_rejected() {
         let metric_with_exemplar = |trace_id: Vec<u8>, span_id: Vec<u8>| ResourceMetrics {
             scope_metrics: vec![ScopeMetrics {
                 metrics: vec![ProtoMetric {
@@ -1029,11 +1046,62 @@ mod tests {
             }],
             ..Default::default()
         };
+        let convert = |trace_id: Vec<u8>, span_id: Vec<u8>| {
+            let chunks = map_chunks(vec![metric_with_exemplar(trace_id, span_id)])
+                .expect("an invalid exemplar id must not fail the request");
+            let IngestMessage::Metrics(chunk) = &chunks[0].1 else {
+                panic!("expected metrics chunk");
+            };
+            let MetricData::Gauge(gauge) = &chunk.records[0].data else {
+                panic!("expected gauge");
+            };
+            let exemplar = &gauge.data_points[0].exemplars[0];
+            (exemplar.trace_id, exemplar.span_id)
+        };
 
-        assert!(map_chunks(vec![metric_with_exemplar(vec![1], vec![9; 8])]).is_err());
-        assert!(map_chunks(vec![metric_with_exemplar(vec![8; 16], vec![1])]).is_err());
-        assert!(map_chunks(vec![metric_with_exemplar(vec![0; 16], vec![])]).is_err());
-        assert!(map_chunks(vec![metric_with_exemplar(vec![], vec![])]).is_ok());
+        // Wrong-length ids carry no trace association: None, request kept.
+        assert_eq!(convert(vec![1], vec![9; 8]), (None, Some([9; 8])));
+        assert_eq!(convert(vec![8; 16], vec![1]), (Some([8; 16]), None));
+        // All-zeroes ids are invalid per the OTLP spec: mapped to absent.
+        assert_eq!(convert(vec![0; 16], vec![]), (None, None));
+        // Absent ids (empty) are valid "no trace context".
+        assert_eq!(convert(vec![], vec![]), (None, None));
+    }
+
+    #[test]
+    fn overflowing_timestamps_saturate_across_point_kinds() {
+        let point = |time: u64| ProtoNumberPoint {
+            start_time_unix_nano: time,
+            time_unix_nano: time,
+            value: Some(number_data_point::Value::AsInt(1)),
+            exemplars: vec![ProtoExemplar {
+                time_unix_nano: time,
+                span_id: vec![9; 8],
+                trace_id: vec![8; 16],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let proto_batch = ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![sum_metric(vec![point(u64::MAX)])],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let batch = try_convert_batch(proto_batch).expect("valid request converts");
+        let MetricData::Sum(sum) = &batch.records[0].data else {
+            panic!("expected sum")
+        };
+        let point = &sum.data_points[0];
+        assert_eq!(
+            point.start_time_unix_nano,
+            i64::MAX,
+            "an overflowing start time must saturate, not wrap negative"
+        );
+        assert_eq!(point.time_unix_nano, i64::MAX);
+        assert_eq!(point.exemplars[0].time_unix_nano, i64::MAX);
     }
 
     #[test]
@@ -1199,6 +1267,42 @@ mod tests {
             validate_request(&[group], &IngressConfig::default()).is_err(),
             "40 levels of nesting must exceed MAX_NESTING_DEPTH"
         );
+    }
+
+    #[test]
+    fn validate_rejects_scope_metadata_amplification() {
+        let group = ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                scope: Some(InstrumentationScope {
+                    name: "scope-m".to_owned(),
+                    attributes: vec![KeyValue {
+                        key: "k".to_owned(),
+                        value: any(Value::StringValue("v".repeat(900))),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                metrics: (0..10)
+                    .map(|i| {
+                        metric(
+                            &format!("m{i}"),
+                            proto::metric::Data::Gauge(proto::Gauge {
+                                data_points: vec![int_point(100, i)],
+                            }),
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let limits = IngressConfig {
+            max_scope_metadata_expansion_bytes: 4096,
+            ..IngressConfig::default()
+        };
+        let error = validate_request(&[group], &limits)
+            .expect_err("scope metadata repeated over 10 metrics must exceed a 4 KiB budget");
+        assert!(error.to_string().contains("expansion budget"));
     }
 
     #[test]

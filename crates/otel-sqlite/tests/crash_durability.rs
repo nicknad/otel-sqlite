@@ -187,13 +187,22 @@ fn wait_for_exit(proc: &mut ServerProc, timeout: Duration) -> bool {
     }
 }
 
+/// SQLite WAL sidecar path (`<db>-wal`): appending the suffix matches
+/// SQLite's naming for any database path, including extensionless ones,
+/// unlike `Path::with_extension`.
+fn wal_path(db_path: &Path) -> PathBuf {
+    let mut os = db_path.as_os_str().to_owned();
+    os.push("-wal");
+    PathBuf::from(os)
+}
+
 /// Waits until the WAL holds at least one page of un-checkpointed frames —
 /// proof that commits are sitting in the WAL at the moment of the kill.
 fn wait_wal_active(db_path: &Path, timeout: Duration) {
-    let wal_path = db_path.with_extension("db-wal");
+    let sidecar = wal_path(db_path);
     let started = Instant::now();
     loop {
-        let size = std::fs::metadata(&wal_path).map_or(0, |meta| meta.len());
+        let size = std::fs::metadata(&sidecar).map_or(0, |meta| meta.len());
         if size >= 4096 {
             return;
         }
@@ -459,7 +468,6 @@ async fn clean_shutdown_is_graceful_and_serving_flips() {
     // final checkpoint truncated the WAL.
     assert_valid(&server.db_path, "clean-shutdown", &outcome)
         .expect("graceful shutdown must not lose acknowledged records");
-    let wal_size =
-        std::fs::metadata(server.db_path.with_extension("db-wal")).map_or(0, |meta| meta.len());
+    let wal_size = std::fs::metadata(wal_path(&server.db_path)).map_or(0, |meta| meta.len());
     assert_eq!(wal_size, 0, "graceful shutdown truncates the WAL");
 }

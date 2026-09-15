@@ -68,8 +68,8 @@ fn proto_record(seq: u64, attributes_per_record: usize) -> ProtoLogRecord {
         observed_time_unix_nano: 1_700_000_000_000_000_001 + seq,
         severity_number: SeverityNumber::Info as i32,
         severity_text: "INFO".to_owned(),
-        // Never all-zeroes: OTLP mapping rejects all-zero trace and span ids,
-        // and seq=0 (used by the smallest sweep size) must stay a valid request.
+        // Valid, non-zero ids: invalid ones carry no trace association and
+        // map to a zeroed id, so keeping these valid measures the real path.
         trace_id: {
             let mut id = vec![(seq & 0xff) as u8; 16];
             id[0] |= 1;

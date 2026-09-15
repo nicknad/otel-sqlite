@@ -94,6 +94,13 @@ pub struct PipelineSample {
     pub outstanding_tickets: u64,
     /// Milliseconds since the contiguous commit watermark last advanced.
     pub watermark_idle_ms: u64,
+    /// Whether the writer is currently executing a maintenance-class command
+    /// (checkpoint, prune, vacuum, FTS rebuild, quota eviction). Insert
+    /// commits legitimately pause during that window.
+    pub maintenance_in_progress: bool,
+    /// Milliseconds since the current maintenance command started; `0` when
+    /// none is in progress.
+    pub maintenance_elapsed_ms: u64,
 }
 
 impl PipelineSample {
@@ -101,11 +108,6 @@ impl PipelineSample {
     /// plus records still buffered in the insert batcher.
     pub fn pending_work(&self) -> usize {
         self.queue_depth.saturating_add(self.pending_records)
-    }
-
-    /// Time since *any* pipeline stage last made meaningful progress.
-    fn progress_age(&self) -> Duration {
-        Duration::from_millis(self.writer_idle_ms.min(self.batcher_idle_ms))
     }
 }
 
@@ -134,6 +136,30 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
         return Evaluation {
             state: HealthState::Unhealthy,
             reason: "insert batcher thread is not running".to_owned(),
+        };
+    }
+
+    // Maintenance window. The writer has stopped committing by design, so
+    // the ordinary stall rules would produce a false "records lost" verdict
+    // during a legitimate VACUUM/rebuild under live traffic. Suspend them,
+    // but keep one bound so a genuinely hung maintenance call is still
+    // detected and reported.
+    if sample.maintenance_in_progress {
+        let elapsed = Duration::from_millis(sample.maintenance_elapsed_ms);
+        if elapsed >= config.maintenance_stall_after {
+            return Evaluation {
+                state: HealthState::Unhealthy,
+                reason: format!(
+                    "maintenance has been running for {elapsed:.1?} without completing \
+                     (limit {:.1?})",
+                    config.maintenance_stall_after,
+                ),
+            };
+        }
+        let pending = sample.pending_work();
+        return Evaluation {
+            state: HealthState::Healthy,
+            reason: format!("maintenance in progress ({elapsed:.1?}), {pending} record(s) pending"),
         };
     }
 
@@ -175,15 +201,22 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
         };
     }
 
-    // WORK BUT NO PROGRESS: judge by whichever stage moved most recently.
-    let age = sample.progress_age();
-    if age >= config.unhealthy_after {
+    // WORK BUT NO PROGRESS: judge each stage independently. Taking the
+    // fresher of the two would let a still-accepting batcher mask a wedged
+    // writer until its queue fills.
+    let writer_age = Duration::from_millis(sample.writer_idle_ms);
+    let batcher_age = Duration::from_millis(sample.batcher_idle_ms);
+    let age = writer_age.max(batcher_age);
+    if writer_age >= config.unhealthy_after || batcher_age >= config.unhealthy_after {
         return Evaluation {
             state: HealthState::Unhealthy,
-            reason: format!("{pending} record(s) pending but no pipeline progress for {age:.1?}"),
+            reason: format!(
+                "{pending} record(s) pending but no pipeline progress for {age:.1?} \
+                 (writer {writer_age:.1?}, batcher {batcher_age:.1?})"
+            ),
         };
     }
-    if age >= config.degraded_after {
+    if writer_age >= config.degraded_after || batcher_age >= config.degraded_after {
         return Evaluation {
             state: HealthState::Degraded,
             reason: format!(
@@ -289,10 +322,11 @@ impl WatchdogHandle {
         self.halted.load(Ordering::Relaxed)
     }
 
-    /// Signals the watchdog to stop without waiting for it.
+    /// Signals the watchdog to stop without waiting for it. Idempotent: a
+    /// second call (or one after the thread has exited) is a no-op.
     pub fn shutdown(&self) {
         if let Some(sender) = &self.shutdown {
-            let _ = sender.send(());
+            let _ = sender.try_send(());
         }
     }
 
@@ -371,6 +405,8 @@ fn run(
                 pending_records = sample.pending_records,
                 outstanding_tickets = sample.outstanding_tickets,
                 watermark_idle_ms = sample.watermark_idle_ms,
+                maintenance_in_progress = sample.maintenance_in_progress,
+                maintenance_elapsed_ms = sample.maintenance_elapsed_ms,
                 "watchdog initiating graceful shutdown"
             );
             let _ = halt.send(true);
@@ -385,7 +421,11 @@ fn run(
     }
 
     ::metrics::gauge!("sidecar_watchdog_active").set(0.0);
-    ::metrics::gauge!("sidecar_health_state").set(HealthState::Healthy.as_metric());
+    if !halted.load(Ordering::Relaxed) {
+        // After an unhealthy halt the last verdict must stay visible until the
+        // process exits; only a clean observer shutdown resets it.
+        ::metrics::gauge!("sidecar_health_state").set(HealthState::Healthy.as_metric());
+    }
     tracing::info!("watchdog stopped");
 }
 
@@ -426,6 +466,7 @@ mod tests {
             degraded_after: Duration::from_millis(50),
             unhealthy_after: Duration::from_millis(100),
             ack_stall_after: Duration::from_millis(60),
+            maintenance_stall_after: Duration::from_millis(300),
             queue_pressure_ratio: 0.75,
             halt_on_unhealthy: true,
         }
@@ -442,6 +483,8 @@ mod tests {
             pending_records: 5,
             outstanding_tickets: 0,
             watermark_idle_ms: 10,
+            maintenance_in_progress: false,
+            maintenance_elapsed_ms: 0,
         }
     }
 
@@ -470,9 +513,8 @@ mod tests {
         sample.writer_idle_ms = 150;
         sample.batcher_idle_ms = 150;
         assert_eq!(evaluate(&sample, &config()).state, HealthState::Unhealthy);
-        // Either stage progressing recently keeps the pipeline alive.
-        sample.batcher_idle_ms = 5;
-        assert_eq!(evaluate(&sample, &config()).state, HealthState::Healthy);
+        // Fresh progress on either stage alone is not enough to clear the
+        // verdict; see `fresh_batcher_progress_cannot_mask_a_wedged_writer`.
     }
 
     #[test]
@@ -481,6 +523,36 @@ mod tests {
         sample.writer_idle_ms = 60;
         sample.batcher_idle_ms = 60;
         assert_eq!(evaluate(&sample, &config()).state, HealthState::Degraded);
+    }
+
+    /// A long VACUUM/rebuild under live traffic must not be mistaken for a
+    /// lost-record stall; only exceeding the maintenance bound is unhealthy.
+    #[test]
+    fn maintenance_suspends_stall_verdicts_until_its_own_bound() {
+        let mut sample = running_sample();
+        sample.maintenance_in_progress = true;
+        sample.maintenance_elapsed_ms = 50;
+        // Even a frozen watermark with outstanding tickets is expected while
+        // maintenance holds the writer.
+        sample.writer_idle_ms = 50_000;
+        sample.batcher_idle_ms = 50_000;
+        sample.outstanding_tickets = 2;
+        sample.watermark_idle_ms = 50_000;
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Healthy);
+
+        sample.maintenance_elapsed_ms = 500; // >= maintenance_stall_after (300)
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Unhealthy);
+    }
+
+    /// The fresher of the two stages must not mask a wedged counterpart:
+    /// with a stalled writer, fresh batcher activity only means the queue is
+    /// still absorbing records.
+    #[test]
+    fn fresh_batcher_progress_cannot_mask_a_wedged_writer() {
+        let mut sample = running_sample();
+        sample.writer_idle_ms = 150; // >= unhealthy_after (100)
+        sample.batcher_idle_ms = 5;
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Unhealthy);
     }
 
     #[test]

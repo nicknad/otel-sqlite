@@ -3,7 +3,10 @@
 //! [`enqueue`] is the only way OTLP handlers touch the queue. Requests are
 //! admitted **all-or-nothing**: [`IngestSender::reserve`] either reserves room
 //! for every chunk of the request up front or rejects the whole request
-//! without touching the queue or the commit ledger.
+//! without touching the queue or the commit ledger. A request that maps to
+//! more chunks than the queue can ever hold (even when empty) is a permanent
+//! mapping error instead: retrying can never succeed, so handlers answer
+//! `INVALID_ARGUMENT` and tell the client to split the request.
 //!
 //! All-or-nothing admission is what makes retries safe. A handler that answers
 //! `UNAVAILABLE` has had *none* of the request's records accepted, so a
@@ -22,6 +25,7 @@ use std::time::Instant;
 
 use otel_sqlite_core::storage::{CommitLedger, IngestMessage};
 
+use crate::error::IngressError;
 use crate::{IngestSender, SendFailure};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -42,14 +46,30 @@ pub(crate) struct EnqueueOutcome {
 /// rejected (`accepted = 0`, `rejected = total`, `last_ticket = None`) without
 /// issuing any durability tickets. On success the chunks are enqueued in order
 /// under one admission reservation, so no other producer can interleave.
+///
+/// Returns [`IngressError::Mapping`] when the request maps to more chunks than
+/// the queue's total capacity: no retry could ever fit, so the caller must
+/// answer with a permanent error instead of `UNAVAILABLE`.
 pub(crate) fn enqueue(
     signal: &'static str,
     queue: &IngestSender,
     ledger: &CommitLedger,
     work: Vec<(u64, IngestMessage)>,
-) -> EnqueueOutcome {
+) -> Result<EnqueueOutcome, IngressError> {
     let mut outcome = EnqueueOutcome::default();
     let total_records: u64 = work.iter().map(|(records, _)| *records).sum();
+
+    // A request with more chunks than the queue can hold is permanently
+    // unadmittable (an empty queue still has `capacity` slots), so a retry
+    // loop would spin forever. Surface it as a permanent mapping error and
+    // tell the client to split the request.
+    if work.len() > queue.capacity() {
+        return Err(IngressError::Mapping(format!(
+            "request maps to {} chunks, which exceeds the ingest queue capacity of {}; split the request",
+            work.len(),
+            queue.capacity()
+        )));
+    }
 
     // Reserve room for the whole request up front. Failing here rejects the
     // request wholesale: no tickets were issued, nothing was enqueued, and the
@@ -58,7 +78,7 @@ pub(crate) fn enqueue(
     let Ok(guard) = queue.reserve(work.len()) else {
         outcome.rejected = total_records;
         ::metrics::counter!("ingress_queue_full_total", "signal" => signal).increment(1);
-        return outcome;
+        return Ok(outcome);
     };
 
     for (records, mut message) in work {
@@ -102,7 +122,7 @@ pub(crate) fn enqueue(
         }
     }
 
-    outcome
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -127,18 +147,22 @@ mod tests {
     #[test]
     fn whole_request_is_rejected_when_it_cannot_all_fit() {
         let ledger = Arc::new(CommitLedger::new());
-        let (queue, receiver) = channel(1);
+        let (queue, receiver) = channel(2);
 
-        // The one-slot queue can hold a single chunk; two chunks can never
-        // both fit, so the entire request is refused.
-        let outcome = enqueue("logs", &queue, &ledger, vec![log_chunk(2), log_chunk(3)]);
+        // A two-slot queue already holding a control message; the request's
+        // two chunks can never both fit right now, so the entire request is
+        // refused (transiently — this is the retryable case).
+        queue.send(IngestMessage::Flush).expect("control send");
+        let outcome = enqueue("logs", &queue, &ledger, vec![log_chunk(2), log_chunk(3)])
+            .expect("transient queue pressure is not a permanent error");
 
         assert_eq!(outcome.accepted, 0);
         assert_eq!(outcome.rejected, 5);
         assert_eq!(outcome.last_ticket, None);
         assert!(!outcome.disconnected);
-        assert!(
-            receiver.is_empty(),
+        assert_eq!(
+            receiver.len(),
+            1,
             "a rejected request must not leave chunks behind"
         );
         assert_eq!(
@@ -149,11 +173,30 @@ mod tests {
     }
 
     #[test]
+    fn request_larger_than_the_queue_capacity_is_a_permanent_mapping_error() {
+        let ledger = Arc::new(CommitLedger::new());
+        let (queue, receiver) = channel(1);
+
+        // Two chunks can never fit in a one-slot queue, no matter how long
+        // the client retries: that must be a permanent, non-retryable error.
+        let error = enqueue("logs", &queue, &ledger, vec![log_chunk(2), log_chunk(3)])
+            .expect_err("a request exceeding the total capacity can never fit");
+        let message = error.to_string();
+        assert!(message.contains("2 chunks"), "{message}");
+        assert!(message.contains("capacity of 1"), "{message}");
+        assert!(message.contains("split the request"), "{message}");
+
+        assert_eq!(ledger.watermark().committed_through, 0);
+        assert!(receiver.is_empty(), "nothing may be enqueued");
+    }
+
+    #[test]
     fn whole_request_is_admitted_contiguously_when_it_fits() {
         let ledger = Arc::new(CommitLedger::new());
         let (queue, receiver) = channel(4);
 
-        let outcome = enqueue("logs", &queue, &ledger, vec![log_chunk(2), log_chunk(3)]);
+        let outcome = enqueue("logs", &queue, &ledger, vec![log_chunk(2), log_chunk(3)])
+            .expect("request fits");
 
         assert_eq!(outcome.accepted, 5);
         assert_eq!(outcome.rejected, 0);
@@ -173,7 +216,8 @@ mod tests {
         // Storage gone: every send is rejected as disconnected, no ticket is
         // ever left outstanding, and the ledger is not closed by ingress.
         drop(receiver);
-        let outcome = enqueue("logs", &queue, &ledger, vec![log_chunk(1), log_chunk(1)]);
+        let outcome = enqueue("logs", &queue, &ledger, vec![log_chunk(1), log_chunk(1)])
+            .expect("disconnect is not a mapping error");
 
         assert!(outcome.disconnected);
         assert_eq!(outcome.rejected, 2);

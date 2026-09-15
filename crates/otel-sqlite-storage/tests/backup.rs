@@ -101,7 +101,7 @@ fn backup_matches_source_and_restores_into_a_clean_directory() {
     assert!(!report.encrypted);
     assert_eq!(report.verify.integrity, "ok");
     assert_eq!(report.verify.foreign_key_violations, 0);
-    assert_eq!(report.verify.schema_version.as_deref(), Some("003"));
+    assert_eq!(report.verify.schema_version.as_deref(), Some("004"));
     assert_eq!(
         report.verify.row_counts, source.row_counts,
         "snapshot row counts must match the source exactly"
@@ -121,7 +121,7 @@ fn backup_matches_source_and_restores_into_a_clean_directory() {
     );
     assert_eq!(
         restored.verified_after.schema_version.as_deref(),
-        Some("003")
+        Some("004")
     );
     assert_eq!(restored.verified_after.integrity, "ok");
     assert_eq!(restored.verified_after.foreign_key_violations, 0);
@@ -318,6 +318,17 @@ fn encryption_rejects_bad_key_lengths() {
         ),
         "8-byte keys must be rejected"
     );
+
+    // Oversized key files are rejected by length without being read into RAM.
+    let huge = dir.path().join("huge.key");
+    std::fs::write(&huge, vec![0u8; 1_048_576]).unwrap();
+    assert!(
+        matches!(
+            backup::encrypt_file(&snapshot, &dir.path().join("y.otsb"), &huge),
+            Err(BackupError::InvalidKeyLen(1_048_576))
+        ),
+        "oversized keys must be rejected by their length"
+    );
 }
 
 /// Retention pruning removes only backup artifacts, newest-first, and never
@@ -363,6 +374,45 @@ fn prune_keeps_newest_and_leaves_live_db_and_unrelated_files_alone() {
     assert!(dir.path().join(names[0]).exists());
     assert!(dir.path().join(names[1]).exists());
     assert!(dir.path().join(names[2]).exists());
+}
+
+/// A crashed restore's transient artifacts (the `*.decrypting` temp, hidden
+/// files) must never be counted as backups: if they were, a stale temp could
+/// evict a real backup from retention.
+#[test]
+fn prune_ignores_transient_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let names = [
+        "otel-logs.db.20260801T000000Z.bak",
+        "otel-logs.db.20260802T000000Z.bak",
+        "otel-logs.db.20260803T000000Z.bak",
+    ];
+    for (i, name) in names.iter().enumerate() {
+        let path = dir.path().join(name);
+        std::fs::write(&path, "x").unwrap();
+        let mtime = std::fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(86_400 * (i as u64 + 1)));
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(mtime)
+            .unwrap();
+    }
+    // Newest mtimes of all: if they counted as backups they would evict the
+    // real day-3 artifact.
+    let temp = dir.path().join("otel-logs.db.decrypting");
+    std::fs::write(&temp, "partial decrypt").unwrap();
+    let hidden = dir.path().join("otel-logs.db..tmp");
+    std::fs::write(&hidden, "hidden temp").unwrap();
+
+    let removed = backup::prune_old_backups(dir.path(), 1).unwrap();
+    assert_eq!(removed, 2, "only completed backups count toward retention");
+    assert!(temp.exists(), "the decrypting temp must survive pruning");
+    assert!(hidden.exists(), "hidden artifacts must survive pruning");
+    assert!(dir.path().join(names[2]).exists(), "newest backup survives");
+    assert!(!dir.path().join(names[0]).exists());
+    assert!(!dir.path().join(names[1]).exists());
 }
 
 /// Backup artifact names are unique per second and match the retention prefix.
@@ -428,6 +478,94 @@ fn backup_missing_source_is_a_clear_error() {
     let dir = tempfile::tempdir().unwrap();
     let outcome = backup::backup_to(&dir.path().join("nope.db"), &dir.path().join("out.bak"));
     assert!(matches!(outcome, Err(BackupError::Io(_))));
+}
+
+/// A failed backup must not leave a partial artifact behind: retention counts
+/// every `otel-logs.db.*` file as a backup, so a half-written destination
+/// would silently occupy a retention slot and could later be restored as
+/// garbage.
+#[test]
+fn failed_backup_leaves_no_partial_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("partial.bak");
+
+    // 1. Corrupt source (truncated database): fails the pre-flight checks.
+    let seed = populated_db(dir.path(), "seed.db");
+    let bytes = std::fs::read(&seed).unwrap();
+    let corrupt = dir.path().join("corrupt.db");
+    std::fs::write(&corrupt, &bytes[..bytes.len() / 2]).unwrap();
+    assert!(backup::backup_to(&corrupt, &dest).is_err());
+    assert!(
+        !dest.exists(),
+        "no partial destination after a corrupt source"
+    );
+
+    // 2. Non-database source.
+    let garbage = dir.path().join("garbage.db");
+    std::fs::write(&garbage, b"definitely not a sqlite file").unwrap();
+    assert!(backup::backup_to(&garbage, &dest).is_err());
+    assert!(
+        !dest.exists(),
+        "no partial destination after a non-database"
+    );
+
+    // 3. Missing source.
+    assert!(backup::backup_to(&dir.path().join("missing.db"), &dest).is_err());
+    assert!(
+        !dest.exists(),
+        "no partial destination after a missing source"
+    );
+}
+
+/// A valid SQLite file without the otel schema must verify (integrity and
+/// foreign keys) with an explicit `is_otel_schema = false` instead of failing
+/// with a misleading `no such table: log_event`.
+#[test]
+fn verify_accepts_a_plain_sqlite_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("plain.db");
+    let conn = rusqlite::Connection::open(&plain).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+         INSERT INTO notes (body) VALUES ('not telemetry');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let report = backup::verify(&plain).unwrap();
+    assert_eq!(report.integrity, "ok");
+    assert_eq!(report.foreign_key_violations, 0);
+    assert!(!report.is_otel_schema);
+    assert_eq!(report.schema_version, None);
+    assert_eq!(report.row_counts, backup::RowCounts::default());
+}
+
+/// Backup, restore and both verification phases work for a plain SQLite file:
+/// content equality is enforced byte-for-byte and no row counts are invented.
+#[test]
+fn restore_handles_non_otel_sqlite_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("plain-source.db");
+    let conn = rusqlite::Connection::open(&source).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+         INSERT INTO t (v) VALUES ('x');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let snapshot = dir.path().join("plain.bak");
+    let report = backup::backup_to(&source, &snapshot).unwrap();
+    assert!(!report.verify.is_otel_schema);
+
+    let clean = dir.path().join("restored-plain");
+    let restored = backup::restore_into(&snapshot, &clean, None).unwrap();
+    assert!(!restored.verified_before.is_otel_schema);
+    assert!(!restored.verified_after.is_otel_schema);
+    assert_eq!(
+        restored.verified_before.sha256, restored.verified_after.sha256,
+        "post-copy verification must match the verified backup"
+    );
 }
 
 /// The snapshot bytes are what `restore` installs: after copying, re-verifying

@@ -7,16 +7,17 @@ use super::pb::common::v1::{AnyValue, InstrumentationScope};
 use super::pb::logs::v1::{LogRecord as ProtoLogRecord, ResourceLogs, ScopeLogs};
 use super::{
     attribute_value, attributes, check_any_value, check_attributes, check_plain_string,
-    convert_resource, parse_span_id, parse_trace_id,
+    check_scope_expansion, convert_resource, parse_span_id, parse_trace_id, scope_metadata_bytes,
+    timestamp,
 };
 use crate::config::IngressConfig;
 
 /// Fallible proto → model conversion of one `ResourceLogs` group.
 ///
-/// Unlike the previous infallible `From` impl, malformed trace/span ids are
-/// rejected here instead of silently zero-filled: a request carrying an
-/// invalid id is refused wholesale by the handler, so no record is persisted
-/// under a corrupted trace context.
+/// Mapping only fails for shape/byte/depth bounds that would otherwise
+/// exhaust memory or CPU. Present-but-invalid trace/span ids carry no trace
+/// association: they are zeroed and counted (`otlp_mapping_loss_total`) rather
+/// than rejecting the request, per the OTLP spec's SHOULD.
 pub fn try_convert_batch(value: ResourceLogs) -> Result<LogBatch, IngressError> {
     let ResourceLogs {
         resource,
@@ -27,7 +28,9 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogBatch, IngressError> 
     let capacity: usize = scope_logs.iter().map(|scope| scope.log_records.len()).sum();
     let mut batch = LogBatch::with_capacity(capacity);
 
-    let mut resource = resource.map(convert_resource).transpose()?;
+    let mut resource = resource
+        .map(|value| convert_resource(value, "logs"))
+        .transpose()?;
     if let Some(resource) = &mut resource {
         resource.schema_url.clone_from(&schema_url);
     }
@@ -49,7 +52,7 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogBatch, IngressError> 
                  }| (name, version, attributes),
             )
             .unwrap_or_default();
-        let scope_attributes = attributes(scope_attributes)?;
+        let scope_attributes = attributes(scope_attributes, "logs")?;
         for record in log_records {
             batch.push(convert_record(
                 record,
@@ -79,9 +82,9 @@ pub(crate) fn count(resource_logs: &[ResourceLogs]) -> usize {
 /// This is deliberately *not* a batching step: the OTLP batch boundaries are a
 /// transport concern. Each chunk is handed to the storage-owned insert
 /// batcher, which owns all grouping/splitting policy. Records move into the
-/// chunks by ownership transfer without cloning. Mapping is fallible: a
-/// malformed trace/span id fails the whole request before anything is
-/// enqueued (all-or-nothing, matching P0-1).
+/// chunks by ownership transfer without cloning. Mapping is fallible only for
+/// shape/byte/depth bounds; invalid trace/span ids are zeroed and counted, not
+/// a request failure.
 pub(crate) fn map_chunks(
     resource_logs: Vec<ResourceLogs>,
 ) -> Result<Vec<(u64, IngestMessage)>, IngressError> {
@@ -105,8 +108,8 @@ pub(crate) fn map_chunks(
                     schema_url,
                 },
                 records,
-                // No durability ledger exists yet; chunks start unstamped
-                // and are stamped later once ticketing lands.
+                // The enqueue path stamps every accepted chunk with its
+                // durability ticket before handing it to the queue.
                 commit_seq: 0,
             }),
         ));
@@ -136,22 +139,29 @@ fn convert_record(
         ..
     } = value;
 
-    let trace_id = parse_trace_id(trace_id)
-        .map_err(|error| IngressError::Mapping(format!("invalid trace id: {error}")))?;
-    let span_id = parse_span_id(span_id)
-        .map_err(|error| IngressError::Mapping(format!("invalid span id: {error}")))?;
+    let trace_id = parse_trace_id(trace_id).into_id("logs", "invalid_trace_id");
+    let span_id = parse_span_id(span_id).into_id("logs", "invalid_span_id");
     let (body, body_json) = body_value(body)?;
 
+    let observed_time_unix_nano = timestamp(observed_time_unix_nano, "logs");
+    // OTLP: an unset `time_unix_nano` is to be treated as
+    // `observed_time_unix_nano`.
+    let time_unix_nano = if time_unix_nano == 0 {
+        observed_time_unix_nano
+    } else {
+        timestamp(time_unix_nano, "logs")
+    };
+
     Ok(LogRecord {
-        time_unix_nano: time_unix_nano as i64,
-        observed_time_unix_nano: observed_time_unix_nano as i64,
+        time_unix_nano,
+        observed_time_unix_nano,
         severity_number: severity(severity_number),
         severity_text,
         trace_id: trace_id.unwrap_or_default(),
         span_id: span_id.unwrap_or_default(),
         body,
         body_json,
-        attributes: attributes(record_attributes)?,
+        attributes: attributes(record_attributes, "logs")?,
         dropped_attributes_count,
         flags,
         event_name,
@@ -202,7 +212,7 @@ fn body_value(value: Option<super::AnyValue>) -> Result<(String, Option<String>)
             let items = values
                 .values
                 .into_iter()
-                .map(attribute_value)
+                .map(|value| attribute_value(value, "logs"))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((
                 String::new(),
@@ -211,7 +221,7 @@ fn body_value(value: Option<super::AnyValue>) -> Result<(String, Option<String>)
         }
         Some(super::AnyValueKind::KvlistValue(values)) => Ok((
             String::new(),
-            Some(AttributeValue::Kvlist(attributes(values.values)?).to_canonical_json()),
+            Some(AttributeValue::Kvlist(attributes(values.values, "logs")?).to_canonical_json()),
         )),
         _ => Ok((String::new(), None)),
     }
@@ -246,6 +256,13 @@ pub(crate) fn validate_request(
                 check_plain_string(&s.name, limits, "scope.name")?;
                 check_plain_string(&s.version, limits, "scope.version")?;
             }
+            check_plain_string(&scope.schema_url, limits, "scope.schema_url")?;
+            check_scope_expansion(
+                scope_metadata_bytes(scope_view, &scope.schema_url),
+                scope.log_records.len(),
+                limits,
+                "log",
+            )?;
             for record in &scope.log_records {
                 check_attributes(&record.attributes, limits, "log.attributes")?;
                 check_plain_string(&record.severity_text, limits, "severity_text")?;
@@ -477,8 +494,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malformed_trace_and_span_ids() {
-        let malformed = |trace_id: Vec<u8>, span_id: Vec<u8>| {
+    fn invalid_trace_and_span_ids_are_zeroed_not_rejected() {
+        let convert = |trace_id: Vec<u8>, span_id: Vec<u8>| {
             let proto = ResourceLogs {
                 scope_logs: vec![ScopeLogs {
                     log_records: vec![ProtoLogRecord {
@@ -490,18 +507,54 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            map_chunks(vec![proto])
+            let chunks = map_chunks(vec![proto]).expect("an invalid id must not fail the request");
+            let IngestMessage::Logs(chunk) = &chunks[0].1 else {
+                panic!("expected logs chunk");
+            };
+            (chunk.records[0].trace_id, chunk.records[0].span_id)
         };
 
-        // Wrong trace length.
-        assert!(malformed(vec![1, 2], vec![9; 8]).is_err());
-        // Wrong span length.
-        assert!(malformed(vec![7; 16], vec![1]).is_err());
-        // Present-but-all-zeroes ids are invalid per the OTLP spec.
-        assert!(malformed(vec![0; 16], vec![9; 8]).is_err());
-        assert!(malformed(vec![7; 16], vec![0; 8]).is_err());
+        // Wrong-length ids carry no trace association: zeroed, request kept.
+        assert_eq!(convert(vec![1, 2], vec![9; 8]), ([0; 16], [9; 8]));
+        assert_eq!(convert(vec![7; 16], vec![1]), ([7; 16], [0; 8]));
+        // Present-but-all-zeroes ids are invalid per the OTLP spec: zeroed.
+        assert_eq!(convert(vec![0; 16], vec![9; 8]), ([0; 16], [9; 8]));
+        assert_eq!(convert(vec![7; 16], vec![0; 8]), ([7; 16], [0; 8]));
         // Absent ids (empty) are valid "no trace context".
-        assert!(malformed(vec![], vec![]).is_ok());
+        assert_eq!(convert(vec![], vec![]), ([0; 16], [0; 8]));
+    }
+
+    #[test]
+    fn zero_time_falls_back_to_observed_and_overflow_saturates() {
+        let proto = ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![
+                    ProtoLogRecord {
+                        time_unix_nano: 0,
+                        observed_time_unix_nano: 222,
+                        ..Default::default()
+                    },
+                    ProtoLogRecord {
+                        time_unix_nano: u64::MAX,
+                        observed_time_unix_nano: u64::MAX,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let batch = try_convert_batch(proto).expect("valid request converts");
+
+        assert_eq!(batch.records[0].time_unix_nano, 222);
+        assert_eq!(batch.records[0].observed_time_unix_nano, 222);
+        assert_eq!(
+            batch.records[1].time_unix_nano,
+            i64::MAX,
+            "an overflowing timestamp must saturate, not wrap negative"
+        );
+        assert_eq!(batch.records[1].observed_time_unix_nano, i64::MAX);
     }
 
     #[test]
@@ -702,6 +755,56 @@ mod tests {
         assert!(
             validate_request(&[proto], &IngressConfig::default()).is_err(),
             "40 levels of nesting must exceed MAX_NESTING_DEPTH"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_scope_metadata_amplification() {
+        let proto = ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "scope-a".to_owned(),
+                    attributes: vec![KeyValue {
+                        key: "k".to_owned(),
+                        value: any(Value::StringValue("v".repeat(900))),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                log_records: (0..10).map(|_| ProtoLogRecord::default()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let limits = IngressConfig {
+            max_scope_metadata_expansion_bytes: 4096,
+            ..IngressConfig::default()
+        };
+        let error = validate_request(&[proto], &limits)
+            .expect_err("scope metadata repeated over 10 records must exceed a 4 KiB budget");
+        assert!(error.to_string().contains("expansion budget"));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_scope_schema_url() {
+        let proto = ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "scope-a".to_owned(),
+                    ..Default::default()
+                }),
+                log_records: vec![ProtoLogRecord::default()],
+                schema_url: "s".repeat(4096),
+            }],
+            ..Default::default()
+        };
+        let limits = IngressConfig {
+            max_attribute_value_bytes: 512,
+            ..IngressConfig::default()
+        };
+        assert!(
+            validate_request(&[proto], &limits).is_err(),
+            "over-long scope.schema_url must be rejected"
         );
     }
 

@@ -144,7 +144,8 @@ pub fn write_server_config(config: &CrashServerConfig) -> PathBuf {
 #[derive(Debug)]
 pub struct LoadOutcome {
     pub counters: ClientCountersSnapshot,
-    /// Sequences definitively rejected (`UNAVAILABLE`/`InvalidArgument`).
+    /// Sequences definitively rejected by the server (`InvalidArgument` or
+    /// server-generated `UNAVAILABLE`); transport failures become ambiguous.
     pub rejected: IntervalSet,
     /// Sequences whose fate is unknown client-side (timeout/transport break).
     pub ambiguous: IntervalSet,

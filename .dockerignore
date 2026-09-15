@@ -15,6 +15,12 @@ logs/
 *.db
 *.db-shm
 *.db-wal
+# Generated PKI/keys must never reach builder image layers: the Dockerfile
+# copies crates/ wholesale, and `gen-certs` writes alongside the sources.
+*.key
+*.pem
+*.otsb
+certs/
 tests/docker/compose.*.yml
 Dockerfile
 tests/docker/Dockerfile.benchmark

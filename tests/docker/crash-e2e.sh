@@ -29,8 +29,19 @@ ENDPOINT="http://sidecar:4317"
 
 DURATION_SECS="${CRASH_DURATION_SECS:-10}"
 KILL_AT_SECS="${CRASH_KILL_AT_SECS:-5}"
+# Unique per invocation so a rerun after a failed/crashed run can never
+# validate against rows left behind by the previous attempt (same run id +
+# same seed would look like duplicates), even if the volume survived.
+RUN_ID="${CRASH_RUN_ID:-$(date +%Y%m%d%H%M%S)-$$}"
 
 cd "$REPO_ROOT"
+
+# Always tear the stack down, on success or failure. Fixed container/volume
+# names mean a leftover stack would make the next run collide.
+cleanup() {
+    "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 
 echo "== build benchmark image =="
 "${COMPOSE[@]}" build
@@ -39,13 +50,13 @@ echo "== start sidecar =="
 "${COMPOSE[@]}" up -d --wait sidecar
 echo "sidecar healthy"
 
-echo "== phase 1: load crash-a (host kills the sidecar mid-load) =="
+echo "== phase 1: load crash-a-$RUN_ID (host kills the sidecar mid-load) =="
 (
   "${COMPOSE[@]}" run --rm loadgen load \
     --endpoint "$ENDPOINT" \
-    --run-id crash-a \
+    --run-id "crash-a-$RUN_ID" \
     --duration-secs "$DURATION_SECS" \
-    --output /artifacts/crash-a.json
+    --output "/artifacts/crash-a-$RUN_ID.json"
 ) &
 LOAD_PID=$!
 sleep "$KILL_AT_SECS"
@@ -56,22 +67,20 @@ echo "== restart sidecar on the same volume (WAL recovery) =="
 "${COMPOSE[@]}" up -d --wait --force-recreate sidecar
 echo "sidecar recovered and healthy"
 
-echo "== phase 2: post-restart load crash-b =="
+echo "== phase 2: post-restart load crash-b-$RUN_ID =="
 "${COMPOSE[@]}" run --rm loadgen load \
   --endpoint "$ENDPOINT" \
-  --run-id crash-b \
+  --run-id "crash-b-$RUN_ID" \
   --duration-secs 5 \
-  --output /artifacts/crash-b.json
+  --output "/artifacts/crash-b-$RUN_ID.json"
 
 echo "== validate manifests =="
 "${COMPOSE[@]}" run --rm loadgen validate \
   --db-path /data/otel-logs.db \
-  --manifest /artifacts/crash-a.json
+  --manifest "/artifacts/crash-a-$RUN_ID.json"
 "${COMPOSE[@]}" run --rm loadgen validate \
   --db-path /data/otel-logs.db \
-  --manifest /artifacts/crash-b.json
+  --manifest "/artifacts/crash-b-$RUN_ID.json"
 
 echo
 echo "PASS: container crash durability verified (no acknowledged loss after docker kill + restart)"
-
-"${COMPOSE[@]}" down -v

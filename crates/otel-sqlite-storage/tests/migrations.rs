@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use crossbeam_channel::unbounded;
-use otel_sqlite_storage::{Storage, StorageConfig, migrate_up_to};
+use otel_sqlite_storage::{Storage, StorageConfig, StorageError, migrate_up_to};
 use rusqlite::Connection;
 
 /// A database built and stamped at an old schema version, seeded with data
@@ -91,7 +91,7 @@ fn assert_upgraded(path: &std::path::Path) {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "003", "upgrade must land on the current schema");
+    assert_eq!(version, "004", "upgrade must land on the current schema");
 
     let applied: Vec<String> = conn
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -208,7 +208,7 @@ fn database_stamped_002_upgrades_through_current_schema() {
     assert_upgraded(&db);
 }
 
-/// Reopening a current-schema database is a no-op: the stamp stays 003 and the
+/// Reopening a current-schema database is a no-op: the stamp stays 004 and the
 /// data is untouched — upgrades are idempotent for already-current databases.
 #[test]
 fn current_schema_reopen_is_idempotent() {
@@ -218,6 +218,47 @@ fn current_schema_reopen_is_idempotent() {
     upgrade_via_storage_open(&db);
     upgrade_via_storage_open(&db);
     assert_upgraded(&db);
+}
+
+/// A database stamped by a newer binary must be rejected at startup instead of
+/// silently downgraded: this binary cannot know what the newer schema means.
+#[test]
+fn newer_recorded_schema_version_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("otel-logs.db");
+    historic_db(&db, "003");
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO schema_migrations (version, description) VALUES ('999', 'from the future')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (sender, receiver) = unbounded();
+    let result = Storage::open(
+        receiver,
+        StorageConfig {
+            sqlite_path: db,
+            ..StorageConfig::default()
+        },
+    );
+    let error = result.expect_err("a newer schema stamp must be rejected");
+    match error {
+        StorageError::StartupFailed { message } => {
+            assert!(
+                message.contains("999"),
+                "message must name the offending version: {message}"
+            );
+            assert!(
+                message.contains("004"),
+                "message must name the newest supported version: {message}"
+            );
+        }
+        other => panic!("expected StartupFailed, got {other:?}"),
+    }
+    drop(sender);
 }
 
 /// A capped migration run refuses to go beyond its target version: building a

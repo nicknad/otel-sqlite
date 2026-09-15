@@ -2,11 +2,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use otel_sqlite_core::storage::{CommitLedger, DurabilityMode};
+use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
 use crate::IngestSender;
 use crate::config::IngressConfig;
 use crate::enqueue::enqueue;
+use crate::error::IngressError;
 use crate::mapping::logs::{count, map_chunks, validate_request};
 use crate::mapping::pb::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse, logs_service_server::LogsService,
@@ -20,6 +22,11 @@ pub struct LogsIngress {
     /// `DurabilityMode::Commit` the export response waits here until the
     /// writer has committed everything this request had accepted.
     commit: Arc<CommitLedger>,
+    /// Process-wide export concurrency guard shared with the metrics service;
+    /// the HTTP/2 `max_concurrent_streams` setting is per connection, so this
+    /// is what bounds in-flight exports across all connections. `new` leaves
+    /// it effectively unlimited; production wiring attaches the shared one.
+    stream_limit: Arc<Semaphore>,
 }
 
 impl LogsIngress {
@@ -28,7 +35,15 @@ impl LogsIngress {
             queue,
             config,
             commit,
+            stream_limit: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
         }
+    }
+
+    /// Shares `limit` with other OTLP services so all exports draw from one
+    /// process-wide concurrency budget.
+    pub fn with_stream_limit(mut self, limit: Arc<Semaphore>) -> Self {
+        self.stream_limit = limit;
+        self
     }
 }
 
@@ -62,46 +77,48 @@ impl LogsService for LogsIngress {
 }
 
 impl LogsIngress {
-    async fn handle(
+    pub(crate) async fn handle(
         &self,
         request: ExportLogsServiceRequest,
     ) -> Result<ExportLogsServiceResponse, Status> {
-        let total = {
-            let _span = tracing::info_span!("validate").entered();
-            let total = count(&request.resource_logs);
-            if total > self.config.max_records_per_request {
-                return Err(Status::invalid_argument(format!(
-                    "request contains {total} log records, limit is {}",
-                    self.config.max_records_per_request
-                )));
-            }
-            // Per-field caps (H2) + nesting depth (H3) before any allocation:
-            // a single record with millions of attributes/bytes must fail here,
-            // not inside the blocking mapping task.
-            validate_request(&request.resource_logs, &self.config)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            total
-        };
+        // Process-wide export concurrency: the transport's per-connection
+        // stream cap is not enough to bound in-flight memory across
+        // connections. Acquirable unless the semaphore is closed, which never
+        // happens here.
+        let _permit = self
+            .stream_limit
+            .acquire()
+            .await
+            .map_err(|_| Status::internal("log stream limiter is closed"))?;
 
-        ::metrics::counter!("otlp_records_received_total", "signal" => "logs")
-            .increment(total as u64);
-
-        // CPU-heavy proto→model conversion (attribute cloning, canonical
-        // JSON) runs on the blocking pool so this tokio worker stays free
-        // to serve other streams while a large request maps. Bounded by
-        // MAPPING_TIMEOUT so one hostile request cannot hold its stream slot
-        // (and blocking thread) indefinitely; timeouts answer UNAVAILABLE so
-        // exporters retry.
+        // Request-level counting and validation run on the blocking pool with
+        // the CPU-heavy mapping: the async path only ever does channel and
+        // ledger work, so a walk of borrowed proto fields cannot stall a tokio
+        // worker. The record cap is checked before mapping allocates chunks.
         let resource_logs = request.resource_logs;
+        let limits = Arc::clone(&self.config);
         let work = tokio::time::timeout(
             crate::config::MAPPING_TIMEOUT,
             tokio::task::spawn_blocking(move || {
                 let _span = tracing::info_span!("map").entered();
+                let total = count(&resource_logs);
+                if total > limits.max_records_per_request {
+                    return Err(IngressError::Mapping(format!(
+                        "request contains {total} log records, limit is {}",
+                        limits.max_records_per_request
+                    )));
+                }
+                validate_request(&resource_logs, &limits)?;
+                ::metrics::counter!("otlp_records_received_total", "signal" => "logs")
+                    .increment(total as u64);
                 map_chunks(resource_logs)
             }),
         )
         .await
         .map_err(|_| {
+            // tokio cannot cancel `spawn_blocking`; the mapping task keeps
+            // running in the background, but the future, stream slot and
+            // concurrency permit are released so the exporter can retry.
             ::metrics::counter!("otlp_mapping_timeout_total", "signal" => "logs").increment(1);
             Status::unavailable("log mapping timed out")
         })?
@@ -110,7 +127,11 @@ impl LogsIngress {
 
         let outcome = {
             let _span = tracing::info_span!("enqueue").entered();
+            // A request mapping to more chunks than the queue can ever hold
+            // is permanent: answer INVALID_ARGUMENT (via the mapping error)
+            // instead of a retryable UNAVAILABLE.
             enqueue("logs", &self.queue, &self.commit, work)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?
         };
 
         // All-or-nothing admission: a request is either fully accepted or
@@ -202,12 +223,16 @@ mod tests {
         // Simulate the writer committing the request's ticket.
         ledger.complete(1);
 
-        let response = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        let _response = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
             .await
             .expect("response released after commit")
             .expect("handler did not panic")
             .expect("export succeeds");
-        assert!(response.partial_success.is_none());
+        assert_eq!(
+            ledger.watermark().committed_through,
+            1,
+            "the response must not be released before the ticket committed"
+        );
         assert!(started.elapsed() >= std::time::Duration::from_millis(50));
     }
 
@@ -233,14 +258,13 @@ mod tests {
         let ledger = Arc::new(CommitLedger::new());
         let (ingress, _) = ingress_with(8, DurabilityMode::Enqueue, Arc::clone(&ledger));
 
-        let response = tokio::time::timeout(
+        let _response = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             ingress.handle(request_with(2)),
         )
         .await
         .expect("enqueue mode returns immediately")
         .expect("export succeeds");
-        assert!(response.partial_success.is_none());
         // Nothing was committed, yet the ack already went out.
         assert_eq!(ledger.watermark().committed_through, 0);
     }
@@ -252,9 +276,17 @@ mod tests {
             durability_mode: DurabilityMode::Commit,
             ..IngressConfig::default()
         });
-        // One ingest slot, never drained: no chunk of this request can fit.
-        let (queue, receiver) = channel(1);
-        std::mem::forget(receiver);
+        // Two of the three ingest slots are already occupied, so this
+        // request's two chunks can never both fit right now. That is
+        // transient backpressure (a drain could make room), not a permanent
+        // mapping error, so it stays retryable UNAVAILABLE.
+        let (queue, receiver) = channel(3);
+        queue
+            .send(otel_sqlite_core::storage::IngestMessage::Flush)
+            .expect("prefill");
+        queue
+            .send(otel_sqlite_core::storage::IngestMessage::Flush)
+            .expect("prefill");
         let ingress = LogsIngress::new(queue, config, Arc::clone(&ledger));
 
         let group = |severity: &str| ResourceLogs {
@@ -285,25 +317,67 @@ mod tests {
             "nothing was accepted, so the watermark never moved"
         );
         assert!(!ledger.watermark().closed);
+        assert_eq!(receiver.len(), 2, "only the prefill messages remain");
     }
 
     #[tokio::test]
-    async fn malformed_trace_id_rejects_the_whole_request_before_enqueue() {
+    async fn request_mapping_to_more_chunks_than_capacity_is_invalid_argument() {
         let ledger = Arc::new(CommitLedger::new());
         let config = Arc::new(IngressConfig {
             durability_mode: DurabilityMode::Commit,
             ..IngressConfig::default()
         });
-        let (queue, receiver) = channel(4);
-        let ingress = LogsIngress::new(queue.clone(), config, Arc::clone(&ledger));
+        // One ingest slot total: no drain can ever fit a two-chunk request.
+        let (queue, receiver) = channel(1);
+        let ingress = LogsIngress::new(queue, config, Arc::clone(&ledger));
 
-        // A wrong-length trace id must surface as INVALID_ARGUMENT and enqueue
-        // nothing (all-or-nothing: no partial acceptance, no ticket issued).
+        let group = |severity: &str| ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![ProtoLogRecord {
+                    severity_text: severity.to_owned(),
+                    ..ProtoLogRecord::default()
+                }],
+                ..ScopeLogs::default()
+            }],
+            ..ResourceLogs::default()
+        };
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![group("A"), group("B")],
+        };
+
+        let status =
+            tokio::time::timeout(std::time::Duration::from_secs(2), ingress.handle(request))
+                .await
+                .expect("permanent rejection returns promptly")
+                .expect_err("a request that can never fit must be rejected permanently");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("split the request"),
+            "the error must tell the client how to proceed: {}",
+            status.message()
+        );
+        assert!(receiver.is_empty(), "nothing may be enqueued");
+        assert_eq!(ledger.watermark().committed_through, 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_trace_id_is_accepted_with_zeroed_id() {
+        let ledger = Arc::new(CommitLedger::new());
+        let config = Arc::new(IngressConfig {
+            durability_mode: DurabilityMode::Enqueue,
+            ..IngressConfig::default()
+        });
+        let (queue, receiver) = channel(4);
+        let ingress = LogsIngress::new(queue, config, Arc::clone(&ledger));
+
+        // A wrong-length trace id carries no trace association: it must be
+        // zeroed and counted, never reject the request (OTLP SHOULD).
         let request = ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 scope_logs: vec![ScopeLogs {
                     log_records: vec![ProtoLogRecord {
                         trace_id: vec![1, 2],
+                        span_id: vec![9; 8],
                         ..ProtoLogRecord::default()
                     }],
                     ..ScopeLogs::default()
@@ -312,16 +386,89 @@ mod tests {
             }],
         };
 
-        let status =
+        let _response =
             tokio::time::timeout(std::time::Duration::from_secs(2), ingress.handle(request))
                 .await
-                .expect("rejection returns promptly")
-                .expect_err("malformed id must be rejected");
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                .expect("invalid ids must not stall the export")
+                .expect("invalid ids must not reject the request");
+        let message = receiver.recv().expect("record enqueued");
+        let otel_sqlite_core::storage::IngestMessage::Logs(chunk) = message else {
+            panic!("expected logs chunk");
+        };
+        assert_eq!(chunk.records[0].trace_id, [0; 16]);
+        assert_eq!(chunk.records[0].span_id, [9; 8]);
+    }
+
+    fn metrics_request() -> crate::mapping::pb::collector::metrics::v1::ExportMetricsServiceRequest
+    {
+        use crate::mapping::pb::metrics::v1 as proto;
+        use crate::mapping::pb::metrics::v1::{
+            Metric as ProtoMetric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+            number_data_point,
+        };
+        crate::mapping::pb::collector::metrics::v1::ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![ProtoMetric {
+                        name: "probe".to_owned(),
+                        data: Some(proto::metric::Data::Gauge(proto::Gauge {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: 1,
+                                value: Some(number_data_point::Value::AsInt(1)),
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// Both services must draw from the one process-wide permit set: while
+    /// the only permit is held, a logs export and a metrics export both wait,
+    /// then both complete once it is released.
+    #[tokio::test]
+    async fn stream_limit_is_shared_between_services() {
+        let ledger = Arc::new(CommitLedger::new());
+        let limit = Arc::new(Semaphore::new(1));
+        let held_permit = Arc::clone(&limit).acquire_owned().await.expect("permit");
+
+        let (queue, receiver) = channel(8);
+        std::mem::forget(receiver);
+        let config = Arc::new(IngressConfig {
+            durability_mode: DurabilityMode::Enqueue,
+            ..IngressConfig::default()
+        });
+        let logs = LogsIngress::new(queue.clone(), Arc::clone(&config), Arc::clone(&ledger))
+            .with_stream_limit(Arc::clone(&limit));
+        let metrics =
+            crate::MetricsIngress::new(queue, config, ledger).with_stream_limit(Arc::clone(&limit));
+
+        let logs_task = tokio::spawn(async move { logs.handle(request_with(1)).await });
+        let metrics_task = tokio::spawn(async move { metrics.handle(metrics_request()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
-            receiver.is_empty(),
-            "a rejected request must not leave chunks behind"
+            !logs_task.is_finished(),
+            "the logs export must wait for the shared stream permit"
         );
-        assert_eq!(ledger.watermark().committed_through, 0);
+        assert!(
+            !metrics_task.is_finished(),
+            "the metrics export must share the same process-wide limit"
+        );
+
+        drop(held_permit);
+        tokio::time::timeout(std::time::Duration::from_secs(2), logs_task)
+            .await
+            .expect("logs export completes once a permit frees")
+            .expect("logs task did not panic")
+            .expect("logs export succeeds");
+        tokio::time::timeout(std::time::Duration::from_secs(2), metrics_task)
+            .await
+            .expect("metrics export completes once a permit frees")
+            .expect("metrics task did not panic")
+            .expect("metrics export succeeds");
     }
 }

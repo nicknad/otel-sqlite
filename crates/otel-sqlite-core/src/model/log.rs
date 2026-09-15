@@ -19,6 +19,10 @@ pub struct LogRecord {
     pub dropped_attributes_count: u32,
     pub flags: u32,
     pub event_name: String,
+    /// Reserved: resource identity is derived at persist time from [`resource`]
+    /// (or the batch origin); the writer never reads this field.
+    ///
+    /// [`resource`]: LogRecord::resource
     pub resource_id: String,
     pub resource: Option<Resource>,
     pub scope_name: String,

@@ -18,6 +18,10 @@ use otel_sqlite_ingress::pb::collector::metrics::v1::{
 use otel_sqlite_ingress::{IngressConfig, MetricsIngress};
 use prost::Message as _;
 
+/// Accepted-request cap configured below; a successful export can never
+/// enqueue more metric data points than this.
+const MAX_RECORDS_PER_REQUEST: usize = 100_000;
+
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -32,7 +36,7 @@ fuzz_target!(|data: &[u8]| {
 
     let (sender, receiver) = otel_sqlite_ingress::channel(16);
     let config = Arc::new(IngressConfig {
-        max_records_per_request: 100_000,
+        max_records_per_request: MAX_RECORDS_PER_REQUEST,
         // No storage pipeline runs inside the harness: in the default
         // `Commit` mode every accepted request would wait forever on a
         // durable-ack that never arrives. Acknowledge on enqueue instead so
@@ -45,15 +49,34 @@ fuzz_target!(|data: &[u8]| {
     let response = RUNTIME.block_on(ingress.export(tonic::Request::new(request)));
 
     // All-or-nothing admission invariant: an accepted request carries no
-    // partial success, and a rejected request surfaces as an error status with
-    // nothing enqueued — so a retrying client can never double-insert. Drained
-    // chunks must be non-empty (map_chunks filters empty groups).
-    if let Ok(response) = response {
-        assert!(
-            response.into_inner().partial_success.is_none(),
-            "all-or-nothing admission never reports partial success"
-        );
-    }
+    // partial success, and a rejected request surfaces as a definitive error
+    // status with nothing enqueued — so a retrying client can never
+    // double-insert. Drained chunks must be non-empty (map_chunks filters
+    // empty groups).
+    let accepted = match response {
+        Ok(response) => {
+            assert!(
+                response.into_inner().partial_success.is_none(),
+                "all-or-nothing admission never reports partial success"
+            );
+            true
+        }
+        Err(status) => {
+            // Only the ingress admission/validation errors are legitimate
+            // here: InvalidArgument (malformed/oversized request that can
+            // never fit the queue) and Unavailable (mapping timeout,
+            // transient queue-full).
+            let code = status.code();
+            assert!(
+                matches!(
+                    code,
+                    tonic::Code::InvalidArgument | tonic::Code::Unavailable
+                ),
+                "unexpected rejection status {code:?}: {status}"
+            );
+            false
+        }
+    };
 
     let mut drained_records = 0_usize;
     for command in receiver.try_iter() {
@@ -70,8 +93,15 @@ fuzz_target!(|data: &[u8]| {
             IngestMessage::Flush | IngestMessage::Checkpoint(_) | IngestMessage::Maintenance(_) => {}
         }
     }
-    assert!(
-        drained_records <= 100_000,
-        "accepted {drained_records} records exceeds max_records_per_request"
-    );
+    if accepted {
+        assert!(
+            drained_records <= MAX_RECORDS_PER_REQUEST,
+            "accepted {drained_records} records exceeds max_records_per_request"
+        );
+    } else {
+        assert_eq!(
+            drained_records, 0,
+            "a rejected export must enqueue nothing (got {drained_records} records)"
+        );
+    }
 });

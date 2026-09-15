@@ -4,7 +4,9 @@ use tonic::transport::Error as TransportError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IngressError {
-    #[error("invalid listen address `{listen_address}`")]
+    #[error(
+        "invalid listen address `{listen_address}`: use an IP:port tuple (e.g. `127.0.0.1:4317`); a bare `:port` binds all interfaces, and hostnames are not supported"
+    )]
     InvalidListenAddress {
         listen_address: String,
         #[source]

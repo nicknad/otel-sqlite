@@ -66,9 +66,7 @@ ENV RUST_LOG=warn
 # on SERVING (both pipeline threads alive). No curl/bash needed in the slim
 # runtime image - the server answers for itself. Override the probed endpoint
 # with OTEL_SQLITE_HEALTHCHECK_ENDPOINT when the listen port differs.
-HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/otel-sqlite", "healthcheck"]
-
+#
 # Default: run the production server against /data.
 WORKDIR /data
 

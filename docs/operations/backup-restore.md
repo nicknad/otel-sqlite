@@ -87,7 +87,10 @@ same mechanism as `sqlite3 source.db ".backup dest.db"`.
   `metric`, `scope`, `logs_fts`).
 * The highest `schema_migrations` stamp.
 * A SHA-256 of the file bytes (compare against the `backup` report to confirm
-  the artifact was not altered in storage).
+  the artifact was not altered in storage). For encrypted backups the report's
+  `sha256`/`verify.sha256` both cover the final `.otsb` artifact as stored,
+  while `verify`'s integrity/row-count fields describe its decrypted contents
+  (the plaintext snapshot is removed after encryption).
 
 Recommended restore validation:
 
@@ -121,9 +124,10 @@ owner-only permissions (`0600`) on unix.
   filesystem ACLs (the binary cannot set POSIX modes there).
 * Consider volume/disk-level encryption (e.g. LUKS, BitLocker) so backups are
   encrypted at rest even when the artifact itself is plaintext.
-* **Memory note:** encryption reads the snapshot into memory (≈ the database
-  size). For multi-GB databases prefer volume-level encryption or an external
-  streamed tool (`openssl enc`, `age`) piped from a filesystem copy.
+* **Memory note:** encryption streams the snapshot in 64 KiB frames
+  (constant memory: roughly the frame buffers, independent of database
+  size), so multi-GB databases can be encrypted in place without loading
+  them into RAM.
 
 **Alternatives.** Any tool that produces a consistent SQLite snapshot can be
 used instead: `sqlite3 source.db ".backup dest.db"` (the same API), or

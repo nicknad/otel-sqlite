@@ -23,9 +23,10 @@ User=otel-sqlite
 Group=otel-sqlite
 # The backup only needs read access to /data and write access to /backups.
 # Keep the key (when encrypting) readable only by this user and OUT of the
-# data directory.
+# data directory. Note: the `backup` subcommand takes its paths from the
+# explicit `--db`/`--out` arguments below and does NOT read
+# OTEL_SQLITE_CFG_PATH, so no server config file needs to be loaded here.
 WorkingDirectory=/backups
-Environment=OTEL_SQLITE_CFG_PATH=/etc/otel-sqlite/otel-sqlite.toml
 ExecStart=/usr/local/bin/otel-sqlite backup \
     --db /data/otel-logs.db \
     --out /backups \

@@ -21,12 +21,15 @@
 FROM rust:1.89-bookworm
 
 ARG TOOLCHAIN=nightly
+# Pinned cargo-fuzz release (installed with --locked) so the image is
+# reproducible and cannot pick up an unreviewed upstream version.
+ARG CARGO_FUZZ_VERSION=0.13.2
 
 RUN rustup toolchain install "${TOOLCHAIN}" \
         --profile minimal \
         --component llvm-tools-preview \
     && rustup default "${TOOLCHAIN}" \
-    && cargo install cargo-fuzz --locked
+    && cargo install cargo-fuzz --locked --version "${CARGO_FUZZ_VERSION}"
 
 # Runs as root on purpose: the workspace is bind-mounted from the host
 # (matching compose.criterion.yml), and matching the bind mount owner

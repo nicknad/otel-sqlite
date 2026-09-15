@@ -6,8 +6,12 @@
 
 # docker run --rm \
 #     -v otel-sqlite-data:/data \
+#     -v "$PWD/otel-sqlite.toml:/data/otel-sqlite.toml:ro" \
+#     -e OTEL_SQLITE_CFG_PATH=/data/otel-sqlite.toml \
 #     -p 4317:4317 \
 #     otel-sqlite
+# The config must set listen_address to 0.0.0.0 (with allow_insecure_remote
+# or [tls]); the default binds loopback only.
 # ------------------------------------------------------------
 
 FROM rust:1.89-bookworm AS builder

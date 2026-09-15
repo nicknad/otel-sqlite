@@ -16,6 +16,10 @@ pub(crate) struct Pacer {
 }
 
 impl Pacer {
+    /// `None` (or a non-positive rate, kept as "unthrottled" for legacy
+    /// callers) runs closed-loop. CLI front ends must reject `--rate 0`
+    /// explicitly (the benchmark binaries do, via clap range validation) so
+    /// an unbounded run is never requested by accident.
     pub(crate) fn new(offered_requests_per_second: Option<f64>) -> Self {
         Self {
             start: TokioInstant::now(),

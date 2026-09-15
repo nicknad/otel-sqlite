@@ -12,9 +12,10 @@
 //!   process.
 //! * **No plaintext retention**: lines are hashed (SHA-256) at load time and
 //!   only digests are compared — constant-time, so request timing does not
-//!   leak how much of a presented token matched. File contents and transient
-//!   digests live in `zeroize::Zeroizing` wrappers so heap copies are cleared
-//!   on drop instead of lingering for scrapers/core dumps.
+//!   leak how much of a presented token matched. The raw file bytes are read
+//!   into a pre-sized `zeroize::Zeroizing` buffer and decoded in place, and
+//!   transient digest buffers are zeroized too, so heap copies are cleared on
+//!   drop instead of lingering for scrapers/core dumps.
 //! * **Bounded parsing**: the file is read through a [`MAX_TOKEN_FILE_BYTES`]
 //!   cap, lines past [`MAX_TOKEN_LINE_BYTES`] are skipped, and files holding
 //!   more than [`MAX_TOKENS`] tokens are rejected, so a bloated token file
@@ -28,6 +29,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
@@ -64,6 +66,11 @@ pub struct TokenFileVault {
     reload_interval: Duration,
     max_stale_age: Duration,
     cached: RwLock<CachedTokens>,
+    /// Single-flight claim: only one thread reads the file per stale window;
+    /// concurrent verifiers keep checking the current set instead of piling
+    /// up more file reads. Released by an RAII guard so a panicking reload
+    /// cannot wedge the vault into never reloading again.
+    reloading: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -89,8 +96,9 @@ impl TokenFileVault {
             reload_interval: DEFAULT_RELOAD_INTERVAL,
             max_stale_age: MAX_STALE_TOKEN_AGE,
             cached: RwLock::new(CachedTokens::default()),
+            reloading: AtomicBool::new(false),
         };
-        warn_if_token_file_world_readable(&vault.path);
+        warn_if_token_file_over_permissive(&vault.path);
         let hashes = read_token_hashes(&vault.path)?;
         {
             let mut cached = vault.write_cached();
@@ -149,10 +157,23 @@ impl TokenFileVault {
             }
         }
 
-        // Slow path: reload is due. Do the blocking file I/O *outside* any
-        // lock so concurrent exports keep verifying against the old set on
-        // their read locks instead of serializing behind us. The raw text is
-        // zeroized on drop; only digests escape it.
+        // Slow path: reload is due. Claim single-flight first so at most one
+        // thread reads the file per stale window; a loser checks the current
+        // set instead of queueing behind another read.
+        if self
+            .reloading
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            let cached = self.read_cached();
+            return cached.hashes.iter().any(|known| ct_eq(known, &digest));
+        }
+        let _claim = ReloadClaim(&self.reloading);
+
+        // The blocking file I/O runs *outside* any lock so concurrent exports
+        // keep verifying against the old set on their read locks instead of
+        // serializing behind us. The raw bytes are zeroized on drop; only
+        // digests escape it.
         let file_result = match read_token_file(&self.path) {
             Ok(parsed) => ReloadOutcome::Loaded(parsed),
             Err(LoadError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -339,6 +360,10 @@ enum LoadError {
 /// pre-checked via metadata *and* the read itself goes through
 /// `take(MAX + 1)`, so a file grown between the two (TOCTOU) still cannot
 /// buffer past the cap.
+///
+/// The bytes land in a `Zeroizing` buffer pre-sized from the file length and
+/// are decoded there in place, so no plaintext string allocation (whose
+/// growth reallocations would leave unzeroized copies behind) is ever made.
 fn read_token_file(path: &Path) -> Result<ParsedTokens, LoadError> {
     use std::io::Read as _;
 
@@ -347,15 +372,22 @@ fn read_token_file(path: &Path) -> Result<ParsedTokens, LoadError> {
     if size > MAX_TOKEN_FILE_BYTES {
         return Err(LoadError::TooLarge(size));
     }
-    let mut text = Zeroizing::new(String::new());
+    let capacity = usize::try_from(size.min(MAX_TOKEN_FILE_BYTES))
+        .unwrap_or(0)
+        .min(MAX_TOKEN_FILE_BYTES as usize);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
     (&file)
         .take(MAX_TOKEN_FILE_BYTES + 1)
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .map_err(LoadError::Io)?;
-    if text.len() as u64 > MAX_TOKEN_FILE_BYTES {
-        return Err(LoadError::TooLarge(text.len() as u64));
+    if bytes.len() as u64 > MAX_TOKEN_FILE_BYTES {
+        return Err(LoadError::TooLarge(bytes.len() as u64));
     }
-    parse_token_lines(&text)
+    // Invalid UTF-8 fails exactly like the previous `read_to_string` path.
+    let text = std::str::from_utf8(&bytes).map_err(|error| {
+        LoadError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
+    parse_token_lines(text)
 }
 
 fn parse_token_lines(text: &str) -> Result<ParsedTokens, LoadError> {
@@ -389,6 +421,16 @@ fn is_stale(loaded_at: Option<Instant>, reload_interval: Duration) -> bool {
     loaded_at.is_none_or(|loaded_at| loaded_at.elapsed() >= reload_interval)
 }
 
+/// Releases the single-flight claim on drop, including while unwinding, so a
+/// panicking reload only fails that one attempt instead of disabling reloads.
+struct ReloadClaim<'a>(&'a AtomicBool);
+
+impl Drop for ReloadClaim<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Result of reading the token file outside the cache lock.
 enum ReloadOutcome {
     Loaded(ParsedTokens),
@@ -409,20 +451,22 @@ enum LogEvent {
     StaleExpired(String),
 }
 
-/// Warns when the bearer-token file is readable beyond its owner (unix).
-/// Misconfigured `0644` tokens are a common credential leak; warn, don't fail,
-/// so existing deployments keep working while operators fix perms.
-fn warn_if_token_file_world_readable(path: &Path) {
+/// Warns when the bearer-token file is accessible beyond its owner (unix):
+/// group/other read lets scrapers exfiltrate tokens and group/other write
+/// lets anyone replace them. Misconfigured `0644` tokens are a common
+/// credential leak; warn, don't fail, so existing deployments keep working
+/// while operators fix perms.
+fn warn_if_token_file_over_permissive(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(mode) = std::fs::metadata(path).map(|metadata| metadata.permissions().mode())
-            && mode & 0o044 != 0
+            && token_file_permissions_are_over_permissive(mode)
         {
             tracing::warn!(
                 path = %path.display(),
                 mode = format!("{mode:o}"),
-                "bearer token file is readable beyond its owner; chmod 600 it",
+                "bearer token file is readable or writable beyond its owner; chmod 600 it",
             );
         }
     }
@@ -430,6 +474,13 @@ fn warn_if_token_file_world_readable(path: &Path) {
     {
         let _ = path;
     }
+}
+
+/// Whether a unix mode grants group/other any access (read, write or exec
+/// bits). Only owner-only modes (`0600`, `0400`) are safe for token files.
+#[cfg(unix)]
+fn token_file_permissions_are_over_permissive(mode: u32) -> bool {
+    mode & 0o077 != 0
 }
 
 /// Constant-time equality over equal-length digests: XOR-folds all bytes so
@@ -767,5 +818,42 @@ mod tests {
         // Both the read fast-path and the reload write-path must work after.
         assert!(intercept_bearer(&vault, request_with_token("alpha-secret")).is_ok());
         assert!(intercept_bearer(&vault, request_with_token("gamma")).is_err());
+    }
+
+    /// While another thread is reading the file, a stale verify must not start
+    /// a second read: it keeps verifying against the cached set.
+    #[test]
+    fn stale_verify_skips_a_second_read_while_a_reload_is_in_flight() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("tokens.txt");
+        write_tokens(&path, &["keep-working"]);
+        let mut vault = TokenFileVault::open(&path).expect("open");
+        vault.reload_interval = Duration::ZERO;
+
+        // Simulate an in-flight reload, then remove the file. The claiming
+        // (reading) thread would revoke on this observation; the single-flight
+        // fallback must keep the cached set instead.
+        vault.reloading.store(true, Ordering::Release);
+        fs::remove_file(&path).expect("remove");
+        assert!(
+            intercept_bearer(&vault, request_with_token("keep-working")).is_ok(),
+            "a concurrent reload must not trigger a second file read"
+        );
+
+        // Once the claim is released, the next stale verify observes the
+        // removal and revokes as usual.
+        vault.reloading.store(false, Ordering::Release);
+        assert!(intercept_bearer(&vault, request_with_token("keep-working")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_or_other_access_counts_as_over_permissive() {
+        assert!(!token_file_permissions_are_over_permissive(0o600));
+        assert!(!token_file_permissions_are_over_permissive(0o400));
+        assert!(token_file_permissions_are_over_permissive(0o640));
+        assert!(token_file_permissions_are_over_permissive(0o604));
+        assert!(token_file_permissions_are_over_permissive(0o660));
+        assert!(token_file_permissions_are_over_permissive(0o606));
     }
 }

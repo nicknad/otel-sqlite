@@ -16,6 +16,11 @@
 
 name: CI
 
+# Least privilege: every job only reads the repository (checkout + tests);
+# no job publishes, uploads artifacts or writes back to the repo.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main, development]
@@ -193,7 +198,9 @@ jobs:
   semgrep:
     runs-on: ubuntu-latest
     container:
-      image: semgrep/semgrep
+      # Pinned release tag (not `latest`) so a fresh upstream image cannot
+      # change or break the gate without a deliberate bump.
+      image: semgrep/semgrep:1.176.0
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5

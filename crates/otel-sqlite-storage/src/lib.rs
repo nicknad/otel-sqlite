@@ -21,6 +21,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
+use otel_sqlite_core::saturating_deadline;
 use otel_sqlite_core::storage::{CommitLedger, IngestMessage, InsertBatcherConfig, WriteCommand};
 
 pub use config::{
@@ -73,14 +74,25 @@ impl Storage {
     /// persists one transaction at a time.
     ///
     /// **Storage-ready guarantee:** this call blocks until the writer thread
-    /// finished bootstrapping (database opened, schema migrated). A broken
-    /// backend therefore surfaces as `Err` at boot instead of on first
-    /// traffic; on timeout or bootstrap failure no caller can observe a
-    /// half-started pipeline.
+    /// finished bootstrapping (database opened, schema migrated) and the
+    /// insert batcher publishes its liveness guard. A broken backend
+    /// therefore surfaces as `Err` at boot instead of on first traffic. On
+    /// failure nothing is detached: the input receiver never left this call,
+    /// so dropping it disconnects ingress, and the writer is reaped with a
+    /// short budget before the error returns.
     pub fn open(
         input: Receiver<IngestMessage>,
         config: StorageConfig,
     ) -> Result<Self, StorageError> {
+        // `InsertBatcher::new` asserts this; validating here turns a dead
+        // batcher thread after a successful `open` into a startup error.
+        if config.insert_batcher.max_batch_records == 0 {
+            return Err(StorageError::StartupFailed {
+                message: "insert_batcher.max_batch_records must be at least 1".to_owned(),
+            });
+        }
+
+        let batcher_config: InsertBatcherConfig = config.insert_batcher;
         let stats = Arc::new(stats::WriterStats::new());
         let batcher_stats = Arc::new(stats::BatcherStats::new());
         let ledger = Arc::new(CommitLedger::new());
@@ -103,19 +115,10 @@ impl Storage {
         // schema is migrated; `open` waits for exactly that signal.
         let (ready_tx, ready_rx) = crossbeam_channel::bounded::<Result<(), String>>(1);
 
-        let batcher_config: InsertBatcherConfig = config.insert_batcher;
-        let batcher_handle = std::thread::Builder::new()
-            .name("otel-sqlite-batcher".to_owned())
-            .spawn(move || {
-                batcher::run(
-                    input,
-                    commands,
-                    &batcher_ledger,
-                    batcher_config,
-                    &worker_batcher_stats,
-                );
-            })?;
-
+        // Bootstrap the writer first. Only then is the batcher started, so a
+        // failed startup never leaves a detached batcher holding the input
+        // receiver: until the batcher spawns, `input` stays here and drops
+        // with the error, disconnecting every ingress sender.
         let join_handle = std::thread::Builder::new()
             .name("otel-sqlite-writer".to_owned())
             .spawn(move || {
@@ -124,22 +127,65 @@ impl Storage {
 
         match ready_rx.recv_timeout(startup_timeout) {
             Ok(Ok(())) => {}
-            Ok(Err(message)) => return Err(StorageError::StartupFailed { message }),
+            Ok(Err(message)) => {
+                drop(commands);
+                drop(producer_source);
+                reap_startup(join_handle);
+                return Err(StorageError::StartupFailed { message });
+            }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                drop(commands);
+                drop(producer_source);
+                reap_startup(join_handle);
                 return Err(StorageError::StartupTimeout {
                     timeout_secs: startup_timeout.as_secs(),
                 });
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                drop(commands);
+                drop(producer_source);
+                reap_startup(join_handle);
                 return Err(StorageError::WriterPanicked);
             }
         }
 
-        // Publish liveness eagerly so health probes are correct the moment
-        // `open` returns; the in-thread guards remain authoritative and clear
-        // these flags on every exit path.
-        stats.running.store(true, Ordering::Relaxed);
-        batcher_stats.running.store(true, Ordering::Relaxed);
+        // Wait for the batcher's liveness guard so `open` never returns with
+        // a not-yet-running (or already dead) batcher.
+        let (batcher_ready_tx, batcher_ready_rx) = crossbeam_channel::bounded::<()>(1);
+        let batcher_handle = match std::thread::Builder::new()
+            .name("otel-sqlite-batcher".to_owned())
+            .spawn(move || {
+                batcher::run(
+                    input,
+                    commands,
+                    &batcher_ledger,
+                    batcher_config,
+                    &worker_batcher_stats,
+                    batcher_ready_tx,
+                );
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(producer_source);
+                reap_startup(join_handle);
+                return Err(error.into());
+            }
+        };
+        match batcher_ready_rx.recv_timeout(startup_timeout) {
+            Ok(()) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                drop(producer_source);
+                reap_startup(join_handle);
+                return Err(StorageError::BatcherPanicked);
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                drop(producer_source);
+                reap_startup(join_handle);
+                return Err(StorageError::StartupTimeout {
+                    timeout_secs: startup_timeout.as_secs(),
+                });
+            }
+        }
 
         Ok(Self {
             stats,
@@ -191,9 +237,10 @@ impl Storage {
 
     /// Returns a cheap, cloneable health probe over the pipeline threads.
     ///
-    /// The probe only reads atomics owned by the writer and batcher threads —
-    /// it never locks, blocks, or touches SQLite — so it is safe to poll from
-    /// a watchdog even while the pipeline is wedged. This is the
+    /// The probe reads atomics owned by the writer and batcher threads and
+    /// takes the commit ledger's short-lived mutex for ticket progress — it
+    /// never blocks on pipeline work or touches SQLite — so it is safe to
+    /// poll from a watchdog even while the pipeline is wedged. This is the
     /// "components publish evidence, observers read it" direction; nothing
     /// here asks the components a question they must answer.
     pub fn health(&self) -> StorageHealth {
@@ -242,7 +289,7 @@ impl Storage {
     }
 
     fn join_inner(&mut self, timeout: Option<Duration>) -> Result<(), StorageError> {
-        let budget = timeout.map(|timeout| (Instant::now() + timeout, timeout));
+        let budget = timeout.map(|timeout| (saturating_deadline(Instant::now(), timeout), timeout));
         // Release our own queue reference first; every handle from
         // `producer()` must already be dropped by its owner, otherwise the
         // queue cannot close and the writer would wait forever.
@@ -269,6 +316,22 @@ impl Storage {
 /// [`JoinHandle::is_finished`]; 5 ms bounds the added shutdown latency far
 /// below any meaningful timeout.
 const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Reap budget on a failed startup: a thread already exiting finishes well
+/// inside it; a thread wedged in a blocked SQLite call is detached, which is
+/// unavoidable because there is no portable way to cancel it.
+const STARTUP_REAP_BUDGET: Duration = Duration::from_secs(2);
+
+/// Waits briefly for a thread exiting after a startup failure, then joins it.
+fn reap_startup<T>(handle: JoinHandle<T>) {
+    let deadline = saturating_deadline(Instant::now(), STARTUP_REAP_BUDGET);
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(JOIN_POLL_INTERVAL);
+    }
+    if handle.is_finished() {
+        let _ = handle.join();
+    }
+}
 
 fn wait_finished<T>(
     handle: Option<&JoinHandle<T>>,

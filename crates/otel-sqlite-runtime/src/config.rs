@@ -93,6 +93,13 @@ pub struct WatchdogConfig {
     /// `durability = "commit"` deployments; keep it well above the largest
     /// expected commit gap.
     pub ack_stall_after: Duration,
+    /// How long a single maintenance operation (checkpoint, prune, vacuum,
+    /// FTS rebuild, quota eviction) may run before the watchdog treats it as
+    /// a genuine hang. While maintenance is in progress the ordinary stall
+    /// rules are suspended — the writer legitimately stops committing — so
+    /// this is the only bound on it. Must exceed the longest expected
+    /// `VACUUM`/rebuild.
+    pub maintenance_stall_after: Duration,
     /// Fraction of the command queue depth treated as saturation pressure
     /// (`0.0 < r <= 1.0`). Reaching it reports degraded even while progress
     /// continues — the "SQLite is slow" signal. Clamped into range.
@@ -111,6 +118,7 @@ impl Default for WatchdogConfig {
             degraded_after: Duration::from_secs(30),
             unhealthy_after: Duration::from_secs(120),
             ack_stall_after: Duration::from_secs(60),
+            maintenance_stall_after: Duration::from_secs(30 * 60),
             queue_pressure_ratio: 0.75,
             halt_on_unhealthy: true,
         }

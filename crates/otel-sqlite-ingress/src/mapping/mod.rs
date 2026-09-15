@@ -47,7 +47,8 @@ pub mod pb {
 
 pub(crate) use common::{
     attribute_value, attributes, check_any_value, check_attributes, check_plain_string,
-    convert_resource, parse_span_id, parse_trace_id,
+    check_scope_expansion, convert_resource, parse_span_id, parse_trace_id, scope_metadata_bytes,
+    timestamp,
 };
 
 // Imported here so signal mapping modules can refer to them as

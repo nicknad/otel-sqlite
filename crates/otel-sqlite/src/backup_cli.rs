@@ -52,52 +52,82 @@ pub struct VerifyArgs {
 }
 
 /// Parses `backup` arguments. Flags: `--db PATH`, `--out DIR`, `--keep N`,
-/// `--key-file PATH`, `--json`.
+/// `--key-file PATH`, `--json`. Every flag may be given at most once; a
+/// value-less flag or a value that looks like another flag is an error.
 pub fn parse_backup_args(args: &[String]) -> Result<BackupArgs> {
-    let mut parsed = BackupArgs {
-        db: PathBuf::from(DEFAULT_DB_PATH),
-        out_dir: PathBuf::from(DEFAULT_BACKUP_DIR),
-        keep: DEFAULT_KEEP,
-        key_file: None,
-        json: false,
-    };
+    let mut db: Option<PathBuf> = None;
+    let mut out_dir: Option<PathBuf> = None;
+    let mut keep: Option<usize> = None;
+    let mut key_file: Option<PathBuf> = None;
+    let mut json = false;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         match flag.as_str() {
-            "--json" => parsed.json = true,
-            "--db" => parsed.db = PathBuf::from(value(flag, &mut iter)?),
-            "--out" => parsed.out_dir = PathBuf::from(value(flag, &mut iter)?),
-            "--key-file" => parsed.key_file = Some(PathBuf::from(value(flag, &mut iter)?)),
+            "--json" => {
+                if json {
+                    bail!("flag --json was given more than once");
+                }
+                json = true;
+            }
+            "--db" => set_once(&mut db, PathBuf::from(value(flag, &mut iter)?), "--db")?,
+            "--out" => set_once(
+                &mut out_dir,
+                PathBuf::from(value(flag, &mut iter)?),
+                "--out",
+            )?,
+            "--key-file" => set_once(
+                &mut key_file,
+                PathBuf::from(value(flag, &mut iter)?),
+                "--key-file",
+            )?,
             "--keep" => {
                 let raw = value(flag, &mut iter)?;
-                parsed.keep = raw.parse().with_context(|| {
+                let parsed_keep: usize = raw.parse().with_context(|| {
                     format!("--keep must be a non-negative integer, got `{raw}`")
                 })?;
+                set_once(&mut keep, parsed_keep, "--keep")?;
             }
             other => bail!(
                 "unknown backup flag `{other}` (expected --db, --out, --keep, --key-file, --json)"
             ),
         }
     }
-    Ok(parsed)
+    Ok(BackupArgs {
+        db: db.unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH)),
+        out_dir: out_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_BACKUP_DIR)),
+        keep: keep.unwrap_or(DEFAULT_KEEP),
+        key_file,
+        json,
+    })
 }
 
 /// Parses `restore` arguments. Flags: `--backup PATH`, `--dir DIR`,
 /// `--key-file PATH`, `--json`.
 pub fn parse_restore_args(args: &[String]) -> Result<RestoreArgs> {
-    let mut parsed = RestoreArgs {
-        backup: PathBuf::new(),
-        dir: PathBuf::new(),
-        key_file: None,
-        json: false,
-    };
+    let mut backup: Option<PathBuf> = None;
+    let mut dir: Option<PathBuf> = None;
+    let mut key_file: Option<PathBuf> = None;
+    let mut json = false;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         match flag.as_str() {
-            "--json" => parsed.json = true,
-            "--backup" => parsed.backup = PathBuf::from(value(flag, &mut iter)?),
-            "--dir" => parsed.dir = PathBuf::from(value(flag, &mut iter)?),
-            "--key-file" => parsed.key_file = Some(PathBuf::from(value(flag, &mut iter)?)),
+            "--json" => {
+                if json {
+                    bail!("flag --json was given more than once");
+                }
+                json = true;
+            }
+            "--backup" => set_once(
+                &mut backup,
+                PathBuf::from(value(flag, &mut iter)?),
+                "--backup",
+            )?,
+            "--dir" => set_once(&mut dir, PathBuf::from(value(flag, &mut iter)?), "--dir")?,
+            "--key-file" => set_once(
+                &mut key_file,
+                PathBuf::from(value(flag, &mut iter)?),
+                "--key-file",
+            )?,
             other => {
                 bail!(
                     "unknown restore flag `{other}` (expected --backup, --dir, --key-file, --json)"
@@ -105,43 +135,68 @@ pub fn parse_restore_args(args: &[String]) -> Result<RestoreArgs> {
             }
         }
     }
-    if parsed.backup.as_os_str().is_empty() {
-        bail!("restore requires --backup PATH");
-    }
-    if parsed.dir.as_os_str().is_empty() {
-        bail!("restore requires --dir DIR (must be empty or absent)");
-    }
-    Ok(parsed)
+    let backup = backup.with_context(|| "restore requires --backup PATH")?;
+    let dir = dir.with_context(|| "restore requires --dir DIR (must be empty or absent)")?;
+    Ok(RestoreArgs {
+        backup,
+        dir,
+        key_file,
+        json,
+    })
 }
 
 /// Parses `verify` arguments. Flags: `--db PATH`, `--json`.
 pub fn parse_verify_args(args: &[String]) -> Result<VerifyArgs> {
-    let mut parsed = VerifyArgs {
-        db: PathBuf::from(DEFAULT_DB_PATH),
-        json: false,
-    };
+    let mut db: Option<PathBuf> = None;
+    let mut json = false;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         match flag.as_str() {
-            "--json" => parsed.json = true,
-            "--db" => parsed.db = PathBuf::from(value(flag, &mut iter)?),
+            "--json" => {
+                if json {
+                    bail!("flag --json was given more than once");
+                }
+                json = true;
+            }
+            "--db" => set_once(&mut db, PathBuf::from(value(flag, &mut iter)?), "--db")?,
             other => bail!("unknown verify flag `{other}` (expected --db, --json)"),
         }
     }
-    Ok(parsed)
+    Ok(VerifyArgs {
+        db: db.unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH)),
+        json,
+    })
+}
+
+/// Records a value for `flag`, rejecting a second occurrence instead of
+/// silently letting the last one win.
+fn set_once<T>(slot: &mut Option<T>, value: T, flag: &str) -> Result<()> {
+    if slot.is_some() {
+        bail!("flag {flag} was given more than once");
+    }
+    *slot = Some(value);
+    Ok(())
 }
 
 fn value<'a>(flag: &str, iter: &mut impl Iterator<Item = &'a String>) -> Result<String> {
-    iter.next()
+    let value = iter
+        .next()
         .cloned()
-        .with_context(|| format!("flag {flag} is missing its value"))
+        .with_context(|| format!("flag {flag} is missing its value"))?;
+    if value.starts_with("--") {
+        bail!("flag {flag} is missing its value (`{value}` looks like another flag)");
+    }
+    Ok(value)
 }
 
-fn now_epoch_secs() -> u64 {
+/// Current Unix time, or an explicit error when the system clock is before
+/// the epoch: naming a fresh artifact `1970...` would silently hide a broken
+/// clock and collide with existing backups.
+fn now_epoch_secs() -> Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
-        .unwrap_or_default()
+        .context("system clock is before the Unix epoch; refusing to name a backup artifact")
 }
 
 /// Runs `backup`: take an online snapshot, optionally encrypt it, then prune
@@ -152,7 +207,7 @@ pub fn run_backup(args: &BackupArgs) -> Result<()> {
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("cannot create {}", args.out_dir.display()))?;
 
-    let epoch = now_epoch_secs();
+    let epoch = now_epoch_secs()?;
     let plain = backup::unique_backup_path(&args.out_dir, epoch, false);
     let mut report = backup::backup_to(&args.db, &plain)?;
 
@@ -164,6 +219,13 @@ pub fn run_backup(args: &BackupArgs) -> Result<()> {
         report.backup = encrypted;
         report.encrypted = true;
         report.sha256 = backup::sha256_hex(&report.backup)?;
+        // `report.verify` was computed on the plaintext snapshot, which no
+        // longer exists. Point it at the surviving artifact and align the
+        // digest so the report never describes a deleted file: both `sha256`
+        // fields then cover the final `.otsb` artifact as stored, while the
+        // integrity/row-count fields still describe its decrypted contents.
+        report.verify.path = report.backup.clone();
+        report.verify.sha256 = report.sha256.clone();
     }
 
     let pruned = backup::prune_old_backups(&args.out_dir, args.keep)?;
@@ -356,6 +418,54 @@ mod tests {
     #[test]
     fn parse_backup_rejects_bad_keep() {
         assert!(parse_backup_args(&["--keep".into(), "lots".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_flags() {
+        assert!(
+            parse_backup_args(&["--db".into(), "a".into(), "--db".into(), "b".into()]).is_err()
+        );
+        assert!(
+            parse_backup_args(&["--out".into(), "a".into(), "--out".into(), "b".into()]).is_err()
+        );
+        assert!(
+            parse_backup_args(&["--keep".into(), "1".into(), "--keep".into(), "2".into()]).is_err()
+        );
+        assert!(
+            parse_backup_args(&[
+                "--key-file".into(),
+                "a".into(),
+                "--key-file".into(),
+                "b".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_restore_args(&[
+                "--backup".into(),
+                "a".into(),
+                "--backup".into(),
+                "b".into(),
+                "--dir".into(),
+                "d".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_verify_args(&["--db".into(), "a".into(), "--db".into(), "b".into()]).is_err()
+        );
+        assert!(parse_verify_args(&["--json".into(), "--json".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_flag_like_values_and_missing_values() {
+        // A flag can never consume the next flag as its value.
+        assert!(parse_backup_args(&["--db".into(), "--out".into()]).is_err());
+        assert!(parse_backup_args(&["--out".into()]).is_err());
+        assert!(parse_backup_args(&["--key-file".into(), "--json".into()]).is_err());
+        assert!(parse_verify_args(&["--db".into(), "--json".into()]).is_err());
+        // The `--json` boolean does not consume a following flag either.
+        assert!(parse_verify_args(&["--json".into()]).is_ok());
     }
 
     #[test]

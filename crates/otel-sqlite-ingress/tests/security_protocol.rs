@@ -50,8 +50,8 @@ use otel_sqlite_core::storage::{CommitLedger, DurabilityMode, IngestMessage, Ins
 use otel_sqlite_ingress::mapping::pb::collector::logs::v1::{
     ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
 };
-use otel_sqlite_ingress::mapping::pb::common::v1::AnyValue;
 use otel_sqlite_ingress::mapping::pb::common::v1::any_value::Value as AnyValueKind;
+use otel_sqlite_ingress::mapping::pb::common::v1::{AnyValue, ArrayValue, KeyValue};
 use otel_sqlite_ingress::mapping::pb::logs::v1::{
     LogRecord as ProtoLogRecord, ResourceLogs, ScopeLogs,
 };
@@ -344,6 +344,17 @@ impl BootedServer {
         self.receiver.try_iter().collect()
     }
 
+    /// Total log records observed across enqueued chunks so far.
+    fn enqueued_log_records(&self) -> usize {
+        self.drained()
+            .iter()
+            .map(|message| match message {
+                IngestMessage::Logs(chunk) => chunk.records.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+
     /// Graceful shutdown: halt → drain → serve task returns.
     async fn shutdown(self) {
         let _ = self.halt.send(true);
@@ -392,30 +403,58 @@ async fn client_channel(addr: SocketAddr) -> Channel {
         .expect("client connects")
 }
 
+/// Why a TLS export attempt did not complete. Distinguishing connect/handshake
+/// failures from RPC failures keeps "the server refused this identity" tests
+/// from passing because of an unrelated timeout or RPC error.
+#[derive(Debug)]
+enum TlsProbeError {
+    /// The TLS/HTTP2 connection could not be established (handshake refused,
+    /// connect error, connect timeout).
+    Connect(String),
+    /// The export RPC failed after the connection came up (or timed out).
+    Rpc(String),
+}
+
+impl std::fmt::Display for TlsProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect(detail) => write!(f, "connect/handshake failed: {detail}"),
+            Self::Rpc(detail) => write!(f, "export RPC failed: {detail}"),
+        }
+    }
+}
+
 /// Drives one export over TLS with the given client TLS configuration and
-/// reports whether the FULL call (handshake + RPC) succeeded. A rejected
-/// handshake, a connect timeout, or a failed RPC all count as `false` — the
-/// common shape of every "this identity must be refused" assertion.
-async fn export_over_tls(addr: SocketAddr, tls_config: ClientTlsConfig) -> bool {
+/// reports whether the FULL call (handshake + RPC) succeeded, returning a
+/// typed error naming the failing layer otherwise.
+async fn export_over_tls(
+    addr: SocketAddr,
+    tls_config: ClientTlsConfig,
+) -> Result<(), TlsProbeError> {
     let connected = tokio::time::timeout(
         Duration::from_secs(5),
         Channel::builder(uri_for(addr, true))
             .tls_config(tls_config)
-            .unwrap()
+            .map_err(|error| TlsProbeError::Connect(error.to_string()))?
             .connect(),
     )
     .await;
-    match connected {
-        Ok(Ok(channel)) => {
-            let mut client = LogsServiceClient::new(channel);
-            let rpc = tokio::time::timeout(
-                Duration::from_secs(5),
-                client.export(Request::new(export_request("tls-probe"))),
-            )
-            .await;
-            matches!(rpc, Ok(Ok(_)))
-        }
-        _ => false,
+    let channel = match connected {
+        Ok(Ok(channel)) => channel,
+        Ok(Err(error)) => return Err(TlsProbeError::Connect(error.to_string())),
+        Err(_) => return Err(TlsProbeError::Connect("connect timed out".to_owned())),
+    };
+
+    let mut client = LogsServiceClient::new(channel);
+    let rpc = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.export(Request::new(export_request("tls-probe"))),
+    )
+    .await;
+    match rpc {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(status)) => Err(TlsProbeError::Rpc(status.to_string())),
+        Err(_) => Err(TlsProbeError::Rpc("export timed out".to_owned())),
     }
 }
 
@@ -564,15 +603,19 @@ async fn server_certificate_hostname_san_validation_rejects_wrong_names() {
         .await
         .expect("valid hostname connects");
     let mut good_client = LogsServiceClient::new(good);
-    let response = good_client
+    good_client
         .export(Request::new(export_request("san-ok")))
         .await
         .expect("export with the correct SAN succeeds");
-    assert!(response.into_inner().partial_success.is_none());
+    assert_eq!(
+        server.enqueued_log_records(),
+        1,
+        "the SAN-valid export must reach the ingest queue"
+    );
 
     // A hostname the certificate does NOT cover must fail verification,
     // either during connect or on the first RPC.
-    let succeeded = export_over_tls(
+    let outcome = export_over_tls(
         server.addr,
         ClientTlsConfig::new()
             .ca_certificate(ca)
@@ -580,8 +623,8 @@ async fn server_certificate_hostname_san_validation_rejects_wrong_names() {
     )
     .await;
     assert!(
-        !succeeded,
-        "a client using a hostname absent from the server SANs must never export"
+        outcome.is_err(),
+        "a client using a hostname absent from the server SANs must never export (got {outcome:?})"
     );
 
     server.shutdown().await;
@@ -612,11 +655,15 @@ async fn missing_and_invalid_bearer_tokens_are_rejected_over_the_wire() {
     let mut client = LogsServiceClient::new(client_channel(server.addr).await);
 
     // Valid token: accepted.
-    let response = client
+    client
         .export(bearer("good-token", "valid"))
         .await
         .expect("valid token accepted");
-    assert!(response.into_inner().partial_success.is_none());
+    assert_eq!(
+        server.enqueued_log_records(),
+        1,
+        "the authorized export must reach the ingest queue"
+    );
 
     // Invalid token: rejected and the presented value is not echoed back.
     let status = client
@@ -669,7 +716,7 @@ async fn client_certificate_signed_by_the_wrong_ca_is_rejected() {
 
     // The client trusts the real CA (for the server cert) but presents an
     // identity signed by the rogue CA. The server must refuse the handshake.
-    let succeeded = export_over_tls(
+    let outcome = export_over_tls(
         server.addr,
         ClientTlsConfig::new()
             .ca_certificate(TlsCertificate::from_pem(
@@ -683,8 +730,8 @@ async fn client_certificate_signed_by_the_wrong_ca_is_rejected() {
     )
     .await;
     assert!(
-        !succeeded,
-        "a client certificate signed by an untrusted CA must never connect"
+        outcome.is_err(),
+        "a client certificate signed by an untrusted CA must never connect (got {outcome:?})"
     );
 
     server.shutdown().await;
@@ -738,11 +785,15 @@ async fn mtls_and_bearer_token_guard_the_ingress_together() {
         .await
         .expect("mTLS client connects");
     let mut client = LogsServiceClient::new(channel);
-    let response = client
+    client
         .export(bearer("good-token", "mtls-ok"))
         .await
         .expect("valid identity + valid token accepted");
-    assert!(response.into_inner().partial_success.is_none());
+    assert_eq!(
+        server.enqueued_log_records(),
+        1,
+        "the mTLS + token export must reach the ingest queue"
+    );
 
     // Same identity, invalid token: the token check still applies.
     let status = client
@@ -752,7 +803,7 @@ async fn mtls_and_bearer_token_guard_the_ingress_together() {
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 
     // No client certificate at all: the server refuses the handshake.
-    let succeeded = export_over_tls(
+    let outcome = export_over_tls(
         server.addr,
         ClientTlsConfig::new()
             .ca_certificate(ca)
@@ -760,8 +811,8 @@ async fn mtls_and_bearer_token_guard_the_ingress_together() {
     )
     .await;
     assert!(
-        !succeeded,
-        "connections without a client certificate must never export under mTLS"
+        outcome.is_err(),
+        "connections without a client certificate must never export under mTLS (got {outcome:?})"
     );
 
     server.shutdown().await;
@@ -792,7 +843,7 @@ async fn expired_server_certificate_is_rejected_by_clients() {
 
     // The client trusts the CA, but the leaf is expired (valid only during
     // 2000-2001): rustls must reject it on validity, not trust.
-    let succeeded = export_over_tls(
+    let outcome = export_over_tls(
         server.addr,
         ClientTlsConfig::new()
             .ca_certificate(TlsCertificate::from_pem(
@@ -802,8 +853,8 @@ async fn expired_server_certificate_is_rejected_by_clients() {
     )
     .await;
     assert!(
-        !succeeded,
-        "an expired server certificate must never be trusted by a client"
+        outcome.is_err(),
+        "an expired server certificate must never be trusted by a client (got {outcome:?})"
     );
 
     server.shutdown().await;
@@ -834,7 +885,7 @@ async fn expired_client_certificate_is_rejected_by_mtls() {
 
     // The client presents an identity signed by the trusted CA, but it
     // expired years ago: the mTLS handshake must refuse it.
-    let succeeded = export_over_tls(
+    let outcome = export_over_tls(
         server.addr,
         ClientTlsConfig::new()
             .ca_certificate(TlsCertificate::from_pem(
@@ -848,8 +899,8 @@ async fn expired_client_certificate_is_rejected_by_mtls() {
     )
     .await;
     assert!(
-        !succeeded,
-        "an expired client certificate must never pass the mTLS handshake"
+        outcome.is_err(),
+        "an expired client certificate must never pass the mTLS handshake (got {outcome:?})"
     );
 
     server.shutdown().await;
@@ -1046,23 +1097,14 @@ async fn gzip_compressed_otlp_requests_are_accepted_and_processed() {
     // default; the real serve wiring accepts it via `accept_compressed`.
     let channel = client_channel(server.addr).await;
     let mut client = LogsServiceClient::new(channel).send_compressed(CompressionEncoding::Gzip);
-    let response = client
+    client
         .export(Request::new(export_request("gzip-body")))
         .await
         .expect("gzip-compressed export accepted");
-    assert!(response.into_inner().partial_success.is_none());
 
     // Prove the decompressed request was actually mapped and handed off.
-    let enqueued_records: usize = server
-        .drained()
-        .iter()
-        .map(|message| match message {
-            IngestMessage::Logs(chunk) => chunk.records.len(),
-            _ => 0,
-        })
-        .sum();
     assert!(
-        enqueued_records >= 1,
+        server.enqueued_log_records() >= 1,
         "the decompressed request must reach the ingest queue"
     );
 
@@ -1103,11 +1145,14 @@ async fn requests_above_max_recv_msg_size_are_rejected_with_out_of_range() {
     );
 
     // The server stays healthy and a small request still succeeds.
-    let response = client
+    client
         .export(Request::new(export_request("small")))
         .await
         .expect("a request within the limit is accepted after a rejected one");
-    assert!(response.into_inner().partial_success.is_none());
+    assert!(
+        server.enqueued_log_records() >= 1,
+        "the accepted request must reach the ingest queue after a rejected one"
+    );
 
     server.shutdown().await;
 }
@@ -1127,16 +1172,30 @@ async fn malformed_otlp_payloads_return_clean_errors_and_never_panic_the_server(
 
     let mut client = LogsServiceClient::new(client_channel(server.addr).await);
 
-    // Semantically malformed payload: a wrong-length trace id must surface as
-    // INVALID_ARGUMENT (all-or-nothing, nothing enqueued), never a panic.
+    // Semantically malformed payload: an attribute nested past the supported
+    // depth must surface as INVALID_ARGUMENT with nothing enqueued, never a
+    // panic. (Invalid trace/span ids are NOT malformed anymore: per the OTLP
+    // spec they map to no trace context and the request is accepted.)
     // Arbitrary-byte protobuf decode is additionally fuzzed by
     // `fuzz/logs_ingress_export` / `fuzz/metrics_ingress_export`, which assert
     // the no-panic invariant across the whole decode→map→enqueue path.
+    let mut deep = AnyValue {
+        value: Some(AnyValueKind::StringValue("leaf".to_owned())),
+    };
+    for _ in 0..40 {
+        deep = AnyValue {
+            value: Some(AnyValueKind::ArrayValue(ArrayValue { values: vec![deep] })),
+        };
+    }
     let malformed = ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
             scope_logs: vec![ScopeLogs {
                 log_records: vec![ProtoLogRecord {
-                    trace_id: vec![1, 2],
+                    attributes: vec![KeyValue {
+                        key: "deep".to_owned(),
+                        value: Some(deep),
+                        ..Default::default()
+                    }],
                     ..ProtoLogRecord::default()
                 }],
                 ..ScopeLogs::default()
@@ -1149,13 +1208,21 @@ async fn malformed_otlp_payloads_return_clean_errors_and_never_panic_the_server(
         .await
         .expect_err("malformed request rejected");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        server.enqueued_log_records(),
+        0,
+        "a rejected request must enqueue nothing"
+    );
 
     // The server must keep serving after hostile input.
-    let response = client
+    client
         .export(Request::new(export_request("after-malformed")))
         .await
         .expect("server keeps serving after malformed input");
-    assert!(response.into_inner().partial_success.is_none());
+    assert!(
+        server.enqueued_log_records() >= 1,
+        "the server must keep accepting valid exports after hostile input"
+    );
 
     server.shutdown().await;
 }
@@ -1210,12 +1277,12 @@ async fn bearer_credentials_never_escape_into_logs_metrics_status_or_database() 
 
     let mut client = LogsServiceClient::new(client_channel(addr).await);
 
-    // A valid export whose commit is durable before the response returns.
-    let response = client
+    // A valid export whose commit is durable before the response returns;
+    // the database scan below proves the record was actually persisted.
+    client
         .export(bearer(token, marker))
         .await
         .expect("authorized export accepted");
-    assert!(response.into_inner().partial_success.is_none());
 
     // An unauthorized one, whose status text must not echo the token.
     let presented = "attacker-token-77";

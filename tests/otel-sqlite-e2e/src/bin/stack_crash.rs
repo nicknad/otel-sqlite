@@ -54,7 +54,7 @@ enum Command {
         duration_secs: u64,
         #[arg(long, default_value_t = 4)]
         clients: usize,
-        #[arg(long, default_value_t = 500)]
+        #[arg(long, default_value_t = 500, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
         records_per_request: usize,
         #[arg(long, default_value_t = 7)]
         seed: u64,

@@ -16,19 +16,10 @@
 //! exit path, including panics. The watchdog only ever reads these values;
 //! nothing here blocks or wakes the observed threads.
 
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
 
 use otel_sqlite_core::storage::CommitLedger;
-
-/// Process-wide epoch for monotonic health timestamps. Values are comparable
-/// across threads because everyone converts through this same instant.
-static MONOTONIC_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
-
-pub(crate) fn monotonic_millis() -> u64 {
-    u64::try_from(LazyLock::force(&MONOTONIC_EPOCH).elapsed().as_millis()).unwrap_or(u64::MAX)
-}
+use otel_sqlite_core::time::monotonic_millis;
 
 /// Writer-side counters (`writer` thread).
 ///
@@ -56,6 +47,15 @@ pub(crate) struct WriterStats {
     /// Monotonic ms of the last successful command execution (commit,
     /// checkpoint or maintenance operation).
     pub last_progress_ms: AtomicU64,
+    /// True while the writer is executing a maintenance-class command
+    /// (checkpoint, prune, vacuum, FTS rebuild, quota eviction). During that
+    /// window insert commits legitimately stop, so the watchdog must not
+    /// apply its ordinary stall rules.
+    pub maintenance_in_progress: AtomicBool,
+    /// Monotonic ms at which the current maintenance operation started;
+    /// `0` while none is in progress. Used to bound a genuinely hung
+    /// maintenance call.
+    pub maintenance_started_ms: AtomicU64,
     /// False while the writer thread is not running; cleared by a drop guard
     /// so early returns and panics are both covered.
     pub running: AtomicBool,
@@ -81,6 +81,28 @@ impl WriterStats {
     pub(crate) fn running_guard(&self) -> RunningGuard<'_> {
         RunningGuard::new(&self.running)
     }
+
+    /// Publishes "maintenance in progress" until the returned guard is
+    /// dropped (or unwound), timestamping the start for stall detection.
+    pub(crate) fn maintenance_guard(&self) -> MaintenanceGuard<'_> {
+        self.maintenance_started_ms
+            .store(monotonic_millis(), Ordering::Relaxed);
+        self.maintenance_in_progress.store(true, Ordering::Relaxed);
+        MaintenanceGuard(self)
+    }
+}
+
+/// RAII maintenance flag: set on creation, cleared (with the start timestamp)
+/// on drop, covering normal returns, `?` and panics alike.
+pub(crate) struct MaintenanceGuard<'a>(&'a WriterStats);
+
+impl Drop for MaintenanceGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .maintenance_in_progress
+            .store(false, Ordering::Relaxed);
+        self.0.maintenance_started_ms.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Insert-batcher counters (`batcher` thread), surfaced through
@@ -98,6 +120,11 @@ pub struct BatcherStats {
     pub batches_emitted: AtomicU64,
     pub timer_flushes: AtomicU64,
     pub buffered_records: AtomicUsize,
+    /// Command-queue depth as observed by the producer after each submission.
+    /// The writer's own `queue_depth` is only refreshed at the top of its
+    /// loop, so it goes stale while a long command executes; the watchdog
+    /// takes the max of the two to avoid under-reporting backlog.
+    pub queued_commands: AtomicUsize,
     pub dropped_records: AtomicU64,
     /// Monotonic ms of the last chunk received or batch submitted.
     pub last_progress_ms: AtomicU64,
@@ -151,9 +178,11 @@ impl Drop for RunningGuard<'_> {
 
 /// Cheap, cloneable probe over pipeline liveness and progress evidence.
 ///
-/// Holds only `Arc`s to the threads' atomic stat structs; `sample()` is a
-/// lock-free read suitable for polling from a watchdog thread even while the
-/// observed components are blocked or wedged.
+/// Holds only `Arc`s to the threads' stat structs. `sample()` reads the
+/// writer/batcher atomics without blocking and additionally takes the commit
+/// ledger's short-lived mutex for ticket progress; it never touches SQLite or
+/// waits on pipeline work, so it stays suitable for a watchdog thread even
+/// while the observed components are blocked or wedged.
 #[derive(Clone, Debug)]
 pub struct StorageHealth {
     pub(crate) writer: std::sync::Arc<WriterStats>,
@@ -165,10 +194,12 @@ pub struct StorageHealth {
 impl StorageHealth {
     /// Reads one consistent-enough point-in-time sample of health evidence.
     ///
-    /// Fields are individually atomic reads (relaxed ordering); they are
-    /// diagnostics for a watchdog evaluator, not a transactional snapshot.
+    /// Fields are individually atomic reads (relaxed ordering) plus two
+    /// short ledger lock acquisitions; they are diagnostics for a watchdog
+    /// evaluator, not a transactional snapshot. No I/O and no blocking.
     pub fn sample(&self) -> StorageHealthSample {
         let now = monotonic_millis();
+        let maintenance_started_ms = self.writer.maintenance_started_ms.load(Ordering::Relaxed);
         StorageHealthSample {
             writer_running: self.writer.running.load(Ordering::Relaxed),
             batcher_running: self.batcher.running.load(Ordering::Relaxed),
@@ -176,11 +207,21 @@ impl StorageHealth {
                 .saturating_sub(self.writer.last_progress_ms.load(Ordering::Relaxed)),
             batcher_idle_ms: now
                 .saturating_sub(self.batcher.last_progress_ms.load(Ordering::Relaxed)),
-            queue_depth: self.writer.queue_depth.load(Ordering::Relaxed),
+            queue_depth: self
+                .writer
+                .queue_depth
+                .load(Ordering::Relaxed)
+                .max(self.batcher.queued_commands.load(Ordering::Relaxed)),
             queue_capacity: self.queue_capacity,
             buffered_records: self.batcher.buffered_records.load(Ordering::Relaxed),
             outstanding_commit_tickets: self.ledger.outstanding_tickets(),
             watermark_idle_ms: now.saturating_sub(self.ledger.last_advance_ms()),
+            maintenance_in_progress: self.writer.maintenance_in_progress.load(Ordering::Relaxed),
+            maintenance_elapsed_ms: if maintenance_started_ms == 0 {
+                0
+            } else {
+                now.saturating_sub(maintenance_started_ms)
+            },
         }
     }
 }
@@ -216,6 +257,12 @@ pub struct StorageHealthSample {
     /// Combined with `outstanding_commit_tickets` this detects a stuck
     /// durability watermark.
     pub watermark_idle_ms: u64,
+    /// Whether a maintenance-class command is currently executing on the
+    /// writer. Ordinary stall verdicts must be suspended while this is true.
+    pub maintenance_in_progress: bool,
+    /// Milliseconds since the current maintenance operation started; `0`
+    /// when none is in progress. Bounds a genuinely hung maintenance call.
+    pub maintenance_elapsed_ms: u64,
 }
 
 /// Point-in-time view of every pipeline counter, produced by

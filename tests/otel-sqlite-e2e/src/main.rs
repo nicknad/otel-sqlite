@@ -110,12 +110,14 @@ struct Args {
     #[arg(long)]
     clients: Option<usize>,
 
-    /// Override records-per-request for the selected scenario.
-    #[arg(long)]
+    /// Override records-per-request for the selected scenario (at least 1;
+    /// 0 would make every request carry zero records).
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     records_per_request: Option<usize>,
 
-    /// Override offered records/second where the scenario supports it.
-    #[arg(long)]
+    /// Override offered records/second where the scenario supports it (at
+    /// least 1; 0 would mean an unbounded, unthrottled run).
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
     rate: Option<u64>,
 
     /// Write machine-readable results as JSON to this path.
@@ -126,7 +128,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     keep_going: bool,
 
-    /// Keep the embedded-mode data directory after exit (debugging aid).
+    /// Keep the embedded-mode data directory after exit (debugging aid). An
+    /// explicit --data-dir is always retained: the harness never deletes a
+    /// directory the operator named.
     #[arg(long, default_value_t = false)]
     keep_data: bool,
 
@@ -280,6 +284,20 @@ async fn wait_for_endpoint(endpoint: &str, timeout: Duration) -> Result<()> {
     }
 }
 
+/// Pre-run database state: `"fresh"` when the file does not exist yet,
+/// otherwise `"pre-populated"` plus the pre-existing row count.
+///
+/// Must be called BEFORE an embedded server boots: startup opens and migrates
+/// the database, so probing afterwards would label every run pre-populated.
+async fn probe_database_state(db_path: &Path) -> Result<(&'static str, u64)> {
+    if !db_path.exists() {
+        return Ok(("fresh", 0));
+    }
+    let probe_path = db_path.to_path_buf();
+    let rows = tokio::task::spawn_blocking(move || db::count_all_log_events(&probe_path)).await??;
+    Ok(("pre-populated", rows))
+}
+
 /// Owns the temporary data directory for embedded runs; deletes it on drop
 /// unless retention was requested.
 struct TempDirGuard {
@@ -336,38 +354,33 @@ async fn main() -> Result<()> {
     let mut embedded_server: Option<Arc<server::EmbeddedServer>> = None;
     let mut _temp_guard: Option<TempDirGuard> = None;
 
-    let (endpoint, db_path, execution_mode) = if let Some(url) = &args.endpoint {
-        let db_path = args
-            .db_path
-            .clone()
-            .context("--db-path is required with --endpoint (validation needs the database)")?;
-        wait_for_endpoint(url, Duration::from_secs(30)).await?;
-        (url.clone(), db_path, "native-external")
-    } else {
-        let guard = TempDirGuard::create(
-            args.data_dir.clone(),
-            args.keep_data || args.data_dir.is_some(),
-        )?;
-        println!("embedded data dir: {}", guard.path().display());
-        let started = server::EmbeddedServer::start(&args.listen, guard.path()).await?;
-        let endpoint = started.endpoint().to_owned();
-        let db_path = started.db_path().to_path_buf();
-        embedded_server = Some(Arc::new(started));
-        _temp_guard = Some(guard);
-        (endpoint, db_path, "native-embedded")
-    };
-
-    let database_state = if db_path.exists() {
-        "pre-populated"
-    } else {
-        "fresh"
-    };
-    let pre_existing_rows = if db_path.exists() {
-        let probe_path = db_path.clone();
-        tokio::task::spawn_blocking(move || db::count_all_log_events(&probe_path)).await??
-    } else {
-        0
-    };
+    let (endpoint, db_path, execution_mode, database_state, pre_existing_rows) =
+        if let Some(url) = &args.endpoint {
+            let db_path = args
+                .db_path
+                .clone()
+                .context("--db-path is required with --endpoint (validation needs the database)")?;
+            wait_for_endpoint(url, Duration::from_secs(30)).await?;
+            let (state, rows) = probe_database_state(&db_path).await?;
+            (url.clone(), db_path, "native-external", state, rows)
+        } else {
+            let guard = TempDirGuard::create(
+                args.data_dir.clone(),
+                args.keep_data || args.data_dir.is_some(),
+            )?;
+            println!("embedded data dir: {}", guard.path().display());
+            // The embedded server migrates/creates the database during startup,
+            // so probe the state BEFORE booting it; afterwards every path
+            // would misleadingly report "pre-populated".
+            let db_path = guard.path().join("otel-logs.db");
+            let (state, rows) = probe_database_state(&db_path).await?;
+            let started = server::EmbeddedServer::start(&args.listen, guard.path()).await?;
+            let endpoint = started.endpoint().to_owned();
+            let db_path = started.db_path().to_path_buf();
+            embedded_server = Some(Arc::new(started));
+            _temp_guard = Some(guard);
+            (endpoint, db_path, "native-embedded", state, rows)
+        };
 
     let environment = EnvironmentInfo {
         benchmark_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -379,7 +392,7 @@ async fn main() -> Result<()> {
         cpu_model: cpu_model(),
         ram_bytes: ram_bytes(),
         sqlite_version: rusqlite::version().to_owned(),
-        sqlite_synchronous: server::production_defaults::sync_mode().as_str().to_owned(),
+        sqlite_synchronous: server::benchmark_profile::sync_mode().as_str().to_owned(),
         execution_mode: execution_mode.to_owned(),
         docker: is_docker(),
         database_state: database_state.to_owned(),

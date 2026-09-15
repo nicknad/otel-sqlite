@@ -2,8 +2,8 @@
 
 Design contract and invariants of otel-sqlite. Operational guides live in
 [`README.md`](../README.md) and [`docs/operations/`](operations/); performance
-background in [`docs/performance.md`](performance.md); open work in
-[`TODO.md`](../TODO.md).
+background in [`docs/performance.md`](performance.md); open work is tracked in
+the [issue tracker](https://github.com/nicknad/otel-sqlite/issues).
 
 ## 1. Product contract
 
@@ -30,8 +30,8 @@ The production contract:
 
 Acceptance budgets (sustained records/second, p99/p99.9 latency, maximum queue
 depth, restart recovery time, maximum WAL growth, memory limit, allowed loss
-policy for ambiguous requests) must be agreed before release — tracked in
-[`TODO.md`](../TODO.md).
+policy for ambiguous requests) must be agreed before release — tracked in the
+[issue tracker](https://github.com/nicknad/otel-sqlite/issues).
 
 ## 2. Design invariants
 
