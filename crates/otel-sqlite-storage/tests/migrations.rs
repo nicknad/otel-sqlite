@@ -25,8 +25,9 @@ fn historic_db(path: &std::path::Path, version: &str) {
     drop(conn);
 }
 
-/// Inserts representative logs and metrics using only columns that exist in
-/// every schema version (000-era columns; 003 columns are added later).
+/// Inserts representative logs and (pre-005) metrics using only columns that
+/// exist in every historic schema version (000-era; 003 columns are added
+/// later). The metric rows exercise migration 005's drop of populated tables.
 fn seed(conn: &Connection) {
     conn.execute_batch(
         "INSERT INTO log_resource (id, service_name, host_name, schema_url, attributes_json)
@@ -78,9 +79,9 @@ fn scalar(conn: &Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |row| row.get(0)).unwrap()
 }
 
-/// Asserts the post-upgrade database: current schema stamp, preserved data,
-/// backfilled search index, clean integrity/foreign keys, and the 003 columns
-/// visible on the read-side views.
+/// Asserts the post-upgrade database: current schema stamp, preserved log
+/// data, the metric objects dropped by 005, backfilled search index, clean
+/// integrity/foreign keys, and the 003 columns visible on the read-side view.
 fn assert_upgraded(path: &std::path::Path) {
     let conn = Connection::open(path).expect("open upgraded db");
 
@@ -91,7 +92,7 @@ fn assert_upgraded(path: &std::path::Path) {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "004", "upgrade must land on the current schema");
+    assert_eq!(version, "005", "upgrade must land on the current schema");
 
     let applied: Vec<String> = conn
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -105,25 +106,28 @@ fn assert_upgraded(path: &std::path::Path) {
         "migration stamps must be applied in order: {applied:?}"
     );
 
-    // Data preserved.
+    // Log data preserved.
     assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM log_event"), 2);
     assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM log_resource"), 1);
-    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM scope"), 1);
-    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM metric"), 1);
-    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM metric_series"), 1);
-    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM metric_data_point"), 1);
     let body: String = conn
         .query_row("SELECT body FROM log_event WHERE id = 1", [], |row| {
             row.get(0)
         })
         .unwrap();
     assert_eq!(body, "payment failed");
-    let point_value: i64 = conn
-        .query_row("SELECT int_value FROM metric_data_point", [], |row| {
-            row.get(0)
-        })
+
+    // Every metric schema object is gone, with no leftover rows.
+    let metric_objects: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+                 'scope', 'metric', 'metric_series', 'metric_data_point',
+                 'metrics', 'metric_buckets'
+             )",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
-    assert_eq!(point_value, 42);
+    assert_eq!(metric_objects, 0, "005 must drop the metric schema objects");
 
     // The search index is backfilled and searchable without a rebuild.
     assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM logs_fts"), 2);
@@ -149,7 +153,7 @@ fn assert_upgraded(path: &std::path::Path) {
         .count() as i64;
     assert_eq!(fk_violations, 0);
 
-    // 003 columns exist and the read-side views expose them with defaults.
+    // 003 columns exist and the read-side view exposes them with defaults.
     let scope_attributes: String = conn
         .query_row(
             "SELECT scope_attributes_json FROM logs WHERE body = 'payment failed'",
@@ -158,10 +162,6 @@ fn assert_upgraded(path: &std::path::Path) {
         )
         .unwrap();
     assert_eq!(scope_attributes, "{}");
-    let metric_metadata: String = conn
-        .query_row("SELECT metric_metadata FROM metrics", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(metric_metadata, "{}");
 }
 
 /// A database stamped at version 000 upgrades to the current schema with its
@@ -208,7 +208,58 @@ fn database_stamped_002_upgrades_through_current_schema() {
     assert_upgraded(&db);
 }
 
-/// Reopening a current-schema database is a no-op: the stamp stays 004 and the
+/// A database stamped at version 004 — the last schema carrying metric
+/// tables — upgrades by dropping every metric object and keeping the logs.
+#[test]
+fn database_stamped_004_drops_metrics_and_keeps_logs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("otel-logs.db");
+    historic_db(&db, "004");
+
+    // The 004 snapshot really does carry the metric objects and rows.
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM metric_data_point"), 1);
+    drop(conn);
+
+    upgrade_via_storage_open(&db);
+    assert_upgraded(&db);
+}
+
+/// A brand-new database is created at the current schema and never contains
+/// metric objects.
+#[test]
+fn fresh_database_has_no_metric_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("otel-logs.db");
+
+    let (sender, receiver) = unbounded();
+    let mut storage = Storage::open(
+        receiver,
+        StorageConfig {
+            sqlite_path: db.clone(),
+            ..StorageConfig::default()
+        },
+    )
+    .expect("fresh storage opens");
+    drop(sender);
+    storage.join().expect("storage joins cleanly");
+
+    let conn = Connection::open(&db).unwrap();
+    let metric_objects: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+                 'scope', 'metric', 'metric_series', 'metric_data_point',
+                 'metrics', 'metric_buckets', 'idx_metric_dp_timestamp'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(metric_objects, 0, "a fresh schema is logs-only");
+    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM log_event"), 0);
+}
+
+/// Reopening a current-schema database is a no-op: the stamp stays 005 and the
 /// data is untouched — upgrades are idempotent for already-current databases.
 #[test]
 fn current_schema_reopen_is_idempotent() {
@@ -252,7 +303,7 @@ fn newer_recorded_schema_version_is_rejected() {
                 "message must name the offending version: {message}"
             );
             assert!(
-                message.contains("004"),
+                message.contains("005"),
                 "message must name the newest supported version: {message}"
             );
         }
@@ -262,7 +313,7 @@ fn newer_recorded_schema_version_is_rejected() {
 }
 
 /// A capped migration run refuses to go beyond its target version: building a
-/// version-000 database must not apply 001-003 even though the SQL is present.
+/// version-000 database must not apply 001-005 even though the SQL is present.
 #[test]
 fn migrate_up_to_stops_at_the_target_version() {
     let dir = tempfile::tempdir().unwrap();

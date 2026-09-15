@@ -33,6 +33,12 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/004_metric_identity_temporality.sql"),
         disable_foreign_keys: true,
     },
+    Migration {
+        version: "005",
+        description: "Logs-only sink: drop metric tables, views and indexes",
+        sql: include_str!("../migrations/005_drop_metrics_signal.sql"),
+        disable_foreign_keys: false,
+    },
 ];
 
 struct Migration {

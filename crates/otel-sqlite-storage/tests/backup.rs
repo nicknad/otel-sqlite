@@ -101,7 +101,7 @@ fn backup_matches_source_and_restores_into_a_clean_directory() {
     assert!(!report.encrypted);
     assert_eq!(report.verify.integrity, "ok");
     assert_eq!(report.verify.foreign_key_violations, 0);
-    assert_eq!(report.verify.schema_version.as_deref(), Some("004"));
+    assert_eq!(report.verify.schema_version.as_deref(), Some("005"));
     assert_eq!(
         report.verify.row_counts, source.row_counts,
         "snapshot row counts must match the source exactly"
@@ -121,7 +121,7 @@ fn backup_matches_source_and_restores_into_a_clean_directory() {
     );
     assert_eq!(
         restored.verified_after.schema_version.as_deref(),
-        Some("004")
+        Some("005")
     );
     assert_eq!(restored.verified_after.integrity, "ok");
     assert_eq!(restored.verified_after.foreign_key_violations, 0);

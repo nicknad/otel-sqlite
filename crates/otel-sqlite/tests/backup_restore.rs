@@ -252,7 +252,7 @@ async fn backup_restore_round_trip_against_the_external_binary() {
         "restore must contain exactly the snapshot rows"
     );
     assert_eq!(
-        restore_report["verified_after"]["schema_version"], "004",
+        restore_report["verified_after"]["schema_version"], "005",
         "restored database must carry the current schema"
     );
 
@@ -286,7 +286,7 @@ async fn backup_restore_round_trip_against_the_external_binary() {
         restored_rows + outcome_b.counters.records_accepted as i64,
         "rows written after restore must add to the restored base"
     );
-    assert_eq!(after_restart.schema_version.as_deref(), Some("004"));
+    assert_eq!(after_restart.schema_version.as_deref(), Some("005"));
 
     let _ = kill_process(&mut server2);
 }
@@ -375,7 +375,7 @@ async fn encrypted_backup_restore_against_the_external_binary() {
         snapshot_rows
     );
     assert_eq!(restore_report["verified_after"]["integrity"], "ok");
-    assert_eq!(restore_report["verified_after"]["schema_version"], "004");
+    assert_eq!(restore_report["verified_after"]["schema_version"], "005");
 }
 
 /// `verify` must exit non-zero on a corrupted database — the exit code is the
