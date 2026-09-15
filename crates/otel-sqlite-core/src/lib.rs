@@ -5,10 +5,9 @@ pub mod model;
 pub mod storage;
 pub mod time;
 
-pub use model::{LogBatch, LogRecord, MetricBatch, MetricRecord};
+pub use model::{LogBatch, LogRecord};
 pub use storage::{
     BatchOrigin, BatchOutput, CommitLedger, DurabilityMode, IngestMessage, InsertBatcher,
-    InsertBatcherConfig, LogChunk, LogWriteBatch, MetricChunk, MetricWriteBatch, SyncMode,
-    Watermark, WriteBatch, WriteCommand,
+    InsertBatcherConfig, LogChunk, LogWriteBatch, SyncMode, Watermark, WriteBatch, WriteCommand,
 };
 pub use time::{monotonic_millis, saturating_deadline, unix_nano_now};

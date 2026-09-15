@@ -261,13 +261,9 @@ fn print_backup_summary(report: &BackupReport) {
             .unwrap_or("(not an otel-sqlite database)")
     );
     println!(
-        "  rows:        log_events={} log_resources={} metric_points={} metric_series={} metrics={} scopes={} fts={}",
+        "  rows:        log_events={} log_resources={} fts={}",
         report.verify.row_counts.log_events,
         report.verify.row_counts.log_resources,
-        report.verify.row_counts.metric_points,
-        report.verify.row_counts.metric_series,
-        report.verify.row_counts.metrics,
-        report.verify.row_counts.scopes,
         report.verify.row_counts.fts_rows,
     );
 }
@@ -323,8 +319,8 @@ fn print_restore_summary(report: &RestoreReport) {
             .unwrap_or("(none)")
     );
     println!(
-        "  rows:            log_events={} metric_points={}",
-        report.verified_after.row_counts.log_events, report.verified_after.row_counts.metric_points
+        "  rows:            log_events={}",
+        report.verified_after.row_counts.log_events
     );
 }
 
@@ -371,14 +367,8 @@ fn print_verify_summary(report: &VerifyReport) {
             .unwrap_or("(not an otel-sqlite database)")
     );
     println!(
-        "  rows:        log_events={} log_resources={} metric_points={} metric_series={} metrics={} scopes={} fts={}",
-        report.row_counts.log_events,
-        report.row_counts.log_resources,
-        report.row_counts.metric_points,
-        report.row_counts.metric_series,
-        report.row_counts.metrics,
-        report.row_counts.scopes,
-        report.row_counts.fts_rows,
+        "  rows:        log_events={} log_resources={} fts={}",
+        report.row_counts.log_events, report.row_counts.log_resources, report.row_counts.fts_rows,
     );
     println!("  sha256:      {}", report.sha256);
 }

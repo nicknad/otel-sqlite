@@ -1,15 +1,15 @@
 //! Stable identity derivation and dimension-table upserts.
 //!
-//! Every entity ID (resource, scope, metric, series) is a SHA-256 fingerprint
-//! over its identifying attributes, so re-ingesting the same dimensions is a
-//! no-op (`ON CONFLICT (id) DO NOTHING`) and joins need no lookup tables.
+//! The resource ID is a SHA-256 fingerprint over its identifying attributes,
+//! so re-ingesting the same dimensions is a no-op
+//! (`ON CONFLICT (id) DO NOTHING`) and joins need no lookup tables.
 //! [`fingerprint_into`] hashes length-prefixed parts to keep boundaries
 //! unambiguous and writes the hex digest into a reused buffer.
 
 use std::fmt::Write as _;
 
-use otel_sqlite_core::model::{Attribute, Resource, Temporality};
-use rusqlite::{Connection, Statement, params};
+use otel_sqlite_core::model::Resource;
+use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
 use super::InsertScratch;
@@ -20,16 +20,6 @@ use crate::error::StorageError;
 const SQL_INSERT_RESOURCE: &str = "
 INSERT INTO log_resource (id, service_name, host_name, schema_url, attributes_json)
 VALUES (?1, ?2, ?3, ?4, ?5)
-ON CONFLICT (id) DO NOTHING";
-
-const SQL_INSERT_SCOPE: &str = "
-INSERT INTO scope (id, resource_id, name, version, schema_url, attributes_json)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-ON CONFLICT (id) DO NOTHING";
-
-const SQL_INSERT_METRIC: &str = "
-INSERT INTO metric (id, scope_id, name, description, unit, type, is_monotonic, aggregation_temporality, metadata_json)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
 ON CONFLICT (id) DO NOTHING";
 
 /// Hashes length-prefixed parts and writes the hex digest into `out`,
@@ -77,86 +67,5 @@ pub(super) fn resolve_resource(
         &*scratch.json,
     ])?;
 
-    Ok(())
-}
-
-pub(super) fn resolve_scope(
-    conn: &Connection,
-    name: &str,
-    version: &str,
-    schema_url: &str,
-    attributes: &[Attribute],
-    scratch: &mut InsertScratch,
-) -> Result<(), StorageError> {
-    // Scope identity includes the schema URL (two scopes that differ only in
-    // schema are distinct) but not the descriptive scope attributes, which
-    // are persisted first-wins like metric description. Writing the scope
-    // attributes into `scratch.json` is safe: resolve_scope runs before any
-    // point attributes overwrite the buffer for the same record.
-    write_attributes_json(attributes, scratch);
-    fingerprint_into(
-        &[scratch.resource_id.as_str(), name, version, schema_url],
-        &mut scratch.scope_id,
-    );
-    conn.prepare_cached(SQL_INSERT_SCOPE)?.execute(params![
-        &*scratch.scope_id,
-        &*scratch.resource_id,
-        non_empty(name),
-        non_empty(version),
-        non_empty(schema_url),
-        &*scratch.json,
-    ])?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn resolve_metric(
-    conn: &Connection,
-    name: &str,
-    description: &str,
-    unit: &str,
-    metadata: &[Attribute],
-    metric_type: i64,
-    is_monotonic: bool,
-    temporality: Temporality,
-    scratch: &mut InsertScratch,
-) -> Result<(), StorageError> {
-    // A delta and a cumulative series with the same descriptor are distinct
-    // metrics: temporality and monotonicity are part of the identity, both in
-    // this fingerprint and in the table's UNIQUE constraint.
-    fingerprint_into(
-        &[
-            scratch.scope_id.as_str(),
-            name,
-            unit,
-            &metric_type.to_string(),
-            &i64::from(is_monotonic).to_string(),
-            &(temporality as u8).to_string(),
-        ],
-        &mut scratch.metric_id,
-    );
-    write_attributes_json(metadata, scratch);
-    conn.prepare_cached(SQL_INSERT_METRIC)?.execute(params![
-        &*scratch.metric_id,
-        &*scratch.scope_id,
-        name,
-        non_empty(description),
-        non_empty(unit),
-        metric_type,
-        i64::from(is_monotonic),
-        i64::from(temporality as u8),
-        &*scratch.json,
-    ])?;
-    Ok(())
-}
-
-pub(super) fn resolve_series(
-    statement: &mut Statement<'_>,
-    metric_id: &str,
-    attributes_json: &str,
-    id_out: &mut String,
-) -> Result<(), StorageError> {
-    fingerprint_into(&[metric_id, attributes_json], id_out);
-    statement.execute(params![&*id_out, metric_id, attributes_json])?;
     Ok(())
 }

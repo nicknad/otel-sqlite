@@ -8,7 +8,7 @@
 
 /// A batch of records sized for one storage transaction.
 ///
-/// `T` is the record type (`LogRecord`, `MetricRecord`, ...). The batch owns
+/// `T` is the record type (`LogRecord`). The batch owns
 /// its records outright so handing it over to a writer never copies payloads.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WriteBatch<T> {
