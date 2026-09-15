@@ -7,7 +7,6 @@
 #   wsl -d Debian -e bash tests/docker/fuzz-wsl.sh setup        # one-time toolchain bootstrap
 #   wsl -d Debian -e bash tests/docker/fuzz-wsl.sh build        # compile all fuzz targets
 #   wsl -d Debian -e bash tests/docker/fuzz-wsl.sh smoke-logs   # 120 s OTLP logs target
-#   wsl -d Debian -e bash tests/docker/fuzz-wsl.sh smoke-metrics
 #   wsl -d Debian -e bash tests/docker/fuzz-wsl.sh smoke-batcher
 #
 # Arbitrary runs / libFuzzer flags:
@@ -21,7 +20,6 @@
 #   on a 2-vCPU WSL2 VM with --debug-assertions:
 #     core_batcher           ~3.6k exec/s   rss ~412 MB
 #     logs_ingress_export    ~1.1k exec/s   rss ~75 MB
-#     metrics_ingress_export ~1.3k exec/s   rss ~76 MB
 #   Reproduce that verification by putting `processors=2` under [wsl2] in
 #   %UserProfile%\.wslconfig, running `wsl --shutdown`, then the three
 #   smoke targets; remove the file and shut down again afterwards.
@@ -114,7 +112,6 @@ case "${1:-help}" in
     setup)          setup ;;
     build)          build_targets ;;
     smoke-logs)     run_target logs_ingress_export  -max_total_time=120 ;;
-    smoke-metrics)  run_target metrics_ingress_export -max_total_time=120 ;;
     smoke-batcher)  run_target core_batcher         -max_total_time=120 ;;
     run)
         [[ $# -ge 2 ]] || { echo "usage: $0 run <target> [libfuzzer args...]" >&2; exit 2; }

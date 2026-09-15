@@ -26,7 +26,7 @@
 //! * requests above `max_recv_msg_size` are rejected with `OutOfRange`;
 //! * semantically malformed OTLP inputs return clean gRPC errors and never
 //!   panic the server (arbitrary-byte decode is additionally fuzzed by
-//!   `fuzz/logs_ingress_export` and `fuzz/metrics_ingress_export`);
+//!   `fuzz/logs_ingress_export`);
 //! * bearer credentials never appear in logs, metrics, gRPC status text, or
 //!   the SQLite database files.
 //!
@@ -1177,7 +1177,7 @@ async fn malformed_otlp_payloads_return_clean_errors_and_never_panic_the_server(
     // panic. (Invalid trace/span ids are NOT malformed anymore: per the OTLP
     // spec they map to no trace context and the request is accepted.)
     // Arbitrary-byte protobuf decode is additionally fuzzed by
-    // `fuzz/logs_ingress_export` / `fuzz/metrics_ingress_export`, which assert
+    // `fuzz/logs_ingress_export`, which asserts
     // the no-panic invariant across the whole decode→map→enqueue path.
     let mut deep = AnyValue {
         value: Some(AnyValueKind::StringValue("leaf".to_owned())),

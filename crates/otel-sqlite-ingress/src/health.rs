@@ -1,7 +1,7 @@
 //! gRPC health checking (`grpc.health.v1`).
 //!
 //! The health service answers `Check`/`Watch` for the overall server (empty
-//! service name, what standard probes use) and for both OTLP services
+//! service name, what standard probes use) and for the OTLP logs service
 //! individually. Statuses are driven by a [`ServingCheck`] sampled once per
 //! second: while the storage pipeline is healthy every service reports
 //! `SERVING`; the moment the writer or batcher dies they flip to
@@ -24,7 +24,6 @@ use crate::shutdown::wait_for_halt;
 
 const OVERALL_SERVICE_NAME: &str = "";
 const LOGS_SERVICE_NAME: &str = "opentelemetry.proto.collector.logs.v1.LogsService";
-const METRICS_SERVICE_NAME: &str = "opentelemetry.proto.collector.metrics.v1.MetricsService";
 
 /// How often the readiness source is polled; bounds how long a dead pipeline
 /// keeps reporting SERVING.
@@ -48,9 +47,6 @@ async fn apply_serving_state(reporter: &HealthReporter, serving: bool) {
         .set_service_status(OVERALL_SERVICE_NAME, status)
         .await;
     reporter.set_service_status(LOGS_SERVICE_NAME, status).await;
-    reporter
-        .set_service_status(METRICS_SERVICE_NAME, status)
-        .await;
 }
 
 /// Spawns the one-second readiness monitor. The task ends when shutdown
@@ -152,10 +148,6 @@ mod tests {
         // Per-service names track too.
         assert_eq!(
             check(&mut client, LOGS_SERVICE_NAME).await,
-            ServingStatus::Serving
-        );
-        assert_eq!(
-            check(&mut client, METRICS_SERVICE_NAME).await,
             ServingStatus::Serving
         );
 

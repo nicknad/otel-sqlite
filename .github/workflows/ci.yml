@@ -1,7 +1,4 @@
-# GitHub Actions CI — mirror of `.forgejo/workflows/ci.yml` (Codeberg).
-#
-# Kept in sync with the Forgejo workflow; this copy runs on GitHub so both
-# forges gate the same jobs. Any CI change should be applied to both files.
+# GitHub Actions CI.
 #
 # Runner requirements (GitHub-hosted `ubuntu-latest` covers all of these):
 # * The pure-Rust jobs (`lint-and-test`, `crash-recovery-release`,
@@ -227,9 +224,6 @@ jobs:
       - name: Smoke logs target (2 min)
         run: docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-logs
 
-      - name: Smoke metrics target (2 min)
-        run: docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-metrics
-
       - name: Smoke batcher target (2 min)
         run: docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-batcher
 
@@ -274,11 +268,6 @@ jobs:
         run: >
           docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-logs
           run logs_ingress_export -- -rss_limit_mb=2048 -max_total_time=1800
-
-      - name: Long metrics run (30 min)
-        run: >
-          docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-metrics
-          run metrics_ingress_export -- -rss_limit_mb=2048 -max_total_time=1800
 
       - name: Long batcher run (30 min)
         run: >

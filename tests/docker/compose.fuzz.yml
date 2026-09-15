@@ -5,7 +5,6 @@
 #   docker compose -f tests/docker/compose.fuzz.yml build            # build image (nightly + cargo-fuzz)
 #   docker compose -f tests/docker/compose.fuzz.yml run --rm build   # compile all fuzz targets
 #   docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-logs      # 2 min logs target
-#   docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-metrics   # 2 min metrics target
 #   docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-batcher   # 2 min batcher target
 #
 # Long runs / custom options: override the command after `run`
@@ -24,8 +23,7 @@
 #   fuzz service (cpuset: "0,1" below), matching the WSL-native workflow
 #   in tests/docker/fuzz-wsl.sh. Measured on that envelope (WSL2, 2 vCPUs,
 #   --debug-assertions): core_batcher ~3.6k exec/s @ 412 MB RSS,
-#   logs_ingress_export ~1.1k exec/s @ 75 MB, metrics_ingress_export
-#   ~1.3k exec/s @ 76 MB.
+#   logs_ingress_export ~1.1k exec/s @ 75 MB.
 # * Why Docker at all: libFuzzer needs a nightly compiler with sanitizer
 #   coverage; that toolchain is unsupported on windows-msvc hosts. The
 #   Linux image is also where CI will run these targets.
@@ -81,23 +79,6 @@ services:
     cpuset: "0,1"
     # OTLP logs export: protobuf decode -> validation -> mapping -> enqueue.
     command: run logs_ingress_export -- -rss_limit_mb=2048 -max_total_time=120
-
-  smoke-metrics:
-    image: otel-sqlite-fuzz:latest
-    depends_on:
-      build:
-        condition: service_completed_successfully
-    working_dir: /work/fuzz
-    environment:
-      CARGO_TARGET_DIR: /work/target-container-fuzz
-    volumes:
-      - ../..:/work
-      - fuzz-cargo-registry:/usr/local/cargo/registry
-    mem_limit: 2560m
-    cpuset: "0,1"
-    # OTLP metrics export: widest conversion surface (all point types,
-    # exponential buckets, temporality fallbacks, width casts).
-    command: run metrics_ingress_export -- -rss_limit_mb=2048 -max_total_time=120
 
   smoke-batcher:
     image: otel-sqlite-fuzz:latest

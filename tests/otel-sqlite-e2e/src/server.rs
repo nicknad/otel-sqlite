@@ -2,7 +2,7 @@
 //! `otel-sqlite` binary does (see `crates/otel-sqlite/src/main.rs`):
 //!
 //! ```text
-//! tonic gRPC (real TCP) -> real LogsIngress/MetricsIngress handlers
+//! tonic gRPC (real TCP) -> real LogsIngress handler
 //!     -> bounded ingest channel -> storage insert batcher thread
 //!     -> bounded WriteCommand queue -> single Storage writer thread -> SQLite WAL
 //! ```
@@ -23,8 +23,7 @@ use std::time::Duration;
 
 use otel_sqlite_core::storage::{IngestMessage, InsertBatcherConfig};
 use otel_sqlite_ingress::mapping::pb::collector::logs::v1::logs_service_server::LogsServiceServer;
-use otel_sqlite_ingress::mapping::pb::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
-use otel_sqlite_ingress::{IngressConfig, LogsIngress, MetricsIngress};
+use otel_sqlite_ingress::{IngressConfig, LogsIngress};
 use otel_sqlite_storage::{Storage, StorageConfig};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -136,12 +135,6 @@ impl EmbeddedServer {
         let logs_service = LogsServiceServer::new(LogsIngress::new(
             ingest_tx.clone(),
             Arc::clone(&config),
-            Arc::clone(&commit_ledger),
-        ))
-        .max_decoding_message_size(config.max_recv_msg_size);
-        let metrics_service = MetricsServiceServer::new(MetricsIngress::new(
-            ingest_tx.clone(),
-            Arc::clone(&config),
             commit_ledger,
         ))
         .max_decoding_message_size(config.max_recv_msg_size);
@@ -152,7 +145,6 @@ impl EmbeddedServer {
             Server::builder()
                 .max_concurrent_streams(max_concurrent_streams)
                 .add_service(logs_service)
-                .add_service(metrics_service)
                 .serve_with_shutdown(addr, async move {
                     let _ = shutdown_rx.changed().await;
                 })

@@ -10,7 +10,6 @@ mod grpc;
 mod health;
 pub mod logs;
 pub mod mapping;
-pub mod metrics;
 mod shutdown;
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -33,7 +32,6 @@ pub use error::IngressError;
 pub use grpc::{serve, serve_with_shutdown};
 pub use logs::LogsIngress;
 pub use mapping::pb;
-pub use metrics::MetricsIngress;
 
 /// Sender half of the bounded channel feeding the storage insert batcher.
 ///
