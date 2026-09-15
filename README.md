@@ -10,7 +10,7 @@ insert batcher → bounded command queue → single SQLite writer (WAL)`.
   (`cargo run --release -p otel-sqlite-e2e -- --scenario baseline`)
 - Architecture, design contract & invariants: [docs/architecture.md](docs/architecture.md)
 - Open work & hardening backlog: [GitHub issues](https://github.com/nicknad/otel-sqlite/issues)
-- Local CI (run `.forgejo/workflows/ci.yml` on your machine with `act`):
+- Local CI (run `.github/workflows/ci.yml` on your machine with `act`):
   [tools/local-ci/](tools/local-ci/) (`.\tools\local-ci\run.ps1` or `./tools/local-ci/run.sh`)
 
 ## Project scope
@@ -154,13 +154,13 @@ Rejected requests issue no commit tickets and never stall later commits.
 
 ### Observability
 
-- **Prometheus `/metrics`** is served on `metrics_address`
-  (default `127.0.0.1:8888`; set `"off"` in the TOML to disable). It exposes
-  OTLP request/record counters and histograms, ingest/storage queue depths,
-  batcher buffer occupancy, transaction durations, writer errors, drop
+- **Prometheus `/metrics`** is disabled by default; set `metrics_address` to
+  a `host:port` to serve it (an empty value or `"off"` keeps it disabled). It
+  exposes OTLP request/record counters and histograms, ingest/storage queue
+  depths, batcher buffer occupancy, transaction durations, writer errors, drop
   counters, and the watchdog's `sidecar_health_state`.
   **Exposure stance:** the endpoint is plain HTTP by design — bind it to
-  localhost (the default) and terminate TLS/auth on a reverse proxy if you
+  localhost and terminate TLS/auth on a reverse proxy if you
   must scrape remotely. Do not point `metrics_address` at a routable
   interface without such a front; it carries no authentication of its own
   (`[tls]` applies only to the OTLP listener).
@@ -189,7 +189,7 @@ Rejected requests issue no commit tickets and never stall later commits.
 ```toml
 listen_address = "0.0.0.0:4317"
 allow_insecure_remote = true         # only on an isolated/trusted network; prefer [tls]
-metrics_address = "127.0.0.1:8888"   # "off" disables /metrics
+# metrics_address = "127.0.0.1:8888" # disabled by default; set to enable /metrics
 max_records_per_request = 100000
 # allow_remote_metrics = true         # explicit opt-in; prefer a protected proxy
 ```

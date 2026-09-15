@@ -23,8 +23,6 @@ use serde::Deserialize;
 pub const CONFIG_PATH_ENV_VAR: &str = "OTEL_SQLITE_CFG_PATH";
 const CONFIG_PATH_ENV_VAR_LOWER: &str = "otel-sqlite-cfg-path";
 
-/// Default admin address serving Prometheus `/metrics`.
-pub const DEFAULT_METRICS_ADDRESS: &str = "127.0.0.1:8888";
 pub const DEFAULT_INGEST_QUEUE_CAPACITY: usize = 50_000;
 pub const MAX_INGEST_QUEUE_CAPACITY: usize = 1_000_000;
 pub const MAX_GRPC_RECV_MSG_SIZE: usize = 256 * 1024 * 1024;
@@ -95,7 +93,8 @@ pub struct Config {
     /// WAL checkpoint-time syncing; `full` fsyncs every commit).
     pub sqlite_synchronous: SyncMode,
     /// Admin address serving Prometheus `/metrics`. `None` disables the
-    /// endpoint (TOML value `"off"`). Defaults to localhost-only.
+    /// endpoint (TOML value `"off"`), and that is the default: the endpoint
+    /// is opt-in and, when configured, should stay loopback-only.
     pub metrics_address: Option<String>,
     /// Explicit opt-in for exposing the unauthenticated plain HTTP metrics
     /// endpoint beyond loopback. A reverse proxy is preferred in production.
@@ -136,7 +135,7 @@ impl Default for Config {
             watchdog: WatchdogConfig::default(),
             durability_mode: DurabilityMode::default(),
             sqlite_synchronous: SyncMode::default(),
-            metrics_address: Some(DEFAULT_METRICS_ADDRESS.to_owned()),
+            metrics_address: None,
             allow_remote_metrics: false,
             allow_insecure_remote: false,
             tls: None,
@@ -1482,13 +1481,10 @@ mod tests {
     }
 
     #[test]
-    fn metrics_address_defaults_on_localhost_and_can_be_disabled() {
+    fn metrics_address_is_disabled_by_default_and_can_be_enabled() {
         let mut config = Config::default();
         file_config("").apply_to(&mut config).expect("applies");
-        assert_eq!(
-            config.metrics_address.as_deref(),
-            Some(DEFAULT_METRICS_ADDRESS)
-        );
+        assert_eq!(config.metrics_address, None, "metrics are off by default");
 
         file_config("metrics_address = \"0.0.0.0:9100\"\nallow_remote_metrics = true")
             .apply_to(&mut config)

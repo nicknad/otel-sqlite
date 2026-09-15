@@ -6,7 +6,6 @@
 target/
 target-container/
 .git/
-.forgejo/
 .idea/
 .github/
 docs/

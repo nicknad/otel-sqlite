@@ -43,7 +43,7 @@ LABEL org.opencontainers.image.title="otel-sqlite" \
       org.opencontainers.image.description="OpenTelemetry OTLP sink with SQLite storage" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.revision="${REVISION}" \
-      org.opencontainers.image.source="https://codeberg.org/nicknad/otel-sqlite" \
+      org.opencontainers.image.source="https://github.com/nicknad/otel-sqlite" \
       org.opencontainers.image.licenses="MIT"
 
 RUN apt-get update \

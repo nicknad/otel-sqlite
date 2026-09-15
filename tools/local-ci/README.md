@@ -1,8 +1,9 @@
 # Local CI with `act`
 
-Runs the repository's Forgejo workflow (`.forgejo/workflows/ci.yml`) **locally**
-with [act](https://github.com/nektos/act) — the same GitHub/Forgejo Actions
-interpreter the Forgejo runner uses, driven through your local Docker daemon.
+Runs the repository's GitHub Actions workflow (`.github/workflows/ci.yml`)
+**locally** with [act](https://github.com/nektos/act) — the same GitHub
+Actions interpreter the GitHub runner uses, driven through your local Docker
+daemon.
 This is a release gate loop without pushing to the forge:
 validate formatting, clippy, tests, cargo-deny, cargo-audit, semgrep, and (optionally) the
 Docker jobs before a commit.
@@ -40,9 +41,9 @@ so `.actrc`/`.act.env` are read, and select the job with `-j`:
 
 ```bash
 cd tools/local-ci
-act -C ../.. -W "$PWD/../../.forgejo/workflows" -j lint-and-test
+act -C ../.. -W "$PWD/../../.github/workflows" -j lint-and-test
 # extra act flags go before the job selector, e.g.:
-act -C ../.. -W "$PWD/../../.forgejo/workflows" -v -j lint-and-test
+act -C ../.. -W "$PWD/../../.github/workflows" -v -j lint-and-test
 ```
 
 ## What this configuration does
@@ -55,7 +56,7 @@ act -C ../.. -W "$PWD/../../.forgejo/workflows" -v -j lint-and-test
 - `.act.env` — safe environment defaults (`RUST_LOG`, `CARGO_TERM_COLOR`).
   Copy `.act.env.example` over it for overrides.
 - `run.ps1` / `run.sh` — `cd` into this folder (so `.actrc` applies), then
-  `act -C <repo> -W <repo>/.forgejo/workflows <jobs>`.
+  `act -C <repo> -W <repo>/.github/workflows <jobs>`.
 
 ## Limitations
 

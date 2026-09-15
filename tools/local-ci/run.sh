@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Local CI with act — runs `.forgejo/workflows/ci.yml` on this machine using
-# the Docker daemon, exactly the pipeline the Forgejo runner would run.
+# Local CI with act — runs `.github/workflows/ci.yml` on this machine using
+# the Docker daemon, exactly the pipeline GitHub Actions would run.
 #
 # Changes into this directory so `.actrc` / `.act.env` are read, then invokes
-# `act -C <repo-root> -W <repo>/.forgejo/workflows`.
+# `act -C <repo-root> -W <repo>/.github/workflows`.
 #
 # Usage (WSL / Linux / macOS):
 #   ./tools/local-ci/run.sh            # release-gate jobs (containerized, no dind)
@@ -49,7 +49,7 @@ if [[ "$ALL" -eq 1 ]]; then
     fi
 fi
 
-WORKFLOWS="$REPO/.forgejo/workflows"
+WORKFLOWS="$REPO/.github/workflows"
 
 if [[ "$LIST" -eq 1 ]]; then
     exec "$ACT" -C "$REPO" -W "$WORKFLOWS" -l

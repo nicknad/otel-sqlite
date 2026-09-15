@@ -6,7 +6,7 @@
 
 # Runner image for `runs-on:` (host) jobs. `catthehacker/ubuntu:act-latest` is
 # the community-standard full-featured GitHub-runner image (git, docker CLI,
-# compose). The `container:` jobs in `.forgejo/workflows/ci.yml`
+# compose). The `container:` jobs in `.github/workflows/ci.yml`
 # (rust:1.98-slim-bookworm, semgrep/semgrep:1.176.0) use their own images
 # regardless of this mapping.
 -P ubuntu-latest=catthehacker/ubuntu:act-latest

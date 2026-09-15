@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
                 config::metrics_display_url(address)
             );
         }
-        None => println!("metrics endpoint disabled (metrics_address = \"off\")"),
+        None => println!("prometheus metrics disabled (set metrics_address to enable)"),
     }
 
     let (queue, receiver) = otel_sqlite_ingress::channel(config.ingest_queue_capacity);
