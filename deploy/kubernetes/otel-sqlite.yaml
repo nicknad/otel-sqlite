@@ -54,7 +54,7 @@ data:
     synchronous = "normal"   # "full" for power-loss safety
 
     [maintenance]
-    retention = "7d"         # per-signal windows supported (see README)
+    retention = "7d"         # log-event retention window
     checkpoint_interval = "5m"
 
     # TLS opt-in (recommended): add `server.pem`, `server.key` (and `ca.pem`

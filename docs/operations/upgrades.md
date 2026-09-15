@@ -21,17 +21,22 @@ deployment. Schema evolution always adds a new `NNN_*.sql` file.
 Every database is stamped with the *highest* applied migration. A binary is
 compatible with a database when the binary's `MIGRATIONS` contains every
 stamped version — i.e. the binary is **at or above** the database's schema
-version. Current schema version: **003**.
+version. Current schema version: **005**.
 
 | Version | Contents | Additive? | Notes |
 |---|---|---|---|
-| `000` | Baseline canonical schema: resources, log events, contentless `logs_fts`, scope/metric/series/data-point tables, read-side views | — | The squashed starting point. |
+| `000` | Baseline canonical schema: resources, log events, contentless `logs_fts`, scope/metric/series/data-point tables, read-side views | — | The squashed starting point; the metric tables were dropped again by `005`. |
 | `001` | Recreates `logs_fts` as contentless FTS5 with `contentless_delete = 1` and installs incremental INSERT/DELETE triggers; backfills existing rows | **No** | Replaces the old FTS table shape. A database stamped `000` cannot be read by a binary that only knows `000` after this migration exists — the FTS table and trigger shape differ. |
-| `002` | Adds `idx_metric_dp_timestamp` (metric retention access path) | Yes | Pure index addition; no data or view change. |
+| `002` | Adds `idx_metric_dp_timestamp` (metric retention access path) | Yes | Pure index addition; removed again by `005`. |
 | `003` | Adds `log_event.scope_attributes_json`, `log_event.scope_schema_url`, `scope.attributes_json`, `metric.metadata_json`; recreates `logs`/`metrics` views to expose them | Yes (tables) / view shape changes | New columns carry defaults (`'{}'`/NULL) so existing rows stay valid; the recreated views only add columns, so old `SELECT` queries against them keep working. |
+| `004` | Metric dimension identity includes `is_monotonic` and `aggregation_temporality` (table rebuild) | **No** | Rebuilds the `metric` table; the table is dropped by `005`. |
+| `005` | Drops the OTLP metrics signal: `metrics`/`metric_buckets` views and the `scope`, `metric`, `metric_series`, `metric_data_point` tables | **No** | **Destructive and irreversible:** stored metric rows are deleted. Log tables, the `logs` view and the FTS index are untouched. |
 
 **Incompatible changes to be aware of:**
 
+* `005` removes the metrics signal entirely. A metrics export returns
+  `UNIMPLEMENTED` and previously stored metric rows are gone; take a backup
+  first if that data matters.
 * Downgrading the **binary** below the database's schema version is not
   supported: the older binary does not know the newer columns/views and will
   fail at startup. The only rollback for a too-new database is **restore from a
@@ -59,7 +64,7 @@ version. Current schema version: **003**.
    ```sh
    otel-sqlite verify --db /data/otel-logs.db
    ```
-   Confirm the report shows `schema: 003`, `integrity: ok`, `foreign keys: 0
+   Confirm the report shows `schema: 005`, `integrity: ok`, `foreign keys: 0
    violation(s)`, and row counts that match the pre-upgrade numbers (plus any
    traffic that arrived during the restart window).
 6. **Keep the pre-upgrade backup** until the *next* backup succeeds and
@@ -72,8 +77,8 @@ version. Current schema version: **003**.
 * The only rollback mechanism is **restore from a pre-upgrade backup**:
   1. Stop the server.
   2. `otel-sqlite restore --backup /backups/otel-logs.db.<UTC>.bak --dir /data/restored`
-     (the database it produces is schema version `000`–`002`, matching the
-     pre-upgrade backup).
+     (the database it produces carries the schema version the backup was
+     taken at).
   3. Move the restored database into place, start the older binary, verify.
 * Because the restored database is older than the new binary's schema, the
   restore procedure must be paired with the **old binary** — restore does not
@@ -83,12 +88,14 @@ version. Current schema version: **003**.
 ## Upgrade test coverage
 
 `crates/otel-sqlite-storage/tests/migrations.rs` builds a database stamped at
-every historical version (`000`, `001`, `002`), seeds era-appropriate data,
-and reopens it through the production `Storage::open` path. It asserts:
+every historical version (`000`–`004`), seeds era-appropriate data, and reopens
+it through the production `Storage::open` path. It asserts:
 
-* migrations apply in order and land on the current stamp (`003`);
-* seeded log and metric rows survive with identical counts and content;
+* migrations apply in order and land on the current stamp (`005`);
+* seeded log rows survive with identical counts and content;
+* every metric schema object is gone after `005`, even from a populated `004`
+  database, and a fresh database never creates any;
 * the search index is backfilled and searchable without a manual rebuild;
 * `PRAGMA integrity_check` is `ok` and `PRAGMA foreign_key_check` is clean;
-* the `003` columns are present and visible on the read-side views;
+* the `003` columns are present and visible on the read-side view;
 * reopening a current-schema database is a no-op (idempotent).

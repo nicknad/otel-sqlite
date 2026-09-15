@@ -1077,7 +1077,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "otel-sqlite"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "otel-sqlite-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "serde",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "otel-sqlite-e2e"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1137,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "otel-sqlite-ingress"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "crossbeam-channel",
@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "otel-sqlite-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "metrics",
@@ -1179,7 +1179,7 @@ dependencies = [
 
 [[package]]
 name = "otel-sqlite-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "criterion",
@@ -1201,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "otel-sqlite-test-support"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
 ]
