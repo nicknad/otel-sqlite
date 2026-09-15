@@ -1,4 +1,4 @@
-# Fast local mirrors of the CI quality gates (.forgejo/workflows/ci.yml).
+# Fast local mirrors of the CI quality gates (.github/workflows/ci.yml).
 #
 # One-time setup per clone:
 #   lefthook install

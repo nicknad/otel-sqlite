@@ -1147,7 +1147,6 @@ dependencies = [
  "prost",
  "protoc-bin-vendored",
  "rcgen",
- "serde_json",
  "sha2",
  "tempfile",
  "thiserror",

@@ -77,9 +77,8 @@ via `.semgrepignore`. Justified findings are suppressed inline with
 Install the local CLI with `uv tool install semgrep==1.175.0`, then run
 `semgrep scan --config .semgrep.yml`. WSL or Docker remain alternatives:
 `docker run --rm -v "${PWD}:/src" semgrep/semgrep semgrep --config .semgrep.yml /src`.
-You can also push and let CI run it (`.forgejo/workflows/ci.yml` on Codeberg / Forgejo
-Actions; the repo needs Actions enabled under Settings -> Repository units,
-and `runs-on:` must match a label advertised by your runner).
+You can also push and let CI run it (`.github/workflows/ci.yml` on GitHub
+Actions).
 
 ### Toolchain
 

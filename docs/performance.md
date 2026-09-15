@@ -267,11 +267,11 @@ deployments.
   safe with `synchronous = "full"`). With `"enqueue"`, acks measure request
   handling only and acknowledged records may be lost to a crash. See §7.1
   for the measured cost of each knob.
-* **Metrics endpoint**: production exposes Prometheus `/metrics` on
-  `metrics_address` (default `127.0.0.1:8888`, `"off"` disables) and gRPC
-  health (`grpc.health.v1`) on the OTLP port. The embedded harness uses its
-  own recorder and does not mount the health service; external/Docker mode
-  sees queue-full events through `UNAVAILABLE` rejections and storage
+* **Metrics endpoint**: disabled by default; when `metrics_address` is set,
+  production exposes Prometheus `/metrics` there. gRPC health
+  (`grpc.health.v1`) runs on the OTLP port regardless. The embedded harness
+  uses its own recorder and does not mount the health service; external/Docker
+  mode sees queue-full events through `UNAVAILABLE` rejections and storage
   counters through validation or the scrape endpoint of a running server.
 * **System-level sampling** (CPU/RSS/disk latency) is not collected by the
   harness itself; use `pidstat`/`iostat` (native Linux) or

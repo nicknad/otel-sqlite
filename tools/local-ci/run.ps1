@@ -1,8 +1,8 @@
-# Local CI with act — runs `.forgejo/workflows/ci.yml` on this machine using
-# the Docker daemon, exactly the pipeline the Forgejo runner would run.
+# Local CI with act — runs `.github/workflows/ci.yml` on this machine using
+# the Docker daemon, exactly the pipeline GitHub Actions would run.
 #
 # The wrapper first changes into this directory so `.actrc` / `.act.env` are
-# read, then invokes `act -C <repo-root> -W <repo>/.forgejo/workflows`.
+# read, then invokes `act -C <repo-root> -W <repo>/.github/workflows`.
 #
 # Usage (PowerShell):
 #   .\tools\local-ci\run.ps1            # release-gate jobs (containerized, no dind)
@@ -43,7 +43,7 @@ if ($All) {
     $SocketArgs = @("--container-daemon-socket", "//./pipe/docker_engine")
 }
 
-$Workflows = Join-Path $Repo ".forgejo\workflows"
+$Workflows = Join-Path $Repo ".github\workflows"
 
 if ($List) {
     & $Act -C $Repo -W $Workflows -l
