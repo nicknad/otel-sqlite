@@ -20,10 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={}", proto_root.display());
 
     tonic_prost_build::configure().compile_protos(
-        &[
-            proto_root.join("opentelemetry/proto/collector/logs/v1/logs_service.proto"),
-            proto_root.join("opentelemetry/proto/collector/metrics/v1/metrics_service.proto"),
-        ],
+        &[proto_root.join("opentelemetry/proto/collector/logs/v1/logs_service.proto")],
         &[proto_root],
     )?;
 

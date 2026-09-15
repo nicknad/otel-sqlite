@@ -41,13 +41,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "metrics_ingress_export"
-path = "fuzz_targets/metrics_ingress_export.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "core_batcher"
 path = "fuzz_targets/core_batcher.rs"
 test = false
