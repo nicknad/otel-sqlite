@@ -83,8 +83,7 @@ same mechanism as `sqlite3 source.db ".backup dest.db"`.
 * `PRAGMA integrity_check` — must read `ok`.
 * `PRAGMA foreign_key_check` — must read 0 violations.
 * Row counts for every canonical table plus the search index
-  (`log_event`, `log_resource`, `metric_data_point`, `metric_series`,
-  `metric`, `scope`, `logs_fts`).
+  (`log_event`, `log_resource`, `logs_fts`).
 * The highest `schema_migrations` stamp.
 * A SHA-256 of the file bytes (compare against the `backup` report to confirm
   the artifact was not altered in storage). For encrypted backups the report's

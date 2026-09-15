@@ -7,7 +7,7 @@ the [issue tracker](https://github.com/nicknad/otel-sqlite/issues).
 
 ## 1. Product contract
 
-The system is a single-writer SQLite OTLP logs/metrics sink:
+The system is a single-writer SQLite OTLP logs sink:
 
 ```text
 OTLP gRPC -> bounded ingress queue -> insert batcher -> bounded command queue
@@ -46,8 +46,8 @@ These properties must be preserved by all future work:
   fails pending waiters when the pipeline closes.
 - SQLite errors are classified into retryable, poisonous, and fatal classes.
 - Poisoned rows can be quarantined while healthy rows continue to commit.
-- Retention supports logs and metrics, transactional orphan-dimension
-  collection, and incremental FTS maintenance.
+- Retention supports log events, transactional orphan-resource collection, and
+  incremental FTS maintenance.
 - TLS/mTLS, bearer-token authentication, gRPC health, Prometheus metrics,
   startup storage readiness, Docker volume placement, and an in-binary
   healthcheck exist.

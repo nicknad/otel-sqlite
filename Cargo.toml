@@ -6,7 +6,7 @@ members = [
     "crates/otel-sqlite-storage", "crates/test-support", "tests/otel-sqlite-e2e"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "SQLite Sink for OTEL Logs/Metrics with batched Single-Writer-Queues"
@@ -46,12 +46,12 @@ criterion = { version = "0.7", features = ["html_reports"] }
 tonic = { version = "0.14", features = ["tls-ring", "gzip"] }
 tonic-health = "0.14"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-otel-sqlite-core = { path = "crates/otel-sqlite-core", version = "0.1.0" }
-otel-sqlite-ingress = { path = "crates/otel-sqlite-ingress", version = "0.1.0" }
-otel-sqlite-runtime = { path = "crates/otel-sqlite-runtime", version = "0.1.0" }
-otel-sqlite-storage = { path = "crates/otel-sqlite-storage", version = "0.1.0" }
-otel-sqlite-test-support = { path = "crates/test-support", version = "0.1.0" }
-otel-sqlite-e2e = { path = "tests/otel-sqlite-e2e", version = "0.1.0" }
+otel-sqlite-core = { path = "crates/otel-sqlite-core", version = "0.2.0" }
+otel-sqlite-ingress = { path = "crates/otel-sqlite-ingress", version = "0.2.0" }
+otel-sqlite-runtime = { path = "crates/otel-sqlite-runtime", version = "0.2.0" }
+otel-sqlite-storage = { path = "crates/otel-sqlite-storage", version = "0.2.0" }
+otel-sqlite-test-support = { path = "crates/test-support", version = "0.2.0" }
+otel-sqlite-e2e = { path = "tests/otel-sqlite-e2e", version = "0.2.0" }
 
 # Lint policy shared by every crate via `[lints] workspace = true`.
 #

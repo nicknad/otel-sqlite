@@ -433,20 +433,25 @@ to the WAL file plus a lock operation — no fsync per transaction. Consequences
 
 ### PERF-006 · Redundant dimension work + JSON allocation on the writer thread (S–M)
 
-The metrics persistence path resolves the full dimension hierarchy
-(`resource → scope → metric → series`) per record / per data point inside the
-write transaction, each time performing a SHA-256 hash, a hex-format `String`
-allocation, a `prepare_cached` lookup, and a conflict-ignoring upsert — even
-when the row already exists. Real telemetry is extremely repetitive, so the
-work scales O(records) where O(distinct identities) would suffice (often a
-100x–1000x gap), all on the thread that must also commit transactions.
+> **Obsolete as written:** this item targeted the metric persistence path
+> (`resource → scope → metric → series`), which was removed together with the
+> OTLP metrics signal (migration 005). The log path still resolves a resource
+> row per record (`resolve_resource`) with the same per-record hashing, JSON
+> encoding, `prepare_cached` lookup and conflict-ignoring upsert, so the
+> memoization idea below remains applicable — re-scope it to the resource
+> dimension before picking it up.
 
-**Recommended solution:** a transaction-local dimension cache owned by one
-insert call and cleared between batches (memory-bounded by the current batch's
-cardinality; never process-lifetime). Cache keys must cover **every**
+**Original finding:** dimensions were resolved per record via a SHA-256 hash, a
+hex-format `String` allocation, a `prepare_cached` lookup and an
+upsert — even for rows that already exist. Real telemetry is highly
+repetitive, so the work scales O(records) where O(distinct identities) would
+suffice.
+
+**Recommended solution (log-scoped):** a transaction-local resource cache owned
+by one insert call and cleared between batches (memory-bounded by the current
+batch's cardinality; never process-lifetime). Cache keys must cover **every**
 fingerprint input, and the fingerprint/JSON bytes must remain byte-identical to
-preserve historical IDs. Replace `metric_type.to_string()` with a `match`
-returning `&'static str`. Tolerant/quarantine and commit-ticket behavior must
+preserve historical IDs. Tolerant/quarantine and commit-ticket behavior must
 not change.
 
 > **Contract warning:** the attribute encoding is explicitly part of the
@@ -456,10 +461,10 @@ not change.
 > randomized inputs) or IDs must be versioned.
 
 **Validation:** `cargo bench -p otel-sqlite-storage --bench inserts` before/after
-on the same machine; `storage_transaction_duration` p50/p99 for metric-heavy
-synthetic batches with high identity repetition; a criterion scenario with
-deliberately repetitive identities (e.g. 10k points / 4 scopes); distinct
-inputs never share a cache entry; cache state does not leak between batches.
+on the same machine; `storage_transaction_duration` p50/p99 for log batches
+with high resource repetition; a criterion scenario with deliberately
+repetitive identities (e.g. 10k records / 4 resources); distinct inputs never
+share a cache entry; cache state does not leak between batches.
 
 ### PERF-007 · All CPU work serialized behind the single writer (M–L, staged)
 
@@ -477,7 +482,7 @@ writer becomes bind/step/commit only. Salvage semantics migrate carefully:
 (offending row dropped-and-counted there, its ticket still rides the batch);
 constraint violations remain execution-time in the writer's salvage pass.
 Ordering, barriers, and ticket claiming are untouched. Cost: a core payload-type
-change touching `command.rs`, both fuzz targets, the e2e harness, benches, and
+change touching `command.rs`, the fuzz targets, the e2e harness, benches, and
 the tolerant-mode plumbing.
 
 **Stage 3 — parallelize preparation at mapping** (only if stage 2 profiles

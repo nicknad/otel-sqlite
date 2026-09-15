@@ -16,13 +16,11 @@ insert batcher → bounded command queue → single SQLite writer (WAL)`.
 ## Project scope
 
 Active development targets the **log** pipeline end to end — ingest, storage,
-durability and performance work all focus on logs first.
+durability and performance work all focus on logs.
 
-Metrics are a **future extension**: OTLP metrics are accepted and persisted
-today, but they are not an active workstream and receive no dedicated feature
-or optimization effort. Storage and performance optimizations are deliberately
-shaped so the metric write path stays untouched, leaving it free to evolve
-when metrics work resumes (see `docs/performance.md`, PERF-006/007).
+The OTLP **metrics** signal is **unsupported since migration 005**: the metrics
+service was removed from the gRPC endpoint and every metric table, view and
+index is dropped. A metrics export returns `UNIMPLEMENTED`.
 
 The OTLP **traces** signal is **unsupported and out of scope**: no
 `TraceService` is served on the gRPC endpoint, and `ResourceSpans` payloads
@@ -38,13 +36,8 @@ OTLP values are preserved into SQLite with no silent conversion:
   `attributes_json` columns: arrays become JSON arrays, kvlists become
   sorted-key JSON objects (duplicate keys collapse to the last value), byte
   arrays are hex-encoded, and non-finite doubles become `null`.
-- **Exemplars** on gauge/sum, histogram and exponential-histogram points are
-  persisted into `metric_data_point.exemplars_json` (sorted-key objects,
-  hex-encoded trace/span ids).
-- **Scope attributes and schema URLs** are persisted for both signals
-  (denormalized onto `log_event` for logs, on the shared `scope` table for
-  metrics), and the group-level schema URL is recorded on the resource.
-- **Metric metadata** is persisted on the `metric` table.
+- **Scope attributes and schema URLs** are persisted (denormalized onto
+  `log_event`), and the group-level schema URL is recorded on the resource.
 
 Malformed trace/span ids — wrong length, or present-but-all-zeroes — are
 **rejected** with `INVALID_ARGUMENT` for the whole request (all-or-nothing),
@@ -56,17 +49,15 @@ Every remaining conversion is either rejected visibly or counted as an
 explicit loss in the `otlp_mapping_loss_total` metric (`reason` label), never
 silently turned into an unrelated value:
 
-- Unknown `SeverityNumber` / `aggregation_temporality` enum values are counted
-  (`reason="unknown_severity"` / `reason="unknown_temporality"`) and mapped to
-  the `UNSPECIFIED` value.
+- Unknown `SeverityNumber` enum values are counted
+  (`reason="unknown_severity"`) and mapped to the `UNSPECIFIED` value.
 - The Profiling-only `AnyValue.string_value_strindex` / `KeyValue.key_strindex`
   fields carry no non-Profiling semantic content per the OTLP proto; they are
   treated as absent (`null`).
-- Bytes **log bodies** are rendered as lossy UTF-8 text (the pre-existing
-  behavior; attribute and exemplar byte values are hex-encoded instead).
-- The OTLP **traces** signal is out of scope (`ResourceSpans` is not handled).
-  `SummaryDataPoint` carries no exemplars in the pinned OTLP proto, so summary
-  points persist no exemplar column data.
+- Bytes **log bodies** are rendered as lossy UTF-8 text (attribute byte values
+  are hex-encoded instead).
+- The OTLP **traces** and **metrics** signals are out of scope (`ResourceSpans`
+  and `ResourceMetrics` are not handled).
 
 ## Architecture
 
@@ -98,22 +89,19 @@ The maintenance worker runs on its own thread and owns scheduling only:
 
 Frequencies are explicit in `MaintenanceConfig` and conservative by default:
 purge every 15 min, checkpoint every 5 min, `ANALYZE` twice a day, `VACUUM`
-once a day; retention is disabled unless configured. Retention windows are
-per signal — one uniform window covers logs _and_ metrics:
+once a day; retention is disabled unless configured:
 
 ```toml
 [maintenance]
-retention = "7d"            # uniform window for both signals
+retention = "7d"            # log-event retention window
 
-# …or per-signal windows; keys left out keep their defaults:
+# …or name the signal explicitly:
 [maintenance.retention]
 logs = "7d"
-metrics = "24h"
 ```
 
-A purge deletes expired log events and metric data points in one transaction
-and garbage-collects the dimension rows the deletions orphan (series,
-metric definitions, scopes, resources) — so nothing grows unboundedly once
+A purge deletes expired log events and garbage-collects the resource rows the
+deletions orphan — so nothing grows unboundedly once
 retention is configured. The full-text search index is maintained
 incrementally by triggers, so pruned events leave no stale search hits.
 `rebuild_fts_interval` schedules a full index rebuild as recovery for a
