@@ -41,11 +41,20 @@ pub(crate) fn run(
     stats: &WriterStats,
     ready_tx: Sender<Result<(), String>>,
 ) -> Result<(), StorageError> {
-    let result = run_inner(receiver, config, ledger, stats, ready_tx);
-    // Whether we drained cleanly or died on an error, nobody can rely on
-    // further completions now.
-    ledger.close();
-    result
+    // Closes on every exit path *including unwinding*: a panic must fail
+    // durable-ack waiters instead of leaving them hanging on a dead writer.
+    // `CommitLedger::close` is idempotent, so the normal path is unaffected.
+    let _close_ledger = LedgerCloseOnDrop(ledger);
+    run_inner(receiver, config, ledger, stats, ready_tx)
+}
+
+/// Calls [`CommitLedger::close`] when dropped.
+struct LedgerCloseOnDrop<'a>(&'a CommitLedger);
+
+impl Drop for LedgerCloseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 /// Opens the database and applies migrations. Kept separate so the ready
@@ -109,6 +118,7 @@ fn run_inner(
                 if command.record_count() != 0
                     && let Some(quota) = config.max_db_bytes
                 {
+                    let _maintenance = stats.maintenance_guard();
                     enforce_quota(&mut conn, &config.sqlite_path, quota, stats);
                 }
                 execute(&mut conn, command, ledger, stats, backlog)?;
@@ -194,14 +204,17 @@ fn execute(
         // committed by the time this is received (single FIFO consumer).
         WriteCommand::Flush => {}
         WriteCommand::Checkpoint(mode) => {
+            let _maintenance = stats.maintenance_guard();
             maintenance::checkpoint(conn, mode)?;
             stats.maintenance_runs.fetch_add(1, Ordering::Relaxed);
             stats.mark_progress();
         }
         WriteCommand::Maintenance(operation) => {
-            run_maintenance(conn, operation, queue_backlog)?;
-            stats.maintenance_runs.fetch_add(1, Ordering::Relaxed);
-            stats.mark_progress();
+            let _maintenance = stats.maintenance_guard();
+            if run_maintenance(conn, operation, queue_backlog)? {
+                stats.maintenance_runs.fetch_add(1, Ordering::Relaxed);
+                stats.mark_progress();
+            }
         }
     }
     Ok(())
@@ -371,11 +384,14 @@ fn finish_salvage(
     }
 }
 
+/// Executes one maintenance command, returning `false` when it was
+/// deliberately deferred (backlog pressure) or disabled. Callers only count
+/// and timestamp a run that actually happened.
 fn run_maintenance(
     conn: &mut Connection,
     operation: MaintenanceOperation,
     queue_backlog: usize,
-) -> Result<(), StorageError> {
+) -> Result<bool, StorageError> {
     // Heavy operations (full-file VACUUM, full FTS rebuild, large prunes)
     // stall the single writer for seconds on GB databases. When ingestion is
     // waiting, defer them to the next scheduler interval instead of stalling
@@ -393,15 +409,15 @@ fn run_maintenance(
             queue_backlog,
             "deferring heavy maintenance; ingestion backlog present"
         );
-        return Ok(());
+        return Ok(false);
     }
     match operation {
-        MaintenanceOperation::Analyze => maintenance::analyze(conn),
-        MaintenanceOperation::Vacuum => maintenance::vacuum(conn),
-        MaintenanceOperation::RebuildFts => maintenance::rebuild_fts(conn).map(|_| ()),
+        MaintenanceOperation::Analyze => maintenance::analyze(conn)?,
+        MaintenanceOperation::Vacuum => maintenance::vacuum(conn)?,
+        MaintenanceOperation::RebuildFts => maintenance::rebuild_fts(conn).map(|_| ())?,
         MaintenanceOperation::Prune(policy) => {
             if !policy.is_enabled() {
-                return Ok(());
+                return Ok(false);
             }
             let report = maintenance::prune(conn, &policy, unix_nano_now())?;
             if report.total() > 0 {
@@ -424,9 +440,9 @@ fn run_maintenance(
                     "retention prune applied"
                 );
             }
-            Ok(())
         }
     }
+    Ok(true)
 }
 
 /// Best-effort size-quota enforcement ahead of an insert batch.
@@ -441,7 +457,7 @@ fn enforce_quota(
     quota_bytes: u64,
     stats: &WriterStats,
 ) {
-    let size = crate::maintenance::file_size(db_path);
+    let size = crate::maintenance::database_bytes(db_path);
     if size <= quota_bytes {
         return;
     }
@@ -478,5 +494,21 @@ fn heavy_maintenance_label(operation: &MaintenanceOperation) -> Option<&'static 
         MaintenanceOperation::RebuildFts => Some("rebuild_fts"),
         MaintenanceOperation::Prune(policy) if policy.is_enabled() => Some("prune"),
         MaintenanceOperation::Prune(_) | MaintenanceOperation::Analyze => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The writer's only cleanup guarantee on an unwind is this guard: a
+    /// panic must fail durable-ack waiters instead of leaving them hanging.
+    #[test]
+    fn ledger_guard_closes_the_ledger_on_drop() {
+        let ledger = CommitLedger::new();
+        {
+            let _guard = LedgerCloseOnDrop(&ledger);
+        }
+        assert!(ledger.watermark().closed);
     }
 }

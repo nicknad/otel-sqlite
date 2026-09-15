@@ -104,13 +104,14 @@ for an unverified artifact. Monitor the volume with your regular disk alerts.
 
 ## 6. Alerting on failure
 
-A failed backup exits non-zero. Wire an `OnFailure=` unit to page:
+A failed backup exits non-zero. Add an `OnFailure=` directive to the
+**backup** unit (`otel-sqlite-backup.service`) naming a notifier unit to
+page. The directive belongs in the failure source unit, not in the notifier:
 
 ```ini
 # /etc/systemd/system/otel-sqlite-backup-notify.service
 [Unit]
 Description=Alert on failed otel-sqlite backup
-OnFailure=   # (see note)
 
 [Service]
 Type=oneshot
@@ -118,7 +119,7 @@ ExecStart=/usr/local/bin/otel-backup-alert.sh  # your paging/email/script hook
 ```
 
 ```ini
-# /etc/systemd/system/otel-sqlite-backup.service  (add)
+# /etc/systemd/system/otel-sqlite-backup.service  (add to its [Unit] section)
 [Unit]
 OnFailure=otel-sqlite-backup-notify.service
 ```

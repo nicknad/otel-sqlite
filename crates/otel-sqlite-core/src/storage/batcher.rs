@@ -234,7 +234,10 @@ impl<T> InsertBatcher<T> {
         self.buffer.append(records);
         debug_assert!(records.is_empty());
         if was_empty {
-            self.deadline = Some(Instant::now() + self.config.max_batch_age);
+            self.deadline = Some(crate::time::saturating_deadline(
+                Instant::now(),
+                self.config.max_batch_age,
+            ));
         }
     }
 }
@@ -387,6 +390,18 @@ mod tests {
 
         batcher.push(records(1));
         assert!(batcher.deadline().unwrap() > now);
+    }
+
+    #[test]
+    fn absurd_max_batch_age_saturates_instead_of_panicking() {
+        let mut batcher = InsertBatcher::new(InsertBatcherConfig::new(10, Duration::MAX));
+
+        batcher.push(records(3));
+
+        // The deadline clamps to a representable instant and does not fire now.
+        assert!(batcher.deadline().is_some());
+        assert!(batcher.flush_if_expired(Instant::now()).is_none());
+        assert_eq!(batcher.buffered(), 3);
     }
 
     #[test]

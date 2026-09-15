@@ -24,9 +24,10 @@ pub use config::{
     AuthConfig, DEFAULT_LISTEN_ADDRESS, DEFAULT_MAX_ATTRIBUTE_KEY_BYTES,
     DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES, DEFAULT_MAX_ATTRIBUTES_PER_RECORD, DEFAULT_MAX_BODY_BYTES,
     DEFAULT_MAX_BUCKETS_PER_POINT, DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_EXEMPLARS_PER_POINT,
-    DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_MAX_RECV_MSG_SIZE, DEFAULT_SHUTDOWN_TIMEOUT,
-    IngressConfig, MAX_ATTRIBUTE_KEY_BYTES, MAX_ATTRIBUTE_VALUE_BYTES, MAX_ATTRIBUTES_PER_RECORD,
-    MAX_BODY_BYTES, MAX_BUCKETS_PER_POINT, MAX_EXEMPLARS_PER_POINT, TlsConfig,
+    DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_MAX_RECV_MSG_SIZE,
+    DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES, DEFAULT_SHUTDOWN_TIMEOUT, IngressConfig,
+    MAX_ATTRIBUTE_KEY_BYTES, MAX_ATTRIBUTE_VALUE_BYTES, MAX_ATTRIBUTES_PER_RECORD, MAX_BODY_BYTES,
+    MAX_BUCKETS_PER_POINT, MAX_EXEMPLARS_PER_POINT, MAX_SCOPE_METADATA_EXPANSION_BYTES, TlsConfig,
 };
 pub use error::IngressError;
 pub use grpc::{serve, serve_with_shutdown};
@@ -135,6 +136,15 @@ impl IngestSender {
     /// Whether the channel currently holds no messages.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Total capacity of the underlying bounded channel in messages.
+    ///
+    /// A request mapping to more chunks than this can never be admitted, not
+    /// even into an empty queue; [`reserve`](Self::reserve) would reject it
+    /// forever, so callers treat that case as a permanent mapping error.
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Reserves room for `n` messages, or rejects the whole reservation.

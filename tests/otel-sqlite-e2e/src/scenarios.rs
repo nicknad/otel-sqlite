@@ -151,7 +151,7 @@ pub fn insert_batching(overrides: &Overrides) -> Vec<StepParams> {
         (
             "insert-at-capacity",
             8,
-            crate::server::production_defaults::MAX_BATCH_RECORDS,
+            crate::server::benchmark_profile::MAX_BATCH_RECORDS,
             Some(40_000),
             15,
         ),
@@ -233,12 +233,13 @@ pub async fn run_scenario(
             Ok(raw) => raw,
             Err(error) => {
                 // A step that loses its producer cannot produce trustworthy
-                // numbers; fail loudly instead of reporting partial data.
-                if reports.is_empty() {
-                    return Err(error);
-                }
-                eprintln!("step '{}' aborted early: {error}", params.label);
-                break;
+                // numbers; fail the whole scenario (and the process) instead
+                // of reporting partial data.
+                context.telemetry.end_window();
+                return Err(error.context(format!(
+                    "scenario '{name}' step '{}' lost its producer",
+                    params.label
+                )));
             }
         };
         let window = context.telemetry.end_window();

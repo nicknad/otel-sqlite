@@ -121,12 +121,17 @@ pub(super) fn resolve_metric(
     temporality: Temporality,
     scratch: &mut InsertScratch,
 ) -> Result<(), StorageError> {
+    // A delta and a cumulative series with the same descriptor are distinct
+    // metrics: temporality and monotonicity are part of the identity, both in
+    // this fingerprint and in the table's UNIQUE constraint.
     fingerprint_into(
         &[
             scratch.scope_id.as_str(),
             name,
             unit,
             &metric_type.to_string(),
+            &i64::from(is_monotonic).to_string(),
+            &(temporality as u8).to_string(),
         ],
         &mut scratch.metric_id,
     );

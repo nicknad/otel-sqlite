@@ -34,6 +34,8 @@ impl HealthSampleSource for StorageHealthSource {
             pending_records: sample.buffered_records,
             outstanding_tickets: sample.outstanding_commit_tickets,
             watermark_idle_ms: sample.watermark_idle_ms,
+            maintenance_in_progress: sample.maintenance_in_progress,
+            maintenance_elapsed_ms: sample.maintenance_elapsed_ms,
         }
     }
 }
@@ -65,6 +67,30 @@ fn install_metrics_exporter(address: &str) -> Result<()> {
     Ok(())
 }
 
+fn print_usage() {
+    println!(
+        "otel-sqlite - OTLP/gRPC to SQLite collector
+
+Usage:
+  otel-sqlite [COMMAND] [OPTIONS]
+
+With no command, starts the server. Configuration is read from the TOML
+file named by OTEL_SQLITE_CFG_PATH; without it the built-in defaults apply.
+
+Commands:
+  healthcheck   probe the local gRPC health service (Docker HEALTHCHECK)
+  gen-certs     generate the in-house CA, server and client certificates
+  backup        take an online SQLite snapshot (optionally encrypted)
+  restore       restore a backup into a clean directory
+  verify        run integrity/foreign-key/row-count checks on a database
+
+Options:
+  -h, --help    print this help
+
+Each command has its own flags (for example `otel-sqlite backup --db PATH`)."
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -76,6 +102,10 @@ async fn main() -> Result<()> {
     // Anything else starts the server.
     let mut cli_args = std::env::args().skip(1);
     match cli_args.next().as_deref() {
+        Some("--help" | "-h" | "help") => {
+            print_usage();
+            return Ok(());
+        }
         Some("healthcheck") => return healthcheck::run_healthcheck().await,
         Some("gen-certs") => {
             let rest = cli_args.collect::<Vec<_>>();
@@ -98,9 +128,7 @@ async fn main() -> Result<()> {
             return backup_cli::run_verify(&args);
         }
         Some(unknown) => {
-            eprintln!(
-                "unknown argument `{unknown}`; usage: otel-sqlite [healthcheck | gen-certs | backup | restore | verify]"
-            );
+            eprintln!("unknown argument `{unknown}`; run `otel-sqlite --help` for usage");
             std::process::exit(2);
         }
         None => {}
@@ -126,7 +154,10 @@ async fn main() -> Result<()> {
         Some(address) => {
             install_metrics_exporter(address)
                 .context("failed to start the prometheus metrics endpoint")?;
-            println!("prometheus metrics on http://{address}/metrics");
+            println!(
+                "prometheus metrics on {}",
+                config::metrics_display_url(address)
+            );
         }
         None => println!("metrics endpoint disabled (metrics_address = \"off\")"),
     }

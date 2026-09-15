@@ -65,10 +65,11 @@ pub struct MaintenanceHandle {
 }
 
 impl MaintenanceHandle {
-    /// Signals the worker to stop without waiting for it.
+    /// Signals the worker to stop without waiting for it. Idempotent: a
+    /// second call (or one after the thread has exited) is a no-op.
     pub fn shutdown(&self) {
         if let Some(sender) = &self.shutdown {
-            let _ = sender.send(());
+            let _ = sender.try_send(());
         }
     }
 

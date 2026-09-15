@@ -25,20 +25,13 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use tokio::sync::watch;
 
-/// Process-wide epoch for monotonic stall-evidence timestamps.
-static MONOTONIC_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
-
-fn monotonic_millis() -> u64 {
-    u64::try_from(LazyLock::force(&MONOTONIC_EPOCH).elapsed().as_millis()).unwrap_or(u64::MAX)
-}
+use crate::time::monotonic_millis;
 
 /// Published progress of the SQLite writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,11 +226,15 @@ impl CommitLedger {
         let mut updates = self.updates.subscribe();
         loop {
             let state = *updates.borrow_and_update();
-            if state.closed {
-                return Err(CommitLedgerClosed);
-            }
+            // Commit evidence outranks closure: a ticket whose data already
+            // committed must resolve Ok even when the pipeline has since shut
+            // down, otherwise a waiter that wakes after `close` observes a
+            // spurious failure for durable data.
             if state.committed_through >= ticket {
                 return Ok(());
+            }
+            if state.closed {
+                return Err(CommitLedgerClosed);
             }
             updates.changed().await.map_err(|_| CommitLedgerClosed)?;
         }
@@ -492,6 +489,30 @@ mod tests {
         assert!(ledger.committed(ticket).await.is_ok());
         // Ticket zero is the "nothing accepted" sentinel and never waits.
         assert!(ledger.committed(0).await.is_ok());
+    }
+
+    /// The committed watermark must win over the closed flag: a waiter that
+    /// wakes after both happened holds durable data and must see `Ok`.
+    #[tokio::test]
+    async fn committed_succeeds_after_close_for_an_already_committed_ticket() {
+        let ledger = CommitLedger::new();
+        let committed = ledger.issue();
+        let stranded = ledger.issue();
+        ledger.complete(committed);
+
+        ledger.close();
+        assert!(ledger.watermark().closed);
+
+        assert_eq!(
+            ledger.committed(committed).await,
+            Ok(()),
+            "already-committed data must not be reported as lost just because the pipeline closed"
+        );
+        assert_eq!(
+            ledger.committed(stranded).await,
+            Err(CommitLedgerClosed),
+            "uncommitted tickets still fail fast on close"
+        );
     }
 
     #[tokio::test]

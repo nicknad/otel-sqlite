@@ -1,5 +1,12 @@
 # Stack E2E: full multi-container topology against the production sink.
 #
+# MANUAL / NON-HERMETIC: this stack is NOT run by CI. The `explorer` service
+# builds from a sibling `../otel-sqlite-explorer` checkout (outside this
+# repository), so it cannot be started from a bare CI clone. Run it by hand
+# from a machine that has both repositories side by side, using the commands
+# below. The hermetic container gates in CI are tests/docker/crash-e2e.sh and
+# tests/docker/container-smoke.sh.
+#
 #   nginx (frontend + reverse proxy) ──> backend container
 #     │ access log (file)                    │ OTLP/HTTP JSON logs
 #     ▼                                      ▼

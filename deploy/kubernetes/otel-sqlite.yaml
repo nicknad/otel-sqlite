@@ -28,9 +28,9 @@ spec:
     - name: otlp
       port: 4317
       targetPort: otlp
-    - name: metrics
-      port: 8888
-      targetPort: metrics
+    # No metrics port: /metrics binds 127.0.0.1 inside the pod and carries no
+    # authentication. Scrape it through a sidecar/proxy or `kubectl exec`,
+    # or explicitly opt into a remote bind in the ConfigMap (see there).
 
 ---
 apiVersion: v1
@@ -39,7 +39,12 @@ metadata:
   name: otel-sqlite-config
 data:
   otel-sqlite.toml: |
+    # Cleartext opt-in so this manifest starts as shipped. telemetry travels
+    # unencrypted to anyone on the path; replace with the [tls] block below
+    # (and set allow_insecure_remote = false / remove it) in production, or
+    # only keep this on an isolated network you trust.
     listen_address = "0.0.0.0:4317"
+    allow_insecure_remote = true
     metrics_address = "127.0.0.1:8888"
     sqlite_path = "/data/otel-logs.db"
     shutdown_timeout = "30s"
@@ -52,11 +57,10 @@ data:
     retention = "7d"         # per-signal windows supported (see README)
     checkpoint_interval = "5m"
 
-    # A non-loopback bind without [tls] refuses to start: mount a server
-    # identity below (recommended; bootstrap one with
-    # `otel-sqlite gen-certs`, keep the material in the otel-sqlite-security
-    # Secret mounted read-only) or — only on an isolated network you trust —
-    # set `allow_insecure_remote = true`.
+    # TLS opt-in (recommended): add `server.pem`, `server.key` (and `ca.pem`
+    # for mTLS) to the otel-sqlite-security Secret, mount the tls volume that
+    # is already declared below, delete `allow_insecure_remote` above, then
+    # uncomment this block.
     #
     # [tls]
     # cert = "/etc/otel-sqlite-tls/server.pem"
@@ -121,8 +125,8 @@ spec:
           ports:
             - name: otlp
               containerPort: 4317
-            - name: metrics
-              containerPort: 8888
+            # /metrics is loopback-only (config above); no container port is
+            # published for it. Expose it deliberately if you need scraping.
           # Readiness: NOT_SERVING while the pipeline drains or is unhealthy,
           # so Services stop routing before downtime.
           readinessProbe:
@@ -166,6 +170,13 @@ spec:
               mountPath: /etc/otel-sqlite/clients.txt
               subPath: clients.txt
               readOnly: true
+            # TLS material for the opt-in [tls] block in the ConfigMap.
+            # `optional: true` keeps the pod startable while those keys are
+            # absent; add server.pem/server.key/ca.pem to the Secret to
+            # enable TLS.
+            - name: tls
+              mountPath: /etc/otel-sqlite-tls
+              readOnly: true
             # SQLite temp files under a read-only rootfs go here.
             - name: tmp
               mountPath: /tmp
@@ -177,6 +188,18 @@ spec:
           secret:
             secretName: otel-sqlite-security
             defaultMode: 0400
+        - name: tls
+          secret:
+            secretName: otel-sqlite-security
+            optional: true
+            defaultMode: 0400
+            items:
+              - key: server.pem
+                path: server.pem
+              - key: server.key
+                path: server.key
+              - key: ca.pem
+                path: ca.pem
         - name: tmp
           emptyDir: {}
   # Persistent storage for the database + WAL. This is the single copy of

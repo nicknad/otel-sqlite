@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use otel_sqlite_core::storage::CommitLedger;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 use crate::IngestSender;
@@ -72,12 +72,21 @@ async fn run(
         BearerInterceptor::new(config.auth.as_ref().map(|auth| auth.token_file.as_path()))
             .map_err(|error| IngressError::Auth(error.to_string()))?;
 
+    // Process-wide export concurrency guard shared by both OTLP services:
+    // the transport's `max_concurrent_streams` is per HTTP/2 connection, so
+    // this semaphore enforces the same budget across every connection and
+    // both signals. Health stays outside it.
+    let stream_limit = Arc::new(Semaphore::new(
+        usize::try_from(config.max_concurrent_streams)
+            .unwrap_or(usize::MAX)
+            .max(1),
+    ));
+
     let logs_service = tonic::codegen::InterceptedService::new(
-        LogsServiceServer::new(LogsIngress::new(
-            queue.clone(),
-            Arc::clone(&config),
-            Arc::clone(&commit),
-        ))
+        LogsServiceServer::new(
+            LogsIngress::new(queue.clone(), Arc::clone(&config), Arc::clone(&commit))
+                .with_stream_limit(Arc::clone(&stream_limit)),
+        )
         // The OTLP spec expects receivers to accept gzip and the OpenTelemetry
         // Collector's exporters send it by default; without this the request
         // is rejected as a permanent `Unimplemented` error and data is lost.
@@ -86,9 +95,11 @@ async fn run(
         auth_interceptor.clone(),
     );
     let metrics_service = tonic::codegen::InterceptedService::new(
-        MetricsServiceServer::new(MetricsIngress::new(queue, Arc::clone(&config), commit))
-            .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-            .max_decoding_message_size(config.max_recv_msg_size),
+        MetricsServiceServer::new(
+            MetricsIngress::new(queue, Arc::clone(&config), commit).with_stream_limit(stream_limit),
+        )
+        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+        .max_decoding_message_size(config.max_recv_msg_size),
         auth_interceptor,
     );
 

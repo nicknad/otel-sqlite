@@ -11,4 +11,4 @@ pub use storage::{
     InsertBatcherConfig, LogChunk, LogWriteBatch, MetricChunk, MetricWriteBatch, SyncMode,
     Watermark, WriteBatch, WriteCommand,
 };
-pub use time::unix_nano_now;
+pub use time::{monotonic_millis, saturating_deadline, unix_nano_now};

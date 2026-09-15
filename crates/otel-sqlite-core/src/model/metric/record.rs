@@ -12,7 +12,15 @@ pub struct MetricRecord {
     pub unit: String,
     pub data: MetricData,
     pub metadata: Vec<Attribute>,
+    /// Reserved: resource identity is derived at persist time from [`resource`]
+    /// (or the batch origin); the writer never reads this field.
+    ///
+    /// [`resource`]: MetricRecord::resource
     pub resource_id: String,
+    /// Per-record resource override, honored symmetrically with
+    /// [`LogRecord::resource`](crate::model::LogRecord::resource): when set,
+    /// the record's scope/metric dimensions resolve under it instead of the
+    /// batch origin's resource.
     pub resource: Option<Resource>,
     pub scope_name: String,
     pub scope_version: String,

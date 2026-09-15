@@ -68,17 +68,43 @@ pub(crate) fn vacuum(conn: &Connection) -> Result<(), StorageError> {
     // Prefer incremental vacuum: frees freelist pages without rewriting the
     // entire file, so ingestion stalls for milliseconds, not seconds. Only
     // effective when `auto_vacuum = INCREMENTAL` (set for new databases in
-    // `sqlite::open`); legacy databases convert once via a full VACUUM below
-    // and are incremental thereafter.
-    let auto_vacuum: i64 = conn
-        .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
-        .unwrap_or(0);
-    if auto_vacuum == 2 {
-        conn.execute_batch("PRAGMA incremental_vacuum;")?;
+    // `sqlite::open`); legacy databases convert once via a full VACUUM and
+    // are incremental thereafter.
+    if auto_vacuum_mode(conn) == INCREMENTAL_AUTO_VACUUM {
+        incremental_vacuum(conn)
     } else {
-        tracing::info!("converting database to incremental auto-vacuum (one-time full VACUUM)");
-        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+        convert_to_incremental_vacuum(conn)
     }
+}
+
+/// `PRAGMA auto_vacuum` value for `INCREMENTAL`.
+const INCREMENTAL_AUTO_VACUUM: i64 = 2;
+
+fn auto_vacuum_mode(conn: &Connection) -> i64 {
+    conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+        .unwrap_or(0)
+}
+
+/// One-time conversion for databases created before incremental auto-vacuum
+/// was enabled at creation. Until this runs, `incremental_vacuum` reclaims
+/// nothing, so quota eviction would delete rows without ever shrinking the
+/// file.
+fn convert_to_incremental_vacuum(conn: &Connection) -> Result<(), StorageError> {
+    tracing::info!("converting database to incremental auto-vacuum (one-time full VACUUM)");
+    conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+    Ok(())
+}
+
+/// Reclaims the whole freelist.
+///
+/// `PRAGMA incremental_vacuum` emits one zero-column row per page it
+/// reclaims, and `Connection::execute_batch` steps a statement exactly once,
+/// so the naive form frees a single page per call. Stepping until
+/// `SQLITE_DONE` reclaims everything the freelist holds.
+fn incremental_vacuum(conn: &Connection) -> Result<(), StorageError> {
+    let mut statement = conn.prepare("PRAGMA incremental_vacuum;")?;
+    let mut rows = statement.query([])?;
+    while rows.next()?.is_some() {}
     Ok(())
 }
 
@@ -285,22 +311,46 @@ pub(crate) fn enforce_size_quota(
     quota_bytes: u64,
 ) -> Result<QuotaReport, StorageError> {
     let mut report = QuotaReport {
-        bytes_before: file_size(db_path),
+        bytes_before: database_bytes(db_path),
         ..Default::default()
     };
+    // Fold the WAL into the main file so sizes observed below reflect
+    // committed state. A checkpoint failure (busy reader) makes reclaimed
+    // bytes unobservable: stop rather than evict blindly.
+    if !try_checkpoint_truncate(conn) {
+        report.bytes_after = database_bytes(db_path);
+        return Ok(report);
+    }
+    // Legacy databases were created without auto-vacuum and need a one-time
+    // converting VACUUM before deletions can shrink the file; without it the
+    // loop below would evict batch after batch without ever fitting.
+    if auto_vacuum_mode(conn) != INCREMENTAL_AUTO_VACUUM {
+        convert_to_incremental_vacuum(conn)?;
+    }
     for _ in 0..MAX_QUOTA_ROUNDS {
         if file_size(db_path) <= quota_bytes {
             break;
         }
         let deleted = prune_oldest_batch(conn)?;
-        if deleted.0 + deleted.1 == 0 {
-            // Rows are gone but the file is still big: fragmented freelist.
-            // Reclaim it so the size check observes real usage.
-            conn.execute_batch("PRAGMA incremental_vacuum;")?;
-            break;
-        }
         report.log_events += deleted.0;
         report.metric_points += deleted.1;
+        if deleted.0 + deleted.1 == 0 {
+            // Nothing left to evict: the remaining bytes are schema/freelist
+            // that cannot be reclaimed further.
+            break;
+        }
+        // `DELETE` lands in the WAL and never shrinks the main file, so fold
+        // it in, reclaim the freelist, and fold the reclamation too before
+        // the next size check. Without this every round deletes another full
+        // batch while the measured size never decreases, wiping far more
+        // history than the quota requires.
+        if !try_checkpoint_truncate(conn) {
+            break;
+        }
+        incremental_vacuum(conn)?;
+        if !try_checkpoint_truncate(conn) {
+            break;
+        }
     }
     // One orphan-dimension sweep for everything evicted above (cheaper than
     // per-batch when several rounds ran).
@@ -310,14 +360,44 @@ pub(crate) fn enforce_size_quota(
         collect_orphan_dimensions(&tx, &mut sweep)?;
         tx.commit()?;
     }
-    report.bytes_after = file_size(db_path);
+    report.bytes_after = database_bytes(db_path);
     Ok(report)
+}
+
+/// Best-effort `wal_checkpoint(TRUNCATE)`; `true` when the WAL is fully
+/// folded into the main file.
+fn try_checkpoint_truncate(conn: &Connection) -> bool {
+    match checkpoint(conn, CheckpointMode::Truncate) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "size quota: wal checkpoint failed; stopping eviction early"
+            );
+            false
+        }
+    }
 }
 
 /// Best-effort file size; missing/unreadable counts as zero so enforcement
 /// degrades to a no-op instead of failing the insert it guards.
 pub(crate) fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map_or(0, |metadata| metadata.len())
+}
+
+/// SQLite sidecar path (`<db>-wal`), matching SQLite's suffix convention
+/// rather than `Path::with_extension`.
+fn wal_path(db_path: &Path) -> std::path::PathBuf {
+    let mut os = db_path.as_os_str().to_owned();
+    os.push("-wal");
+    std::path::PathBuf::from(os)
+}
+
+/// On-disk bytes used by the database: main file plus WAL. The quota is a
+/// disk budget, so the WAL must count; it is bounded by
+/// `journal_size_limit` but can still hold megabytes between checkpoints.
+pub(crate) fn database_bytes(db_path: &Path) -> u64 {
+    file_size(db_path).saturating_add(file_size(&wal_path(db_path)))
 }
 
 /// Deletes one bounded batch of the oldest rows per signal (oldest-first by
@@ -340,4 +420,102 @@ fn prune_oldest_batch(conn: &mut Connection) -> Result<(usize, usize), StorageEr
     )?;
     tx.commit()?;
     Ok((logs, metrics))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otel_sqlite_core::storage::SyncMode;
+
+    /// Seeds 6000 log events for quota tests.
+    fn seed_logs(conn: &mut Connection, resource_id: &str, count: i64) {
+        conn.execute(
+            "INSERT INTO log_resource (id, service_name) VALUES (?1, 'svc')",
+            [resource_id],
+        )
+        .expect("insert resource");
+        {
+            let tx = conn.transaction().expect("transaction");
+            for i in 0..count {
+                tx.execute(
+                    "INSERT INTO log_event (
+                        resource_id, timestamp_ns, observed_timestamp_ns, severity_number, body
+                     ) VALUES (?1, ?2, ?2, 9, ?3)",
+                    rusqlite::params![resource_id, i, format!("body-{i}")],
+                )
+                .expect("insert log");
+            }
+            tx.commit().expect("commit");
+        }
+    }
+
+    fn remaining_logs(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM log_event", [], |row| row.get(0))
+            .expect("count")
+    }
+
+    /// Regression guard for the quota loop: `DELETE` alone never shrinks the
+    /// file, so eviction must reclaim pages between rounds and stop as soon
+    /// as the file fits the budget instead of wiping every row.
+    #[test]
+    fn quota_eviction_reclaims_pages_and_stops_at_the_budget() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("quota.db");
+        let mut conn = crate::sqlite::open(&path, SyncMode::default()).expect("open");
+        crate::migration::migrate(&mut conn).expect("migrate");
+        seed_logs(&mut conn, "r", 6_000);
+        checkpoint(&conn, CheckpointMode::Truncate).expect("checkpoint");
+        let size = file_size(&path);
+        let quota = size.saturating_sub(16 * 1024);
+
+        let report = enforce_size_quota(&mut conn, &path, quota).expect("enforce quota");
+
+        assert!(
+            report.log_events > 0,
+            "over-budget database must evict rows"
+        );
+        assert!(
+            remaining_logs(&conn) > 0,
+            "eviction must stop once the file fits the quota, not wipe the table"
+        );
+        assert!(
+            report.bytes_after < report.bytes_before,
+            "quota enforcement must actually reclaim file space"
+        );
+    }
+
+    /// Databases created before incremental auto-vacuum was enabled need a
+    /// one-time converting VACUUM: without it `incremental_vacuum` is a no-op
+    /// and the eviction loop would delete rows while never fitting.
+    #[test]
+    fn quota_eviction_converts_legacy_databases_before_deleting() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("legacy.db");
+        let mut conn = Connection::open(&path).expect("open legacy db");
+        crate::migration::migrate(&mut conn).expect("migrate");
+        seed_logs(&mut conn, "r", 6_000);
+        let size = file_size(&path);
+        assert_eq!(
+            auto_vacuum_mode(&conn),
+            0,
+            "legacy default has no auto-vacuum"
+        );
+        let quota = size.saturating_sub(16 * 1024);
+
+        let report = enforce_size_quota(&mut conn, &path, quota).expect("enforce quota");
+
+        assert_eq!(
+            auto_vacuum_mode(&conn),
+            INCREMENTAL_AUTO_VACUUM,
+            "quota enforcement must convert the database once"
+        );
+        assert!(
+            report.log_events > 0,
+            "over-budget database must evict rows"
+        );
+        assert!(
+            remaining_logs(&conn) > 0,
+            "eviction must stop once the file fits the quota, not wipe the table"
+        );
+    }
 }

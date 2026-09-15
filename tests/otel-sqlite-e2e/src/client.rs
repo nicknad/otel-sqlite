@@ -10,12 +10,18 @@
 //!
 //! * `AllAccepted` / `PartiallyRejected` - authoritative counts reported by
 //!   the server.
-//! * `Rejected`                          - definitively not enqueued
-//!   (`InvalidArgument` / `Unavailable`).
-//! * `Ambiguous`                         - timeout or transport failure; the
-//!   records may still have been enqueued before the failure, so validation
-//!   must tolerate them being either present or absent.
+//! * `Rejected`                          - the server answered definitively
+//!   with a status that carries no error source: `InvalidArgument`
+//!   (malformed request data) or server-generated `Unavailable` (ingress
+//!   queue full/closed). Nothing was enqueued, so validation requires those
+//!   sequences to be absent.
+//! * `Ambiguous`                         - timeout, or a transport-generated
+//!   status (`Status::source()` present: connection refused/reset, HTTP/2
+//!   stream reset). The request may have been received and enqueued before
+//!   the failure, so validation tolerates those records either present or
+//!   absent. Server `Internal`/`ResourceExhausted` are treated the same way.
 
+use std::error::Error as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -56,9 +62,11 @@ pub enum OutcomeKind {
     AllAccepted,
     /// Server reported rejections through OTLP `partial_success`.
     PartiallyRejected { accepted: u64, rejected: u64 },
-    /// Definitively not enqueued (queue disconnected / invalid request).
+    /// Definitively not enqueued: server `InvalidArgument` or server-generated
+    /// `Unavailable` (admission-gate backpressure, queue closed).
     Rejected,
-    /// Unknown fate: timed out or failed before a definitive answer.
+    /// Unknown fate: timed out, or a transport-generated failure before the
+    /// server could answer definitively.
     Ambiguous,
 }
 
@@ -200,7 +208,13 @@ impl LoadClient {
                 OutcomeKind::Ambiguous
             }
             Ok(Err(status)) => match status.code() {
-                tonic::Code::InvalidArgument | tonic::Code::Unavailable => {
+                // Server-generated verdicts carry no `source`; a status with
+                // one attached was synthesized by the transport (connect
+                // failure, HTTP/2 stream reset) and the request may still have
+                // reached the server, so it is not a definitive rejection.
+                tonic::Code::InvalidArgument | tonic::Code::Unavailable
+                    if status.source().is_none() =>
+                {
                     self.counters
                         .requests_failed
                         .fetch_add(1, Ordering::Relaxed);

@@ -20,7 +20,7 @@ pub(crate) async fn run_healthcheck() -> Result<()> {
         .ok()
         .filter(|endpoint| !endpoint.trim().is_empty())
         .unwrap_or_else(|| derive_healthcheck_endpoint(&config));
-    let tls = build_probe_tls(&config);
+    let tls = build_probe_tls(&config, &endpoint);
     let result = probe_health(&endpoint, tls.as_ref()).await;
     match result {
         Ok(tonic_health::pb::health_check_response::ServingStatus::Serving) => {
@@ -63,13 +63,26 @@ struct ProbeTls {
     identity: Option<(Vec<u8>, Vec<u8>)>,
 }
 
-fn build_probe_tls(config: &Config) -> Option<ProbeTls> {
+fn build_probe_tls(config: &Config, endpoint: &str) -> Option<ProbeTls> {
     let tls = config.tls.as_ref()?;
-    let ca_path = tls.client_ca.as_ref().unwrap_or(&tls.cert);
-    let ca_pem = std::fs::read(ca_path)
+    // Trust the client CA when mTLS is enabled, otherwise the CA that issued
+    // the server leaf. `gen-certs` writes `ca.pem` next to `server.pem`, so
+    // sibling discovery makes the default server-only TLS setup probe
+    // correctly instead of failing with `UnknownIssuer` (a CA-signed leaf is
+    // not a valid trust anchor). The leaf itself remains the last resort for
+    // self-signed certificates.
+    let ca_path = tls
+        .client_ca
+        .clone()
+        .or_else(|| {
+            let sibling = tls.cert.with_file_name("ca.pem");
+            sibling.is_file().then_some(sibling)
+        })
+        .unwrap_or_else(|| tls.cert.clone());
+    let ca_pem = std::fs::read(&ca_path)
         .with_context(|| format!("read healthcheck CA {}", ca_path.display()))
         .ok()?;
-    let domain_name = healthcheck_domain_name(&derive_healthcheck_endpoint(config));
+    let domain_name = healthcheck_domain_name(endpoint);
     let identity = if tls.client_ca.is_some() {
         let cert = std::fs::read(&tls.cert).ok()?;
         let key = std::fs::read(&tls.key).ok()?;
@@ -200,5 +213,67 @@ mod tests {
             healthcheck_domain_name("https://otel.internal:4317"),
             "otel.internal"
         );
+    }
+
+    /// Server-only TLS (no `client_ca`) must verify against the issuing CA:
+    /// the leaf is not a valid trust anchor, so the probe falls back to the
+    /// `ca.pem` written next to the server identity by `gen-certs`.
+    #[test]
+    fn server_only_tls_probe_trusts_the_sibling_ca_not_the_leaf() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        crate::gencerts::run(&crate::gencerts::GenCertsArgs {
+            hosts: vec!["localhost".to_owned()],
+            clients: Vec::new(),
+            out_dir: dir.path().to_path_buf(),
+            force: false,
+        })
+        .expect("generate PKI");
+
+        let config = Config {
+            tls: Some(otel_sqlite_ingress::TlsConfig {
+                cert: dir.path().join("server.pem"),
+                key: dir.path().join("server.key"),
+                client_ca: None,
+            }),
+            ..Config::default()
+        };
+        let probe = build_probe_tls(&config, "https://127.0.0.1:4317").expect("probe TLS");
+        let ca = std::fs::read(dir.path().join("ca.pem")).expect("read ca.pem");
+        let leaf = std::fs::read(dir.path().join("server.pem")).expect("read server.pem");
+        assert_eq!(probe.ca_pem, ca, "must trust the issuing CA");
+        assert_ne!(probe.ca_pem, leaf, "the leaf is not a trust anchor");
+        assert_eq!(probe.domain_name, "127.0.0.1");
+        assert!(
+            probe.identity.is_none(),
+            "server-only TLS has no client identity to present"
+        );
+    }
+
+    /// The effective endpoint (including an env override) determines the TLS
+    /// server name, not the derived listen address.
+    #[test]
+    fn probe_domain_name_follows_the_effective_endpoint() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        crate::gencerts::run(&crate::gencerts::GenCertsArgs {
+            hosts: vec!["localhost".to_owned()],
+            clients: Vec::new(),
+            out_dir: dir.path().to_path_buf(),
+            force: false,
+        })
+        .expect("generate PKI");
+
+        let config = Config {
+            listen_address: "127.0.0.1:4317".to_owned(),
+            tls: Some(otel_sqlite_ingress::TlsConfig {
+                cert: dir.path().join("server.pem"),
+                key: dir.path().join("server.key"),
+                client_ca: Some(dir.path().join("ca.pem")),
+            }),
+            ..Config::default()
+        };
+        let probe =
+            build_probe_tls(&config, "https://localhost:24419").expect("probe TLS with identity");
+        assert_eq!(probe.domain_name, "localhost");
+        assert!(probe.identity.is_some(), "mTLS must present an identity");
     }
 }

@@ -33,11 +33,16 @@ the runner images on first use (the `catthehacker` image and
 | `... -List` / `--list` | Lists the workflows act sees for the `push` event, then exits. |
 | `... -Act <path>` / `ACT=<path>` | Use a specific act binary. |
 
-Targeted runs: pass extra act flags after the job list, or call act directly
-from this directory (`.actrc` is read here), e.g.:
+Targeted runs: the wrapper scripts take only `-All`/`--all`, `-List`/`--list`
+and an act binary override; they do **not** forward extra flags. To run a
+subset (or pass additional act flags), call act directly from this directory
+so `.actrc`/`.act.env` are read, and select the job with `-j`:
 
 ```bash
-cd tools/local-ci && act -C ../.. -W .forgejo/workflows lint-and-test -- -v
+cd tools/local-ci
+act -C ../.. -W "$PWD/../../.forgejo/workflows" -j lint-and-test
+# extra act flags go before the job selector, e.g.:
+act -C ../.. -W "$PWD/../../.forgejo/workflows" -v -j lint-and-test
 ```
 
 ## What this configuration does

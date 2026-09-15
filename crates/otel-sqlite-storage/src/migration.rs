@@ -7,21 +7,31 @@ const MIGRATIONS: &[Migration] = &[
         version: "000",
         description: "Canonical OTLP SQLite schema: logs, resources, contentless FTS5, metrics and read-side views",
         sql: include_str!("../migrations/000_baseline.sql"),
+        disable_foreign_keys: false,
     },
     Migration {
         version: "001",
         description: "Incrementally maintained log search index: triggers keep FTS5 consistent with inserts and retention prunes",
         sql: include_str!("../migrations/001_log_fts_incremental.sql"),
+        disable_foreign_keys: false,
     },
     Migration {
         version: "002",
         description: "Metric retention access path: timestamp index for age-based data-point prunes",
         sql: include_str!("../migrations/002_metric_retention_index.sql"),
+        disable_foreign_keys: false,
     },
     Migration {
         version: "003",
         description: "Mapping fidelity: scope attributes/schema URL on log events and scopes, metric metadata, exemplar persistence columns exposed on the read-side views",
         sql: include_str!("../migrations/003_mapping_fidelity.sql"),
+        disable_foreign_keys: false,
+    },
+    Migration {
+        version: "004",
+        description: "Metric identity includes is_monotonic and aggregation_temporality in the dimension UNIQUE constraint (table rebuild)",
+        sql: include_str!("../migrations/004_metric_identity_temporality.sql"),
+        disable_foreign_keys: true,
     },
 ];
 
@@ -29,6 +39,10 @@ struct Migration {
     version: &'static str,
     description: &'static str,
     sql: &'static str,
+    /// Run with `PRAGMA foreign_keys = OFF`. Required for table rebuilds that
+    /// drop a parent table: with FKs on, `DROP TABLE` would cascade into the
+    /// child rows before the rebuilt table is renamed into place.
+    disable_foreign_keys: bool,
 }
 
 pub(crate) fn migrate(conn: &mut Connection) -> Result<(), StorageError> {
@@ -58,6 +72,24 @@ fn migrate_inner(conn: &mut Connection, target_version: Option<&str>) -> Result<
         rows.collect::<Result<Vec<_>, _>>()?
     };
 
+    // Downgrade guard: an older binary must refuse to run against a database
+    // stamped by a newer one. Proceeding would silently write a schema that
+    // the newer binary cannot reason about (or worse, misread).
+    let newest_known = MIGRATIONS
+        .last()
+        .map(|migration| migration.version)
+        .unwrap_or_default();
+    if let Some(newest_applied) = applied.iter().max()
+        && newest_applied.as_str() > newest_known
+    {
+        return Err(StorageError::StartupFailed {
+            message: format!(
+                "database schema version {newest_applied} is newer than the newest supported \
+                 version {newest_known}; upgrade this binary before opening it"
+            ),
+        });
+    }
+
     for migration in MIGRATIONS {
         if applied.iter().any(|version| version == migration.version) {
             continue;
@@ -69,6 +101,9 @@ fn migrate_inner(conn: &mut Connection, target_version: Option<&str>) -> Result<
             continue;
         }
 
+        if migration.disable_foreign_keys {
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+        }
         let tx = conn.transaction()?;
         tx.execute_batch(migration.sql)?;
         tx.execute(
@@ -76,6 +111,9 @@ fn migrate_inner(conn: &mut Connection, target_version: Option<&str>) -> Result<
             rusqlite::params![migration.version, migration.description],
         )?;
         tx.commit()?;
+        if migration.disable_foreign_keys {
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+        }
 
         tracing::info!(version = migration.version, "applied schema migration");
     }

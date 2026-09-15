@@ -24,6 +24,15 @@ pub(crate) fn open(path: &Path, synchronous: SyncMode) -> Result<Connection, Sto
     // sidecars must be owner-only from creation, mirroring backup artifacts.
     crate::permissions::harden_database_files(path);
 
+    // Prefer incremental vacuum for future maintenance: full VACUUM rewrites
+    // the entire file under an exclusive lock (seconds on GB DBs). This must
+    // be set *before* the first header write (the journal-mode switch below),
+    // otherwise SQLite persists `auto_vacuum=0` and only a converting VACUUM
+    // can change it later (see `maintenance::vacuum` for that legacy path).
+    if let Err(error) = conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;") {
+        tracing::debug!(%error, "auto_vacuum left at default");
+    }
+
     let journal_mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
     tracing::debug!(journal_mode = journal_mode.as_str(), "sqlite journal mode");
 
@@ -49,13 +58,6 @@ pub(crate) fn open(path: &Path, synchronous: SyncMode) -> Result<Connection, Sto
         if let Err(error) = conn.pragma_update(None, pragma, value) {
             tracing::debug!(pragma, %error, "sqlite pragma left at default");
         }
-    }
-    // Prefer incremental vacuum for future maintenance: full VACUUM rewrites
-    // the entire file under an exclusive lock (seconds on GB DBs). This only
-    // takes effect for new databases (or after one converting VACUUM); see
-    // `maintenance::vacuum` for the migration path.
-    if let Err(error) = conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;") {
-        tracing::debug!(%error, "auto_vacuum left at default");
     }
 
     Ok(conn)

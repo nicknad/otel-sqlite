@@ -30,10 +30,23 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
 
-/// Production defaults mirrored from `crates/otel-sqlite/src/config.rs`.
-pub mod production_defaults {
+/// Benchmark pipeline profile.
+///
+/// The handlers and pipeline wiring are the production implementations, but
+/// this profile is deliberately NOT a verbatim copy of the production
+/// defaults in `crates/otel-sqlite/src/config.rs`: most per-record caps are
+/// tighter (harness payloads are tiny, and tighter caps make the validation
+/// and backpressure paths cheap to reach in short runs) and the stream count
+/// is higher (so the concurrency ramp can hold more simultaneous clients).
+/// Values that do match production are imported from the ingress crate so
+/// they cannot drift silently; each field below is annotated.
+pub mod benchmark_profile {
     use super::{Duration, IngressConfig, InsertBatcherConfig, PathBuf, StorageConfig};
     use otel_sqlite_core::storage::{DurabilityMode, SyncMode};
+    use otel_sqlite_ingress::{
+        DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_MAX_RECV_MSG_SIZE,
+        DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES, DEFAULT_SHUTDOWN_TIMEOUT,
+    };
 
     pub const INGEST_QUEUE_CAPACITY: usize = 50_000;
     pub const COMMAND_QUEUE_CAPACITY: usize = 50_000;
@@ -49,16 +62,19 @@ pub mod production_defaults {
     pub fn ingress_config(listen_address: String) -> IngressConfig {
         IngressConfig {
             listen_address,
-            max_recv_msg_size: 16 * 1024 * 1024,
+            max_recv_msg_size: DEFAULT_MAX_RECV_MSG_SIZE, // production
+            // Production default is 64; raised so ramp scenarios can hold
+            // more simultaneous clients.
             max_concurrent_streams: 256,
-            shutdown_timeout: Duration::from_secs(30),
-            max_records_per_request: 100_000,
-            max_attributes_per_record: 128,
-            max_attribute_key_bytes: 256,
-            max_attribute_value_bytes: 4096,
-            max_body_bytes: 65536,
-            max_buckets_per_point: 160,
-            max_exemplars_per_point: 32,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT, // production
+            max_records_per_request: DEFAULT_MAX_RECORDS_PER_REQUEST, // production
+            max_attributes_per_record: 128,             // production 1_000
+            max_attribute_key_bytes: 256,               // production 512
+            max_attribute_value_bytes: 4096,            // production 64 KiB
+            max_body_bytes: 65536,                      // production 1 MiB
+            max_buckets_per_point: 160,                 // production 10_000
+            max_exemplars_per_point: 32,                // production 100
+            max_scope_metadata_expansion_bytes: DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES,
             durability_mode: DurabilityMode::Commit,
             tls: None,
             auth: None,
@@ -105,14 +121,14 @@ pub struct EmbeddedServer {
 impl EmbeddedServer {
     /// Start the full pipeline. Mirrors `crates/otel-sqlite/src/main.rs`.
     pub async fn start(listen_addr: &str, data_dir: &Path) -> anyhow::Result<Self> {
-        let config = production_defaults::ingress_config(listen_addr.to_owned());
-        let storage_config = production_defaults::storage_config(data_dir.join("otel-logs.db"));
+        let config = benchmark_profile::ingress_config(listen_addr.to_owned());
+        let storage_config = benchmark_profile::storage_config(data_dir.join("otel-logs.db"));
 
         let addr: SocketAddr = config.socket_addr()?;
         let config = Arc::new(config);
 
         let (ingest_tx, receiver) =
-            otel_sqlite_ingress::channel(production_defaults::INGEST_QUEUE_CAPACITY);
+            otel_sqlite_ingress::channel(benchmark_profile::INGEST_QUEUE_CAPACITY);
         let storage = Storage::open(receiver, storage_config)
             .map_err(|error| anyhow::anyhow!("failed to start sqlite storage: {error}"))?;
         let commit_ledger = storage.commit_ledger();
@@ -253,7 +269,7 @@ impl EmbeddedServer {
     /// hanging this process forever. (The underlying threads are leaked on
     /// such an error; the harness exits non-zero immediately afterwards.)
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
-        use production_defaults::SHUTDOWN_PHASE_TIMEOUT;
+        use benchmark_profile::SHUTDOWN_PHASE_TIMEOUT;
 
         let _ = self.shutdown_tx.send(true);
         let serve_handle = self.serve_handle;

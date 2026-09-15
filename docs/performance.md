@@ -286,8 +286,10 @@ deployments.
   will engage naturally on slower disks or network-loaded deployments; when
   it does, the harness validates rejected sequence positions exactly (all
   rejections are whole-request).
-* Windows-native runs bind loopback (avoids firewall prompts); production
-  binds all interfaces. This does not affect throughput characteristics.
+* Windows-native runs bind loopback (avoids firewall prompts), matching the
+  production default (`listen_address = "127.0.0.1:4317"`). Deployments that
+  need remote ingress opt into a wildcard/explicit bind, which does not affect
+  throughput characteristics.
 * `ingress_queue_full_total` counts *rejected requests* (a
   whole-request rejection), not individual chunks. It increments once per
   export that could not be admitted, which is the number clients actually
@@ -410,8 +412,10 @@ Conclusions applied to the configuration:
 
 ## 11. Hardening backlog: PERF-006 / PERF-007
 
-Open work is tracked in [`TODO.md`](../TODO.md) (P2). This section preserves
-the design detail from the superseded `HANDOFF-PERFORMANCE.md`.
+Open work is tracked in the
+[issue tracker](https://github.com/nicknad/otel-sqlite/issues) (P2). This
+section preserves the design detail from the superseded
+`HANDOFF-PERFORMANCE.md`.
 
 ### Why these matter
 

@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use otel_sqlite_core::storage::IngestMessage;
 use otel_sqlite_e2e::generator::WorkloadSpec;
-use otel_sqlite_e2e::server::production_defaults;
+use otel_sqlite_e2e::server::benchmark_profile;
 use otel_sqlite_ingress::LogsIngress;
 use otel_sqlite_ingress::mapping::pb::collector::logs::v1::logs_service_server::LogsService;
 use otel_sqlite_storage::Storage;
@@ -58,18 +58,15 @@ fn bench_ingest_to_sqlite(c: &mut Criterion) {
         .expect("tokio runtime");
 
     let dir = TempDir::new().expect("temp dir");
-    let (sender, receiver) =
-        otel_sqlite_ingress::channel(production_defaults::INGEST_QUEUE_CAPACITY);
+    let (sender, receiver) = otel_sqlite_ingress::channel(benchmark_profile::INGEST_QUEUE_CAPACITY);
     let mut storage = Storage::open(
         receiver,
-        production_defaults::storage_config(dir.path().join("otel-logs.db")),
+        benchmark_profile::storage_config(dir.path().join("otel-logs.db")),
     )
     .expect("storage opens");
     let ingress = LogsIngress::new(
         sender.clone(),
-        Arc::new(production_defaults::ingress_config(
-            "127.0.0.1:0".to_owned(),
-        )),
+        Arc::new(benchmark_profile::ingress_config("127.0.0.1:0".to_owned())),
         storage.commit_ledger(),
     );
 

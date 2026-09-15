@@ -60,18 +60,30 @@ enum Event {
 /// `ledger` is the durability-ticket book: chunks skipped as empty get their
 /// ticket voided (nothing to persist), and a dead writer triggers
 /// [`CommitLedger::close`] so waiting OTLP handlers fail fast instead of
-/// hanging on acks that can never be backed by a commit.
+/// hanging on acks that can never be backed by a commit. `ready_tx` receives
+/// one signal once the thread started and its liveness guard is published, so
+/// [`crate::Storage::open`] can never return a batcher that is not running.
 pub(crate) fn run(
     input: Receiver<IngestMessage>,
     commands: Sender<WriteCommand>,
     ledger: &CommitLedger,
     config: InsertBatcherConfig,
     stats: &BatcherStats,
+    ready_tx: Sender<()>,
 ) {
     // Cleared on every exit path (including panics) so the watchdog can tell
     // a dead batcher thread from a merely idle one.
     let _running = stats.running_guard();
+    let _ = ready_tx.send(());
     stats.mark_progress();
+
+    // Closes the ledger if the batcher dies (panic or early return) while the
+    // writer may still owe nothing: disarmed only when the writer remains
+    // alive and therefore owns the close at its own exit.
+    let mut close_ledger = CloseLedgerOnDrop {
+        ledger,
+        armed: true,
+    };
     let mut logs = OriginBuffers::<LogRecord>::new(config);
     let mut metrics = OriginBuffers::<MetricRecord>::new(config);
 
@@ -187,6 +199,10 @@ pub(crate) fn run(
         // Input closed: flush every partial batch so no buffered record is
         // lost, then close the command queue so the writer can drain and exit.
         flush_buffers(&mut logs, &mut metrics, &commands, stats, &mut alive);
+    }
+    if alive {
+        // The writer is still draining and closes the ledger itself at exit.
+        close_ledger.armed = false;
     } else {
         tracing::error!(
             dropped_records = stats.dropped_records.load(Ordering::Relaxed),
@@ -195,10 +211,26 @@ pub(crate) fn run(
         // The writer is gone: records held here were dropped, so no pending
         // ticket can ever be completed. Fail every durable-ack waiter now.
         ledger.close();
+        close_ledger.armed = false;
     }
 
     stats.observe_buffered(0, 0);
     drop(commands);
+}
+
+/// Closes the ledger on drop unless disarmed. Covers panics (and early
+/// returns) that would otherwise leave durable-ack waiters hanging.
+struct CloseLedgerOnDrop<'a> {
+    ledger: &'a CommitLedger,
+    armed: bool,
+}
+
+impl Drop for CloseLedgerOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.ledger.close();
+        }
+    }
 }
 
 /// Emits every per-origin partial batch (if any) so control commands act as
@@ -219,7 +251,11 @@ fn flush_buffers(
 }
 
 fn submit(commands: &Sender<WriteCommand>, command: WriteCommand, stats: &BatcherStats) -> bool {
-    match commands.send(command) {
+    let outcome = commands.send(command);
+    stats
+        .queued_commands
+        .store(commands.len(), Ordering::Relaxed);
+    match outcome {
         Ok(()) => true,
         Err(SendError(command)) => {
             // The writer is gone; there is nowhere to persist these records.
@@ -315,9 +351,20 @@ mod tests {
         let ledger = Arc::new(CommitLedger::new());
         let thread_stats = Arc::clone(&stats);
         let thread_ledger = Arc::clone(&ledger);
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
         let handle = std::thread::spawn(move || {
-            run(receiver, commands, &thread_ledger, config, &thread_stats);
+            run(
+                receiver,
+                commands,
+                &thread_ledger,
+                config,
+                &thread_stats,
+                ready_tx,
+            );
         });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("batcher publishes readiness");
         (input, handle, stats, ledger)
     }
 
@@ -392,8 +439,16 @@ mod tests {
         let (input, receiver) = crossbeam_channel::unbounded();
         let stats = BatcherStats::default();
         let ledger = CommitLedger::new();
+        let (ready_tx, _ready_rx) = crossbeam_channel::unbounded();
         let handle = std::thread::spawn(move || {
-            run(receiver, commands_tx, &ledger, config(1000, 30), &stats);
+            run(
+                receiver,
+                commands_tx,
+                &ledger,
+                config(1000, 30),
+                &stats,
+                ready_tx,
+            );
         });
 
         let started = Instant::now();
@@ -542,6 +597,7 @@ mod tests {
         let stats = Arc::new(BatcherStats::default());
         let ledger = CommitLedger::new();
         let thread_stats = Arc::clone(&stats);
+        let (ready_tx, _ready_rx) = crossbeam_channel::unbounded();
         let handle = std::thread::spawn(move || {
             run(
                 receiver,
@@ -549,6 +605,7 @@ mod tests {
                 &ledger,
                 config(10, 60_000),
                 &thread_stats,
+                ready_tx,
             );
         });
 
@@ -604,6 +661,7 @@ mod tests {
         let ledger = Arc::new(CommitLedger::new());
         let thread_stats = Arc::clone(&stats);
         let thread_ledger = Arc::clone(&ledger);
+        let (ready_tx, _ready_rx) = crossbeam_channel::unbounded();
         let handle = std::thread::spawn(move || {
             run(
                 receiver,
@@ -611,6 +669,7 @@ mod tests {
                 &thread_ledger,
                 config(4, 60_000),
                 &thread_stats,
+                ready_tx,
             );
         });
         drop(commands_rx); // simulate writer death
@@ -640,6 +699,45 @@ mod tests {
             ledger.watermark().closed,
             "writer death must close the ledger so durable-ack waiters fail fast"
         );
+    }
+
+    /// A panic in the batcher must close the ledger on unwind, so durable-ack
+    /// waiters fail fast instead of hanging on a thread that no longer exists.
+    #[test]
+    fn panicking_batcher_closes_the_ledger() {
+        let (commands_tx, _commands_rx) = crossbeam_channel::unbounded();
+        let (input, receiver) = crossbeam_channel::unbounded();
+        let stats = Arc::new(BatcherStats::default());
+        let ledger = Arc::new(CommitLedger::new());
+        let thread_stats = Arc::clone(&stats);
+        let thread_ledger = Arc::clone(&ledger);
+        let (ready_tx, _ready_rx) = crossbeam_channel::unbounded();
+        let handle = std::thread::spawn(move || {
+            run(
+                receiver,
+                commands_tx,
+                &thread_ledger,
+                InsertBatcherConfig {
+                    max_batch_records: 0,
+                    max_batch_age: Duration::from_millis(10),
+                },
+                &thread_stats,
+                ready_tx,
+            );
+        });
+
+        // The first record reaches `InsertBatcher::new`, which panics on a
+        // zero capacity; the unwind must run the ledger guard.
+        input.send(chunk("a", 1)).unwrap();
+        assert!(
+            handle.join().is_err(),
+            "the zero-capacity batcher must have panicked"
+        );
+        assert!(
+            ledger.watermark().closed,
+            "an unwinding batcher must close the ledger"
+        );
+        assert!(!stats.running.load(Ordering::Relaxed));
     }
 
     #[test]

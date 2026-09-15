@@ -9,7 +9,7 @@ insert batcher → bounded command queue → single SQLite writer (WAL)`.
 - Benchmarks & performance docs: [docs/performance.md](docs/performance.md)
   (`cargo run --release -p otel-sqlite-e2e -- --scenario baseline`)
 - Architecture, design contract & invariants: [docs/architecture.md](docs/architecture.md)
-- Open work & roadmap: [TODO.md](TODO.md)
+- Open work & hardening backlog: [GitHub issues](https://github.com/nicknad/otel-sqlite/issues)
 - Local CI (run `.forgejo/workflows/ci.yml` on your machine with `act`):
   [tools/local-ci/](tools/local-ci/) (`.\tools\local-ci\run.ps1` or `./tools/local-ci/run.sh`)
 
@@ -188,6 +188,7 @@ Rejected requests issue no commit tickets and never stall later commits.
 
 ```toml
 listen_address = "0.0.0.0:4317"
+allow_insecure_remote = true         # only on an isolated/trusted network; prefer [tls]
 metrics_address = "127.0.0.1:8888"   # "off" disables /metrics
 max_records_per_request = 100000
 # allow_remote_metrics = true         # explicit opt-in; prefer a protected proxy
@@ -203,10 +204,17 @@ printed as JSON at startup. Remote Prometheus exposure is rejected unless
 
 The image runs as non-root user `otel-sqlite` with `WORKDIR /data`, so the
 default relative database path lands inside the declared `/data` volume —
-mount a volume or the data lives on the ephemeral container layer:
+mount a volume or the data lives on the ephemeral container layer. The
+process binds loopback by default, so a published port only works when the
+config opts into a wildcard bind (cleartext needs `allow_insecure_remote`,
+or configure `[tls]`):
 
 ```sh
-docker run -d -v otel-sqlite-data:/data -p 4317:4317 otel-sqlite
+# otel-sqlite.toml: listen_address = "0.0.0.0:4317" + allow_insecure_remote = true
+docker run -d -v otel-sqlite-data:/data \
+  -v "$PWD/otel-sqlite.toml:/data/otel-sqlite.toml:ro" \
+  -e OTEL_SQLITE_CFG_PATH=/data/otel-sqlite.toml \
+  -p 4317:4317 otel-sqlite
 ```
 
 The image ships a `HEALTHCHECK` backed by `otel-sqlite healthcheck`, which
@@ -273,7 +281,9 @@ token_file = "/etc/otel-sqlite/clients.txt"   # one token per line, all valid
 
 - **mTLS**: clients must present a certificate signed by `client_ca`.
   Rotation = reissue a client cert from the CA (`gen-certs --client x`
-  again); the CA itself stays stable for years.
+  again, which reuses the existing `ca.pem`/`ca.key` in `--out`); the CA
+  itself stays stable until you explicitly rotate it with `gen-certs --force`
+  (which invalidates every previously issued certificate).
 - **Tokens** travel as `authorization: Bearer <token>` headers, are stored
   hashed (constant-time compare) and reloaded from disk every few seconds —
   rotate with zero downtime by appending a new line to `clients.txt`,

@@ -7,9 +7,10 @@ use otel_sqlite_ingress::{
     AuthConfig, DEFAULT_LISTEN_ADDRESS, DEFAULT_MAX_ATTRIBUTE_KEY_BYTES,
     DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES, DEFAULT_MAX_ATTRIBUTES_PER_RECORD, DEFAULT_MAX_BODY_BYTES,
     DEFAULT_MAX_BUCKETS_PER_POINT, DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_EXEMPLARS_PER_POINT,
-    DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_MAX_RECV_MSG_SIZE, DEFAULT_SHUTDOWN_TIMEOUT,
-    IngressConfig, MAX_ATTRIBUTE_KEY_BYTES, MAX_ATTRIBUTE_VALUE_BYTES, MAX_ATTRIBUTES_PER_RECORD,
-    MAX_BODY_BYTES, MAX_BUCKETS_PER_POINT, MAX_EXEMPLARS_PER_POINT, TlsConfig,
+    DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_MAX_RECV_MSG_SIZE,
+    DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES, DEFAULT_SHUTDOWN_TIMEOUT, IngressConfig,
+    MAX_ATTRIBUTE_KEY_BYTES, MAX_ATTRIBUTE_VALUE_BYTES, MAX_ATTRIBUTES_PER_RECORD, MAX_BODY_BYTES,
+    MAX_BUCKETS_PER_POINT, MAX_EXEMPLARS_PER_POINT, MAX_SCOPE_METADATA_EXPANSION_BYTES, TlsConfig,
 };
 use otel_sqlite_runtime::{MaintenanceConfig, WatchdogConfig};
 use otel_sqlite_storage::StorageConfig;
@@ -71,6 +72,10 @@ pub struct Config {
     pub max_buckets_per_point: usize,
     /// Max exemplars on one metric point (H2).
     pub max_exemplars_per_point: usize,
+    /// Aggregate scope-metadata expansion budget per request (C1): scope
+    /// metadata bytes multiplied by member records. See ingress
+    /// `DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES`.
+    pub max_scope_metadata_expansion_bytes: usize,
     /// Optional on-disk size quota for the SQLite database file, in bytes
     /// (`None` = unbounded). When set, the storage writer evicts the oldest
     /// rows before each insert batch once the file exceeds the quota.
@@ -124,6 +129,7 @@ impl Default for Config {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_buckets_per_point: DEFAULT_MAX_BUCKETS_PER_POINT,
             max_exemplars_per_point: DEFAULT_MAX_EXEMPLARS_PER_POINT,
+            max_scope_metadata_expansion_bytes: DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES,
             max_db_bytes: None,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             maintenance: MaintenanceConfig::default(),
@@ -290,6 +296,12 @@ impl Config {
             1,
             MAX_EXEMPLARS_PER_POINT,
         )?;
+        validate_range(
+            "max_scope_metadata_expansion_bytes",
+            self.max_scope_metadata_expansion_bytes,
+            1024,
+            MAX_SCOPE_METADATA_EXPANSION_BYTES,
+        )?;
         if let Some(quota) = self.max_db_bytes
             && quota < MIN_DB_QUOTA_BYTES
         {
@@ -337,6 +349,13 @@ impl Config {
         validate_duration("watchdog.degraded_after", self.watchdog.degraded_after)?;
         validate_duration("watchdog.unhealthy_after", self.watchdog.unhealthy_after)?;
         validate_duration("watchdog.ack_stall_after", self.watchdog.ack_stall_after)?;
+        validate_duration(
+            "watchdog.maintenance_stall_after",
+            self.watchdog.maintenance_stall_after,
+        )?;
+        if self.watchdog.maintenance_stall_after < self.watchdog.unhealthy_after {
+            bail!("watchdog.maintenance_stall_after must be at least unhealthy_after");
+        }
         if self.watchdog.degraded_after >= self.watchdog.unhealthy_after {
             bail!("watchdog.degraded_after must be less than unhealthy_after");
         }
@@ -384,6 +403,13 @@ impl Config {
             "grpc_max_recv_msg_size": self.grpc_max_recv_msg_size,
             "grpc_max_concurrent_streams": self.grpc_max_concurrent_streams,
             "max_records_per_request": self.max_records_per_request,
+            "max_attributes_per_record": self.max_attributes_per_record,
+            "max_attribute_key_bytes": self.max_attribute_key_bytes,
+            "max_attribute_value_bytes": self.max_attribute_value_bytes,
+            "max_body_bytes": self.max_body_bytes,
+            "max_buckets_per_point": self.max_buckets_per_point,
+            "max_exemplars_per_point": self.max_exemplars_per_point,
+            "max_scope_metadata_expansion_bytes": self.max_scope_metadata_expansion_bytes,
             "max_db_bytes": self.max_db_bytes,
             "shutdown_timeout_ms": self.shutdown_timeout.as_millis(),
             "durability_mode": format!("{:?}", self.durability_mode),
@@ -393,8 +419,8 @@ impl Config {
             "allow_insecure_remote": self.allow_insecure_remote,
             "tls_configured": self.tls.is_some(),
             "auth_configured": self.auth.is_some(),
-            "maintenance": format!("{:?}", self.maintenance),
-            "watchdog": format!("{:?}", self.watchdog),
+            "maintenance": maintenance_dump(&self.maintenance),
+            "watchdog": watchdog_dump(&self.watchdog),
         }))
         .context("failed to serialize effective configuration")
     }
@@ -412,6 +438,7 @@ impl Config {
             max_body_bytes: self.max_body_bytes,
             max_buckets_per_point: self.max_buckets_per_point,
             max_exemplars_per_point: self.max_exemplars_per_point,
+            max_scope_metadata_expansion_bytes: self.max_scope_metadata_expansion_bytes,
             durability_mode: self.durability_mode,
             tls: self.tls.clone(),
             auth: self.auth.clone(),
@@ -437,6 +464,51 @@ impl Config {
     }
 }
 
+/// Effective maintenance schedule as a JSON object (durations in
+/// milliseconds), used by the JSON startup dump.
+fn maintenance_dump(config: &MaintenanceConfig) -> serde_json::Value {
+    let ms = |duration: &Option<Duration>| duration.map(|value| value.as_millis());
+    serde_json::json!({
+        "retention_ms": ms(&config.retention),
+        "metric_retention_ms": ms(&config.metric_retention),
+        "purge_interval_ms": ms(&config.purge_interval),
+        "checkpoint_interval_ms": ms(&config.checkpoint_interval),
+        "checkpoint_mode": format!("{:?}", config.checkpoint_mode),
+        "optimize_interval_ms": ms(&config.optimize_interval),
+        "vacuum_interval_ms": ms(&config.vacuum_interval),
+        "rebuild_fts_interval_ms": ms(&config.rebuild_fts_interval),
+        "retry_delay_ms": config.retry_delay.as_millis(),
+    })
+}
+
+/// Effective watchdog policy as a JSON object (durations in milliseconds).
+fn watchdog_dump(config: &WatchdogConfig) -> serde_json::Value {
+    serde_json::json!({
+        "tick_interval_ms": config.tick_interval.as_millis(),
+        "degraded_after_ms": config.degraded_after.as_millis(),
+        "unhealthy_after_ms": config.unhealthy_after.as_millis(),
+        "ack_stall_after_ms": config.ack_stall_after.as_millis(),
+        "maintenance_stall_after_ms": config.maintenance_stall_after.as_millis(),
+        "queue_pressure_ratio": config.queue_pressure_ratio,
+        "halt_on_unhealthy": config.halt_on_unhealthy,
+    })
+}
+
+/// Human-facing URL for the Prometheus endpoint. Bare `":port"` and
+/// wildcard binds are shown as loopback, which is where a local operator can
+/// actually scrape them (the raw bind address is not a valid URL host).
+pub fn metrics_display_url(address: &str) -> String {
+    match expand_bind_address(address)
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .filter(|addr| addr.ip().is_unspecified())
+    {
+        Some(addr) if addr.is_ipv4() => format!("http://127.0.0.1:{}/metrics", addr.port()),
+        Some(addr) => format!("http://[::1]:{}/metrics", addr.port()),
+        None => format!("http://{address}/metrics"),
+    }
+}
+
 /// Mirror of [`Config`] where every field is optional; `None` means "keep
 /// the built-in default".
 #[derive(Debug, Default, Deserialize)]
@@ -457,6 +529,7 @@ struct FileConfig {
     max_body_bytes: Option<usize>,
     max_buckets_per_point: Option<usize>,
     max_exemplars_per_point: Option<usize>,
+    max_scope_metadata_expansion_bytes: Option<usize>,
     max_db_bytes: Option<u64>,
     shutdown_timeout: Option<RawDuration>,
     maintenance: Option<MaintenanceSection>,
@@ -517,6 +590,9 @@ impl FileConfig {
         }
         if let Some(value) = self.max_exemplars_per_point {
             config.max_exemplars_per_point = value;
+        }
+        if let Some(value) = self.max_scope_metadata_expansion_bytes {
+            config.max_scope_metadata_expansion_bytes = value;
         }
         if let Some(value) = self.max_db_bytes {
             config.max_db_bytes = Some(value);
@@ -664,6 +740,18 @@ fn validate_optional_duration(key: &str, value: Option<Duration>, maximum: Durat
 }
 
 fn readable_file(key: &str, path: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(path).with_context(|| {
+        format!(
+            "config key `{key}` must point to a readable file: {}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        bail!(
+            "config key `{key}` must point to a readable file: {} is not a regular file",
+            path.display()
+        );
+    }
     std::fs::File::open(path).with_context(|| {
         format!(
             "config key `{key}` must point to a readable file: {}",
@@ -734,7 +822,7 @@ impl DurabilitySection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct MaintenanceSection {
-    retention: Option<RawRetention>,
+    retention: Option<toml::Value>,
     purge_interval: Option<RawDuration>,
     checkpoint_interval: Option<RawDuration>,
     checkpoint_mode: Option<String>,
@@ -746,7 +834,7 @@ struct MaintenanceSection {
 
 impl MaintenanceSection {
     fn apply_to(self, config: &mut MaintenanceConfig) -> Result<()> {
-        apply_retention(config, self.retention);
+        apply_retention(config, self.retention)?;
         apply_optional_duration(&mut config.purge_interval, self.purge_interval);
         apply_optional_duration(&mut config.checkpoint_interval, self.checkpoint_interval);
         apply_optional_duration(&mut config.optimize_interval, self.optimize_interval);
@@ -781,35 +869,41 @@ impl MaintenanceSection {
 /// logs = "7d"
 /// metrics = "24h"
 /// ```
+///
+/// The raw TOML value is resolved in [`apply_retention`] so an unknown key in
+/// the table form (`metris = "24h"`) produces a named error instead of an
+/// untagged-enum type mismatch.
 #[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(untagged)]
-enum RawRetention {
-    /// One window for every signal.
-    Uniform(RawDuration),
-    /// Per-signal windows.
-    PerSignal {
-        logs: Option<RawDuration>,
-        metrics: Option<RawDuration>,
-    },
+#[serde(deny_unknown_fields)]
+struct PerSignalRetention {
+    logs: Option<RawDuration>,
+    metrics: Option<RawDuration>,
 }
 
-fn apply_retention(config: &mut MaintenanceConfig, raw: Option<RawRetention>) {
-    let Some(raw) = raw else { return };
-    match raw {
-        RawRetention::Uniform(RawDuration::Enabled(window)) => {
+fn apply_retention(config: &mut MaintenanceConfig, raw: Option<toml::Value>) -> Result<()> {
+    let Some(raw) = raw else { return Ok(()) };
+    if matches!(raw, toml::Value::Table(_)) {
+        let per_signal: PerSignalRetention = raw.try_into().map_err(|error| {
+            anyhow::anyhow!("invalid [maintenance.retention] settings: {error}")
+        })?;
+        apply_optional_duration(&mut config.retention, per_signal.logs);
+        apply_optional_duration(&mut config.metric_retention, per_signal.metrics);
+        return Ok(());
+    }
+    let window = RawDuration::deserialize(raw)
+        .map_err(|error| anyhow::anyhow!("invalid retention window: {error}"))?;
+    match window {
+        RawDuration::Enabled(window) => {
             config.retention = Some(window);
             config.metric_retention = Some(window);
         }
         // Explicit opt-out ("off") disables both signals at once.
-        RawRetention::Uniform(RawDuration::Disabled) => {
+        RawDuration::Disabled => {
             config.retention = None;
             config.metric_retention = None;
         }
-        RawRetention::PerSignal { logs, metrics } => {
-            apply_optional_duration(&mut config.retention, logs);
-            apply_optional_duration(&mut config.metric_retention, metrics);
-        }
     }
+    Ok(())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -819,6 +913,7 @@ struct WatchdogSection {
     degraded_after: Option<RawDuration>,
     unhealthy_after: Option<RawDuration>,
     ack_stall_after: Option<RawDuration>,
+    maintenance_stall_after: Option<RawDuration>,
     queue_pressure_ratio: Option<f32>,
     halt_on_unhealthy: Option<bool>,
 }
@@ -844,6 +939,11 @@ impl WatchdogSection {
             &mut config.ack_stall_after,
             self.ack_stall_after,
             "watchdog.ack_stall_after",
+        )?;
+        apply_required_duration(
+            &mut config.maintenance_stall_after,
+            self.maintenance_stall_after,
+            "watchdog.maintenance_stall_after",
         )?;
         if let Some(ratio) = self.queue_pressure_ratio {
             config.queue_pressure_ratio = ratio;
@@ -1056,6 +1156,7 @@ mod tests {
              max_body_bytes = 444
              max_buckets_per_point = 555
              max_exemplars_per_point = 666
+             max_scope_metadata_expansion_bytes = 8192
              shutdown_timeout = 90
             "#,
         )
@@ -1076,6 +1177,7 @@ mod tests {
         assert_eq!(config.max_body_bytes, 444);
         assert_eq!(config.max_buckets_per_point, 555);
         assert_eq!(config.max_exemplars_per_point, 666);
+        assert_eq!(config.max_scope_metadata_expansion_bytes, 8192);
         assert_eq!(config.shutdown_timeout, Duration::from_secs(90));
     }
 
@@ -1227,6 +1329,23 @@ mod tests {
         assert_eq!(
             config.maintenance.metric_retention,
             Some(Duration::from_secs(2 * 86_400))
+        );
+    }
+
+    #[test]
+    fn retention_rejects_unknown_signal_keys() {
+        // A typo inside the per-signal table must fail applying the config
+        // instead of being silently ignored (which would keep the signal
+        // unpruned).
+        let file = toml::from_str::<FileConfig>("[maintenance.retention]\nmetris = \"24h\"")
+            .expect("raw TOML parses into the file mirror");
+        let mut config = Config::default();
+        let error = file
+            .apply_to(&mut config)
+            .expect_err("unknown per-signal retention key must be rejected");
+        assert!(
+            error.to_string().contains("metris"),
+            "error must name the unknown key: {error}"
         );
     }
 
@@ -1578,6 +1697,30 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_directories_as_security_files() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let cert = dir.path().join("server.pem");
+        std::fs::write(&cert, "test").expect("write test file");
+        // On unix `File::open` happily opens a directory; validation must
+        // reject it because a directory is not usable certificate material.
+        let config = Config {
+            tls: Some(TlsConfig {
+                cert,
+                key: dir.path().to_path_buf(),
+                client_ca: None,
+            }),
+            ..Config::default()
+        };
+        let error = config
+            .validate()
+            .expect_err("a directory must not pass as tls.key");
+        assert!(
+            error.to_string().contains("tls.key"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn effective_dump_contains_runtime_values() {
         let config = Config {
             max_records_per_request: 321,
@@ -1589,6 +1732,44 @@ mod tests {
         assert!(dump.contains("\"metrics_address\": null"));
         assert!(dump.contains("\"allow_remote_metrics\": false"));
         assert!(dump.contains("\"allow_insecure_remote\": false"));
+
+        // Maintenance and watchdog are structured JSON, not Rust `Debug`
+        // strings, so machine consumers can read individual knobs.
+        let value: serde_json::Value = serde_json::from_str(&dump).expect("valid JSON dump");
+        let maintenance = value
+            .get("maintenance")
+            .and_then(serde_json::Value::as_object)
+            .expect("maintenance must be a JSON object");
+        assert!(maintenance.contains_key("checkpoint_mode"));
+        assert!(maintenance.contains_key("retention_ms"));
+        let watchdog = value
+            .get("watchdog")
+            .and_then(serde_json::Value::as_object)
+            .expect("watchdog must be a JSON object");
+        assert!(watchdog.contains_key("maintenance_stall_after_ms"));
+        assert!(watchdog.contains_key("halt_on_unhealthy"));
+        assert!(!dump.contains("MaintenanceConfig"), "{dump}");
+        assert!(!dump.contains("WatchdogConfig"), "{dump}");
+    }
+
+    #[test]
+    fn metrics_url_uses_a_usable_host() {
+        assert_eq!(
+            metrics_display_url(":8888"),
+            "http://127.0.0.1:8888/metrics"
+        );
+        assert_eq!(
+            metrics_display_url("0.0.0.0:9100"),
+            "http://127.0.0.1:9100/metrics"
+        );
+        assert_eq!(
+            metrics_display_url("[::]:8888"),
+            "http://[::1]:8888/metrics"
+        );
+        assert_eq!(
+            metrics_display_url("127.0.0.1:8888"),
+            "http://127.0.0.1:8888/metrics"
+        );
     }
 
     #[test]

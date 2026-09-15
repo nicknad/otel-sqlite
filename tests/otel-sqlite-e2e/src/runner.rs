@@ -24,9 +24,11 @@ use crate::metrics::TelemetryHandle;
 use crate::pacer::Pacer;
 use crate::params::{RunContext, StepParams};
 
-/// Maximum consecutive failed/ambiguous requests tolerated before a worker
-/// concludes the endpoint is gone. Legitimate backpressure outcomes
-/// (`partial_success`) do not count towards this.
+/// Maximum consecutive transport-classified (`Ambiguous`) requests tolerated
+/// before a worker concludes the endpoint is gone. Definitive server
+/// verdicts — including queue-full backpressure (`UNAVAILABLE` from the
+/// admission gate) and `InvalidArgument` — never count: the server answered,
+/// so it is demonstrably alive.
 const WORKER_FAILURE_ABORT: u32 = 25;
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,7 +57,7 @@ async fn sampler_task(
             elapsed_secs: started.elapsed().as_secs_f64(),
             gauges: telemetry.sample_gauges(),
             database_bytes: file_len(&db_path),
-            wal_bytes: file_len(&db_path.with_extension("db-wal")),
+            wal_bytes: file_len(&db::wal_path(&db_path)),
         });
     }
 }
@@ -107,16 +109,22 @@ async fn worker_loop(
 
         let result = client.send_one().await;
         match result.kind {
-            OutcomeKind::AllAccepted | OutcomeKind::PartiallyRejected { .. } => {
-                consecutive_failures = 0;
-            }
-            _ => {
+            // Only transport-classified outcomes indicate a lost endpoint;
+            // any answer from the server (accepted, partially rejected or
+            // definitively rejected) resets the counter.
+            OutcomeKind::Ambiguous => {
                 consecutive_failures += 1;
                 if consecutive_failures >= WORKER_FAILURE_ABORT {
                     anyhow::bail!(
-                        "worker aborted after {consecutive_failures} consecutive failed/ambiguous requests"
+                        "worker aborted after {consecutive_failures} consecutive \
+                         transport-failed/ambiguous requests"
                     );
                 }
+            }
+            OutcomeKind::AllAccepted
+            | OutcomeKind::PartiallyRejected { .. }
+            | OutcomeKind::Rejected => {
+                consecutive_failures = 0;
             }
         }
         ledger.record(&result);
@@ -278,8 +286,10 @@ pub(crate) async fn drain_storage(
 ///
 /// During a live session both threads must be running; either flag being
 /// clear means the thread died mid-run (SQL error, panic) and every record
-/// still upstream of it is stranded. `dropped_records`/`errors` are
-/// cumulative process-wide counters that must stay zero in any valid run.
+/// still upstream of it is stranded. Data loss is `quarantined_records` +
+/// `dropped_records`; `errors` also counts retryable `BUSY`/`LOCKED`
+/// failures that later succeeded, so it is reported as advisory evidence
+/// rather than a failure.
 fn verify_pipeline_healthy(server: &crate::server::EmbeddedServer) -> anyhow::Result<()> {
     if let Some(sample) = server.health_sample()
         && (!sample.writer_running || !sample.batcher_running)
@@ -296,14 +306,23 @@ fn verify_pipeline_healthy(server: &crate::server::EmbeddedServer) -> anyhow::Re
             stats.map_or(0, |s| s.errors),
         );
     }
-    if let Some(stats) = server.stats()
-        && (stats.errors > 0 || stats.dropped_records > 0)
-    {
-        anyhow::bail!(
-            "storage pipeline lost data (errors={}, dropped_records={})",
-            stats.errors,
-            stats.dropped_records,
-        );
+    if let Some(stats) = server.stats() {
+        if stats.quarantined_records > 0 || stats.dropped_records > 0 {
+            anyhow::bail!(
+                "storage pipeline lost data (quarantined_records={}, dropped_records={}, errors={})",
+                stats.quarantined_records,
+                stats.dropped_records,
+                stats.errors,
+            );
+        }
+        if stats.errors > 0 {
+            tracing::warn!(
+                errors = stats.errors,
+                transient_retries = stats.transient_retries,
+                "storage reported errors (retried transient failures included); \
+                 loss counters are clean"
+            );
+        }
     }
     Ok(())
 }

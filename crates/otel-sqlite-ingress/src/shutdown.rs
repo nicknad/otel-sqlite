@@ -16,17 +16,25 @@ pub(crate) async fn wait_for_halt(halt: &mut watch::Receiver<bool>) {
 
 pub(crate) async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            // A failed handler installation must not look like a received
+            // signal: log it and keep serving instead of initiating shutdown.
+            tracing::error!(%error, "failed to install Ctrl+C handler; Ctrl+C shutdown disabled");
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to install SIGTERM handler; SIGTERM shutdown disabled");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]

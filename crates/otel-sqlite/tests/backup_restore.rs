@@ -252,7 +252,7 @@ async fn backup_restore_round_trip_against_the_external_binary() {
         "restore must contain exactly the snapshot rows"
     );
     assert_eq!(
-        restore_report["verified_after"]["schema_version"], "003",
+        restore_report["verified_after"]["schema_version"], "004",
         "restored database must carry the current schema"
     );
 
@@ -286,7 +286,7 @@ async fn backup_restore_round_trip_against_the_external_binary() {
         restored_rows + outcome_b.counters.records_accepted as i64,
         "rows written after restore must add to the restored base"
     );
-    assert_eq!(after_restart.schema_version.as_deref(), Some("003"));
+    assert_eq!(after_restart.schema_version.as_deref(), Some("004"));
 
     let _ = kill_process(&mut server2);
 }
@@ -334,6 +334,16 @@ async fn encrypted_backup_restore_against_the_external_binary() {
         otel_sqlite_storage::backup::looks_encrypted(Path::new(snapshot_path)).expect("read magic"),
         "encrypted artifact must carry the backup magic"
     );
+    // The report must not describe the deleted plaintext snapshot: both
+    // hashes cover the final .otsb artifact and `verify.path` points at it.
+    assert_eq!(
+        report["sha256"], report["verify"]["sha256"],
+        "verify.sha256 must cover the stored .otsb artifact"
+    );
+    assert_eq!(
+        report["backup"], report["verify"]["path"],
+        "verify must never reference the removed plaintext snapshot"
+    );
 
     // Restore with the key into a clean directory.
     let _ = kill_process(&mut server);
@@ -365,7 +375,7 @@ async fn encrypted_backup_restore_against_the_external_binary() {
         snapshot_rows
     );
     assert_eq!(restore_report["verified_after"]["integrity"], "ok");
-    assert_eq!(restore_report["verified_after"]["schema_version"], "003");
+    assert_eq!(restore_report["verified_after"]["schema_version"], "004");
 }
 
 /// `verify` must exit non-zero on a corrupted database — the exit code is the

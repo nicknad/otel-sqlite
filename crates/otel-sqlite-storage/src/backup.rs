@@ -87,6 +87,8 @@ pub enum BackupError {
     InvalidKeyLen(usize),
     #[error("unsupported or corrupted backup file: {0}")]
     CorruptBackup(String),
+    #[error("restored content differs from the verified backup at {path}: {detail}")]
+    ContentMismatch { path: PathBuf, detail: String },
 }
 
 /// Row counts for the canonical tables plus the derived search index. Used to
@@ -118,6 +120,13 @@ pub struct VerifyReport {
     /// Highest applied schema migration (the `schema_migrations` stamp), if
     /// the database is schema-migrated otel-sqlite storage.
     pub schema_version: Option<String>,
+    /// Whether the canonical otel-sqlite table set (specifically `log_event`)
+    /// is present. When false, `row_counts` is the all-zero default and the
+    /// integrity/foreign-key checks still describe the file. Consumers print
+    /// "(not an otel-sqlite database)" for non-otel files.
+    pub is_otel_schema: bool,
+    /// Canonical-table row counts; all zero when [`VerifyReport::is_otel_schema`]
+    /// is false.
     pub row_counts: RowCounts,
     /// SHA-256 of the file bytes as they sit on disk.
     pub sha256: String,
@@ -174,11 +183,26 @@ fn map_sqlite_error(path: &Path, error: rusqlite::Error) -> BackupError {
     }
 }
 
-/// Reads the canonical table row counts from an open connection.
-fn row_counts(conn: &Connection) -> Result<RowCounts, BackupError> {
+/// Whether `name` is a table in the opened database.
+fn has_table(conn: &Connection, name: &str) -> Result<bool, BackupError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Reads the canonical table row counts from an open connection. A valid
+/// SQLite file without the canonical tables (any non-otel database) yields
+/// `None` instead of a misleading `no such table` failure.
+fn row_counts(conn: &Connection) -> Result<Option<RowCounts>, BackupError> {
+    if !has_table(conn, "log_event")? {
+        return Ok(None);
+    }
     let count =
         |sql: &str| -> Result<i64, BackupError> { Ok(conn.query_row(sql, [], |row| row.get(0))?) };
-    Ok(RowCounts {
+    Ok(Some(RowCounts {
         log_events: count("SELECT COUNT(*) FROM log_event")?,
         log_resources: count("SELECT COUNT(*) FROM log_resource")?,
         metric_points: count("SELECT COUNT(*) FROM metric_data_point")?,
@@ -186,22 +210,19 @@ fn row_counts(conn: &Connection) -> Result<RowCounts, BackupError> {
         metrics: count("SELECT COUNT(*) FROM metric")?,
         scopes: count("SELECT COUNT(*) FROM scope")?,
         fts_rows: count("SELECT COUNT(*) FROM logs_fts")?,
-    })
+    }))
 }
 
-/// Verifies a SQLite file: integrity check, foreign-key check, journal mode,
-/// schema migration stamp, row counts and a SHA-256 of the file bytes.
-///
-/// Works on the live database (read-only, safe while the server ingests), on a
-/// backup file, or on a restored database — the runbook uses the same command
-/// for all three.
-pub fn verify(db_path: &Path) -> Result<VerifyReport, BackupError> {
-    let conn = open_readonly(db_path)?;
-
+/// Runs the integrity and foreign-key checks shared by `verify`, `backup_to`
+/// and `restore_into` against an open read-only connection.
+fn integrity_and_foreign_keys(
+    conn: &Connection,
+    path: &Path,
+) -> Result<(String, i64), BackupError> {
     let integrity: String = {
         let mut statement = conn
             .prepare("PRAGMA integrity_check")
-            .map_err(|error| map_sqlite_error(db_path, error))?;
+            .map_err(|error| map_sqlite_error(path, error))?;
         let rows: Vec<String> = statement
             .query_map([], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
@@ -215,6 +236,21 @@ pub fn verify(db_path: &Path) -> Result<VerifyReport, BackupError> {
             .map(|rows| rows.count() as i64)?
     };
 
+    Ok((integrity, foreign_key_violations))
+}
+
+/// Verifies a SQLite file: integrity check, foreign-key check, journal mode,
+/// schema migration stamp, row counts and a SHA-256 of the file bytes.
+///
+/// Works on the live database (read-only, safe while the server ingests), on a
+/// backup file, or on a restored database — the runbook uses the same command
+/// for all three. Non-otel SQLite files verify successfully with
+/// [`VerifyReport::is_otel_schema`] false and zeroed row counts.
+pub fn verify(db_path: &Path) -> Result<VerifyReport, BackupError> {
+    let conn = open_readonly(db_path)?;
+
+    let (integrity, foreign_key_violations) = integrity_and_foreign_keys(&conn, db_path)?;
+
     let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
 
     let schema_version: Option<String> = conn
@@ -226,6 +262,7 @@ pub fn verify(db_path: &Path) -> Result<VerifyReport, BackupError> {
         .ok();
 
     let counts = row_counts(&conn)?;
+    let is_otel_schema = counts.is_some();
     drop(conn);
 
     Ok(VerifyReport {
@@ -234,7 +271,8 @@ pub fn verify(db_path: &Path) -> Result<VerifyReport, BackupError> {
         foreign_key_violations,
         journal_mode,
         schema_version,
-        row_counts: counts,
+        is_otel_schema,
+        row_counts: counts.unwrap_or_default(),
         sha256: sha256_hex(db_path)?,
     })
 }
@@ -268,6 +306,29 @@ pub fn backup_to(source: &Path, dest: &Path) -> Result<BackupReport, BackupError
     // destination connection is a plain file we own; the API copies page by
     // page into it without ever touching the source's `-wal`/`-shm` files.
     let source_conn = open_readonly(source)?;
+
+    // Verify the source *before* touching the destination: a corrupt source
+    // must fail without creating an artifact that `prune_old_backups` would
+    // then count as a real backup.
+    let (integrity, foreign_key_violations) = integrity_and_foreign_keys(&source_conn, source)?;
+    if integrity != "ok" {
+        return Err(BackupError::Integrity {
+            path: source.to_path_buf(),
+            detail: integrity,
+        });
+    }
+    if foreign_key_violations > 0 {
+        return Err(BackupError::ForeignKeyViolations {
+            path: source.to_path_buf(),
+            violations: foreign_key_violations,
+        });
+    }
+
+    // Every failure after this point removes the partially written
+    // destination (and any sidecars) so it can never be mistaken for a
+    // complete backup.
+    let mut cleanup = RemoveOnDrop(Some(dest.to_path_buf()));
+
     {
         let mut dest_conn = Connection::open(dest)?;
         dest_conn.busy_timeout(Duration::from_secs(5))?;
@@ -303,6 +364,7 @@ pub fn backup_to(source: &Path, dest: &Path) -> Result<BackupReport, BackupError
         });
     }
 
+    cleanup.0 = None;
     Ok(BackupReport {
         source: source.to_path_buf(),
         backup: dest.to_path_buf(),
@@ -310,6 +372,23 @@ pub fn backup_to(source: &Path, dest: &Path) -> Result<BackupReport, BackupError
         sha256: verify.sha256.clone(),
         verify,
     })
+}
+
+/// Removes a partially written SQLite artifact (and its sidecars) on drop,
+/// unless disarmed once the artifact is complete and verified.
+struct RemoveOnDrop(Option<PathBuf>);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(&path);
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let mut sidecar = path.clone().into_os_string();
+                sidecar.push(suffix);
+                let _ = fs::remove_file(PathBuf::from(sidecar));
+            }
+        }
+    }
 }
 
 /// Restores a backup into a **clean** directory.
@@ -355,10 +434,42 @@ pub fn restore_into(
         });
     }
 
+    let mut cleanup = RemoveOnDrop(Some(target.clone()));
     fs::copy(&plain, &target)?;
     crate::permissions::restrict_permissions(&target)?;
     let verified_after = verify(&target)?;
 
+    // Enforce the post-copy verification: a target that does not reproduce
+    // the verified backup byte-for-byte is not a restore.
+    if verified_after.integrity != "ok" {
+        return Err(BackupError::Integrity {
+            path: target.clone(),
+            detail: verified_after.integrity.clone(),
+        });
+    }
+    if verified_after.foreign_key_violations > 0 {
+        return Err(BackupError::ForeignKeyViolations {
+            path: target.clone(),
+            violations: verified_after.foreign_key_violations,
+        });
+    }
+    if verified_after.sha256 != verified_before.sha256 {
+        return Err(BackupError::ContentMismatch {
+            path: target.clone(),
+            detail: "restored bytes do not match the verified backup".to_owned(),
+        });
+    }
+    if verified_after.row_counts != verified_before.row_counts {
+        return Err(BackupError::ContentMismatch {
+            path: target.clone(),
+            detail: format!(
+                "restored row counts {:?} do not match the verified backup {:?}",
+                verified_after.row_counts, verified_before.row_counts
+            ),
+        });
+    }
+
+    cleanup.0 = None;
     Ok(RestoreReport {
         backup: backup_path.to_path_buf(),
         target,
@@ -368,21 +479,17 @@ pub fn restore_into(
 }
 
 /// Deletes all backups in `dir` beyond the newest `keep`, returning how many
-/// were removed. Only files matching the `otel-logs.db.` naming prefix are
-/// considered; the live database itself (`otel-logs.db`) is never touched.
-/// `keep == 0` disables pruning.
+/// were removed. Only completed files matching the `otel-logs.db.` naming
+/// prefix are considered; the live database itself (`otel-logs.db`) and
+/// transient artifacts (hidden files, `*.decrypting`, `*.tmp`, ...) are never
+/// touched. `keep == 0` disables pruning.
 pub fn prune_old_backups(dir: &Path, keep: usize) -> Result<usize, BackupError> {
     if keep == 0 {
         return Ok(0);
     }
     let mut backups: Vec<(PathBuf, io::Result<fs::Metadata>)> = fs::read_dir(dir)?
         .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(OTEL_DB_PREFIX)
-        })
+        .filter(|entry| is_backup_artifact(&entry.file_name().to_string_lossy()))
         .map(|entry| (entry.path(), entry.metadata()))
         .collect();
 
@@ -408,6 +515,23 @@ fn modified(metadata: Option<&fs::Metadata>) -> Option<std::time::SystemTime> {
 /// Prefix of every backup artifact written by `otel-sqlite backup`. Includes
 /// the trailing dot so the live database file (`otel-logs.db`) never matches.
 const OTEL_DB_PREFIX: &str = "otel-logs.db.";
+
+/// Suffixes of transient artifacts (a crashed restore's decryption temp, a
+/// partial download, ...) that must never be counted or pruned as backups.
+const TEMP_ARTIFACT_SUFFIXES: &[&str] = &[".decrypting", ".tmp", ".part", ".partial"];
+
+/// Whether a directory entry name identifies a completed backup artifact:
+/// it carries the retention prefix but is not a hidden or transient file.
+fn is_backup_artifact(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(OTEL_DB_PREFIX) else {
+        return false;
+    };
+    !suffix.is_empty()
+        && !suffix.starts_with('.')
+        && !TEMP_ARTIFACT_SUFFIXES
+            .iter()
+            .any(|temp| name.ends_with(temp))
+}
 
 /// Artifact filename for a backup taken at `epoch_secs` (UTC):
 /// `otel-logs.db.<YYYYMMDDTHHMMSSZ>.otsb` when encrypted, `.bak` otherwise.
@@ -464,13 +588,19 @@ pub fn looks_encrypted(path: &Path) -> io::Result<bool> {
     Ok(read == BACKUP_FILE_MAGIC.len() && &magic == BACKUP_FILE_MAGIC)
 }
 
-/// Reads and validates a backup encryption key (exactly 32 bytes).
+/// Reads and validates a backup encryption key (exactly 32 bytes). The read
+/// is capped at 33 bytes: a wrong file must not be loaded into RAM just to
+/// report its length, which comes from the metadata instead.
 fn read_key(path: &Path) -> Result<Zeroizing<Vec<u8>>, BackupError> {
-    let bytes = fs::read(path)?;
+    let file = fs::File::open(path)?;
+    let declared_len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(ENCRYPTION_KEY_LEN + 1));
+    file.take(ENCRYPTION_KEY_LEN as u64 + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() != ENCRYPTION_KEY_LEN {
-        return Err(BackupError::InvalidKeyLen(bytes.len()));
+        return Err(BackupError::InvalidKeyLen(declared_len.max(bytes.len())));
     }
-    Ok(Zeroizing::new(bytes))
+    Ok(bytes)
 }
 
 fn random_base_nonce() -> Result<[u8; NONCE_LEN], BackupError> {

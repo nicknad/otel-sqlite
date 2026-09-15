@@ -26,6 +26,10 @@ pub struct GenCertsArgs {
     pub hosts: Vec<String>,
     pub clients: Vec<String>,
     pub out_dir: PathBuf,
+    /// Rotate the CA even when `ca.pem`/`ca.key` already exist. Without this,
+    /// an existing CA is reused and only the missing/requested certificates
+    /// are (re)issued.
+    pub force: bool,
 }
 
 /// Parses `["--host","a","--client","b",..]`; errors on unknown/missing values.
@@ -36,6 +40,10 @@ pub fn parse_args(args: &[String]) -> Result<GenCertsArgs> {
     };
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
+        if flag == "--force" {
+            parsed.force = true;
+            continue;
+        }
         let value = iter
             .next()
             .with_context(|| format!("flag {flag} is missing its value"))?;
@@ -43,7 +51,7 @@ pub fn parse_args(args: &[String]) -> Result<GenCertsArgs> {
             "--host" => parsed.hosts.push(value.clone()),
             "--client" => parsed.clients.push(value.clone()),
             "--out" => parsed.out_dir = PathBuf::from(value),
-            other => bail!("unknown flag `{other}` (expected --host, --client, --out)"),
+            other => bail!("unknown flag `{other}` (expected --host, --client, --out, --force)"),
         }
     }
     if parsed.hosts.is_empty() {
@@ -59,46 +67,60 @@ pub fn run(args: &GenCertsArgs) -> Result<()> {
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("cannot create {}", args.out_dir.display()))?;
 
-    // Private root CA.
-    let ca_key = rcgen::KeyPair::generate().context("generate CA key")?;
-    let mut ca_params = rcgen::CertificateParams::new(vec![]).context("CA params")?;
-    ca_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "otel-sqlite in-house CA");
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![
-        rcgen::KeyUsagePurpose::DigitalSignature,
-        rcgen::KeyUsagePurpose::KeyCertSign,
-        rcgen::KeyUsagePurpose::CrlSign,
-    ];
-    let ca_cert = ca_params
+    // Private root CA. Reuse the existing CA unless `--force` rotates it:
+    // silently replacing a CA invalidates every client certificate issued
+    // from it, so the documented rotation flow (`gen-certs --client NAME`
+    // against the same output directory) must keep it stable.
+    let ca_key_path = args.out_dir.join("ca.key");
+    let ca_pem_path = args.out_dir.join("ca.pem");
+    let reuse_ca = !args.force && ca_key_path.is_file() && ca_pem_path.is_file();
+    let ca_key = if reuse_ca {
+        let pem = std::fs::read_to_string(&ca_key_path)
+            .with_context(|| format!("read existing CA key {}", ca_key_path.display()))?;
+        rcgen::KeyPair::from_pem(&pem)
+            .with_context(|| format!("parse existing CA key {}", ca_key_path.display()))?
+    } else {
+        rcgen::KeyPair::generate().context("generate CA key")?
+    };
+    let ca_cert = make_ca_params()?
         .self_signed(&ca_key)
         .context("self-sign CA certificate")?;
+    if reuse_ca {
+        println!("reusing existing CA {}", ca_pem_path.display());
+    } else {
+        write_pem(&ca_pem_path, &ca_cert.pem())?;
+        write_pem(&ca_key_path, &ca_key.serialize_pem())?;
+    }
 
     // Server certificate: every host SAN + loopback, dual EKU so it can also
-    // act as mTLS client identity for the built-in healthcheck probe.
-    let server_key = rcgen::KeyPair::generate().context("generate server key")?;
-    let mut server_params = rcgen::CertificateParams::new(vec![]).context("server params")?;
-    server_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "otel-sqlite server");
-    server_params.subject_alt_names = server_sans(&args.hosts)?;
-    server_params.extended_key_usages = vec![
-        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
-        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
-    ];
-    server_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
-    let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .context("sign server certificate")?;
-
-    write_pem(&args.out_dir.join("ca.pem"), &ca_cert.pem())?;
-    write_pem(&args.out_dir.join("ca.key"), &ca_key.serialize_pem())?;
-    write_pem(&args.out_dir.join("server.pem"), &server_cert.pem())?;
-    write_pem(
-        &args.out_dir.join("server.key"),
-        &server_key.serialize_pem(),
-    )?;
+    // act as mTLS client identity for the built-in healthcheck probe. Keep an
+    // existing identity unless the CA was (re)generated or `--force` asks for
+    // a rotation.
+    let server_pem_path = args.out_dir.join("server.pem");
+    let server_key_path = args.out_dir.join("server.key");
+    if !args.force && reuse_ca && server_pem_path.is_file() && server_key_path.is_file() {
+        println!(
+            "keeping existing server certificate {} (use --force to rotate)",
+            server_pem_path.display()
+        );
+    } else {
+        let server_key = rcgen::KeyPair::generate().context("generate server key")?;
+        let mut server_params = rcgen::CertificateParams::new(vec![]).context("server params")?;
+        server_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "otel-sqlite server");
+        server_params.subject_alt_names = server_sans(&args.hosts)?;
+        server_params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        server_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .context("sign server certificate")?;
+        write_pem(&server_pem_path, &server_cert.pem())?;
+        write_pem(&server_key_path, &server_key.serialize_pem())?;
+    }
 
     for client in &args.clients {
         sanitize_client_name(client)?;
@@ -131,7 +153,29 @@ pub fn run(args: &GenCertsArgs) -> Result<()> {
         args.out_dir.join("server.key").display(),
         args.out_dir.join("ca.pem").display(),
     );
+    if reuse_ca {
+        println!(
+            "NOTE: reused the existing CA; `--force` rotates the CA and server identity \
+             (this invalidates every certificate previously issued from it)."
+        );
+    }
     Ok(())
+}
+
+/// Parameters of the in-house CA. Also used to reconstruct the issuer when an
+/// existing `ca.key` is reused, so the subject/constraints must stay stable.
+fn make_ca_params() -> Result<rcgen::CertificateParams> {
+    let mut ca_params = rcgen::CertificateParams::new(vec![]).context("CA params")?;
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "otel-sqlite in-house CA");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::DigitalSignature,
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    Ok(ca_params)
 }
 
 fn server_sans(hosts: &[String]) -> Result<Vec<rcgen::SanType>> {
@@ -171,6 +215,37 @@ fn sanitize_client_name(name: &str) -> Result<()> {
         && !name.starts_with('.');
     if !ok {
         bail!("invalid client name `{name}` (use ASCII letters, digits, '-', '_', '.')")
+    }
+    // Windows resolves these stems to devices, so `NUL.pem` silently writes
+    // nowhere on Windows. Reject them everywhere for portability.
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_lowercase();
+    let reserved = matches!(
+        stem.as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    );
+    if reserved {
+        bail!("invalid client name `{name}` (reserved Windows device name)");
     }
     Ok(())
 }
@@ -266,6 +341,7 @@ mod tests {
             hosts: vec!["localhost".to_owned()],
             clients: vec!["collector-a".to_owned(), "collector.b".to_owned()],
             out_dir: dir.path().to_path_buf(),
+            force: false,
         };
         run(&args).expect("generation succeeds");
 
@@ -291,5 +367,63 @@ mod tests {
             ..GenCertsArgs::default()
         };
         assert!(run(&bad).is_err(), "path traversal names must be rejected");
+    }
+
+    #[test]
+    fn rerun_reuses_existing_ca_and_keeps_server_identity() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let first = GenCertsArgs {
+            hosts: vec!["localhost".to_owned()],
+            clients: vec!["first".to_owned()],
+            out_dir: dir.path().to_path_buf(),
+            force: false,
+        };
+        run(&first).expect("first generation");
+        let ca_before = std::fs::read_to_string(dir.path().join("ca.pem")).expect("ca.pem");
+        let server_before =
+            std::fs::read_to_string(dir.path().join("server.pem")).expect("server.pem");
+
+        // Rotation = reissue a client certificate without touching the CA.
+        let second = GenCertsArgs {
+            hosts: vec!["localhost".to_owned()],
+            clients: vec!["second".to_owned()],
+            out_dir: dir.path().to_path_buf(),
+            force: false,
+        };
+        run(&second).expect("second generation reuses the CA");
+        assert_eq!(
+            ca_before,
+            std::fs::read_to_string(dir.path().join("ca.pem")).expect("ca.pem"),
+            "re-running must not replace the CA"
+        );
+        assert_eq!(
+            server_before,
+            std::fs::read_to_string(dir.path().join("server.pem")).expect("server.pem"),
+            "re-running must not replace the server identity"
+        );
+        assert!(dir.path().join("first.pem").is_file());
+        assert!(dir.path().join("second.pem").is_file());
+
+        // `--force` is the explicit destructive rotation.
+        let forced = GenCertsArgs {
+            hosts: vec!["localhost".to_owned()],
+            clients: vec!["third".to_owned()],
+            out_dir: dir.path().to_path_buf(),
+            force: true,
+        };
+        run(&forced).expect("forced rotation");
+        assert_ne!(
+            ca_before,
+            std::fs::read_to_string(dir.path().join("ca.pem")).expect("ca.pem"),
+            "--force must rotate the CA"
+        );
+    }
+
+    #[test]
+    fn rejects_reserved_windows_device_names() {
+        assert!(sanitize_client_name("con").is_err());
+        assert!(sanitize_client_name("NUL.pem").is_err());
+        assert!(sanitize_client_name("com1").is_err());
+        assert!(sanitize_client_name("collector-a").is_ok());
     }
 }

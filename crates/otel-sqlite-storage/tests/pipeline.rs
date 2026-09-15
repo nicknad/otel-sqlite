@@ -514,15 +514,10 @@ fn commit_watermark_tracks_accepted_tickets_through_the_real_pipeline() {
         "all records must be persisted before the watermark check"
     );
 
-    // Every accepted ticket is now committed: a durable ack waiting on any
-    // of them must resolve.
+    // Every accepted ticket is now committed at once: the contiguous
+    // watermark cannot pass a hole, so `== last_ticket` already proves every
+    // individual ticket below it resolved.
     assert_eq!(ledger.watermark().committed_through, last_ticket);
-    for ticket in 1..=last_ticket {
-        assert!(wait_until(Duration::from_secs(5), || ledger
-            .watermark()
-            .committed_through
-            >= ticket),);
-    }
 
     drop(sender);
     storage.join().unwrap();

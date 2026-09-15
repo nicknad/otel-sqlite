@@ -29,6 +29,15 @@ fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).map_or(0, |meta| meta.len())
 }
 
+/// SQLite write-ahead-log sidecar path (`<db>-wal`). Appending the suffix
+/// matches SQLite's naming for any database path, including extensionless
+/// ones, unlike `Path::with_extension`.
+pub(crate) fn wal_path(db_path: &Path) -> std::path::PathBuf {
+    let mut os = db_path.as_os_str().to_owned();
+    os.push("-wal");
+    std::path::PathBuf::from(os)
+}
+
 pub fn open_readonly(db_path: &Path) -> anyhow::Result<Connection> {
     Connection::open_with_flags(
         db_path,
@@ -55,7 +64,7 @@ pub fn inspect(db_path: &Path) -> anyhow::Result<StorageInfo> {
         page_size: pragma_i64("page_size")?,
         sqlite_version: rusqlite::version().to_owned(),
         database_bytes: file_len(db_path),
-        wal_bytes: file_len(&db_path.with_extension("db-wal")),
+        wal_bytes: file_len(&wal_path(db_path)),
     })
 }
 

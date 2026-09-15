@@ -25,6 +25,10 @@ const METRIC_TYPE_HISTOGRAM: i64 = 2;
 const METRIC_TYPE_EXPONENTIAL_HISTOGRAM: i64 = 3;
 const METRIC_TYPE_SUMMARY: i64 = 4;
 
+/// Reserved `nan_mask` column value: OTLP data points carry no NaN-presence
+/// bits, so every row is written with the "no NaNs" mask.
+const RESERVED_NAN_MASK: i64 = 0;
+
 const SQL_INSERT_SERIES: &str = "
 INSERT INTO metric_series (id, metric_id, attributes_json)
 VALUES (?1, ?2, ?3)
@@ -72,8 +76,11 @@ fn insert_metrics_inner(
     batch: &MetricWriteBatch,
     tolerant: bool,
 ) -> Result<(u64, u64), StorageError> {
-    // Row-level serialization reuses this scratch across the whole batch.
+    // Row-level serialization reuses these buffers; the second scratch only
+    // serves the rare records carrying their own resource so the batch-level
+    // dimensions in `scratch` survive them (mirrors `insert_logs`).
     let mut scratch = InsertScratch::new();
+    let mut record_scratch = InsertScratch::new();
 
     let default_resource;
     let batch_resource = if let Some(resource) = &batch.origin.resource {
@@ -91,13 +98,22 @@ fn insert_metrics_inner(
     let mut written = 0u64;
     let mut dropped = 0u64;
     for record in batch.records.records() {
+        // A record-level resource overrides the batch origin for this
+        // record's scope/metric/series chain, exactly like log records.
+        let scratch = match &record.resource {
+            Some(resource) => {
+                resolve_resource(conn, resource, &mut record_scratch)?;
+                &mut record_scratch
+            }
+            None => &mut scratch,
+        };
         resolve_scope(
             conn,
             record.scope_name.as_str(),
             record.scope_version.as_str(),
             record.scope_schema_url.as_str(),
             &record.scope_attributes,
-            &mut scratch,
+            scratch,
         )?;
 
         let (metric_type, is_monotonic, temporality) = match &record.data {
@@ -129,7 +145,7 @@ fn insert_metrics_inner(
             metric_type,
             is_monotonic,
             temporality,
-            &mut scratch,
+            scratch,
         )?;
 
         match &record.data {
@@ -139,7 +155,7 @@ fn insert_metrics_inner(
                     &mut point_statement,
                     &gauge.data_points,
                     tolerant,
-                    &mut scratch,
+                    scratch,
                 )?;
                 written += kept;
                 dropped += points_dropped;
@@ -150,7 +166,7 @@ fn insert_metrics_inner(
                     &mut point_statement,
                     &sum.data_points,
                     tolerant,
-                    &mut scratch,
+                    scratch,
                 )?;
                 written += kept;
                 dropped += points_dropped;
@@ -161,7 +177,7 @@ fn insert_metrics_inner(
                     &mut point_statement,
                     &histogram.data_points,
                     tolerant,
-                    &mut scratch,
+                    scratch,
                 )?;
                 written += kept;
                 dropped += points_dropped;
@@ -172,7 +188,7 @@ fn insert_metrics_inner(
                     &mut point_statement,
                     &histogram.data_points,
                     tolerant,
-                    &mut scratch,
+                    scratch,
                 )?;
                 written += kept;
                 dropped += points_dropped;
@@ -183,7 +199,7 @@ fn insert_metrics_inner(
                     &mut point_statement,
                     &summary.data_points,
                     tolerant,
-                    &mut scratch,
+                    scratch,
                 )?;
                 written += kept;
                 dropped += points_dropped;
@@ -202,6 +218,39 @@ fn exemplars_param<'a>(exemplars: &[Exemplar], out: &'a mut String) -> Option<&'
     }
     write_json(&ExemplarsDoc(exemplars), out);
     Some(out.as_str())
+}
+
+/// Converts a `u64` OTLP count for the `count` column. A value past
+/// `i64::MAX` cannot be represented; treating it as a row-local
+/// (poison-class) error makes the writer's salvage pass quarantine just that
+/// point instead of silently persisting NULL.
+fn count_param(
+    count: u64,
+    tolerant: bool,
+    timestamp_ns: i64,
+    dropped: &mut u64,
+) -> Result<Option<i64>, StorageError> {
+    match i64::try_from(count) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => {
+            if tolerant {
+                *dropped += 1;
+                tracing::warn!(
+                    timestamp_ns,
+                    count,
+                    "metric data point count exceeds i64::MAX; quarantined (dropped)"
+                );
+                Ok(None)
+            } else {
+                Err(StorageError::Sqlite(
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "metric data point count exceeds i64::MAX",
+                    ))),
+                ))
+            }
+        }
+    }
 }
 
 /// Classifies one data-point insert: counts it written, quarantines a
@@ -268,7 +317,7 @@ fn write_number_points(
                 None::<f64>,
                 None::<f64>,
                 None::<f64>,
-                0,
+                RESERVED_NAN_MASK,
                 None::<String>,
                 None::<String>,
                 None::<String>,
@@ -293,6 +342,11 @@ fn write_histogram_points(
     let mut written = 0u64;
     let mut dropped = 0u64;
     for point in points {
+        let Some(row_count) =
+            count_param(point.count, tolerant, point.time_unix_nano, &mut dropped)?
+        else {
+            continue;
+        };
         write_attributes_json(&point.attributes, scratch);
         resolve_series(
             series_statement,
@@ -320,11 +374,11 @@ fn write_histogram_points(
                 point.flags,
                 None::<f64>,
                 None::<i64>,
-                i64::try_from(point.count).ok(),
+                row_count,
                 point.sum,
                 point.min,
                 point.max,
-                0,
+                RESERVED_NAN_MASK,
                 &*scratch.json,
                 None::<String>,
                 None::<String>,
@@ -349,6 +403,11 @@ fn write_exponential_points(
     let mut written = 0u64;
     let mut dropped = 0u64;
     for point in points {
+        let Some(row_count) =
+            count_param(point.count, tolerant, point.time_unix_nano, &mut dropped)?
+        else {
+            continue;
+        };
         write_attributes_json(&point.attributes, scratch);
         resolve_series(
             series_statement,
@@ -379,11 +438,11 @@ fn write_exponential_points(
                 point.flags,
                 None::<f64>,
                 None::<i64>,
-                i64::try_from(point.count).ok(),
+                row_count,
                 point.sum,
                 point.min,
                 point.max,
-                0,
+                RESERVED_NAN_MASK,
                 None::<String>,
                 &*scratch.json,
                 None::<String>,
@@ -408,6 +467,11 @@ fn write_summary_points(
     let mut written = 0u64;
     let mut dropped = 0u64;
     for point in points {
+        let Some(row_count) =
+            count_param(point.count, tolerant, point.time_unix_nano, &mut dropped)?
+        else {
+            continue;
+        };
         write_attributes_json(&point.attributes, scratch);
         resolve_series(
             series_statement,
@@ -436,11 +500,11 @@ fn write_summary_points(
                 point.flags,
                 None::<f64>,
                 None::<i64>,
-                i64::try_from(point.count).ok(),
+                row_count,
                 Some(point.sum),
                 None::<f64>,
                 None::<f64>,
-                0,
+                RESERVED_NAN_MASK,
                 None::<String>,
                 None::<String>,
                 &*scratch.json,

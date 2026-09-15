@@ -31,8 +31,12 @@ kubectl -n otel-sqlite apply -f deploy/kubernetes/otel-sqlite.yaml
 kubectl -n otel-sqlite apply -f deploy/kubernetes/otel-sqlite-backup-cronjob.yaml
 ```
 
-Because the data volume is `ReadWriteOnce`, the CronJob pod is scheduled onto
-the node that already hosts the volume; both pods mount it concurrently, which
+Because the data volume is `ReadWriteOnce`, the CronJob pod must run on the
+**same node** as the server pod: a `ReadWriteOnce` volume can be mounted by
+multiple pods, but only on one node at a time. Most CSI drivers express this
+through the PVC's volume node affinity, so the scheduler places the CronJob
+pod on that node automatically; if it stays `Pending`, check
+`kubectl describe pod`. Both pods then mount the volume concurrently, which
 SQLite WAL supports for one reader plus one writer.
 
 ## 3. Verify it works
@@ -250,17 +254,60 @@ kubectl -n otel-sqlite wait --for=condition=complete job/otel-sqlite-verify
 kubectl -n otel-sqlite logs job/otel-sqlite-verify
 #    Confirm: integrity=ok, foreign keys=0, schema=003, rows match the backup.
 
-# 4. Put the restored database in place and start the server.
-kubectl -n otel-sqlite delete job otel-sqlite-restore otel-sqlite-verify
-kubectl -n otel-sqlite exec otel-sqlite-0 -- sh -c \
-  'cd /data && mv otel-logs.db otel-logs.db.pre-restore && mv restored/otel-logs.db otel-logs.db'
+# 4. Put the restored database in place. The StatefulSet is still scaled to
+#    0, so there is no server pod to `kubectl exec` into: a one-shot job
+#    performs the swap directly on the data PVC.
+kubectl -n otel-sqlite apply -f - <<'YAML'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: otel-sqlite-swap
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: swap
+          image: otel-sqlite:0.1.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              cd /data
+              if [ -f otel-logs.db ]; then
+                mv otel-logs.db otel-logs.db.pre-restore
+              fi
+              mv restored/otel-logs.db otel-logs.db
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: otel-sqlite-data-otel-sqlite-0 }
+        - name: tmp
+          emptyDir: {}
+YAML
+kubectl -n otel-sqlite wait --for=condition=complete job/otel-sqlite-swap
+kubectl -n otel-sqlite logs job/otel-sqlite-swap
+
+# 5. Clean up the restore jobs and start the server, now on the restored
+#    database.
+kubectl -n otel-sqlite delete job otel-sqlite-restore otel-sqlite-verify otel-sqlite-swap
 kubectl -n otel-sqlite scale statefulset otel-sqlite --replicas=1
 ```
 
-> The `exec otel-sqlite-0` step above runs *after* the server is back up — if
-> you prefer, do the `mv` inside the restore job before deleting it (add a
-> `command: ["/bin/sh","-c", "...restore && mv ..."]`). Keep the failed
-> database and the artifact until the next successful backup.
+Keep the failed database (`otel-logs.db.pre-restore`) and the artifact until
+the next successful backup.
 
 ## 8. Troubleshooting
 

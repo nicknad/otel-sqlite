@@ -153,9 +153,12 @@ fn writes_logs_deduplicates_resources() -> Result<(), Box<dyn std::error::Error>
     let (sender, receiver) = unbounded();
     let config = StorageConfig {
         sqlite_path: db_path.clone(),
+        // Large age: this test wants same-origin merging, not timer flushes,
+        // so a 20 ms race between the two sends and `Flush` must not split
+        // the batch into two transactions.
         insert_batcher: otel_sqlite_core::storage::InsertBatcherConfig::new(
             1_000,
-            Duration::from_millis(20),
+            Duration::from_secs(60),
         ),
         ..StorageConfig::default()
     };
@@ -203,7 +206,7 @@ fn writes_logs_deduplicates_resources() -> Result<(), Box<dyn std::error::Error>
         [],
         |r| r.get(0),
     )?;
-    assert_eq!(migration, "003");
+    assert_eq!(migration, "004");
 
     Ok(())
 }
@@ -445,6 +448,121 @@ fn writes_normalized_metric_hierarchy() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+/// OTLP counts are `u64` while the column is `i64`. A count past `i64::MAX`
+/// must be quarantined as a row-local poison — never silently written as
+/// NULL — and the batch must still commit.
+#[test]
+fn oversized_metric_count_is_quarantined_not_persisted_as_null()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("overflow.db");
+
+    let (sender, receiver) = unbounded();
+    let mut storage = Storage::open(
+        receiver,
+        StorageConfig {
+            sqlite_path: db_path.clone(),
+            ..StorageConfig::default()
+        },
+    )?;
+
+    let mut batch = MetricBatch::with_capacity(1);
+    batch.resource = Some(Resource::new(vec![("service.name", "checkout").into()]));
+    push_metric(
+        &mut batch,
+        "oversized.histogram",
+        "",
+        "1",
+        MetricData::Histogram(otel_sqlite_core::model::Histogram {
+            data_points: vec![HistogramDataPoint {
+                time_unix_nano: 100,
+                count: u64::MAX,
+                bucket_counts: vec![1],
+                explicit_bounds: vec![1.0],
+                ..HistogramDataPoint::default()
+            }],
+            aggregation_temporality: Temporality::Cumulative,
+        }),
+    );
+
+    sender.send(metrics_message(batch))?;
+    sender.send(IngestMessage::Flush)?;
+    drop(sender);
+    storage.join()?;
+
+    let stats = storage.stats();
+    assert_eq!(
+        stats.quarantined_records, 1,
+        "the overflowing point must be quarantined"
+    );
+    assert_eq!(stats.records_written, 0);
+    assert_eq!(stats.errors, 1, "the failed strict attempt is accounted");
+
+    let conn = Connection::open(&db_path)?;
+    let null_counts: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM metric_data_point WHERE count IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(null_counts, 0, "no NULL count row may reach the database");
+
+    Ok(())
+}
+
+/// A metric record carrying its own resource must attribute its scope
+/// dimensions to that resource, symmetric with log records; the batch origin
+/// only supplies the fallback.
+#[test]
+fn record_level_metric_resource_overrides_the_batch_origin()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("metric-resource.db");
+
+    let (sender, receiver) = unbounded();
+    let mut storage = Storage::open(
+        receiver,
+        StorageConfig {
+            sqlite_path: db_path.clone(),
+            ..StorageConfig::default()
+        },
+    )?;
+
+    let mut batch = MetricBatch::with_capacity(1);
+    batch.resource = Some(Resource::new(vec![("service.name", "batch-svc").into()]));
+    push_metric(
+        &mut batch,
+        "host.metric",
+        "",
+        "1",
+        MetricData::Gauge(otel_sqlite_core::model::Gauge {
+            data_points: vec![NumberDataPoint {
+                time_unix_nano: 100,
+                value: Some(NumberValue::Int(1)),
+                ..NumberDataPoint::default()
+            }],
+        }),
+    );
+    batch.records[0].resource = Some(Resource::new(vec![("service.name", "record-svc").into()]));
+
+    sender.send(metrics_message(batch))?;
+    sender.send(IngestMessage::Flush)?;
+    drop(sender);
+    storage.join()?;
+
+    let conn = Connection::open(&db_path)?;
+    let service: String = conn.query_row(
+        "SELECT lr.service_name FROM scope s JOIN log_resource lr ON lr.id = s.resource_id",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(
+        service, "record-svc",
+        "the record-level resource must win over the batch origin"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn health_probe_reports_liveness_and_progress() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
@@ -527,6 +645,33 @@ fn open_fails_fast_when_the_database_is_unusable() {
         started.elapsed() < Duration::from_secs(5),
         "startup failure must surface immediately, took {:?}",
         started.elapsed()
+    );
+}
+
+/// `max_batch_records = 0` would panic the batcher thread *after* `open`
+/// returned Ok, leaving a dead pipeline behind a success. It must be rejected
+/// as a startup error instead. The struct literal avoids the debug assertion
+/// in `InsertBatcherConfig::new` so the release-only failure is exercised.
+#[test]
+fn open_rejects_zero_max_batch_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_sender, receiver) = unbounded();
+    let result = Storage::open(
+        receiver,
+        StorageConfig {
+            sqlite_path: dir.path().join("zero.db"),
+            insert_batcher: otel_sqlite_core::storage::InsertBatcherConfig {
+                max_batch_records: 0,
+                max_batch_age: Duration::from_millis(20),
+            },
+            ..StorageConfig::default()
+        },
+    );
+
+    let error = result.expect_err("zero max_batch_records must be rejected");
+    assert!(
+        matches!(error, StorageError::StartupFailed { .. }),
+        "unexpected error variant: {error:?}"
     );
 }
 
@@ -992,6 +1137,76 @@ fn size_quota_evicts_oldest_first_and_keeps_newest() -> Result<(), Box<dyn std::
         "an over-quota insert must evict the oldest rows first"
     );
     assert_eq!(fresh, 1, "the newest rows must survive quota enforcement");
+
+    Ok(())
+}
+
+/// A delta and a cumulative Sum with the same descriptor are distinct
+/// metrics: temporality and monotonicity are part of metric identity, so both
+/// must persist instead of the second being quarantined by the uniqueness
+/// constraint.
+#[test]
+fn same_descriptor_different_temporality_are_distinct_metrics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("metric-identity.db");
+
+    let (sender, receiver) = unbounded();
+    let mut storage = Storage::open(
+        receiver,
+        StorageConfig {
+            sqlite_path: db_path.clone(),
+            ..StorageConfig::default()
+        },
+    )?;
+
+    let batch = |temporality: Temporality, is_monotonic: bool, value: i64, time: i64| {
+        let mut batch = MetricBatch::with_capacity(1);
+        batch.resource = Some(Resource::new(vec![("service.name", "checkout").into()]));
+        push_metric(
+            &mut batch,
+            "http.requests",
+            "requests",
+            "1",
+            MetricData::Sum(Sum {
+                data_points: vec![NumberDataPoint {
+                    start_time_unix_nano: 100,
+                    time_unix_nano: time,
+                    value: Some(NumberValue::Int(value)),
+                    ..NumberDataPoint::default()
+                }],
+                aggregation_temporality: temporality,
+                is_monotonic,
+            }),
+        );
+        batch
+    };
+
+    sender.send(metrics_message(batch(Temporality::Delta, true, 10, 1_000)))?;
+    sender.send(metrics_message(batch(
+        Temporality::Cumulative,
+        true,
+        20,
+        2_000,
+    )))?;
+    sender.send(IngestMessage::Flush)?;
+    drop(sender);
+    storage.join()?;
+
+    assert_eq!(storage.stats().errors, 0);
+    assert_eq!(
+        storage.stats().quarantined_records,
+        0,
+        "distinct temporality must not be quarantined as a uniqueness violation"
+    );
+
+    let conn = Connection::open(&db_path)?;
+    let metrics: i64 = conn.query_row("SELECT COUNT(*) FROM metric", [], |row| row.get(0))?;
+    let points: i64 = conn.query_row("SELECT COUNT(*) FROM metric_data_point", [], |row| {
+        row.get(0)
+    })?;
+    assert_eq!(metrics, 2, "delta and cumulative sums must be two metrics");
+    assert_eq!(points, 2, "both data points must persist");
 
     Ok(())
 }
