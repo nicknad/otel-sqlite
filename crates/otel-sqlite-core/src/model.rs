@@ -3,8 +3,8 @@ pub mod log;
 pub mod resource;
 pub mod severity;
 
-pub use attribute::{Attribute, AttributeValue};
-pub use log::{LogBatch, LogRecord};
+pub use attribute::{Attribute, AttributeValue, write_attributes_json_into};
+pub use log::{LogBatch, LogRecord, LogScope};
 pub use resource::Resource;
 pub use severity::Severity;
 

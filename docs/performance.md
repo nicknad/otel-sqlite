@@ -502,11 +502,32 @@ salvage-semantics migration.
 the existing timer, partial-batch, shutdown, and backpressure tests are the
 regression suite.
 
+### PERF-009 · Scope metadata precomputed once per group — DONE
+
+Records no longer deep-clone their instrumentation scope and the writer no
+longer sorts + serializes the identical scope JSON per row. `LogScope` (core)
+renders the canonical `attributes_json` once in `new`, and every record of a
+`ScopeLogs` group shares it through `Arc<LogScope>`. The canonical
+flat-attribute encoder moved from the storage `command/json.rs` module to
+`core/src/model/attribute.rs`, so ingress legitimately owns the encoding
+instead of coupling to storage internals — this is the scope-metadata slice of
+PERF-007 stage 3, not the whole stage: per-record attribute encoding and
+resource identity resolution still run inside the writer transaction
+(PERF-006). Regression suites: the encoder's canonical-bytes tests in core,
+`mapping_fidelity_persists_canonical_structured_values`, and the exact-bytes
+`scope_attributes_json` assertions in `storage/tests/storage.rs`. Measured
+A/B on the mapping boundary: no regression at >=100 records/group (22–83%
+faster there); singleton groups pay one extra render (<=1.3 µs/batch), offset
+by the removed per-row writer encode (0.19–1.86 µs/row for 2–16 scope
+attributes).
+
 ### Sequencing
 
 1. **PERF-008** — done.
-2. **PERF-006** — highest yield per risk; establishes the measurement baselines
-   everything after depends on.
-3. Re-profile. If the writer remains CPU-bound on realistic workloads, proceed
-   to **PERF-007 stage 2**; revisit stage 3 only with profile evidence that a
-   single batcher thread cannot keep up.
+2. **PERF-009** — done (scope metadata).
+3. **PERF-006** — highest yield per risk; establishes the measurement baselines
+   everything after depends on. Re-scope it to the resource dimension (and the
+   remaining per-record attribute encoding).
+4. Re-profile. If the writer remains CPU-bound on realistic workloads, proceed
+   to **PERF-007 stage 2**; revisit stage 3 for record-level payloads only with
+   profile evidence that a single batcher thread cannot keep up.

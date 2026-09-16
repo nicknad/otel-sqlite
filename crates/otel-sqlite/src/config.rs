@@ -66,8 +66,9 @@ pub struct Config {
     /// Max bytes for a scalar log body (H2).
     pub max_body_bytes: usize,
     /// Aggregate scope-metadata expansion budget per request (C1): scope
-    /// metadata bytes multiplied by member records. See ingress
-    /// `DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES`.
+    /// metadata bytes multiplied by member records, a conservative worst-case
+    /// bound (mapped records share one scope allocation per group). See
+    /// ingress `DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES`.
     pub max_scope_metadata_expansion_bytes: usize,
     /// Optional on-disk size quota for the SQLite database file, in bytes
     /// (`None` = unbounded). When set, the storage writer evicts the oldest

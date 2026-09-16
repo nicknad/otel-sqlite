@@ -14,11 +14,12 @@
 
 #![no_main]
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use otel_sqlite_core::model::{Attribute, AttributeValue, LogRecord, Severity};
+use otel_sqlite_core::model::{Attribute, AttributeValue, LogRecord, LogScope, Severity};
 use otel_sqlite_core::storage::{InsertBatcher, InsertBatcherConfig, WriteBatch};
 
 /// Arbitrary stand-in for [`LogRecord`]: keeps an `arbitrary` dependency out
@@ -105,10 +106,12 @@ impl From<FuzzLogRecord> for LogRecord {
             event_name: value.event_name,
             resource_id: String::new(),
             resource: None,
-            scope_name: String::new(),
-            scope_version: String::new(),
-            scope_attributes: fuzz_attributes(value.scope_attributes),
-            scope_schema_url: value.scope_schema_url,
+            scope: Arc::new(LogScope::new(
+                String::new(),
+                String::new(),
+                fuzz_attributes(value.scope_attributes),
+                value.scope_schema_url,
+            )),
         }
     }
 }

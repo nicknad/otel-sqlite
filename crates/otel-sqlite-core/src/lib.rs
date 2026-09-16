@@ -5,7 +5,7 @@ pub mod model;
 pub mod storage;
 pub mod time;
 
-pub use model::{LogBatch, LogRecord};
+pub use model::{LogBatch, LogRecord, LogScope};
 pub use storage::{
     BatchOrigin, BatchOutput, CommitLedger, DurabilityMode, IngestMessage, InsertBatcher,
     InsertBatcherConfig, LogChunk, LogWriteBatch, SyncMode, Watermark, WriteBatch, WriteCommand,

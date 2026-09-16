@@ -8,12 +8,11 @@
 
 use std::fmt::Write as _;
 
-use otel_sqlite_core::model::Resource;
+use otel_sqlite_core::model::{Resource, write_attributes_json_into};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
 use super::InsertScratch;
-use super::json::write_attributes_json;
 use super::non_empty;
 use crate::error::StorageError;
 
@@ -48,7 +47,7 @@ pub(super) fn resolve_resource(
     let host_name = non_empty(resource.host_name());
     let schema_url = non_empty(resource.schema_url.as_str());
 
-    write_attributes_json(&resource.attributes, scratch);
+    write_attributes_json_into(&resource.attributes, &mut scratch.order, &mut scratch.json);
     fingerprint_into(
         &[
             service_name,
