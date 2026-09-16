@@ -38,8 +38,6 @@ struct FuzzLogRecord {
     dropped_attributes_count: u32,
     flags: u32,
     event_name: String,
-    scope_attributes: Vec<(String, FuzzAttributeValue)>,
-    scope_schema_url: String,
 }
 
 #[derive(Arbitrary, Debug)]
@@ -89,30 +87,23 @@ fn fuzz_attributes(values: Vec<(String, FuzzAttributeValue)>) -> Vec<Attribute> 
         .collect()
 }
 
-impl From<FuzzLogRecord> for LogRecord {
-    fn from(value: FuzzLogRecord) -> Self {
-        Self {
-            time_unix_nano: value.time_unix_nano,
-            observed_time_unix_nano: value.observed_time_unix_nano,
-            severity_number: Severity::from_u8(value.severity_number).unwrap_or_default(),
-            severity_text: value.severity_text,
-            trace_id: value.trace_id,
-            span_id: value.span_id,
-            body: value.body,
-            body_json: value.body_json,
-            attributes: fuzz_attributes(value.attributes),
-            dropped_attributes_count: value.dropped_attributes_count,
-            flags: value.flags,
-            event_name: value.event_name,
-            resource_id: String::new(),
-            resource: None,
-            scope: Arc::new(LogScope::new(
-                String::new(),
-                String::new(),
-                fuzz_attributes(value.scope_attributes),
-                value.scope_schema_url,
-            )),
-        }
+fn convert(value: FuzzLogRecord, scope: &Arc<LogScope>) -> LogRecord {
+    LogRecord {
+        time_unix_nano: value.time_unix_nano,
+        observed_time_unix_nano: value.observed_time_unix_nano,
+        severity_number: Severity::from_u8(value.severity_number).unwrap_or_default(),
+        severity_text: value.severity_text,
+        trace_id: value.trace_id,
+        span_id: value.span_id,
+        body: value.body,
+        body_json: value.body_json,
+        attributes: fuzz_attributes(value.attributes),
+        dropped_attributes_count: value.dropped_attributes_count,
+        flags: value.flags,
+        event_name: value.event_name,
+        resource_id: String::new(),
+        resource: None,
+        scope: Arc::clone(scope),
     }
 }
 
@@ -125,8 +116,18 @@ enum Op {
         max_batch_records: u16,
         max_batch_age_millis: u32,
     },
-    Push(Vec<FuzzLogRecord>),
-    FlushIfExpired { advance_millis: u32 },
+    /// One scope shared by every record of the push, mirroring the production
+    /// mapping model (one `LogScope` per `ScopeLogs` group): building one per
+    /// record would render the canonical JSON per record and inflate the
+    /// harness's memory profile far beyond anything production can produce.
+    Push {
+        scope_attributes: Vec<(String, FuzzAttributeValue)>,
+        scope_schema_url: String,
+        records: Vec<FuzzLogRecord>,
+    },
+    FlushIfExpired {
+        advance_millis: u32,
+    },
     Flush,
 }
 
@@ -148,13 +149,27 @@ fuzz_target!(|ops: Vec<Op>| {
                     max_batch_age: Duration::from_millis(u64::from(max_batch_age_millis)),
                 });
             }
-            Op::Push(records) => {
+            Op::Push {
+                scope_attributes,
+                scope_schema_url,
+                records,
+            } => {
                 if records.is_empty() {
                     continue;
                 }
                 pushed += records.len();
                 let limit = batcher.config().max_batch_records;
-                let output = batcher.push(records.into_iter().map(LogRecord::from).collect());
+                let scope = Arc::new(LogScope::new(
+                    String::new(),
+                    String::new(),
+                    fuzz_attributes(scope_attributes),
+                    scope_schema_url,
+                ));
+                let batch = records
+                    .into_iter()
+                    .map(|record| convert(record, &scope))
+                    .collect();
+                let output = batcher.push(batch);
                 let mut ready = 0_usize;
                 output.for_each(|batch| ready += check_batch(batch, limit));
                 emitted += ready;
