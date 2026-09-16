@@ -70,10 +70,11 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 /// bytes of one `ScopeLogs`/`ScopeMetrics` metadata block (name + version +
 /// schema URL + attributes) multiplied by the number of member records.
 ///
-/// Each mapped record owns a copy of its scope metadata, so without this
-/// bound a small scope block repeated across the 100k-record cap can force
-/// multi-GiB mappings (and as many duplicated JSON bytes in SQLite) from a
-/// request that is tiny on the wire. Defaults to one wire budget
+/// Mapped records share one `LogScope` per group, so this product is a
+/// conservative worst-case bound rather than the actual mapped footprint: it
+/// still rejects a small scope block repeated across the 100k-record cap that
+/// would have forced multi-GiB mappings (and as many duplicated JSON bytes in
+/// SQLite) under the old per-record copy model. Defaults to one wire budget
 /// (`DEFAULT_MAX_RECV_MSG_SIZE`), so scope expansion can never exceed the
 /// memory the request could already have used on the wire.
 pub const DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES: usize = 16 * 1024 * 1024;

@@ -1,12 +1,11 @@
 //! Log-event persistence: one insert per record, one transaction per batch.
 
-use otel_sqlite_core::model::Resource;
+use otel_sqlite_core::model::{Resource, write_attributes_json_into};
 use otel_sqlite_core::storage::LogWriteBatch;
 use rusqlite::{Connection, params};
 
 use super::InsertScratch;
 use super::identity::resolve_resource;
-use super::json::{write_attributes_json, write_attributes_json_into};
 use super::non_empty;
 use crate::error::StorageError;
 
@@ -70,12 +69,7 @@ fn insert_logs_inner(
     let mut written = 0u64;
     let mut dropped = 0u64;
     for record in batch.records.records() {
-        write_attributes_json(&record.attributes, &mut scratch);
-        write_attributes_json_into(
-            &record.scope_attributes,
-            &mut scratch.order,
-            &mut scratch.scope_json,
-        );
+        write_attributes_json_into(&record.attributes, &mut scratch.order, &mut scratch.json);
         let resource_id = match &record.resource {
             Some(resource) => {
                 resolve_resource(conn, resource, &mut record_scratch)?;
@@ -101,10 +95,10 @@ fn insert_logs_inner(
             non_empty(record.event_name.as_str()),
             record.flags,
             record.dropped_attributes_count,
-            non_empty(record.scope_name.as_str()),
-            non_empty(record.scope_version.as_str()),
-            &*scratch.scope_json,
-            non_empty(record.scope_schema_url.as_str()),
+            non_empty(record.scope.name()),
+            non_empty(record.scope.version()),
+            record.scope.attributes_json(),
+            non_empty(record.scope.schema_url()),
             &*scratch.json,
         ]) {
             Ok(_) => written += 1,

@@ -373,9 +373,11 @@ pub(crate) fn scope_metadata_bytes(
 /// Rejects requests whose scope metadata is repeated across so many member
 /// records that the mapped model would amplify far beyond the wire budget.
 ///
-/// Every record owns a copy of its scope metadata, so `metadata_bytes *
-/// members` is the amplification the request can force. Checked with division
-/// to stay overflow-free for hostile `members` values.
+/// The budget models `metadata_bytes * members` — the amplification the
+/// request could force if every record copied its scope metadata. Since the
+/// mapped model now shares one `LogScope` per group, the check is a
+/// conservative worst-case bound, not the actual mapped footprint. Checked
+/// with division to stay overflow-free for hostile `members` values.
 pub(crate) fn check_scope_expansion(
     metadata_bytes: usize,
     members: usize,

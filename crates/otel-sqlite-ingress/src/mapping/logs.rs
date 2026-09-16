@@ -1,4 +1,6 @@
-use otel_sqlite_core::model::{Attribute, AttributeValue, LogBatch, LogRecord, Severity};
+use std::sync::Arc;
+
+use otel_sqlite_core::model::{AttributeValue, LogBatch, LogRecord, LogScope, Severity};
 use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, LogChunk};
 
 use crate::error::IngressError;
@@ -53,14 +55,22 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogBatch, IngressError> 
             )
             .unwrap_or_default();
         let scope_attributes = attributes(scope_attributes, "logs")?;
+        // Record-less groups are dropped by `map_chunks`; skip the canonical
+        // JSON render (the attribute conversion above still enforces bounds).
+        if log_records.is_empty() {
+            continue;
+        }
+        // One shared scope per `ScopeLogs` group: every record references the
+        // same allocation and reuses the canonical attributes JSON rendered
+        // here instead of cloning/serializing per record.
+        let scope = Arc::new(LogScope::new(
+            scope_name,
+            scope_version,
+            scope_attributes,
+            scope_schema_url,
+        ));
         for record in log_records {
-            batch.push(convert_record(
-                record,
-                &scope_name,
-                &scope_version,
-                &scope_attributes,
-                &scope_schema_url,
-            )?);
+            batch.push(convert_record(record, &scope)?);
         }
     }
 
@@ -117,13 +127,7 @@ pub(crate) fn map_chunks(
     Ok(chunks)
 }
 
-fn convert_record(
-    value: ProtoLogRecord,
-    scope_name: &str,
-    scope_version: &str,
-    scope_attributes: &[Attribute],
-    scope_schema_url: &str,
-) -> Result<LogRecord, IngressError> {
+fn convert_record(value: ProtoLogRecord, scope: &Arc<LogScope>) -> Result<LogRecord, IngressError> {
     let ProtoLogRecord {
         time_unix_nano,
         observed_time_unix_nano,
@@ -167,10 +171,7 @@ fn convert_record(
         event_name,
         resource_id: String::new(),
         resource: None,
-        scope_name: scope_name.to_owned(),
-        scope_version: scope_version.to_owned(),
-        scope_attributes: scope_attributes.to_vec(),
-        scope_schema_url: scope_schema_url.to_owned(),
+        scope: Arc::clone(scope),
     })
 }
 
@@ -408,16 +409,20 @@ mod tests {
         assert!(first.has_trace_context());
         assert_eq!(first.body, "hello");
         assert_eq!(first.attributes[0].value.as_int(), Some(42));
-        assert_eq!(first.scope_name, "scope-a");
-        assert_eq!(first.scope_version, "1.2.3");
+        assert_eq!(first.scope.name(), "scope-a");
+        assert_eq!(first.scope.version(), "1.2.3");
         assert_eq!(first.event_name, "order.placed");
-        assert_eq!(first.scope_attributes[0].value.as_str(), Some("prod"));
+        assert_eq!(first.scope.attributes()[0].value.as_str(), Some("prod"));
+        assert_eq!(first.scope.attributes_json(), r#"{"scope.tag":"prod"}"#);
         assert_eq!(
-            first.scope_schema_url,
+            first.scope.schema_url(),
             "https://example.test/schemas/logs/scope"
         );
 
         let second = &batch.records[1];
+        // Records from one `ScopeLogs` group share the same scope allocation:
+        // no per-record string/attribute clones and one JSON rendering.
+        assert!(Arc::ptr_eq(&first.scope, &second.scope));
         assert_eq!(second.severity_number, Severity::Unspecified);
         assert!(!second.has_trace());
         assert!(!second.has_span());

@@ -147,5 +147,8 @@ predominantly CPU-bound, not I/O-bound. Every microsecond of CPU inside a
 transaction is direct throughput loss; CPU work moved off the writer onto the
 batcher overlaps almost for free. The ingest boundary (tokio multi-thread
 runtime, one task per OTLP request) is the only genuinely parallel stage today.
-The open performance backlog (PERF-006/007) and its measurement methodology are
-detailed in [`docs/performance.md`](performance.md).
+Instrumentation-scope metadata follows that principle: one `LogScope` is
+rendered per `ScopeLogs` group at mapping and shared by reference, so the
+writer binds precomputed bytes instead of re-serializing per row.
+The open performance backlog (PERF-006/007/009) and its measurement methodology
+are detailed in [`docs/performance.md`](performance.md).

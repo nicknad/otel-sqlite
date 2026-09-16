@@ -1,10 +1,13 @@
 // Integration tests may assert with unwrap(); production code must not.
 #![allow(clippy::unwrap_used)]
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::unbounded;
-use otel_sqlite_core::model::{Attribute, AttributeValue, LogBatch, LogRecord, Resource, Severity};
+use otel_sqlite_core::model::{
+    Attribute, AttributeValue, LogBatch, LogRecord, LogScope, Resource, Severity,
+};
 use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, LogChunk, MaintenanceOperation};
 use otel_sqlite_storage::{Storage, StorageConfig, StorageError};
 use rusqlite::Connection;
@@ -37,8 +40,12 @@ fn sample_batch() -> LogBatch {
         trace_id: [7; 16],
         span_id: [9; 8],
         event_name: "order.failed".to_owned(),
-        scope_name: "scope-a".to_owned(),
-        scope_version: "1.0.0".to_owned(),
+        scope: Arc::new(LogScope::new(
+            "scope-a".to_owned(),
+            "1.0.0".to_owned(),
+            Vec::new(),
+            String::new(),
+        )),
         ..LogRecord::default()
     };
     record.attributes.push(Attribute {
@@ -598,19 +605,21 @@ fn mapping_fidelity_persists_canonical_structured_values() -> Result<(), Box<dyn
                 }]),
             ]),
         }],
-        scope_name: "scope-a".to_owned(),
-        scope_version: "1.0.0".to_owned(),
-        scope_attributes: vec![
-            Attribute {
-                key: "b".to_owned(),
-                value: AttributeValue::Int(1),
-            },
-            Attribute {
-                key: "a".to_owned(),
-                value: AttributeValue::String("v".to_owned()),
-            },
-        ],
-        scope_schema_url: "https://example.test/schemas/logs/scope".to_owned(),
+        scope: Arc::new(LogScope::new(
+            "scope-a".to_owned(),
+            "1.0.0".to_owned(),
+            vec![
+                Attribute {
+                    key: "b".to_owned(),
+                    value: AttributeValue::Int(1),
+                },
+                Attribute {
+                    key: "a".to_owned(),
+                    value: AttributeValue::String("v".to_owned()),
+                },
+            ],
+            "https://example.test/schemas/logs/scope".to_owned(),
+        )),
         ..LogRecord::default()
     });
     sender.send(logs_message(log_batch))?;

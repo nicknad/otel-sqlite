@@ -6,14 +6,12 @@
 //!
 //! * `logs` - log-event inserts,
 //! * `identity` - stable SHA-256 fingerprint IDs and the resource upsert
-//!   keyed by them,
-//! * `json` - attribute serialization into the JSON columns.
+//!   keyed by them.
 //!
 //! Statement reuse relies on rusqlite's `prepare_cached`; the SQL strings are
 //! module-private constants next to their only callers.
 
 mod identity;
-mod json;
 mod logs;
 
 pub(crate) use logs::{insert_logs, insert_logs_tolerant};
@@ -52,13 +50,9 @@ pub(crate) fn sanitized_preview(value: &str) -> String {
 pub(crate) struct InsertScratch {
     /// Batch-level resource id (`resolve_resource`).
     pub(crate) resource_id: String,
-    /// Output buffer for the current row's JSON documents.
+    /// Output buffer for the current row's attributes JSON.
     pub(crate) json: String,
-    /// Output buffer for the current row's scope attributes JSON. Kept
-    /// separate so scope dimensions and record attributes never overwrite
-    /// each other within one record.
-    pub(crate) scope_json: String,
-    /// Key-ordering indices used by `write_attributes_json`.
+    /// Key-ordering indices used by the canonical attribute encoder.
     pub(crate) order: Vec<u32>,
 }
 
@@ -68,7 +62,6 @@ impl InsertScratch {
         Self {
             resource_id: String::with_capacity(64),
             json: String::new(),
-            scope_json: String::new(),
             order: Vec::new(),
         }
     }

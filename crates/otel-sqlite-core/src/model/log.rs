@@ -1,8 +1,78 @@
-use super::attribute::Attribute;
+use std::sync::{Arc, LazyLock};
+
+use super::attribute::{Attribute, write_attributes_json_into};
 use super::resource::Resource;
 use super::severity::Severity;
 
-#[derive(Debug, Clone, PartialEq, Default)]
+/// Instrumentation scope dimensions, shared by every record of one OTLP
+/// `ScopeLogs` group.
+///
+/// The canonical flat JSON rendering of `attributes` is computed exactly once
+/// in [`LogScope::new`] and cached, so the mapping layer can precompute it on
+/// the parallel ingest path and the writer binds the bytes without per-record
+/// sorting or serialization.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogScope {
+    name: String,
+    version: String,
+    attributes: Vec<Attribute>,
+    schema_url: String,
+    attributes_json: String,
+}
+
+impl LogScope {
+    pub fn new(
+        name: String,
+        version: String,
+        attributes: Vec<Attribute>,
+        schema_url: String,
+    ) -> Self {
+        let mut attributes_json = String::new();
+        let mut order = Vec::new();
+        write_attributes_json_into(&attributes, &mut order, &mut attributes_json);
+        Self {
+            name,
+            version,
+            attributes,
+            schema_url,
+            attributes_json,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub fn attributes(&self) -> &[Attribute] {
+        &self.attributes
+    }
+
+    pub fn schema_url(&self) -> &str {
+        &self.schema_url
+    }
+
+    /// Canonical JSON object of [`LogScope::attributes`], rendered once at
+    /// construction.
+    pub fn attributes_json(&self) -> &str {
+        &self.attributes_json
+    }
+}
+
+impl Default for LogScope {
+    fn default() -> Self {
+        Self::new(String::new(), String::new(), Vec::new(), String::new())
+    }
+}
+
+/// Shared empty scope for [`LogRecord::default`], so defaulted records (tests,
+/// benches, fuzz harnesses) neither allocate a scope nor render `{}` per call.
+static EMPTY_SCOPE: LazyLock<Arc<LogScope>> = LazyLock::new(|| Arc::new(LogScope::default()));
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogRecord {
     pub time_unix_nano: i64,
     pub observed_time_unix_nano: i64,
@@ -25,10 +95,32 @@ pub struct LogRecord {
     /// [`resource`]: LogRecord::resource
     pub resource_id: String,
     pub resource: Option<Resource>,
-    pub scope_name: String,
-    pub scope_version: String,
-    pub scope_attributes: Vec<Attribute>,
-    pub scope_schema_url: String,
+    /// Shared scope metadata; records from one OTLP `ScopeLogs` group point at
+    /// the same allocation, so neither the strings nor the attribute set are
+    /// cloned per record.
+    pub scope: Arc<LogScope>,
+}
+
+impl Default for LogRecord {
+    fn default() -> Self {
+        Self {
+            time_unix_nano: 0,
+            observed_time_unix_nano: 0,
+            severity_number: Severity::default(),
+            severity_text: String::new(),
+            trace_id: [0; 16],
+            span_id: [0; 8],
+            body: String::new(),
+            body_json: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            flags: 0,
+            event_name: String::new(),
+            resource_id: String::new(),
+            resource: None,
+            scope: Arc::clone(&EMPTY_SCOPE),
+        }
+    }
 }
 
 impl LogRecord {

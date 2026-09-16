@@ -6,10 +6,11 @@
 //! verification, corruption rejection, encryption round-trips and the online
 //! backup-while-ingesting property.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::unbounded;
-use otel_sqlite_core::model::{Attribute, LogBatch, LogRecord, Resource, Severity};
+use otel_sqlite_core::model::{Attribute, LogBatch, LogRecord, LogScope, Resource, Severity};
 use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, LogChunk};
 use otel_sqlite_storage::backup::{self, BackupError};
 use otel_sqlite_storage::{Storage, StorageConfig};
@@ -40,7 +41,12 @@ fn sample_batch() -> LogBatch {
         severity_text: "ERROR".to_owned(),
         body: "payment failed".to_owned(),
         event_name: "order.failed".to_owned(),
-        scope_name: "scope-a".to_owned(),
+        scope: Arc::new(LogScope::new(
+            "scope-a".to_owned(),
+            String::new(),
+            Vec::new(),
+            String::new(),
+        )),
         attributes: vec![Attribute {
             key: "attempt".to_owned(),
             value: otel_sqlite_core::model::AttributeValue::Int(2),

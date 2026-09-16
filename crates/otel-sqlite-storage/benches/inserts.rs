@@ -17,11 +17,12 @@
 //! Run with `cargo bench -p otel-sqlite-storage`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_channel::Sender;
-use otel_sqlite_core::model::{AttributeValue, LogRecord, Severity};
+use otel_sqlite_core::model::{AttributeValue, LogRecord, LogScope, Severity};
 use otel_sqlite_core::storage::{
     BatchOrigin, CheckpointMode, IngestMessage, InsertBatcherConfig, LogChunk, LogWriteBatch,
     MaintenanceOperation, SyncMode, WriteBatch, WriteCommand,
@@ -114,7 +115,19 @@ fn wait_maintenance_run(storage: &Storage, previous_runs: u64) {
     }
 }
 
-fn log_record(seq: usize, time_unix_nano: i64) -> LogRecord {
+/// Shared scope for one record vector: mirrors the production mapping path,
+/// where every record of a `ScopeLogs` group references the same allocation
+/// and reuses its precomputed attributes JSON.
+fn log_scope() -> Arc<LogScope> {
+    Arc::new(LogScope::new(
+        "otel-sqlite-bench".to_owned(),
+        "0.1.0".to_owned(),
+        vec![("scope.kind", "sdk".to_owned()).into()],
+        "https://example.test/schemas/logs/scope".to_owned(),
+    ))
+}
+
+fn log_record(seq: usize, time_unix_nano: i64, scope: &Arc<LogScope>) -> LogRecord {
     let id = (seq & 0xff) as u8;
     LogRecord {
         time_unix_nano,
@@ -130,13 +143,15 @@ fn log_record(seq: usize, time_unix_nano: i64) -> LogRecord {
             ("duration.ms", AttributeValue::Double(12.5)).into(),
         ],
         event_name: "benchmark".to_owned(),
+        scope: Arc::clone(scope),
         ..LogRecord::default()
     }
 }
 
 fn records(start_seq: usize, count: usize, time_unix_nano: i64) -> Vec<LogRecord> {
+    let scope = log_scope();
     (start_seq..start_seq + count)
-        .map(|seq| log_record(seq, time_unix_nano))
+        .map(|seq| log_record(seq, time_unix_nano, &scope))
         .collect()
 }
 

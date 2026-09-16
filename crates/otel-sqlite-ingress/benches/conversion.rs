@@ -105,6 +105,12 @@ fn resource_logs(count: usize, attributes_per_record: usize) -> ResourceLogs {
             scope: Some(InstrumentationScope {
                 name: "otel-sqlite-bench".to_owned(),
                 version: "0.1.0".to_owned(),
+                // Scope attributes exercise the once-per-scope canonical JSON
+                // precompute on the mapping boundary.
+                attributes: vec![
+                    key_value("scope.kind", Value::StringValue("sdk".to_owned())),
+                    key_value("scope.lang", Value::StringValue("rust".to_owned())),
+                ],
                 ..Default::default()
             }),
             log_records: (0..count as u64)
