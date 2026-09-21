@@ -1,10 +1,12 @@
 // Unit tests assert invariants with `.unwrap()`; production code must not.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub mod health;
 pub mod model;
 pub mod storage;
 pub mod time;
 
+pub use health::PipelineSample;
 pub use model::{LogRecord, LogScope};
 pub use storage::{
     BatchOrigin, CommitLedger, DurabilityMode, IngestMessage, InsertBatcher, InsertBatcherConfig,

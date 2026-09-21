@@ -18,6 +18,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use otel_sqlite_core::PipelineSample;
 use otel_sqlite_core::storage::CommitLedger;
 use otel_sqlite_core::time::monotonic_millis;
 
@@ -196,10 +197,10 @@ impl StorageHealth {
     /// Fields are individually atomic reads (relaxed ordering) plus two
     /// short ledger lock acquisitions; they are diagnostics for a watchdog
     /// evaluator, not a transactional snapshot. No I/O and no blocking.
-    pub fn sample(&self) -> StorageHealthSample {
+    pub fn sample(&self) -> PipelineSample {
         let now = monotonic_millis();
         let maintenance_started_ms = self.writer.maintenance_started_ms.load(Ordering::Relaxed);
-        StorageHealthSample {
+        PipelineSample {
             writer_running: self.writer.running.load(Ordering::Relaxed),
             batcher_running: self.batcher.running.load(Ordering::Relaxed),
             writer_idle_ms: now
@@ -212,8 +213,8 @@ impl StorageHealth {
                 .load(Ordering::Relaxed)
                 .max(self.batcher.queued_commands.load(Ordering::Relaxed)),
             queue_capacity: self.queue_capacity,
-            buffered_records: self.batcher.buffered_records.load(Ordering::Relaxed),
-            outstanding_commit_tickets: self.ledger.outstanding_tickets(),
+            pending_records: self.batcher.buffered_records.load(Ordering::Relaxed),
+            outstanding_tickets: self.ledger.outstanding_tickets(),
             watermark_idle_ms: now.saturating_sub(self.ledger.last_advance_ms()),
             maintenance_in_progress: self.writer.maintenance_in_progress.load(Ordering::Relaxed),
             maintenance_elapsed_ms: if maintenance_started_ms == 0 {
@@ -223,45 +224,6 @@ impl StorageHealth {
             },
         }
     }
-}
-
-/// Point-in-time health evidence for the storage pipeline.
-///
-/// The two "idle" fields are ages: milliseconds since the component last made
-/// meaningful progress. Stale ages are *not* failures by themselves — with an
-/// empty pipeline they simply mean no work arrived (`NO WORK`, not
-/// `WORK BUT NO PROGRESS`). Evaluators must combine them with the pending-work
-/// counters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StorageHealthSample {
-    /// Whether the SQLite writer thread is still running.
-    pub writer_running: bool,
-    /// Whether the insert batcher thread is still running.
-    pub batcher_running: bool,
-    /// Milliseconds since the writer last executed a command successfully.
-    pub writer_idle_ms: u64,
-    /// Milliseconds since the batcher last received input or submitted a batch.
-    pub batcher_idle_ms: u64,
-    /// Depth of the bounded write-command queue (writer's own view).
-    pub queue_depth: usize,
-    /// Capacity of the bounded write-command queue; `0` if unknown.
-    pub queue_capacity: usize,
-    /// Records currently buffered inside the insert batcher.
-    pub buffered_records: usize,
-    /// Issued durability tickets that have not settled (completed or voided).
-    /// In-flight records account for some; a ticket that stays outstanding
-    /// while nothing is in flight is a leak that stalls every durable ack.
-    pub outstanding_commit_tickets: u64,
-    /// Milliseconds since the contiguous commit watermark last advanced.
-    /// Combined with `outstanding_commit_tickets` this detects a stuck
-    /// durability watermark.
-    pub watermark_idle_ms: u64,
-    /// Whether a maintenance-class command is currently executing on the
-    /// writer. Ordinary stall verdicts must be suspended while this is true.
-    pub maintenance_in_progress: bool,
-    /// Milliseconds since the current maintenance operation started; `0`
-    /// when none is in progress. Bounds a genuinely hung maintenance call.
-    pub maintenance_elapsed_ms: u64,
 }
 
 /// Point-in-time view of every pipeline counter, produced by
