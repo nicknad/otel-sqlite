@@ -101,8 +101,6 @@ fn convert(value: FuzzLogRecord, scope: &Arc<LogScope>) -> LogRecord {
         dropped_attributes_count: value.dropped_attributes_count,
         flags: value.flags,
         event_name: value.event_name,
-        resource_id: String::new(),
-        resource: None,
         scope: Arc::clone(scope),
     }
 }

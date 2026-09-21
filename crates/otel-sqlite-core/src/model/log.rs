@@ -1,7 +1,6 @@
 use std::sync::{Arc, LazyLock};
 
 use super::attribute::{Attribute, write_attributes_json_into};
-use super::resource::Resource;
 use super::severity::Severity;
 
 /// Instrumentation scope dimensions, shared by every record of one OTLP
@@ -89,12 +88,6 @@ pub struct LogRecord {
     pub dropped_attributes_count: u32,
     pub flags: u32,
     pub event_name: String,
-    /// Reserved: resource identity is derived at persist time from [`resource`]
-    /// (or the batch origin); the writer never reads this field.
-    ///
-    /// [`resource`]: LogRecord::resource
-    pub resource_id: String,
-    pub resource: Option<Resource>,
     /// Shared scope metadata; records from one OTLP `ScopeLogs` group point at
     /// the same allocation, so neither the strings nor the attribute set are
     /// cloned per record.
@@ -116,8 +109,6 @@ impl Default for LogRecord {
             dropped_attributes_count: 0,
             flags: 0,
             event_name: String::new(),
-            resource_id: String::new(),
-            resource: None,
             scope: Arc::clone(&EMPTY_SCOPE),
         }
     }
