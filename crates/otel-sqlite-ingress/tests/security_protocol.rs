@@ -350,7 +350,7 @@ impl BootedServer {
             .iter()
             .map(|message| match message {
                 IngestMessage::Logs(chunk) => chunk.records.len(),
-                _ => 0,
+                IngestMessage::Flush => 0,
             })
             .sum()
     }

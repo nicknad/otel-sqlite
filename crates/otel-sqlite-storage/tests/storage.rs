@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::unbounded;
 use otel_sqlite_core::model::{Attribute, AttributeValue, LogRecord, LogScope, Resource, Severity};
-use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, LogChunk, MaintenanceOperation};
+use otel_sqlite_core::storage::{
+    BatchOrigin, IngestMessage, LogChunk, MaintenanceOperation, WriteCommand,
+};
 use otel_sqlite_storage::{Storage, StorageConfig, StorageError};
 use rusqlite::Connection;
 
@@ -200,10 +202,11 @@ fn log_search_index_tracks_inserts_and_prunes_without_rebuild()
 
         // The sample records carry epoch timestamps, so any retention
         // window covers them.
-        sender.send(IngestMessage::Maintenance(MaintenanceOperation::Prune(
-            Some(Duration::from_secs(1)),
-        )))?;
-        sender.send(IngestMessage::Flush)?;
+        storage
+            .producer()
+            .send(WriteCommand::Maintenance(MaintenanceOperation::Prune(
+                Some(Duration::from_secs(1)),
+            )))?;
         drop(sender);
         storage.join()?;
 
@@ -273,7 +276,9 @@ fn rebuild_fts_heals_a_crashed_rebuild() -> Result<(), Box<dyn std::error::Error
     {
         let (sender, receiver) = unbounded();
         let mut storage = Storage::open(receiver, config_for())?;
-        sender.send(IngestMessage::Maintenance(MaintenanceOperation::RebuildFts))?;
+        storage
+            .producer()
+            .send(WriteCommand::Maintenance(MaintenanceOperation::RebuildFts))?;
         sender.send(sample_message())?;
         sender.send(IngestMessage::Flush)?;
         drop(sender);
@@ -520,10 +525,11 @@ fn retention_prunes_logs_collects_orphans_and_leaves_no_fts_ghosts()
     );
 
     // Everything from ~1970 expires in the uniform window.
-    sender.send(IngestMessage::Maintenance(MaintenanceOperation::Prune(
-        Some(Duration::from_secs(1)),
-    )))?;
-    sender.send(IngestMessage::Flush)?;
+    storage
+        .producer()
+        .send(WriteCommand::Maintenance(MaintenanceOperation::Prune(
+            Some(Duration::from_secs(1)),
+        )))?;
     drop(sender);
     storage.join()?;
 

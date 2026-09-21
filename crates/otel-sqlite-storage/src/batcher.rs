@@ -139,18 +139,6 @@ pub(crate) fn run(
                     alive = submit(&commands, WriteCommand::Flush, stats);
                 }
             }
-            Event::Message(IngestMessage::Checkpoint(mode)) => {
-                flush_buffers(&mut logs, &commands, stats, &mut alive);
-                if alive {
-                    alive = submit(&commands, WriteCommand::Checkpoint(mode), stats);
-                }
-            }
-            Event::Message(IngestMessage::Maintenance(operation)) => {
-                flush_buffers(&mut logs, &commands, stats, &mut alive);
-                if alive {
-                    alive = submit(&commands, WriteCommand::Maintenance(operation), stats);
-                }
-            }
             Event::Timer => {
                 let now = Instant::now();
                 let expired = logs.flush_expired(now);

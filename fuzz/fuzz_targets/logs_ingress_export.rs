@@ -93,7 +93,7 @@ fuzz_target!(|data: &[u8]| {
             }
             // Control commands carry no records and are never produced by
             // OTLP handlers; tolerated for exhaustiveness.
-            IngestMessage::Flush | IngestMessage::Checkpoint(_) | IngestMessage::Maintenance(_) => {}
+            IngestMessage::Flush => {}
         }
     }
     if accepted {
