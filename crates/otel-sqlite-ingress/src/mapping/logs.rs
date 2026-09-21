@@ -159,8 +159,6 @@ fn convert_record(value: ProtoLogRecord, scope: &Arc<LogScope>) -> Result<LogRec
         dropped_attributes_count,
         flags,
         event_name,
-        resource_id: String::new(),
-        resource: None,
         scope: Arc::clone(scope),
     })
 }

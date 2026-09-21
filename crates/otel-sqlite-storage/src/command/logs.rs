@@ -51,11 +51,9 @@ fn insert_logs_inner(
     batch: &LogWriteBatch,
     tolerant: bool,
 ) -> Result<(u64, u64), StorageError> {
-    // Row-level serialization reuses these buffers; the second scratch only
-    // serves the rare records carrying their own resource so the batch-level
-    // id in `scratch` survives them.
+    // Row-level serialization reuses this buffer; the batch-level resource id
+    // is resolved once up front and shared by every record of the batch.
     let mut scratch = InsertScratch::new();
-    let mut record_scratch = InsertScratch::new();
     let default_resource;
     let batch_resource = if let Some(resource) = &batch.origin.resource {
         resource
@@ -70,20 +68,13 @@ fn insert_logs_inner(
     let mut dropped = 0u64;
     for record in batch.records.records() {
         write_attributes_json_into(&record.attributes, &mut scratch.order, &mut scratch.json);
-        let resource_id = match &record.resource {
-            Some(resource) => {
-                resolve_resource(conn, resource, &mut record_scratch)?;
-                record_scratch.resource_id.as_str()
-            }
-            None => scratch.resource_id.as_str(),
-        };
         let body = record
             .body_json
             .as_deref()
             .or(non_empty(record.body.as_str()));
 
         match statement.execute(params![
-            resource_id,
+            scratch.resource_id.as_str(),
             record.time_unix_nano,
             record.observed_time_unix_nano,
             i64::from(record.severity_number as u8),
