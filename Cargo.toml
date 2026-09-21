@@ -9,7 +9,7 @@ members = [
 version = "0.2.0"
 edition = "2024"
 license = "MIT"
-description = "SQLite Sink for OTEL Logs/Metrics with batched Single-Writer-Queues"
+description = "OTLP logs sink for SQLite with batched single-writer queues"
 rust-version = "1.89.0"
 
 [workspace.dependencies]
