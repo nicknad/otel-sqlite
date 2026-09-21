@@ -171,7 +171,9 @@ fuzz_target!(|ops: Vec<Op>| {
                     .collect();
                 let output = batcher.push(batch);
                 let mut ready = 0_usize;
-                output.for_each(|batch| ready += check_batch(batch, max_batch_records));
+                for batch in output {
+                    ready += check_batch(batch, max_batch_records);
+                }
                 emitted += ready;
             }
             Op::FlushIfExpired { advance_millis } => {

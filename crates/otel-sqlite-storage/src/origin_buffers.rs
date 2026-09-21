@@ -48,54 +48,6 @@ impl<T> Submission<T> {
     }
 }
 
-/// Result of pushing a mapped chunk into an [`OriginBuffers`].
-///
-/// Mirrors the generic `InsertBatcher::push` result (`BatchOutput`) one layer
-/// up: same Buffered/Single/Multiple shape, but every ready batch is paired
-/// with its origin so the driver can submit complete commands directly.
-#[derive(Debug, PartialEq)]
-pub(crate) enum Emitted<T> {
-    /// Nothing ready; the records joined (or formed) the partial batch.
-    Buffered,
-    /// Exactly one batch is ready for submission.
-    Single(Submission<T>),
-    /// An oversized chunk produced several full batches, in order.
-    Multiple(Vec<Submission<T>>),
-}
-
-impl<T> Emitted<T> {
-    pub(crate) fn from_batches(mut batches: Vec<(BatchOrigin, WriteBatch<T>, Vec<u64>)>) -> Self {
-        match batches.len() {
-            0 => Self::Buffered,
-            1 => {
-                let (origin, records, commit_seqs) = batches.swap_remove(0);
-                Self::Single(Submission::new(origin, records, commit_seqs))
-            }
-            _ => Self::Multiple(
-                batches
-                    .into_iter()
-                    .map(|(origin, records, commit_seqs)| {
-                        Submission::new(origin, records, commit_seqs)
-                    })
-                    .collect(),
-            ),
-        }
-    }
-
-    /// Calls `f` with every ready submission in order.
-    pub(crate) fn for_each(self, mut f: impl FnMut(Submission<T>)) {
-        match self {
-            Self::Buffered => {}
-            Self::Single(submission) => f(submission),
-            Self::Multiple(submissions) => {
-                for submission in submissions {
-                    f(submission);
-                }
-            }
-        }
-    }
-}
-
 pub(crate) struct OriginBuffers<T> {
     config: InsertBatcherConfig,
     /// One buffer per active origin. The set holds every durability ticket
@@ -130,13 +82,14 @@ impl<T> OriginBuffers<T> {
     ///
     /// The chunk's ticket joins the buffer's accumulated set before any
     /// emission snapshot is taken, so a full batch emitted by this push
-    /// already claims the incoming ticket.
+    /// already claims the incoming ticket. Returns the ready submissions in
+    /// emission order; an empty vector means everything stayed buffered.
     pub(crate) fn push(
         &mut self,
         origin: BatchOrigin,
         records: Vec<T>,
         commit_seq: u64,
-    ) -> Emitted<T> {
+    ) -> Vec<Submission<T>> {
         let index = if let Some(index) = self
             .buffers
             .iter()
@@ -157,18 +110,18 @@ impl<T> OriginBuffers<T> {
             if self.buffers[index].2.is_empty() {
                 self.buffers.remove(index);
             }
-            return Emitted::Buffered;
+            return Vec::new();
         }
         let claimed = self.buffers[index].1.iter().copied().collect::<Vec<_>>();
-        let mut emitted = Vec::new();
-        output.for_each(|batch| {
-            emitted.push((origin.clone(), batch, claimed.clone()));
-        });
+        let emitted = output
+            .into_iter()
+            .map(|batch| Submission::new(origin.clone(), batch, claimed.clone()))
+            .collect();
         if self.buffers[index].2.is_empty() {
             self.buffers.remove(index);
         }
 
-        Emitted::from_batches(emitted)
+        emitted
     }
 
     /// Emits every expired partial batch (oldest deadline first).
@@ -224,14 +177,14 @@ mod tests {
         let mut buffers = OriginBuffers::<LogRecord>::new(config(4, 60_000));
 
         let pushed = buffers.push(origin("a"), vec![], 0);
-        assert!(matches!(pushed, Emitted::Buffered));
+        assert!(pushed.is_empty());
 
         let pushed = buffers.push(
             origin("a"),
             (0..2).map(|_| LogRecord::default()).collect(),
             3,
         );
-        assert!(matches!(pushed, Emitted::Buffered));
+        assert!(pushed.is_empty());
         assert_eq!(buffers.buffered(), 2);
         assert!(buffers.deadline().is_some());
 
@@ -242,30 +195,25 @@ mod tests {
             (0..3).map(|_| LogRecord::default()).collect(),
             5,
         );
-        assert!(matches!(pushed, Emitted::Buffered));
+        assert!(pushed.is_empty());
 
-        let pushed = buffers.push(
+        let submissions = buffers.push(
             origin("a"),
             (0..9).map(|_| LogRecord::default()).collect(),
             7,
         );
-        match pushed {
-            Emitted::Multiple(submissions) => {
-                assert_eq!(
-                    submissions
-                        .iter()
-                        .map(|s| s.records.len())
-                        .collect::<Vec<_>>(),
-                    vec![4, 4]
-                );
-                assert!(submissions.iter().all(|s| s.origin.schema_url == "a"));
-                // Both emissions claim the origin's whole accumulated ticket
-                // set {3, 7}: settlement downstream must cover every folded
-                // ticket, not just the maximum.
-                assert!(submissions.iter().all(|s| s.commit_seqs == vec![3, 7]));
-            }
-            other => panic!("expected multiple emissions, got {other:?}"),
-        }
+        assert_eq!(
+            submissions
+                .iter()
+                .map(|s| s.records.len())
+                .collect::<Vec<_>>(),
+            vec![4, 4]
+        );
+        assert!(submissions.iter().all(|s| s.origin.schema_url == "a"));
+        // Both emissions claim the origin's whole accumulated ticket set
+        // {3, 7}: settlement downstream must cover every folded ticket, not
+        // just the maximum.
+        assert!(submissions.iter().all(|s| s.commit_seqs == vec![3, 7]));
         // 3 records of "a" plus the untouched 3 of "b" remain.
         assert_eq!(buffers.buffered(), 6);
 
@@ -310,7 +258,7 @@ mod tests {
         );
 
         let submissions = buffers.flush_all();
-        assert!(matches!(pushed, Emitted::Buffered));
+        assert!(pushed.is_empty());
         assert_eq!(submissions.len(), 1);
         assert_eq!(submissions[0].commit_seqs, vec![1, 3]);
     }
