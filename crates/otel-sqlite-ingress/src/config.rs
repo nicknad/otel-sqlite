@@ -31,8 +31,8 @@ pub const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:4317";
 pub const DEFAULT_MAX_RECV_MSG_SIZE: usize = 16 * 1024 * 1024;
 /// Default cap on concurrent OTLP exports. Applied twice: as the HTTP/2
 /// `max_concurrent_streams` per connection, and as a process-wide semaphore
-/// shared by the logs and metrics services (see `grpc::run`), so total
-/// in-flight exports never exceed this even across many connections.
+/// guarding the logs service (see `grpc::run`), so total in-flight exports
+/// never exceed this even across many connections.
 /// Worst-case in-flight request bytes are roughly
 /// `max_concurrent_streams * max_recv_msg_size` (64 * 16 MiB = 1 GiB at the
 /// defaults, before JSON/FTS/fingerprint expansion), so raise it only
@@ -51,14 +51,14 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// but the blocking task itself runs to completion in the background.
 pub const MAPPING_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_RECORDS_PER_REQUEST: usize = 100_000;
-/// Per-record attribute cap: bounds the `attributes`/`metadata`/`filtered_attributes`
-/// vectors that ride on a single log record or metric data point (resource and
-/// scope attribute vectors are each held to the same bound). The gRPC message
-/// size already bounds the request total; this bounds the per-record CPU/alloc
-/// an attacker can force with one record inside that budget.
+/// Per-record attribute cap: bounds the `attributes` vector that rides on a
+/// single log record (resource and scope attribute vectors are each held to
+/// the same bound). The gRPC message size already bounds the request total;
+/// this bounds the per-record CPU/alloc an attacker can force with one record
+/// inside that budget.
 pub const DEFAULT_MAX_ATTRIBUTES_PER_RECORD: usize = 1_000;
-/// Max bytes for a single attribute key (`KeyValue.key`, metric names, scope
-/// names, etc. are held to the value bound below where applicable).
+/// Max bytes for a single attribute key (`KeyValue.key`; scope names etc. are
+/// held to the value bound below where applicable).
 pub const DEFAULT_MAX_ATTRIBUTE_KEY_BYTES: usize = 512;
 /// Max bytes for a single attribute string/bytes value.
 pub const DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES: usize = 64 * 1024;
@@ -67,8 +67,8 @@ pub const DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES: usize = 64 * 1024;
 /// byte bounds plus `MAX_NESTING_DEPTH` instead.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Aggregate scope-metadata expansion budget per request: the estimated model
-/// bytes of one `ScopeLogs`/`ScopeMetrics` metadata block (name + version +
-/// schema URL + attributes) multiplied by the number of member records.
+/// bytes of one `ScopeLogs` metadata block (name + version + schema URL +
+/// attributes) multiplied by the number of member records.
 ///
 /// Mapped records share one `LogScope` per group, so this product is a
 /// conservative worst-case bound rather than the actual mapped footprint: it

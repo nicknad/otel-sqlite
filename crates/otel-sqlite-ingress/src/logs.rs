@@ -22,7 +22,7 @@ pub struct LogsIngress {
     /// `DurabilityMode::Commit` the export response waits here until the
     /// writer has committed everything this request had accepted.
     commit: Arc<CommitLedger>,
-    /// Process-wide export concurrency guard shared with the metrics service;
+    /// Process-wide export concurrency guard shared by every connection;
     /// the HTTP/2 `max_concurrent_streams` setting is per connection, so this
     /// is what bounds in-flight exports across all connections. `new` leaves
     /// it effectively unlimited; production wiring attaches the shared one.

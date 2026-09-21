@@ -56,7 +56,7 @@ pub struct Config {
     pub grpc_max_recv_msg_size: usize,
     pub grpc_max_concurrent_streams: u32,
     pub max_records_per_request: usize,
-    /// Max attributes on one log record / metric point (H2). See ingress
+    /// Max attributes on one log record (H2). See ingress
     /// `DEFAULT_MAX_ATTRIBUTES_PER_RECORD`.
     pub max_attributes_per_record: usize,
     /// Max bytes for one attribute key (H2).

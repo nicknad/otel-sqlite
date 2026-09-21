@@ -6,7 +6,7 @@ use crate::model::LogRecord;
 use super::batch::WriteBatch;
 
 /// Origin metadata shared by all records of one mapped OTLP payload group
-/// (`ResourceLogs` / `ResourceMetrics`).
+/// (`ResourceLogs`).
 ///
 /// Records keep their batch-level origin so the insert batcher can combine
 /// arbitrary incoming groups without ever attributing records to the wrong
