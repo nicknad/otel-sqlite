@@ -43,7 +43,7 @@ pub mod durability;
 
 pub use batch::WriteBatch;
 pub use batcher::{
-    BatchOutput, DEFAULT_MAX_INSERT_BATCH_AGE, DEFAULT_MAX_INSERT_BATCH_RECORDS, InsertBatcher,
+    DEFAULT_MAX_INSERT_BATCH_AGE, DEFAULT_MAX_INSERT_BATCH_RECORDS, InsertBatcher,
     InsertBatcherConfig,
 };
 pub use command::{

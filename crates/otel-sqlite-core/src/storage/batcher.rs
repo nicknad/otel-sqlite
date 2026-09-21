@@ -66,52 +66,6 @@ impl Default for InsertBatcherConfig {
     }
 }
 
-/// Result of pushing an incoming batch into [`InsertBatcher`].
-///
-/// Full batches become ready immediately; ownership of their records is
-/// transferred to the caller without cloning. The common cases allocate
-/// nothing extra (`Buffered`) or exactly one batch (`Single`).
-#[derive(Debug, Default, PartialEq)]
-pub enum BatchOutput<T> {
-    /// No full batch was produced; records stay buffered awaiting more input
-    /// or the age deadline.
-    #[default]
-    Buffered,
-    /// Exactly one full batch became ready.
-    Single(WriteBatch<T>),
-    /// An oversized input produced several full batches, in order.
-    Multiple(Vec<WriteBatch<T>>),
-}
-
-impl<T> BatchOutput<T> {
-    /// Calls `f` with every ready batch in emission order.
-    pub fn for_each(self, mut f: impl FnMut(WriteBatch<T>)) {
-        match self {
-            Self::Buffered => {}
-            Self::Single(batch) => f(batch),
-            Self::Multiple(batches) => {
-                for batch in batches {
-                    f(batch);
-                }
-            }
-        }
-    }
-
-    /// Number of ready batches.
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Buffered => 0,
-            Self::Single(_) => 1,
-            Self::Multiple(batches) => batches.len(),
-        }
-    }
-
-    /// `true` when no batch became ready.
-    pub fn is_empty(&self) -> bool {
-        matches!(self, Self::Buffered)
-    }
-}
-
 /// Accumulates incoming record batches into storage-sized [`WriteBatch`]es.
 ///
 /// Invariant: `deadline` is `Some` if and only if the buffer holds records.
@@ -161,17 +115,13 @@ impl<T> InsertBatcher<T> {
     /// Every complete group of `max_records` records is emitted immediately as
     /// a [`WriteBatch`]; any remainder stays buffered and keeps its place at
     /// the head of future batches (FIFO ordering across all emissions). Empty
-    /// inputs are no-ops that never produce empty write batches.
-    ///
-    /// # Panics
-    /// Panics if the internal invariant "a ready batch is always present when
-    /// exactly one full batch was produced" is violated; unreachable with
-    /// `max_records >= 1`.
-    pub fn push(&mut self, records: Vec<T>) -> BatchOutput<T> {
+    /// inputs are no-ops. Returns the ready batches in emission order; an
+    /// empty vector means everything stayed buffered.
+    pub fn push(&mut self, records: Vec<T>) -> Vec<WriteBatch<T>> {
         let mut ready = Vec::new();
         let mut incoming = records;
         if incoming.is_empty() {
-            return BatchOutput::Buffered;
+            return ready;
         }
 
         while !incoming.is_empty() {
@@ -192,11 +142,7 @@ impl<T> InsertBatcher<T> {
             incoming = tail;
         }
 
-        match ready.len() {
-            0 => BatchOutput::Buffered,
-            1 => BatchOutput::Single(ready.swap_remove(0)),
-            _ => BatchOutput::Multiple(ready),
-        }
+        ready
     }
 
     /// Emits the current partial batch regardless of its age (flush deadline,
@@ -249,10 +195,8 @@ mod tests {
         (0..count).collect()
     }
 
-    fn sizes<T>(output: BatchOutput<T>) -> Vec<usize> {
-        let mut collected = Vec::new();
-        output.for_each(|batch| collected.push(batch.len()));
-        collected
+    fn sizes<T>(output: Vec<WriteBatch<T>>) -> Vec<usize> {
+        output.into_iter().map(|batch| batch.len()).collect()
     }
 
     #[test]
@@ -303,12 +247,12 @@ mod tests {
         let mut batcher = InsertBatcher::new(config(4, 10));
 
         let mut sequence = Vec::new();
-        batcher
-            .push(vec![0, 1])
-            .for_each(|b| sequence.extend(b.into_records()));
-        batcher
-            .push(vec![2, 3, 4])
-            .for_each(|b| sequence.extend(b.into_records()));
+        for batch in batcher.push(vec![0, 1]) {
+            sequence.extend(batch.into_records());
+        }
+        for batch in batcher.push(vec![2, 3, 4]) {
+            sequence.extend(batch.into_records());
+        }
         let tail = batcher.flush().unwrap();
         sequence.extend(tail.into_records());
 
@@ -426,15 +370,13 @@ mod tests {
     }
 
     #[test]
-    fn single_output_variant_carries_one_batch() {
+    fn fit_and_split_pushes_report_their_ready_batches() {
         let mut batcher = InsertBatcher::new(config(3, 10));
         let output = batcher.push(records(3));
-        assert!(matches!(output, BatchOutput::Single(_)));
         assert_eq!(output.len(), 1);
 
         let mut batcher = InsertBatcher::new(config(3, 10));
         let output = batcher.push(records(7));
-        assert!(matches!(output, BatchOutput::Multiple(_)));
         assert_eq!(output.len(), 2);
         assert_eq!(batcher.buffered(), 1);
     }

@@ -125,10 +125,9 @@ pub(crate) fn run(
                 // (`ingress_batch_size`); recording them here too would
                 // double-count every chunk.
 
-                let outcome = logs.push(chunk.origin, chunk.records, chunk.commit_seq);
-                outcome.for_each(|submission| {
+                for submission in logs.push(chunk.origin, chunk.records, chunk.commit_seq) {
                     alive &= submit_log_batch(&commands, submission, stats);
-                });
+                }
             }
             Event::Message(IngestMessage::Flush) => {
                 // Barrier semantics: hand over the partial batches first so

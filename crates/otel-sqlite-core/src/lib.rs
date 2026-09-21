@@ -7,7 +7,7 @@ pub mod time;
 
 pub use model::{LogRecord, LogScope};
 pub use storage::{
-    BatchOrigin, BatchOutput, CommitLedger, DurabilityMode, IngestMessage, InsertBatcher,
-    InsertBatcherConfig, LogChunk, LogWriteBatch, SyncMode, Watermark, WriteBatch, WriteCommand,
+    BatchOrigin, CommitLedger, DurabilityMode, IngestMessage, InsertBatcher, InsertBatcherConfig,
+    LogChunk, LogWriteBatch, SyncMode, Watermark, WriteBatch, WriteCommand,
 };
 pub use time::{monotonic_millis, saturating_deadline, unix_nano_now};
