@@ -10,11 +10,11 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, after, select};
+use otel_sqlite_core::storage::WriteCommand;
 use thiserror::Error;
 
 use crate::config::MaintenanceConfig;
 use crate::scheduler::Scheduler;
-use crate::sink::CommandSink;
 
 #[derive(Debug, Error)]
 pub enum MaintenanceWorkerError {
@@ -24,21 +24,17 @@ pub enum MaintenanceWorkerError {
 
 /// Scheduler-only maintenance unit.
 ///
-/// Constructed with a [`CommandSink`] — in production the producer handle of
-/// the existing command queue (`Storage::producer()`), never a database
-/// connection, which makes bypassing the single-writer model unrepresentable
-/// in this API.
+/// Constructed with the producer handle of the existing bounded command queue
+/// (`Storage::producer()`), never a database connection, which makes bypassing
+/// the single-writer model unrepresentable in this API.
 pub struct MaintenanceWorker {
-    sink: Box<dyn CommandSink>,
+    sink: Sender<WriteCommand>,
     config: MaintenanceConfig,
 }
 
 impl MaintenanceWorker {
-    pub fn new(sink: impl CommandSink, config: MaintenanceConfig) -> Self {
-        Self {
-            sink: Box::new(sink),
-            config,
-        }
+    pub fn new(sink: Sender<WriteCommand>, config: MaintenanceConfig) -> Self {
+        Self { sink, config }
     }
 
     /// Starts the worker on its own thread and returns a handle controlling
@@ -101,7 +97,7 @@ impl Drop for MaintenanceHandle {
     }
 }
 
-fn run(sink: Box<dyn CommandSink>, config: MaintenanceConfig, shutdown: Receiver<()>) {
+fn run(sink: Sender<WriteCommand>, config: MaintenanceConfig, shutdown: Receiver<()>) {
     // The scheduler owns the schedule; derive the startup log count from it
     // instead of duplicating the enabled-operation rules here.
     let mut scheduler = Scheduler::new(config, Instant::now());
@@ -117,7 +113,7 @@ fn run(sink: Box<dyn CommandSink>, config: MaintenanceConfig, shutdown: Receiver
             break;
         }
 
-        let report = scheduler.tick(Instant::now(), sink.as_ref());
+        let report = scheduler.tick(Instant::now(), &sink);
         if report.disconnected {
             // The writer is gone; there is nowhere to schedule into anymore.
             break;
