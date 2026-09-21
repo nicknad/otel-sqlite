@@ -6,15 +6,15 @@ use super::severity::Severity;
 /// Instrumentation scope dimensions, shared by every record of one OTLP
 /// `ScopeLogs` group.
 ///
-/// The canonical flat JSON rendering of `attributes` is computed exactly once
-/// in [`LogScope::new`] and cached, so the mapping layer can precompute it on
-/// the parallel ingest path and the writer binds the bytes without per-record
-/// sorting or serialization.
+/// The canonical flat JSON rendering of the scope attributes is computed
+/// exactly once in [`LogScope::new`] and cached; the raw attribute vector is
+/// not retained because persistence reads only the rendered JSON, so the
+/// mapping layer can precompute it on the parallel ingest path and the writer
+/// binds the bytes without per-record sorting or serialization.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogScope {
     name: String,
     version: String,
-    attributes: Vec<Attribute>,
     schema_url: String,
     attributes_json: String,
 }
@@ -32,7 +32,6 @@ impl LogScope {
         Self {
             name,
             version,
-            attributes,
             schema_url,
             attributes_json,
         }
@@ -46,15 +45,11 @@ impl LogScope {
         &self.version
     }
 
-    pub fn attributes(&self) -> &[Attribute] {
-        &self.attributes
-    }
-
     pub fn schema_url(&self) -> &str {
         &self.schema_url
     }
 
-    /// Canonical JSON object of [`LogScope::attributes`], rendered once at
+    /// Canonical JSON object of the scope attributes, rendered once at
     /// construction.
     pub fn attributes_json(&self) -> &str {
         &self.attributes_json
