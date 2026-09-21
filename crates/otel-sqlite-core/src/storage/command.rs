@@ -45,10 +45,11 @@ impl LogChunk {
 ///
 /// Most items are payloads — mapped records (`LogChunk`) that the batcher
 /// absorbs into sized [`WriteBatch`]es; their boundaries are *not* SQLite
-/// transaction boundaries. The remaining items are barriers
-/// (`Flush`, `Checkpoint`, `Maintenance`): instructions the batcher executes
-/// in stream order. Both kinds must share one stream because barriers derive
-/// their ordering guarantee from interleaving with the payloads they bracket.
+/// transaction boundaries. The remaining item is the `Flush` barrier, an
+/// instruction the batcher executes in stream order. Both kinds must share one
+/// stream because a barrier derives its ordering guarantee from interleaving
+/// with the payloads it brackets. Maintenance and checkpoint commands reach
+/// the writer directly through its producer handle, not this channel.
 #[derive(Debug)]
 pub enum IngestMessage {
     /// Mapped log records plus their origin; a payload for the batcher.
@@ -57,8 +58,6 @@ pub enum IngestMessage {
     /// forwards this, so everything ingested before it reaches SQLite before
     /// anything ingested afterwards is observed.
     Flush,
-    Checkpoint(CheckpointMode),
-    Maintenance(MaintenanceOperation),
 }
 
 impl IngestMessage {
@@ -67,7 +66,7 @@ impl IngestMessage {
     pub fn set_commit_seq(&mut self, commit_seq: u64) {
         match self {
             Self::Logs(chunk) => chunk.commit_seq = commit_seq,
-            Self::Flush | Self::Checkpoint(_) | Self::Maintenance(_) => {}
+            Self::Flush => {}
         }
     }
 
@@ -75,7 +74,7 @@ impl IngestMessage {
     pub const fn commit_seq(&self) -> Option<u64> {
         match self {
             Self::Logs(chunk) => Some(chunk.commit_seq),
-            Self::Flush | Self::Checkpoint(_) | Self::Maintenance(_) => None,
+            Self::Flush => None,
         }
     }
 }

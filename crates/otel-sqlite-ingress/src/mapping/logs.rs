@@ -600,7 +600,7 @@ mod tests {
             assert_eq!(*records, 1);
             match command {
                 IngestMessage::Logs(chunk) => assert_eq!(chunk.records.len(), 1),
-                _ => panic!("expected insert logs chunk"),
+                IngestMessage::Flush => panic!("expected insert logs chunk"),
             }
         }
         let IngestMessage::Logs(first) = &chunks[0].1 else {
@@ -623,7 +623,7 @@ mod tests {
         assert_eq!(*records, 5);
         match command {
             IngestMessage::Logs(chunk) => assert_eq!(chunk.records.len(), 5),
-            _ => panic!("expected insert logs chunk"),
+            IngestMessage::Flush => panic!("expected insert logs chunk"),
         }
     }
 
