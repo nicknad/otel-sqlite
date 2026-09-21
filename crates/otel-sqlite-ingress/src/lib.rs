@@ -48,12 +48,11 @@ pub use mapping::pb;
 /// atomicity is provided by an admission gate: an `Arc<Mutex<()>>` shared by
 /// every clone of this sender. [`IngestSender::reserve`] holds the gate for
 /// the whole check-then-send sequence, and every other way into the channel
-/// ([`IngestSender::try_send`], [`IngestSender::send`],
-/// [`IngestSender::send_timeout`]) briefly acquires the same gate, so no other
-/// producer — including the control messages that share this queue (Flush
-/// barriers and the like) — can consume a reserved slot mid-request. The
-/// storage consumer drains concurrently, but draining only frees capacity, so
-/// a reservation can never be broken by it.
+/// ([`IngestSender::send`], [`IngestSender::send_timeout`]) briefly acquires
+/// the same gate, so no other producer — including the control messages that
+/// share this queue (Flush barriers and the like) — can consume a reserved
+/// slot mid-request. The storage consumer drains concurrently, but draining
+/// only frees capacity, so a reservation can never be broken by it.
 #[derive(Debug, Clone)]
 pub struct IngestSender {
     inner: Sender<IngestMessage>,
@@ -91,9 +90,9 @@ pub struct QueueFull;
 
 /// Why a single-message enqueue attempt did not deliver its message.
 ///
-/// Returned by [`IngestSender::try_send`], [`IngestSender::send`] and
-/// [`AdmissionGuard::try_send`]. Deliberately small: callers only need to
-/// distinguish backpressure from a dead pipeline, never the message itself.
+/// Returned by [`IngestSender::send`] and [`AdmissionGuard::try_send`].
+/// Deliberately small: callers only need to distinguish backpressure from a
+/// dead pipeline, never the message itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendFailure {
     /// The queue has no free slot right now.
@@ -166,24 +165,6 @@ impl IngestSender {
             })
         } else {
             Err(QueueFull)
-        }
-    }
-
-    /// Single-message send that briefly serializes on the admission gate.
-    ///
-    /// Non-blocking except for a momentary wait if another producer is inside
-    /// a reservation critical section. Returns [`SendFailure::Full`] when the
-    /// queue is full and [`SendFailure::Disconnected`] when the storage side
-    /// is gone.
-    pub fn try_send(&self, message: IngestMessage) -> Result<(), SendFailure> {
-        let _gate = self
-            .admission
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        match self.inner.try_send(message) {
-            Ok(()) => Ok(()),
-            Err(crossbeam_channel::TrySendError::Full(_)) => Err(SendFailure::Full),
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => Err(SendFailure::Disconnected),
         }
     }
 
