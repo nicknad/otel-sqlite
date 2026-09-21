@@ -2,8 +2,8 @@
 //!
 //! The scheduler holds one task per periodic operation and owns all schedule
 //! state (`next_due`). It knows nothing about threads or SQLite: a tick takes
-//! an injected timestamp and a [`CommandSink`], which makes every rule below
-//! testable without sleeping or creating a database.
+//! an injected timestamp and the command-queue sender, which makes every rule
+//! below testable without sleeping or creating a database.
 //!
 //! Invariants implemented here:
 //!
@@ -18,10 +18,10 @@
 
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::{Sender, TrySendError};
 use otel_sqlite_core::storage::{MaintenanceOperation, WriteCommand};
 
 use crate::config::MaintenanceConfig;
-use crate::sink::{CommandSink, EnqueueError};
 
 /// Periodic maintenance operations supported by the worker.
 ///
@@ -148,7 +148,7 @@ impl Scheduler {
     }
 
     /// Enqueues every operation that is due, then reports what happened.
-    pub(crate) fn tick(&mut self, now: Instant, sink: &dyn CommandSink) -> TickReport {
+    pub(crate) fn tick(&mut self, now: Instant, sink: &Sender<WriteCommand>) -> TickReport {
         let mut report = TickReport::default();
 
         for task in &mut self.tasks {
@@ -172,7 +172,7 @@ impl Scheduler {
                         "maintenance command scheduled"
                     );
                 }
-                Err(EnqueueError::Full(command)) => {
+                Err(TrySendError::Full(command)) => {
                     task.defer(now, self.config.retry_delay);
                     report.deferred += 1;
                     ::metrics::counter!(
@@ -188,7 +188,7 @@ impl Scheduler {
                         command.kind()
                     );
                 }
-                Err(EnqueueError::Disconnected(command)) => {
+                Err(TrySendError::Disconnected(command)) => {
                     report.disconnected = true;
                     ::metrics::counter!(
                         "maintenance_enqueue_failures_total",
@@ -233,69 +233,20 @@ fn purge_interval(config: &MaintenanceConfig) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use crossbeam_channel::{Receiver, bounded};
     use otel_sqlite_core::storage::{CheckpointMode, MaintenanceOperation, WriteCommand};
 
     use super::*;
-    use crate::sink::CommandSink;
 
-    /// Fake sink recording every accepted command. No SQLite anywhere: these
-    /// tests enforce the architectural boundary by construction.
-    #[derive(Clone, Default)]
-    struct RecordingSink {
-        commands: Arc<Mutex<Vec<WriteCommand>>>,
-        mode: Arc<Mutex<Mode>>,
+    /// Drains every command the scheduler enqueued so far.
+    fn drain(receiver: &Receiver<WriteCommand>) -> Vec<WriteCommand> {
+        receiver.try_iter().collect()
     }
 
-    #[derive(Clone, Copy, PartialEq, Default)]
-    enum Mode {
-        #[default]
-        Accept,
-        Full,
-        Closed,
-    }
-
-    impl RecordingSink {
-        fn accepting() -> Self {
-            Self::with_mode(Mode::Accept)
-        }
-
-        fn with_mode(mode: Mode) -> Self {
-            Self {
-                mode: Arc::new(Mutex::new(mode)),
-                ..Self::default()
-            }
-        }
-
-        fn set_mode(&self, mode: Mode) {
-            *self.mode.lock().unwrap() = mode;
-        }
-
-        fn commands(&self) -> Vec<WriteCommand> {
-            self.commands.lock().unwrap().clone()
-        }
-
-        fn kinds(&self) -> Vec<&'static str> {
-            self.commands()
-                .iter()
-                .map(otel_sqlite_core::WriteCommand::kind)
-                .collect()
-        }
-    }
-
-    impl CommandSink for RecordingSink {
-        fn try_send(&self, command: WriteCommand) -> Result<(), EnqueueError> {
-            match *self.mode.lock().unwrap() {
-                Mode::Accept => {
-                    self.commands.lock().unwrap().push(command);
-                    Ok(())
-                }
-                Mode::Full => Err(EnqueueError::Full(Box::new(command))),
-                Mode::Closed => Err(EnqueueError::Disconnected(Box::new(command))),
-            }
-        }
+    fn kinds(commands: &[WriteCommand]) -> Vec<&'static str> {
+        commands.iter().map(WriteCommand::kind).collect()
     }
 
     fn config(purge: Option<Duration>) -> MaintenanceConfig {
@@ -310,7 +261,7 @@ mod tests {
     fn purge_becomes_due_after_its_interval() {
         let base = Instant::now();
         let mut scheduler = Scheduler::new(config(Some(Duration::from_secs(1))), base);
-        let sink = RecordingSink::accepting();
+        let (sink, enqueued) = bounded::<WriteCommand>(16);
 
         assert!(!scheduler.is_due(Operation::Purge, base));
         assert!(!scheduler.is_due(Operation::Purge, base + Duration::from_millis(999)));
@@ -318,9 +269,9 @@ mod tests {
 
         let report = scheduler.tick(base + Duration::from_secs(1), &sink);
         assert_eq!(report.scheduled, 1);
-        assert_eq!(sink.kinds(), vec!["maintenance"]);
-        let WriteCommand::Maintenance(MaintenanceOperation::Prune(window)) = &sink.commands()[0]
-        else {
+        let commands = drain(&enqueued);
+        assert_eq!(kinds(&commands), vec!["maintenance"]);
+        let WriteCommand::Maintenance(MaintenanceOperation::Prune(window)) = &commands[0] else {
             panic!("expected a prune command");
         };
         assert_eq!(
@@ -334,11 +285,11 @@ mod tests {
     fn first_fire_waits_a_full_interval_after_startup() {
         let base = Instant::now();
         let mut scheduler = Scheduler::new(config(Some(Duration::from_secs(60))), base);
-        let sink = RecordingSink::accepting();
+        let (sink, enqueued) = bounded::<WriteCommand>(16);
 
         let report = scheduler.tick(base, &sink);
         assert_eq!(report, TickReport::default());
-        assert!(sink.commands().is_empty());
+        assert!(drain(&enqueued).is_empty());
     }
 
     #[test]
@@ -353,7 +304,7 @@ mod tests {
         };
         let base = Instant::now();
         let mut scheduler = Scheduler::new(cfg, base);
-        let sink = RecordingSink::accepting();
+        let (sink, enqueued) = bounded::<WriteCommand>(16);
 
         let report = scheduler.tick(base + Duration::from_secs(1), &sink);
         assert_eq!(report.scheduled, 1);
@@ -364,9 +315,9 @@ mod tests {
         let report = scheduler.tick(base + Duration::from_secs(5), &sink);
         assert_eq!(report.scheduled, 2, "purge (due again) plus vacuum");
 
-        let kinds = sink.kinds();
+        let commands = drain(&enqueued);
         assert_eq!(
-            kinds,
+            kinds(&commands),
             vec![
                 "maintenance", // purge @1s
                 "maintenance", // purge @3s
@@ -375,14 +326,20 @@ mod tests {
                 "maintenance", // vacuum @5s
             ]
         );
-        assert_eq!(kinds.iter().filter(|k| **k == "checkpoint").count(), 1);
+        assert_eq!(
+            kinds(&commands)
+                .iter()
+                .filter(|k| **k == "checkpoint")
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn no_duplicate_command_within_one_interval() {
         let base = Instant::now();
         let mut scheduler = Scheduler::new(config(Some(Duration::from_secs(2))), base);
-        let sink = RecordingSink::accepting();
+        let (sink, enqueued) = bounded::<WriteCommand>(16);
 
         scheduler.tick(base + Duration::from_secs(2), &sink);
         for ms in [2_100u64, 2_500, 2_900, 3_500, 3_900] {
@@ -392,7 +349,7 @@ mod tests {
 
         let report = scheduler.tick(base + Duration::from_secs(4), &sink);
         assert_eq!(report.scheduled, 1);
-        assert_eq!(sink.commands().len(), 2);
+        assert_eq!(drain(&enqueued).len(), 2);
     }
 
     #[test]
@@ -405,42 +362,48 @@ mod tests {
             },
             base,
         );
-        let sink = RecordingSink::with_mode(Mode::Full);
+        // A zero-capacity (rendezvous) channel has no slot until a receiver
+        // waits on it, so `try_send` reports Full exactly like a saturated
+        // bounded queue; the idle receiver just never accepts anything.
+        let (saturated, idle) = bounded::<WriteCommand>(0);
 
-        let report = scheduler.tick(base + Duration::from_secs(10), &sink);
+        let report = scheduler.tick(base + Duration::from_secs(10), &saturated);
         assert_eq!(report.deferred, 1);
         assert_eq!(report.scheduled, 0);
-        assert!(sink.commands().is_empty());
+        assert!(drain(&idle).is_empty());
 
         // Still within the retry window: nothing is re-attempted yet, and no
         // duplicate appears.
-        let report = scheduler.tick(base + Duration::new(10, 400_000_000), &sink);
+        let report = scheduler.tick(base + Duration::new(10, 400_000_000), &saturated);
         assert_eq!(report.scheduled, 0);
-        assert!(sink.commands().is_empty());
+        assert!(drain(&idle).is_empty());
 
         // Pressure gone: the pending operation goes through exactly once.
-        sink.set_mode(Mode::Accept);
+        let (sink, enqueued) = bounded::<WriteCommand>(16);
         let report = scheduler.tick(base + Duration::from_millis(10_500), &sink);
         assert_eq!(report.scheduled, 1);
-        assert_eq!(sink.commands().len(), 1);
+        let mut commands = drain(&enqueued);
+        assert_eq!(commands.len(), 1);
 
         // Normal cadence resumes from the successful enqueue.
         let report = scheduler.tick(base + Duration::from_secs(19), &sink);
         assert_eq!(report.scheduled, 0);
         let report = scheduler.tick(base + Duration::from_millis(20_500), &sink);
         assert_eq!(report.scheduled, 1);
-        assert_eq!(sink.commands().len(), 2);
+        commands.extend(drain(&enqueued));
+        assert_eq!(commands.len(), 2);
     }
 
     #[test]
     fn disconnected_queue_is_terminal_for_the_tick() {
         let base = Instant::now();
         let mut scheduler = Scheduler::new(config(Some(Duration::from_secs(1))), base);
-        let sink = RecordingSink::with_mode(Mode::Closed);
+        let (sink, receiver) = bounded::<WriteCommand>(16);
+        drop(receiver); // the writer is gone
 
         let report = scheduler.tick(base + Duration::from_secs(1), &sink);
         assert!(report.disconnected);
-        assert!(sink.commands().is_empty());
+        assert_eq!(report.scheduled, 0);
     }
 
     #[test]
@@ -455,11 +418,12 @@ mod tests {
         };
         let base = Instant::now();
         let mut scheduler = Scheduler::new(cfg, base);
-        let sink = RecordingSink::accepting();
+        let (sink, enqueued) = bounded::<WriteCommand>(16);
 
         let report = scheduler.tick(base + Duration::from_secs(1_000), &sink);
         assert_eq!(report, TickReport::default());
         assert_eq!(scheduler.next_deadline(), None);
+        assert!(drain(&enqueued).is_empty());
     }
 
     #[test]
@@ -495,10 +459,10 @@ mod tests {
         };
         let base = Instant::now();
         let mut scheduler = Scheduler::new(cfg, base);
-        let sink = RecordingSink::accepting();
+        let (sink, enqueued) = bounded::<WriteCommand>(16);
 
         scheduler.tick(base + Duration::from_secs(1), &sink);
-        let commands = sink.commands();
+        let commands = drain(&enqueued);
 
         assert!(
             commands.contains(&WriteCommand::Maintenance(MaintenanceOperation::Prune(
@@ -524,7 +488,7 @@ mod tests {
         };
         let base = Instant::now();
         let mut scheduler = Scheduler::new(cfg, base);
-        let sink = RecordingSink::accepting();
+        let (sink, enqueued) = bounded::<WriteCommand>(16);
 
         let report = scheduler.tick(base, &sink);
         assert_eq!(report.scheduled, 0);
@@ -532,7 +496,7 @@ mod tests {
         let report = scheduler.tick(base + Duration::from_secs(30), &sink);
         assert_eq!(report.scheduled, 1);
         assert_eq!(
-            sink.commands(),
+            drain(&enqueued),
             vec![WriteCommand::Maintenance(MaintenanceOperation::RebuildFts)]
         );
         assert_eq!(scheduler.enabled_task_count(), 1);

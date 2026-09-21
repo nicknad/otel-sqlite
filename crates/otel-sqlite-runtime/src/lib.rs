@@ -21,9 +21,8 @@
 //! The worker owns **scheduling only**:
 //!
 //! - it evaluates which maintenance operations are due,
-//! - it enqueues them as ordinary [`WriteCommand`]s via a
-//!   [`CommandSink`] (in production: the producer handle obtained from
-//!   `otel_sqlite_storage::Storage::producer`),
+//! - it enqueues them as ordinary [`WriteCommand`]s on the producer handle of
+//!   the existing command queue (`Storage::producer`),
 //! - it contains **no SQL** and holds **no SQLite connection**,
 //! - it sleeps until its next deadline or shutdown (never busy-loops).
 //!
@@ -41,7 +40,8 @@
 //!    statements live exclusively in the storage layer.
 //! 4. **No database handles in the worker.** No `Connection`, transaction, or
 //!    equivalent is passed to it; this is enforced by its API (`new` accepts a
-//!    command sink, not a connection) and its tests run without a database.
+//!    command-queue sender, not a connection) and its tests run without a
+//!    database.
 //! 5. **One command queue.** Maintenance shares the ingestion queue. A
 //!    priority-aware queue may be introduced later if backlogs ever starve
 //!    critical maintenance; no second queue/writer is created preemptively.
@@ -94,12 +94,10 @@
 
 pub mod config;
 mod scheduler;
-pub mod sink;
 mod watchdog;
 mod worker;
 
 pub use config::{MaintenanceConfig, WatchdogConfig};
-pub use sink::{CommandSink, EnqueueError};
 pub use watchdog::{
     HealthSampleSource, HealthState, PipelineSample, Watchdog, WatchdogError, WatchdogHandle,
 };
