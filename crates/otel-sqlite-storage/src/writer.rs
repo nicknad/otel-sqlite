@@ -6,6 +6,7 @@ use otel_sqlite_core::unix_nano_now;
 use rusqlite::Connection;
 use std::sync::atomic::Ordering;
 
+use crate::LedgerCloseOnDrop;
 use crate::StorageConfig;
 use crate::command;
 use crate::error::{FailureClass, StorageError};
@@ -44,17 +45,8 @@ pub(crate) fn run(
     // Closes on every exit path *including unwinding*: a panic must fail
     // durable-ack waiters instead of leaving them hanging on a dead writer.
     // `CommitLedger::close` is idempotent, so the normal path is unaffected.
-    let _close_ledger = LedgerCloseOnDrop(ledger);
+    let _close_ledger = LedgerCloseOnDrop::new(ledger);
     run_inner(receiver, config, ledger, stats, ready_tx)
-}
-
-/// Calls [`CommitLedger::close`] when dropped.
-struct LedgerCloseOnDrop<'a>(&'a CommitLedger);
-
-impl Drop for LedgerCloseOnDrop<'_> {
-    fn drop(&mut self) {
-        self.0.close();
-    }
 }
 
 /// Opens the database and applies migrations. Kept separate so the ready
@@ -476,7 +468,7 @@ mod tests {
     fn ledger_guard_closes_the_ledger_on_drop() {
         let ledger = CommitLedger::new();
         {
-            let _guard = LedgerCloseOnDrop(&ledger);
+            let _guard = LedgerCloseOnDrop::new(&ledger);
         }
         assert!(ledger.watermark().closed);
     }

@@ -1,16 +1,14 @@
 use std::path::Path;
 
-use crate::backup::BackupError;
-
 /// Restricts `path` to owner-only access.
 ///
 /// * Unix: `chmod 0o600`.
 /// * Windows: strips inherited ACLs and grants Full Control to the current
 ///   user plus `SYSTEM`/`Administrators` via `icacls` (best-effort: warns
-///   instead of failing when `icacls` is unavailable so backups never break
+///   instead of failing when `icacls` is unavailable so callers never break
 ///   on exotic runners).
 /// * Other platforms: no-op.
-pub(crate) fn restrict_permissions(path: &Path) -> Result<(), BackupError> {
+pub fn restrict_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -32,7 +30,7 @@ pub(crate) fn restrict_permissions(path: &Path) -> Result<(), BackupError> {
 
 #[cfg(windows)]
 #[allow(clippy::unnecessary_wraps)] // mirrors the unix arm's signature for uniform call sites
-fn restrict_windows(path: &Path) -> Result<(), BackupError> {
+fn restrict_windows(path: &Path) -> std::io::Result<()> {
     // Well-known SIDs (locale-independent): *S-1-5-32-544 = Administrators,
     // *S-1-5-18 = SYSTEM. Display names like "Administrators" fail on
     // localized Windows editions.
@@ -52,7 +50,7 @@ fn restrict_windows(path: &Path) -> Result<(), BackupError> {
             tracing::warn!(
                 path = %path.display(),
                 detail = detail.trim(),
-                "icacls failed; backup artifact may inherit permissive ACLs"
+                "icacls failed; the file may inherit permissive ACLs"
             );
             Ok(())
         }
@@ -60,7 +58,7 @@ fn restrict_windows(path: &Path) -> Result<(), BackupError> {
             tracing::warn!(
                 path = %path.display(),
                 %error,
-                "icacls unavailable; backup artifact may inherit permissive ACLs"
+                "icacls unavailable; the file may inherit permissive ACLs"
             );
             Ok(())
         }
@@ -94,8 +92,7 @@ pub(crate) fn harden_database_files(db_path: &Path) {
         match restrict_permissions(Path::new(&sidecar)) {
             Ok(()) => {}
             // Sidecars appear lazily; absence is the normal case, not trouble.
-            Err(crate::backup::BackupError::Io(error))
-                if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 tracing::warn!(
                     path = %Path::new(&sidecar).display(),
@@ -147,7 +144,7 @@ pub(crate) fn harden_database_dir(dir: &Path, created: bool) {
 
 /// Warns when `path` is readable beyond its owner (unix `mode & 0o044`).
 /// No-op on non-unix: ACL inspection needs platform APIs.
-pub(crate) fn warn_if_world_readable(path: &Path, label: &str) {
+pub fn warn_if_world_readable(path: &Path, label: &str) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -35,9 +35,37 @@ pub use error::StorageError;
 /// version and then let [`Storage::open`] migrate them to the current schema.
 #[doc(hidden)]
 pub use migration::migrate_up_to;
-// Convenience re-export: consumers wire the same ledger into ingress.
-pub use otel_sqlite_core::storage::Watermark;
+pub use permissions::{restrict_permissions, warn_if_world_readable};
 pub use stats::{BatcherStats, StorageHealth, StorageHealthSample, StorageStatsSnapshot};
+
+/// Closes the [`CommitLedger`] when dropped, so durable-ack waiters fail fast
+/// instead of hanging on tickets that can never commit. Covers every exit path
+/// including unwinding, because [`CommitLedger::close`] is idempotent;
+/// [`disarm`](LedgerCloseOnDrop::disarm) hands the close to whichever pipeline
+/// thread outlives this one.
+pub(crate) struct LedgerCloseOnDrop<'a> {
+    ledger: Option<&'a CommitLedger>,
+}
+
+impl<'a> LedgerCloseOnDrop<'a> {
+    pub(crate) const fn new(ledger: &'a CommitLedger) -> Self {
+        Self {
+            ledger: Some(ledger),
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.ledger = None;
+    }
+}
+
+impl Drop for LedgerCloseOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(ledger) = self.ledger {
+            ledger.close();
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Storage {

@@ -9,10 +9,10 @@ use otel_sqlite_ingress::{
     DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_MAX_RECV_MSG_SIZE,
     DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES, DEFAULT_SHUTDOWN_TIMEOUT, IngressConfig,
     MAX_ATTRIBUTE_KEY_BYTES, MAX_ATTRIBUTE_VALUE_BYTES, MAX_ATTRIBUTES_PER_RECORD, MAX_BODY_BYTES,
-    MAX_SCOPE_METADATA_EXPANSION_BYTES, TlsConfig,
+    MAX_SCOPE_METADATA_EXPANSION_BYTES, TlsConfig, expand_bind_address,
 };
 use otel_sqlite_runtime::{MaintenanceConfig, WatchdogConfig};
-use otel_sqlite_storage::StorageConfig;
+use otel_sqlite_storage::{StorageConfig, warn_if_world_readable};
 use serde::Deserialize;
 
 /// Environment variable holding the path of an optional TOML config file.
@@ -647,16 +647,6 @@ impl AuthSection {
     }
 }
 
-/// Expands a bare `":port"` into `"0.0.0.0:port"` so the result always
-/// parses as a [`std::net::SocketAddr`]; any other form is returned unchanged.
-pub fn expand_bind_address(address: &str) -> String {
-    if address.starts_with(':') {
-        format!("0.0.0.0{address}")
-    } else {
-        address.to_owned()
-    }
-}
-
 /// Parses an optional listen address; `"off"`/empty disable the endpoint.
 /// Bare `":port"` binds all interfaces, mirroring `listen_address` handling.
 fn parse_optional_address(raw: &str, key: &str) -> Result<Option<String>> {
@@ -724,31 +714,9 @@ fn readable_file(key: &str, path: &Path) -> Result<()> {
     // Private keys and bearer tokens must not be world-readable; public certs
     // are fine to skip. Warn (don't fail) to avoid breaking existing setups.
     if matches!(key, "tls.key" | "auth.token_file") {
-        warn_if_world_readable(key, path);
+        warn_if_world_readable(path, key);
     }
     Ok(())
-}
-
-/// Best-effort permission warning for secret files (unix only).
-fn warn_if_world_readable(key: &str, path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(mode) = std::fs::metadata(path).map(|metadata| metadata.permissions().mode())
-            && mode & 0o044 != 0
-        {
-            tracing::warn!(
-                key,
-                path = %path.display(),
-                mode = format!("{mode:o}"),
-                "secret file is readable beyond its owner; chmod 600 it",
-            );
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (key, path);
-    }
 }
 
 /// `true` when `listen_address` resolves to a loopback-only socket. Used for
@@ -1741,13 +1709,6 @@ mod tests {
         }
         .validate()
         .expect("remote bind with TLS is valid");
-    }
-
-    #[test]
-    fn bare_port_expands_to_wildcard() {
-        assert_eq!(expand_bind_address(":4317"), "0.0.0.0:4317");
-        assert_eq!(expand_bind_address("127.0.0.1:9"), "127.0.0.1:9");
-        assert_eq!(expand_bind_address("[::1]:80"), "[::1]:80");
     }
 
     #[test]

@@ -114,28 +114,6 @@ impl WriteCommand {
         }
     }
 
-    /// Every durability ticket the command's records carry (insert commands
-    /// only). The writer publishes each of them as committed once the
-    /// transaction succeeds.
-    pub fn commit_seqs(&self) -> &[u64] {
-        match self {
-            Self::InsertLogs(batch) => &batch.commit_seqs,
-            Self::Flush | Self::Checkpoint(_) | Self::Maintenance(_) => &[],
-        }
-    }
-
-    /// Rejects insert commands carrying no records; control commands are
-    /// always valid.
-    ///
-    /// # Errors
-    /// Returns [`CommandError::EmptyBatch`] for an empty `InsertLogs` batch.
-    pub fn validate(&self) -> CommandResult<()> {
-        match self {
-            Self::InsertLogs(batch) if batch.records.is_empty() => Err(CommandError::EmptyBatch),
-            _ => Ok(()),
-        }
-    }
-
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::InsertLogs(_) => "insert_logs",
@@ -157,16 +135,6 @@ pub enum CheckpointMode {
 }
 
 impl CheckpointMode {
-    pub const fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(Self::Passive),
-            1 => Some(Self::Full),
-            2 => Some(Self::Restart),
-            3 => Some(Self::Truncate),
-            _ => None,
-        }
-    }
-
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Passive => "PASSIVE",
@@ -196,23 +164,6 @@ pub enum MaintenanceOperation {
     /// the configured window.
     Prune(Option<Duration>),
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandError {
-    EmptyBatch,
-}
-
-impl fmt::Display for CommandError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyBatch => f.write_str("cannot insert an empty batch"),
-        }
-    }
-}
-
-impl std::error::Error for CommandError {}
-
-pub type CommandResult<T> = Result<T, CommandError>;
 
 #[cfg(test)]
 mod tests {
@@ -247,31 +198,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_empty_inserts() {
-        let empty = LogWriteBatch {
-            origin: BatchOrigin::default(),
-            records: WriteBatch::default(),
-            commit_seqs: Vec::new(),
-        };
-        assert_eq!(
-            WriteCommand::InsertLogs(empty).validate(),
-            Err(CommandError::EmptyBatch)
-        );
-
-        assert!(
-            WriteCommand::InsertLogs(sample_log_write(2))
-                .validate()
-                .is_ok()
-        );
-        assert!(WriteCommand::Flush.validate().is_ok());
-        assert!(
-            WriteCommand::Maintenance(MaintenanceOperation::Analyze)
-                .validate()
-                .is_ok()
-        );
-    }
-
-    #[test]
     fn record_counts_only_apply_to_inserts() {
         assert_eq!(WriteCommand::Flush.record_count(), 0);
         assert_eq!(
@@ -285,10 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_modes_round_trip() {
-        assert_eq!(CheckpointMode::from_u8(0), Some(CheckpointMode::Passive));
-        assert_eq!(CheckpointMode::from_u8(3), Some(CheckpointMode::Truncate));
-        assert_eq!(CheckpointMode::from_u8(4), None);
+    fn checkpoint_mode_display_and_default() {
         assert_eq!(CheckpointMode::Full.to_string(), "FULL");
         assert_eq!(CheckpointMode::default(), CheckpointMode::Passive);
     }
@@ -308,11 +231,5 @@ mod tests {
         let mut flush = IngestMessage::Flush;
         flush.set_commit_seq(11);
         assert_eq!(flush.commit_seq(), None);
-
-        assert_eq!(
-            WriteCommand::InsertLogs(sample_log_write(2)).commit_seqs(),
-            &[7]
-        );
-        assert!(WriteCommand::Flush.commit_seqs().is_empty());
     }
 }

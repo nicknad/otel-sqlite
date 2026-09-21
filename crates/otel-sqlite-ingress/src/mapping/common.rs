@@ -1,4 +1,4 @@
-//! Proto → model conversion helpers shared by the logs and metrics mappings.
+//! Proto → model conversion helpers for the OTLP logs mapping.
 
 use otel_sqlite_core::model::{Attribute, AttributeValue, Resource};
 
@@ -36,14 +36,14 @@ pub(crate) enum ParsedId<const N: usize> {
 impl<const N: usize> ParsedId<N> {
     /// Returns the id when valid, `None` for `Absent`, and `None` plus an
     /// `otlp_mapping_loss_total` increment for present-but-invalid ids.
-    pub(crate) fn into_id(self, signal: &'static str, reason: &'static str) -> Option<[u8; N]> {
+    pub(crate) fn into_id(self, reason: &'static str) -> Option<[u8; N]> {
         match self {
             Self::Valid(id) => Some(id),
             Self::Absent => None,
             Self::Invalid => {
                 ::metrics::counter!(
                     "otlp_mapping_loss_total",
-                    "signal" => signal,
+                    "signal" => "logs",
                     "reason" => reason
                 )
                 .increment(1);
@@ -76,11 +76,11 @@ fn parse_id<const N: usize>(value: Vec<u8>) -> ParsedId<N> {
 /// Values above `i64::MAX` saturate to `i64::MAX` instead of wrapping into a
 /// negative instant that retention would delete; each saturation counts
 /// `otlp_mapping_loss_total{reason="timestamp_overflow"}`.
-pub(crate) fn timestamp(value: u64, signal: &'static str) -> i64 {
+pub(crate) fn timestamp(value: u64) -> i64 {
     i64::try_from(value).unwrap_or_else(|_| {
         ::metrics::counter!(
             "otlp_mapping_loss_total",
-            "signal" => signal,
+            "signal" => "logs",
             "reason" => "timestamp_overflow"
         )
         .increment(1);
@@ -88,17 +88,13 @@ pub(crate) fn timestamp(value: u64, signal: &'static str) -> i64 {
     })
 }
 
-pub(crate) fn attribute_value(
-    value: AnyValue,
-    signal: &'static str,
-) -> Result<AttributeValue, IngressError> {
-    attribute_value_with_depth(value, 0, signal)
+pub(crate) fn attribute_value(value: AnyValue) -> Result<AttributeValue, IngressError> {
+    attribute_value_with_depth(value, 0)
 }
 
 fn attribute_value_with_depth(
     value: AnyValue,
     depth: usize,
-    signal: &'static str,
 ) -> Result<AttributeValue, IngressError> {
     match value.value {
         Some(AnyValueKind::StringValue(value)) => Ok(AttributeValue::String(value)),
@@ -120,7 +116,7 @@ fn attribute_value_with_depth(
             array
                 .values
                 .into_iter()
-                .map(|nested| attribute_value_with_depth(nested, depth + 1, signal))
+                .map(|nested| attribute_value_with_depth(nested, depth + 1))
                 .collect::<Result<Vec<_>, _>>()
                 .map(AttributeValue::Array)
         }
@@ -135,11 +131,7 @@ fn attribute_value_with_depth(
                 .map(|KeyValue { key, value, .. }| {
                     Ok(Attribute {
                         key,
-                        value: attribute_value_with_depth(
-                            value.unwrap_or_default(),
-                            depth + 1,
-                            signal,
-                        )?,
+                        value: attribute_value_with_depth(value.unwrap_or_default(), depth + 1)?,
                     })
                 })
                 .collect::<Result<Vec<_>, IngressError>>()
@@ -151,7 +143,7 @@ fn attribute_value_with_depth(
         Some(AnyValueKind::StringValueStrindex(_)) => {
             ::metrics::counter!(
                 "otlp_mapping_loss_total",
-                "signal" => signal,
+                "signal" => "logs",
                 "reason" => "string_value_strindex"
             )
             .increment(1);
@@ -162,16 +154,13 @@ fn attribute_value_with_depth(
     }
 }
 
-pub(crate) fn attributes(
-    values: Vec<KeyValue>,
-    signal: &'static str,
-) -> Result<Vec<Attribute>, IngressError> {
+pub(crate) fn attributes(values: Vec<KeyValue>) -> Result<Vec<Attribute>, IngressError> {
     values
         .into_iter()
         .map(|KeyValue { key, value, .. }| {
             Ok(Attribute {
                 key,
-                value: attribute_value(value.unwrap_or_default(), signal)?,
+                value: attribute_value(value.unwrap_or_default())?,
             })
         })
         .collect()
@@ -403,13 +392,10 @@ pub(crate) fn check_scope_expansion(
 /// persisted: the model has no columns for them, so they are dropped without
 /// a counter (they describe sender-side loss and entity identity, not record
 /// content).
-pub(crate) fn convert_resource(
-    value: ProtoResource,
-    signal: &'static str,
-) -> Result<Resource, IngressError> {
+pub(crate) fn convert_resource(value: ProtoResource) -> Result<Resource, IngressError> {
     Ok(Resource {
         id: String::new(),
-        attributes: attributes(value.attributes, signal)?,
+        attributes: attributes(value.attributes)?,
         schema_url: String::new(),
     })
 }

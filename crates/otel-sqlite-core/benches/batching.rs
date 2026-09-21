@@ -136,7 +136,6 @@ fn bench_command_construction(c: &mut Criterion) {
                         commit_seqs: Vec::new(),
                     });
                     black_box(command.record_count());
-                    black_box(command.validate().is_ok());
                     black_box(command.kind());
                 },
                 BatchSize::LargeInput,

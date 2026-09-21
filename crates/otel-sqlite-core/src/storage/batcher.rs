@@ -141,11 +141,6 @@ impl<T> InsertBatcher<T> {
         }
     }
 
-    /// Configuration this batcher enforces.
-    pub const fn config(&self) -> &InsertBatcherConfig {
-        &self.config
-    }
-
     /// Number of records currently held back waiting for a full batch.
     pub fn buffered(&self) -> usize {
         self.buffer.len()

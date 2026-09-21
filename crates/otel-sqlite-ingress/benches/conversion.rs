@@ -4,10 +4,10 @@
 //! OTLP ExportLogsServiceRequest payload (prost)
 //!     │
 //!     ▼
-//! LogBatch::from(ResourceLogs)   <- measured
+//! try_convert_batch(ResourceLogs)   <- measured
 //!     │
 //!     ▼
-//! internal LogBatch / LogRecord model
+//! internal LogChunk / LogRecord model
 //! ```
 //!
 //! Measures conversion cost across input sizes (linear vs. super-linear
@@ -133,8 +133,8 @@ fn bench_conversion(c: &mut Criterion) {
             b.iter_batched(
                 || payload.clone(),
                 |payload| {
-                    let batch = try_convert_batch(payload).expect("bench payload is valid");
-                    black_box(batch.len());
+                    let chunk = try_convert_batch(payload).expect("bench payload is valid");
+                    black_box(chunk.records.len());
                 },
                 BatchSize::LargeInput,
             );
@@ -149,8 +149,8 @@ fn bench_conversion(c: &mut Criterion) {
             b.iter_batched(
                 || payload.clone(),
                 |payload| {
-                    let batch = try_convert_batch(payload).expect("bench payload is valid");
-                    black_box(batch.len());
+                    let chunk = try_convert_batch(payload).expect("bench payload is valid");
+                    black_box(chunk.records.len());
                 },
                 BatchSize::LargeInput,
             );

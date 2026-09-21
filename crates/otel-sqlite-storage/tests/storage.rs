@@ -5,32 +5,31 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::unbounded;
-use otel_sqlite_core::model::{
-    Attribute, AttributeValue, LogBatch, LogRecord, LogScope, Resource, Severity,
-};
+use otel_sqlite_core::model::{Attribute, AttributeValue, LogRecord, LogScope, Resource, Severity};
 use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, LogChunk, MaintenanceOperation};
 use otel_sqlite_storage::{Storage, StorageConfig, StorageError};
 use rusqlite::Connection;
 
-fn logs_message(batch: LogBatch) -> IngestMessage {
+fn logs_message(records: Vec<LogRecord>) -> IngestMessage {
     IngestMessage::Logs(LogChunk {
-        origin: BatchOrigin {
-            resource: batch.resource,
-            schema_url: batch.schema_url,
-        },
-        records: batch.records,
+        origin: BatchOrigin::default(),
+        records,
         commit_seq: 0,
     })
 }
 
-fn sample_batch() -> LogBatch {
-    let mut batch = LogBatch::with_capacity(2);
-    batch.resource = Some(Resource::new(vec![
-        ("service.name", "checkout").into(),
-        ("retries", 3_i64).into(),
-    ]));
-    "https://example.test/schemas".clone_into(&mut batch.schema_url);
+fn message_for_service(service: &str, record: LogRecord) -> IngestMessage {
+    IngestMessage::Logs(LogChunk {
+        origin: BatchOrigin {
+            resource: Some(Resource::new(vec![("service.name", service).into()])),
+            schema_url: String::new(),
+        },
+        records: vec![record],
+        commit_seq: 0,
+    })
+}
 
+fn sample_message() -> IngestMessage {
     let mut record = LogRecord {
         time_unix_nano: 1_000,
         observed_time_unix_nano: 1_500,
@@ -52,16 +51,26 @@ fn sample_batch() -> LogBatch {
         key: "attempt".to_owned(),
         value: AttributeValue::Int(2),
     });
-    batch.push(record);
 
-    batch.push(LogRecord {
-        time_unix_nano: 2_000,
-        severity_number: Severity::Info,
-        body: "ok".to_owned(),
-        ..LogRecord::default()
-    });
-
-    batch
+    IngestMessage::Logs(LogChunk {
+        origin: BatchOrigin {
+            resource: Some(Resource::new(vec![
+                ("service.name", "checkout").into(),
+                ("retries", 3_i64).into(),
+            ])),
+            schema_url: "https://example.test/schemas".to_owned(),
+        },
+        records: vec![
+            record,
+            LogRecord {
+                time_unix_nano: 2_000,
+                severity_number: Severity::Info,
+                body: "ok".to_owned(),
+                ..LogRecord::default()
+            },
+        ],
+        commit_seq: 0,
+    })
 }
 
 #[test]
@@ -83,8 +92,8 @@ fn writes_logs_deduplicates_resources() -> Result<(), Box<dyn std::error::Error>
     };
     let mut storage = Storage::open(receiver, config)?;
 
-    sender.send(logs_message(sample_batch()))?;
-    sender.send(logs_message(sample_batch()))?;
+    sender.send(sample_message())?;
+    sender.send(sample_message())?;
     sender.send(IngestMessage::Flush)?;
     drop(sender);
     storage.join()?;
@@ -164,7 +173,7 @@ fn log_search_index_tracks_inserts_and_prunes_without_rebuild()
             },
         )?;
 
-        sender.send(logs_message(sample_batch()))?;
+        sender.send(sample_message())?;
         sender.send(IngestMessage::Flush)?;
         drop(sender);
         storage.join()?;
@@ -237,7 +246,7 @@ fn rebuild_fts_heals_a_crashed_rebuild() -> Result<(), Box<dyn std::error::Error
     {
         let (sender, receiver) = unbounded();
         let mut storage = Storage::open(receiver, config_for())?;
-        sender.send(logs_message(sample_batch()))?;
+        sender.send(sample_message())?;
         sender.send(IngestMessage::Flush)?;
         drop(sender);
         storage.join()?;
@@ -265,7 +274,7 @@ fn rebuild_fts_heals_a_crashed_rebuild() -> Result<(), Box<dyn std::error::Error
         let (sender, receiver) = unbounded();
         let mut storage = Storage::open(receiver, config_for())?;
         sender.send(IngestMessage::Maintenance(MaintenanceOperation::RebuildFts))?;
-        sender.send(logs_message(sample_batch()))?;
+        sender.send(sample_message())?;
         sender.send(IngestMessage::Flush)?;
         drop(sender);
         storage.join()?;
@@ -309,7 +318,7 @@ fn health_probe_reports_liveness_and_progress() -> Result<(), Box<dyn std::error
     assert!(sample.batcher_running, "batcher must report running");
     assert_eq!(sample.buffered_records, 0);
 
-    sender.send(logs_message(sample_batch()))?;
+    sender.send(sample_message())?;
     sender.send(IngestMessage::Flush)?;
     let started = std::time::Instant::now();
     while storage.stats().records_written == 0 {
@@ -424,7 +433,7 @@ fn join_timeout_reports_the_budget_overrun_while_input_stays_open() {
     )
     .unwrap();
 
-    sender.send(logs_message(sample_batch())).unwrap();
+    sender.send(sample_message()).unwrap();
     let started = Instant::now();
     let error = storage
         .join_timeout(Duration::from_millis(200))
@@ -466,25 +475,27 @@ fn retention_prunes_logs_collects_orphans_and_leaves_no_fts_ghosts()
     // Epoch-era timestamps: older than any retention window.
     let ancient = 1_000;
 
-    let mut old_logs = LogBatch::with_capacity(1);
-    old_logs.resource = Some(Resource::new(vec![("service.name", "svc-old").into()]));
-    old_logs.push(LogRecord {
-        time_unix_nano: ancient,
-        observed_time_unix_nano: ancient,
-        severity_number: Severity::Info,
-        body: "ancient expired message".to_owned(),
-        ..LogRecord::default()
-    });
+    let old_logs = message_for_service(
+        "svc-old",
+        LogRecord {
+            time_unix_nano: ancient,
+            observed_time_unix_nano: ancient,
+            severity_number: Severity::Info,
+            body: "ancient expired message".to_owned(),
+            ..LogRecord::default()
+        },
+    );
 
-    let mut fresh_logs = LogBatch::with_capacity(1);
-    fresh_logs.resource = Some(Resource::new(vec![("service.name", "svc-live").into()]));
-    fresh_logs.push(LogRecord {
-        time_unix_nano: now,
-        observed_time_unix_nano: now,
-        severity_number: Severity::Info,
-        body: "fresh keeper message".to_owned(),
-        ..LogRecord::default()
-    });
+    let fresh_logs = message_for_service(
+        "svc-live",
+        LogRecord {
+            time_unix_nano: now,
+            observed_time_unix_nano: now,
+            severity_number: Severity::Info,
+            body: "fresh keeper message".to_owned(),
+            ..LogRecord::default()
+        },
+    );
 
     let (sender, receiver) = unbounded();
     let config = StorageConfig {
@@ -497,8 +508,8 @@ fn retention_prunes_logs_collects_orphans_and_leaves_no_fts_ghosts()
     };
     let mut storage = Storage::open(receiver, config)?;
 
-    sender.send(logs_message(old_logs))?;
-    sender.send(logs_message(fresh_logs))?;
+    sender.send(old_logs)?;
+    sender.send(fresh_logs)?;
     sender.send(IngestMessage::Flush)?;
     assert!(
         wait_for(
@@ -587,42 +598,45 @@ fn mapping_fidelity_persists_canonical_structured_values() -> Result<(), Box<dyn
     let mut storage = Storage::open(receiver, config)?;
 
     // --- logs: structured body, nested attribute, scope attrs/schema URL ---
-    let mut log_batch = LogBatch::with_capacity(1);
-    log_batch.resource = Some(Resource::new(vec![("service.name", "checkout").into()]));
-    log_batch.schema_url = "https://example.test/schemas/logs".to_owned();
-    log_batch.push(LogRecord {
-        time_unix_nano: 1_000,
-        severity_number: Severity::Info,
-        body: String::new(),
-        body_json: Some(r#"{"b":1,"a":[true,{"n":1.5}]}"#.to_owned()),
-        attributes: vec![Attribute {
-            key: "nested".to_owned(),
-            value: AttributeValue::Array(vec![
-                AttributeValue::Bool(true),
-                AttributeValue::Kvlist(vec![Attribute {
-                    key: "k".to_owned(),
-                    value: AttributeValue::Int(7),
-                }]),
-            ]),
+    sender.send(IngestMessage::Logs(LogChunk {
+        origin: BatchOrigin {
+            resource: Some(Resource::new(vec![("service.name", "checkout").into()])),
+            schema_url: "https://example.test/schemas/logs".to_owned(),
+        },
+        records: vec![LogRecord {
+            time_unix_nano: 1_000,
+            severity_number: Severity::Info,
+            body: String::new(),
+            body_json: Some(r#"{"b":1,"a":[true,{"n":1.5}]}"#.to_owned()),
+            attributes: vec![Attribute {
+                key: "nested".to_owned(),
+                value: AttributeValue::Array(vec![
+                    AttributeValue::Bool(true),
+                    AttributeValue::Kvlist(vec![Attribute {
+                        key: "k".to_owned(),
+                        value: AttributeValue::Int(7),
+                    }]),
+                ]),
+            }],
+            scope: Arc::new(LogScope::new(
+                "scope-a".to_owned(),
+                "1.0.0".to_owned(),
+                vec![
+                    Attribute {
+                        key: "b".to_owned(),
+                        value: AttributeValue::Int(1),
+                    },
+                    Attribute {
+                        key: "a".to_owned(),
+                        value: AttributeValue::String("v".to_owned()),
+                    },
+                ],
+                "https://example.test/schemas/logs/scope".to_owned(),
+            )),
+            ..LogRecord::default()
         }],
-        scope: Arc::new(LogScope::new(
-            "scope-a".to_owned(),
-            "1.0.0".to_owned(),
-            vec![
-                Attribute {
-                    key: "b".to_owned(),
-                    value: AttributeValue::Int(1),
-                },
-                Attribute {
-                    key: "a".to_owned(),
-                    value: AttributeValue::String("v".to_owned()),
-                },
-            ],
-            "https://example.test/schemas/logs/scope".to_owned(),
-        )),
-        ..LogRecord::default()
-    });
-    sender.send(logs_message(log_batch))?;
+        commit_seq: 0,
+    }))?;
 
     sender.send(IngestMessage::Flush)?;
     drop(sender);
@@ -675,14 +689,12 @@ fn wait_for(predicate: impl Fn() -> bool, budget: Duration) -> bool {
     }
     predicate()
 }
-fn quota_batch_with(body: &str, timestamp_ns: i64) -> LogBatch {
-    let mut batch = LogBatch::with_capacity(1);
-    batch.push(LogRecord {
+fn quota_message_with(body: &str, timestamp_ns: i64) -> IngestMessage {
+    logs_message(vec![LogRecord {
         time_unix_nano: timestamp_ns,
         body: body.to_owned(),
         ..LogRecord::default()
-    });
-    batch
+    }])
 }
 
 /// A size quota forces oldest-first eviction: with a quota no real database
@@ -704,12 +716,9 @@ fn size_quota_evicts_oldest_first_and_keeps_newest() -> Result<(), Box<dyn std::
         },
     )?;
 
-    sender.send(logs_message(quota_batch_with(
-        "quota ancient message",
-        1_000,
-    )))?;
+    sender.send(quota_message_with("quota ancient message", 1_000))?;
     sender.send(IngestMessage::Flush)?;
-    sender.send(logs_message(quota_batch_with("quota fresh message", 2_000)))?;
+    sender.send(quota_message_with("quota fresh message", 2_000))?;
     sender.send(IngestMessage::Flush)?;
     drop(sender);
     storage.join()?;

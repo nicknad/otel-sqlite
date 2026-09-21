@@ -130,7 +130,7 @@ impl LogsIngress {
             // A request mapping to more chunks than the queue can ever hold
             // is permanent: answer INVALID_ARGUMENT (via the mapping error)
             // instead of a retryable UNAVAILABLE.
-            enqueue("logs", &self.queue, &self.commit, work)
+            enqueue(&self.queue, &self.commit, work)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?
         };
 

@@ -34,6 +34,7 @@ use otel_sqlite_core::storage::{
     CommitLedger, IngestMessage, InsertBatcherConfig, LogWriteBatch, WriteCommand,
 };
 
+use crate::LedgerCloseOnDrop;
 use crate::fault;
 use crate::origin_buffers::{OriginBuffers, Submission};
 use crate::stats::BatcherStats;
@@ -73,10 +74,7 @@ pub(crate) fn run(
     // Closes the ledger if the batcher dies (panic or early return) while the
     // writer may still owe nothing: disarmed only when the writer remains
     // alive and therefore owns the close at its own exit.
-    let mut close_ledger = CloseLedgerOnDrop {
-        ledger,
-        armed: true,
-    };
+    let mut close_ledger = LedgerCloseOnDrop::new(ledger);
     let mut logs = OriginBuffers::<LogRecord>::new(config);
 
     let fault_after = fault::armed_after(fault::BATCHER_AFTER_N);
@@ -176,7 +174,7 @@ pub(crate) fn run(
     }
     if alive {
         // The writer is still draining and closes the ledger itself at exit.
-        close_ledger.armed = false;
+        close_ledger.disarm();
     } else {
         tracing::error!(
             dropped_records = stats.dropped_records.load(Ordering::Relaxed),
@@ -185,26 +183,11 @@ pub(crate) fn run(
         // The writer is gone: records held here were dropped, so no pending
         // ticket can ever be completed. Fail every durable-ack waiter now.
         ledger.close();
-        close_ledger.armed = false;
+        close_ledger.disarm();
     }
 
     stats.observe_buffered(0);
     drop(commands);
-}
-
-/// Closes the ledger on drop unless disarmed. Covers panics (and early
-/// returns) that would otherwise leave durable-ack waiters hanging.
-struct CloseLedgerOnDrop<'a> {
-    ledger: &'a CommitLedger,
-    armed: bool,
-}
-
-impl Drop for CloseLedgerOnDrop<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.ledger.close();
-        }
-    }
 }
 
 /// Emits every per-origin partial batch (if any) so control commands act as

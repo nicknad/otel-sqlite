@@ -133,17 +133,23 @@ impl Default for IngressConfig {
     }
 }
 
+/// Expands a bare `":port"` into `"0.0.0.0:port"` so the result always parses
+/// as a [`SocketAddr`]; any other form is returned unchanged.
+pub fn expand_bind_address(address: &str) -> String {
+    if address.starts_with(':') {
+        format!("0.0.0.0{address}")
+    } else {
+        address.to_owned()
+    }
+}
+
 impl IngressConfig {
     /// Parses [`IngressConfig::listen_address`] into a socket address.
     ///
     /// Accepts only `IP:port` or a bare `:port` (which binds all
     /// interfaces as `0.0.0.0:port`); hostnames are not resolved.
     pub fn socket_addr(&self) -> Result<SocketAddr, IngressError> {
-        if let Ok(addr) = self.listen_address.parse::<SocketAddr>() {
-            return Ok(addr);
-        }
-
-        format!("0.0.0.0{}", self.listen_address)
+        expand_bind_address(&self.listen_address)
             .parse()
             .map_err(|source| IngressError::InvalidListenAddress {
                 listen_address: self.listen_address.clone(),
@@ -176,6 +182,13 @@ mod tests {
             "0.0.0.0:4317".parse().unwrap(),
             "a bare `:port` must bind all interfaces"
         );
+    }
+
+    #[test]
+    fn bind_address_expansion_only_touches_bare_ports() {
+        assert_eq!(expand_bind_address(":4317"), "0.0.0.0:4317");
+        assert_eq!(expand_bind_address("127.0.0.1:9"), "127.0.0.1:9");
+        assert_eq!(expand_bind_address("[::1]:80"), "[::1]:80");
     }
 
     #[test]

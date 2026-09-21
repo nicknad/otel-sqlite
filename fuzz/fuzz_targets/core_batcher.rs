@@ -132,7 +132,9 @@ enum Op {
 }
 
 fuzz_target!(|ops: Vec<Op>| {
-    let mut batcher = InsertBatcher::<LogRecord>::new(InsertBatcherConfig::default());
+    let default = InsertBatcherConfig::default();
+    let mut max_batch_records = default.max_batch_records;
+    let mut batcher = InsertBatcher::<LogRecord>::new(default);
     let clock = Instant::now();
     let mut pushed = 0_usize;
     let mut emitted = 0_usize;
@@ -140,12 +142,13 @@ fuzz_target!(|ops: Vec<Op>| {
     for op in ops {
         match op {
             Op::Reconfigure {
-                max_batch_records,
+                max_batch_records: requested,
                 max_batch_age_millis,
             } => {
-                drain(&mut batcher, &mut emitted);
+                drain(&mut batcher, &mut emitted, max_batch_records);
+                max_batch_records = usize::from(requested.max(1));
                 batcher = InsertBatcher::new(InsertBatcherConfig {
-                    max_batch_records: usize::from(max_batch_records.max(1)),
+                    max_batch_records,
                     max_batch_age: Duration::from_millis(u64::from(max_batch_age_millis)),
                 });
             }
@@ -158,7 +161,6 @@ fuzz_target!(|ops: Vec<Op>| {
                     continue;
                 }
                 pushed += records.len();
-                let limit = batcher.config().max_batch_records;
                 let scope = Arc::new(LogScope::new(
                     String::new(),
                     String::new(),
@@ -171,16 +173,16 @@ fuzz_target!(|ops: Vec<Op>| {
                     .collect();
                 let output = batcher.push(batch);
                 let mut ready = 0_usize;
-                output.for_each(|batch| ready += check_batch(batch, limit));
+                output.for_each(|batch| ready += check_batch(batch, max_batch_records));
                 emitted += ready;
             }
             Op::FlushIfExpired { advance_millis } => {
                 let deadline = clock + Duration::from_millis(u64::from(advance_millis));
                 if let Some(batch) = batcher.flush_if_expired(deadline) {
-                    emitted += check_batch(batch, batcher.config().max_batch_records);
+                    emitted += check_batch(batch, max_batch_records);
                 }
             }
-            Op::Flush => drain(&mut batcher, &mut emitted),
+            Op::Flush => drain(&mut batcher, &mut emitted, max_batch_records),
         }
 
         assert_eq!(
@@ -191,16 +193,16 @@ fuzz_target!(|ops: Vec<Op>| {
         );
     }
 
-    drain(&mut batcher, &mut emitted);
+    drain(&mut batcher, &mut emitted, max_batch_records);
     assert_eq!(
         pushed, emitted,
         "final drain left records behind: pushed={pushed} emitted={emitted}"
     );
 });
 
-fn drain(batcher: &mut InsertBatcher<LogRecord>, emitted: &mut usize) {
+fn drain(batcher: &mut InsertBatcher<LogRecord>, emitted: &mut usize, max_batch_records: usize) {
     while let Some(batch) = batcher.flush() {
-        *emitted += check_batch(batch, batcher.config().max_batch_records);
+        *emitted += check_batch(batch, max_batch_records);
     }
 }
 

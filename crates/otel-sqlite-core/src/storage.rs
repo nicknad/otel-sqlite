@@ -34,10 +34,6 @@
 //!   **[`WriteCommand`](command::WriteCommand)** - items crossing the ingress
 //!   boundary vs commands crossing the write boundary. An ingest message is
 //!   *not* a transaction unit; a write command is.
-//!
-//! The model type [`LogBatch`](crate::model::LogBatch) is a mapping-internal
-//! helper (records + origin in one struct) and does not appear on either
-//! queue.
 
 pub mod batch;
 pub mod batcher;
@@ -51,8 +47,8 @@ pub use batcher::{
     InsertBatcherConfig,
 };
 pub use command::{
-    BatchOrigin, CheckpointMode, CommandError, CommandResult, IngestMessage, LogChunk,
-    LogWriteBatch, MaintenanceOperation, WriteCommand,
+    BatchOrigin, CheckpointMode, IngestMessage, LogChunk, LogWriteBatch, MaintenanceOperation,
+    WriteCommand,
 };
 pub use commit::{CommitLedger, CommitLedgerClosed, Watermark};
 pub use durability::{DurabilityMode, SyncMode};

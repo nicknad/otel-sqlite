@@ -10,56 +10,49 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::unbounded;
-use otel_sqlite_core::model::{Attribute, LogBatch, LogRecord, LogScope, Resource, Severity};
+use otel_sqlite_core::model::{Attribute, LogRecord, LogScope, Resource, Severity};
 use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, LogChunk};
 use otel_sqlite_storage::backup::{self, BackupError};
 use otel_sqlite_storage::{Storage, StorageConfig};
 
-fn logs_message(batch: LogBatch) -> IngestMessage {
+fn sample_message() -> IngestMessage {
     IngestMessage::Logs(LogChunk {
         origin: BatchOrigin {
-            resource: batch.resource,
-            schema_url: batch.schema_url,
+            resource: Some(Resource::new(vec![
+                ("service.name", "checkout").into(),
+                ("retries", 3_i64).into(),
+            ])),
+            schema_url: "https://example.test/schemas".to_owned(),
         },
-        records: batch.records,
+        records: vec![
+            LogRecord {
+                time_unix_nano: 1_000,
+                observed_time_unix_nano: 1_500,
+                severity_number: Severity::Error,
+                severity_text: "ERROR".to_owned(),
+                body: "payment failed".to_owned(),
+                event_name: "order.failed".to_owned(),
+                scope: Arc::new(LogScope::new(
+                    "scope-a".to_owned(),
+                    String::new(),
+                    Vec::new(),
+                    String::new(),
+                )),
+                attributes: vec![Attribute {
+                    key: "attempt".to_owned(),
+                    value: otel_sqlite_core::model::AttributeValue::Int(2),
+                }],
+                ..LogRecord::default()
+            },
+            LogRecord {
+                time_unix_nano: 2_000,
+                severity_number: Severity::Info,
+                body: "ok".to_owned(),
+                ..LogRecord::default()
+            },
+        ],
         commit_seq: 0,
     })
-}
-
-fn sample_batch() -> LogBatch {
-    let mut batch = LogBatch::with_capacity(2);
-    batch.resource = Some(Resource::new(vec![
-        ("service.name", "checkout").into(),
-        ("retries", 3_i64).into(),
-    ]));
-    "https://example.test/schemas".clone_into(&mut batch.schema_url);
-
-    batch.push(LogRecord {
-        time_unix_nano: 1_000,
-        observed_time_unix_nano: 1_500,
-        severity_number: Severity::Error,
-        severity_text: "ERROR".to_owned(),
-        body: "payment failed".to_owned(),
-        event_name: "order.failed".to_owned(),
-        scope: Arc::new(LogScope::new(
-            "scope-a".to_owned(),
-            String::new(),
-            Vec::new(),
-            String::new(),
-        )),
-        attributes: vec![Attribute {
-            key: "attempt".to_owned(),
-            value: otel_sqlite_core::model::AttributeValue::Int(2),
-        }],
-        ..LogRecord::default()
-    });
-    batch.push(LogRecord {
-        time_unix_nano: 2_000,
-        severity_number: Severity::Info,
-        body: "ok".to_owned(),
-        ..LogRecord::default()
-    });
-    batch
 }
 
 /// Builds a migrated, populated database through the real pipeline. Returns
@@ -79,8 +72,8 @@ fn populated_db(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
         },
     )
     .expect("storage opens");
-    sender.send(logs_message(sample_batch())).unwrap();
-    sender.send(logs_message(sample_batch())).unwrap();
+    sender.send(sample_message()).unwrap();
+    sender.send(sample_message()).unwrap();
     sender.send(IngestMessage::Flush).unwrap();
     drop(sender);
     storage.join().expect("storage joins cleanly");
@@ -162,7 +155,7 @@ fn backup_is_consistent_while_ingestion_is_active() {
     let feeder = std::thread::spawn(move || {
         let started = std::time::Instant::now();
         while started.elapsed() < Duration::from_millis(800) {
-            feeder_sender.send(logs_message(sample_batch())).unwrap();
+            feeder_sender.send(sample_message()).unwrap();
             std::thread::sleep(Duration::from_millis(5));
         }
     });
