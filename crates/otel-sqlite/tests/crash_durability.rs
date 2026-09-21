@@ -196,6 +196,14 @@ fn wal_path(db_path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// The scenarios in this file each spawn a real server process plus a
+/// closed-loop load generator. Running them concurrently starves the debug
+/// binaries enough that fixed timeout assertions can fire spuriously on a
+/// loaded machine, so they take turns (FIFO; a panicking test releases the
+/// lock normally instead of poisoning it).
+static SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// Waits until the WAL holds at least one page of un-checkpointed frames —
 /// proof that commits are sitting in the WAL at the moment of the kill.
 fn wait_wal_active(db_path: &Path, timeout: Duration) {
@@ -231,6 +239,7 @@ fn healthcheck_reports_serving(endpoint: &str) -> bool {
 /// boot, load, kill mid-WAL-write with requests in flight, restart on the
 /// same database, assert no acknowledged loss, then prove live traffic.
 async fn crash_recovery_acknowledges_are_durable(sync: SyncMode) {
+    let _serial = SERIAL.lock().await;
     let dir = tempfile::tempdir().expect("temp data dir");
     let base = dir.path();
 
@@ -305,6 +314,7 @@ async fn crash_recovery_acknowledges_are_durable_sync_full() {
 /// ingestion, and the process exits within a bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writer_death_fails_pending_acks_with_unavailable() {
+    let _serial = SERIAL.lock().await;
     let dir = tempfile::tempdir().expect("temp data dir");
     let mut config =
         CrashServerConfig::new(dir.path().to_path_buf(), free_port(), SyncMode::Normal);
@@ -360,6 +370,7 @@ async fn writer_death_fails_pending_acks_with_unavailable() {
 /// validated as durable before the batcher dies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batcher_death_fails_pending_acks_with_unavailable() {
+    let _serial = SERIAL.lock().await;
     let dir = tempfile::tempdir().expect("temp data dir");
     let mut config =
         CrashServerConfig::new(dir.path().to_path_buf(), free_port(), SyncMode::Normal);
@@ -411,6 +422,7 @@ async fn batcher_death_fails_pending_acks_with_unavailable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(unsafe_code)] // SAFETY: justified inline where the signal is sent.
 async fn clean_shutdown_is_graceful_and_serving_flips() {
+    let _serial = SERIAL.lock().await;
     let dir = tempfile::tempdir().expect("temp data dir");
     let mut config =
         CrashServerConfig::new(dir.path().to_path_buf(), free_port(), SyncMode::Normal);
