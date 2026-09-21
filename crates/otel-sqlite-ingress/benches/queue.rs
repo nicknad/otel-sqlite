@@ -2,8 +2,8 @@
 //! (the admission-gated [`otel_sqlite_ingress::IngestSender`] wrapper over
 //! crossbeam):
 //!
-//! * `enqueue_dequeue_uncontended`: single-threaded `try_send` + `recv` round
-//!   trip (the per-request cost ingress pays when the queue is healthy),
+//! * `enqueue_dequeue_uncontended`: single-threaded reserve + send + `recv`
+//!   round trip (the per-request cost ingress pays when the queue is healthy),
 //! * `enqueue_1p1c`: one bench thread producing, one consumer thread draining
 //!   — sustained send throughput under real contention,
 //! * `dequeue_1p1c`: one producer thread keeping the queue fed, bench thread
@@ -54,7 +54,11 @@ fn bench_enqueue_dequeue_uncontended(c: &mut Criterion) {
             b.iter_batched(
                 || chunk_message(0, records_per_chunk),
                 |message| {
-                    sender.try_send(message).expect("bounded above workload");
+                    sender
+                        .reserve(1)
+                        .expect("bounded above workload")
+                        .try_send(message)
+                        .expect("reserved slot");
                     black_box(receiver.recv().expect("same process"));
                 },
                 BatchSize::PerIteration,
