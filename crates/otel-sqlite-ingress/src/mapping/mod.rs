@@ -38,6 +38,6 @@ pub(crate) use common::{
     timestamp,
 };
 
-// Imported here so signal mapping modules can refer to them as
+// Imported here so the logs mapping module can refer to them as
 // `super::AnyValue`, `super::AnyValueKind`.
 use pb::common::v1::{AnyValue, any_value::Value as AnyValueKind};

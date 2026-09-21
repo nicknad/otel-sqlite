@@ -19,6 +19,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use otel_sqlite_storage::restrict_permissions;
 
 /// One parsed command line for the subcommand.
 #[derive(Debug, Default)]
@@ -261,55 +262,9 @@ fn write_pem(path: &Path, contents: &str) -> Result<()> {
 
 /// Owner-only restriction for private keys: `0o600` on unix, `icacls`
 /// hardening on Windows (best-effort warn, never fails generation).
-#[allow(clippy::unnecessary_wraps)] // Windows/bare-metal arms always succeed by design
 fn restrict_key_file(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("restrict permissions on {}", path.display()))?;
-        Ok(())
-    }
-    #[cfg(windows)]
-    {
-        let user = std::env::var("USERNAME").unwrap_or_default();
-        if user.is_empty() {
-            eprintln!(
-                "warning: cannot determine USERNAME; key {} may inherit permissive ACLs; restrict it manually",
-                path.display()
-            );
-            return Ok(());
-        }
-        let status = std::process::Command::new("icacls")
-            .arg(path)
-            .arg("/inheritance:r")
-            .arg("/grant:r")
-            .arg(format!("{user}:F"))
-            .arg("*S-1-5-18:F")
-            .arg("*S-1-5-32-544:F")
-            .status();
-        match status {
-            Ok(status) if status.success() => {}
-            Ok(status) => {
-                eprintln!(
-                    "warning: icacls exited {status} for {}; restrict key ACLs manually",
-                    path.display()
-                );
-            }
-            Err(error) => {
-                eprintln!(
-                    "warning: icacls unavailable ({error}); key {} may inherit permissive ACLs",
-                    path.display()
-                );
-            }
-        }
-        Ok(())
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = path;
-        Ok(())
-    }
+    restrict_permissions(path)
+        .with_context(|| format!("restrict permissions on {}", path.display()))
 }
 
 #[cfg(test)]

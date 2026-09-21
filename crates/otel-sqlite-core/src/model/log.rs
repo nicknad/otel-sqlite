@@ -136,31 +136,3 @@ impl LogRecord {
         self.has_trace() && self.has_span()
     }
 }
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct LogBatch {
-    pub records: Vec<LogRecord>,
-    pub resource: Option<Resource>,
-    pub schema_url: String,
-}
-
-impl LogBatch {
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            records: Vec::with_capacity(capacity),
-            ..Self::default()
-        }
-    }
-
-    pub fn push(&mut self, record: LogRecord) {
-        self.records.push(record);
-    }
-
-    pub fn len(&self) -> usize {
-        self.records.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
-    }
-}

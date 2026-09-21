@@ -7,7 +7,7 @@ mod gencerts;
 mod healthcheck;
 
 use anyhow::{Context, Result};
-use otel_sqlite_ingress::ServingCheck;
+use otel_sqlite_ingress::{ServingCheck, expand_bind_address};
 use otel_sqlite_storage::{Storage, StorageHealth};
 use tokio::sync::watch;
 
@@ -54,7 +54,7 @@ impl ServingCheck for StorageServingCheck {
 fn install_metrics_exporter(address: &str) -> Result<()> {
     use metrics_exporter_prometheus::PrometheusBuilder;
 
-    let socket_addr: std::net::SocketAddr = config::expand_bind_address(address)
+    let socket_addr: std::net::SocketAddr = expand_bind_address(address)
         .parse()
         .with_context(|| format!("invalid metrics_address `{address}`"))?;
     // `install` both registers the global recorder and spawns the scrape

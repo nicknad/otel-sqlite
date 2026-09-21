@@ -51,7 +51,6 @@ pub(crate) struct EnqueueOutcome {
 /// the queue's total capacity: no retry could ever fit, so the caller must
 /// answer with a permanent error instead of `UNAVAILABLE`.
 pub(crate) fn enqueue(
-    signal: &'static str,
     queue: &IngestSender,
     ledger: &CommitLedger,
     work: Vec<(u64, IngestMessage)>,
@@ -77,12 +76,12 @@ pub(crate) fn enqueue(
     // any durable wait.
     let Ok(guard) = queue.reserve(work.len()) else {
         outcome.rejected = total_records;
-        ::metrics::counter!("ingress_queue_full_total", "signal" => signal).increment(1);
+        ::metrics::counter!("ingress_queue_full_total", "signal" => "logs").increment(1);
         return Ok(outcome);
     };
 
     for (records, mut message) in work {
-        ::metrics::histogram!("ingress_batch_size", "signal" => signal).record(records as f64);
+        ::metrics::histogram!("ingress_batch_size", "signal" => "logs").record(records as f64);
 
         let started = Instant::now();
         let ticket = ledger.issue();
@@ -113,8 +112,8 @@ pub(crate) fn enqueue(
             }
         }
 
-        ::metrics::gauge!("ingress_queue_depth", "signal" => signal).set(queue.len() as f64);
-        ::metrics::histogram!("ingress_enqueue_duration", "signal" => signal)
+        ::metrics::gauge!("ingress_queue_depth", "signal" => "logs").set(queue.len() as f64);
+        ::metrics::histogram!("ingress_enqueue_duration", "signal" => "logs")
             .record(started.elapsed().as_secs_f64());
 
         if outcome.disconnected {
@@ -153,7 +152,7 @@ mod tests {
         // two chunks can never both fit right now, so the entire request is
         // refused (transiently — this is the retryable case).
         queue.send(IngestMessage::Flush).expect("control send");
-        let outcome = enqueue("logs", &queue, &ledger, vec![log_chunk(2), log_chunk(3)])
+        let outcome = enqueue(&queue, &ledger, vec![log_chunk(2), log_chunk(3)])
             .expect("transient queue pressure is not a permanent error");
 
         assert_eq!(outcome.accepted, 0);
@@ -179,7 +178,7 @@ mod tests {
 
         // Two chunks can never fit in a one-slot queue, no matter how long
         // the client retries: that must be a permanent, non-retryable error.
-        let error = enqueue("logs", &queue, &ledger, vec![log_chunk(2), log_chunk(3)])
+        let error = enqueue(&queue, &ledger, vec![log_chunk(2), log_chunk(3)])
             .expect_err("a request exceeding the total capacity can never fit");
         let message = error.to_string();
         assert!(message.contains("2 chunks"), "{message}");
@@ -195,8 +194,8 @@ mod tests {
         let ledger = Arc::new(CommitLedger::new());
         let (queue, receiver) = channel(4);
 
-        let outcome = enqueue("logs", &queue, &ledger, vec![log_chunk(2), log_chunk(3)])
-            .expect("request fits");
+        let outcome =
+            enqueue(&queue, &ledger, vec![log_chunk(2), log_chunk(3)]).expect("request fits");
 
         assert_eq!(outcome.accepted, 5);
         assert_eq!(outcome.rejected, 0);
@@ -216,7 +215,7 @@ mod tests {
         // Storage gone: every send is rejected as disconnected, no ticket is
         // ever left outstanding, and the ledger is not closed by ingress.
         drop(receiver);
-        let outcome = enqueue("logs", &queue, &ledger, vec![log_chunk(1), log_chunk(1)])
+        let outcome = enqueue(&queue, &ledger, vec![log_chunk(1), log_chunk(1)])
             .expect("disconnect is not a mapping error");
 
         assert!(outcome.disconnected);

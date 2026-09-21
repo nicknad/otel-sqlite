@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use otel_sqlite_core::model::{AttributeValue, LogBatch, LogRecord, LogScope, Severity};
+use otel_sqlite_core::model::{AttributeValue, LogRecord, LogScope, Severity};
 use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, LogChunk};
 
 use crate::error::IngressError;
@@ -14,13 +14,17 @@ use super::{
 };
 use crate::config::IngressConfig;
 
-/// Fallible proto → model conversion of one `ResourceLogs` group.
+/// Fallible proto → model conversion of one `ResourceLogs` group into one
+/// ingest chunk.
+///
+/// `commit_seq` is left at zero: the enqueue path stamps the durability ticket
+/// when the chunk is admitted to the queue.
 ///
 /// Mapping only fails for shape/byte/depth bounds that would otherwise
 /// exhaust memory or CPU. Present-but-invalid trace/span ids carry no trace
 /// association: they are zeroed and counted (`otlp_mapping_loss_total`) rather
 /// than rejecting the request, per the OTLP spec's SHOULD.
-pub fn try_convert_batch(value: ResourceLogs) -> Result<LogBatch, IngressError> {
+pub fn try_convert_batch(value: ResourceLogs) -> Result<LogChunk, IngressError> {
     let ResourceLogs {
         resource,
         scope_logs,
@@ -28,15 +32,12 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogBatch, IngressError> 
     } = value;
 
     let capacity: usize = scope_logs.iter().map(|scope| scope.log_records.len()).sum();
-    let mut batch = LogBatch::with_capacity(capacity);
+    let mut records = Vec::with_capacity(capacity);
 
-    let mut resource = resource
-        .map(|value| convert_resource(value, "logs"))
-        .transpose()?;
+    let mut resource = resource.map(convert_resource).transpose()?;
     if let Some(resource) = &mut resource {
         resource.schema_url.clone_from(&schema_url);
     }
-    batch.resource = resource;
 
     for scope in scope_logs {
         let ScopeLogs {
@@ -54,7 +55,7 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogBatch, IngressError> 
                  }| (name, version, attributes),
             )
             .unwrap_or_default();
-        let scope_attributes = attributes(scope_attributes, "logs")?;
+        let scope_attributes = attributes(scope_attributes)?;
         // Record-less groups are dropped by `map_chunks`; skip the canonical
         // JSON render (the attribute conversion above still enforces bounds).
         if log_records.is_empty() {
@@ -70,12 +71,18 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogBatch, IngressError> 
             scope_schema_url,
         ));
         for record in log_records {
-            batch.push(convert_record(record, &scope)?);
+            records.push(convert_record(record, &scope)?);
         }
     }
 
-    batch.schema_url = schema_url;
-    Ok(batch)
+    Ok(LogChunk {
+        origin: BatchOrigin {
+            resource,
+            schema_url,
+        },
+        records,
+        commit_seq: 0,
+    })
 }
 
 pub(crate) fn count(resource_logs: &[ResourceLogs]) -> usize {
@@ -100,29 +107,12 @@ pub(crate) fn map_chunks(
 ) -> Result<Vec<(u64, IngestMessage)>, IngressError> {
     let mut chunks = Vec::with_capacity(resource_logs.len());
     for item in resource_logs {
-        let LogBatch {
-            records,
-            resource,
-            schema_url,
-            ..
-        } = try_convert_batch(item)?;
-        if records.is_empty() {
+        let chunk = try_convert_batch(item)?;
+        if chunk.records.is_empty() {
             continue;
         }
-        let count = records.len() as u64;
-        chunks.push((
-            count,
-            IngestMessage::Logs(LogChunk {
-                origin: BatchOrigin {
-                    resource,
-                    schema_url,
-                },
-                records,
-                // The enqueue path stamps every accepted chunk with its
-                // durability ticket before handing it to the queue.
-                commit_seq: 0,
-            }),
-        ));
+        let count = chunk.records.len() as u64;
+        chunks.push((count, IngestMessage::Logs(chunk)));
     }
     Ok(chunks)
 }
@@ -143,17 +133,17 @@ fn convert_record(value: ProtoLogRecord, scope: &Arc<LogScope>) -> Result<LogRec
         ..
     } = value;
 
-    let trace_id = parse_trace_id(trace_id).into_id("logs", "invalid_trace_id");
-    let span_id = parse_span_id(span_id).into_id("logs", "invalid_span_id");
+    let trace_id = parse_trace_id(trace_id).into_id("invalid_trace_id");
+    let span_id = parse_span_id(span_id).into_id("invalid_span_id");
     let (body, body_json) = body_value(body)?;
 
-    let observed_time_unix_nano = timestamp(observed_time_unix_nano, "logs");
+    let observed_time_unix_nano = timestamp(observed_time_unix_nano);
     // OTLP: an unset `time_unix_nano` is to be treated as
     // `observed_time_unix_nano`.
     let time_unix_nano = if time_unix_nano == 0 {
         observed_time_unix_nano
     } else {
-        timestamp(time_unix_nano, "logs")
+        timestamp(time_unix_nano)
     };
 
     Ok(LogRecord {
@@ -165,7 +155,7 @@ fn convert_record(value: ProtoLogRecord, scope: &Arc<LogScope>) -> Result<LogRec
         span_id: span_id.unwrap_or_default(),
         body,
         body_json,
-        attributes: attributes(record_attributes, "logs")?,
+        attributes: attributes(record_attributes)?,
         dropped_attributes_count,
         flags,
         event_name,
@@ -213,7 +203,7 @@ fn body_value(value: Option<super::AnyValue>) -> Result<(String, Option<String>)
             let items = values
                 .values
                 .into_iter()
-                .map(|value| attribute_value(value, "logs"))
+                .map(attribute_value)
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((
                 String::new(),
@@ -222,7 +212,7 @@ fn body_value(value: Option<super::AnyValue>) -> Result<(String, Option<String>)
         }
         Some(super::AnyValueKind::KvlistValue(values)) => Ok((
             String::new(),
-            Some(AttributeValue::Kvlist(attributes(values.values, "logs")?).to_canonical_json()),
+            Some(AttributeValue::Kvlist(attributes(values.values)?).to_canonical_json()),
         )),
         _ => Ok((String::new(), None)),
     }
@@ -352,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_resource_logs_into_model_batch() {
+    fn converts_resource_logs_into_ingest_chunk() {
         let proto = ResourceLogs {
             resource: sample_resource(),
             scope_logs: vec![ScopeLogs {
@@ -386,14 +376,15 @@ mod tests {
 
         let batch = try_convert_batch(proto).expect("valid request converts");
 
-        assert_eq!(batch.len(), 2);
-        assert_eq!(batch.schema_url, "https://example.test/schemas/logs");
+        assert_eq!(batch.records.len(), 2);
+        assert_eq!(batch.origin.schema_url, "https://example.test/schemas/logs");
         assert_eq!(
-            batch.resource.as_ref().map(Resource::service_name),
+            batch.origin.resource.as_ref().map(Resource::service_name),
             Some("checkout")
         );
         assert_eq!(
             batch
+                .origin
                 .resource
                 .as_ref()
                 .map(|resource| resource.schema_url.as_str()),
