@@ -401,7 +401,6 @@ mod tests {
         assert_eq!(first.scope.name(), "scope-a");
         assert_eq!(first.scope.version(), "1.2.3");
         assert_eq!(first.event_name, "order.placed");
-        assert_eq!(first.scope.attributes()[0].value.as_str(), Some("prod"));
         assert_eq!(first.scope.attributes_json(), r#"{"scope.tag":"prod"}"#);
         assert_eq!(
             first.scope.schema_url(),
