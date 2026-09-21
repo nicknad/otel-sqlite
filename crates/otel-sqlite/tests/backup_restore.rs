@@ -160,10 +160,19 @@ fn run_cli(args: &[&str]) -> std::process::Output {
         .expect("run otel-sqlite subcommand")
 }
 
+/// The runbook scenarios each spawn a real server plus a closed-loop load
+/// generator. Running them concurrently starves the debug binaries enough that
+/// fixed timeout assertions can fire spuriously on a loaded machine, so they
+/// take turns (FIFO; a panicking test releases the lock normally instead of
+/// poisoning it).
+static SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// Full runbook flow against the external binary: online backup while load is
 /// active, stop, restore into a clean directory, restart, validate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_restore_round_trip_against_the_external_binary() {
+    let _serial = SERIAL.lock().await;
     let dir = tempfile::tempdir().expect("temp data dir");
     let base = dir.path();
 
@@ -295,6 +304,7 @@ async fn backup_restore_round_trip_against_the_external_binary() {
 /// with `--key-file`, then verify the restored database.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn encrypted_backup_restore_against_the_external_binary() {
+    let _serial = SERIAL.lock().await;
     let dir = tempfile::tempdir().expect("temp data dir");
     let base = dir.path();
 
