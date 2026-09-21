@@ -36,7 +36,10 @@ pub use error::StorageError;
 #[doc(hidden)]
 pub use migration::migrate_up_to;
 pub use permissions::{restrict_permissions, warn_if_world_readable};
-pub use stats::{BatcherStats, StorageHealth, StorageHealthSample, StorageStatsSnapshot};
+pub use stats::{BatcherStats, StorageHealth, StorageStatsSnapshot};
+// The health sample returned by `StorageHealth::sample` is core vocabulary so
+// the runtime watchdog can consume it without depending on this crate.
+pub use otel_sqlite_core::PipelineSample;
 
 /// Closes the [`CommitLedger`] when dropped, so durable-ack waiters fail fast
 /// instead of hanging on tickets that can never commit. Covers every exit path

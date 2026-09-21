@@ -243,7 +243,7 @@ impl EmbeddedServer {
 
     /// Liveness/progress evidence for the storage threads, or `None` after
     /// shutdown. Cheap lock-free read; safe to poll from anywhere.
-    pub fn health_sample(&self) -> Option<otel_sqlite_storage::StorageHealthSample> {
+    pub fn health_sample(&self) -> Option<otel_sqlite_storage::PipelineSample> {
         self.storage
             .as_ref()
             .map(|storage| storage.health().sample())

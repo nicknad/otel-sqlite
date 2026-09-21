@@ -46,6 +46,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, after, select};
+use otel_sqlite_core::PipelineSample;
 use thiserror::Error;
 use tokio::sync::watch;
 
@@ -68,46 +69,6 @@ impl HealthState {
             Self::Degraded => 1.0,
             Self::Unhealthy => 2.0,
         }
-    }
-}
-
-/// One observation of pipeline evidence, produced by a
-/// [`HealthSampleSource`].
-#[derive(Debug, Clone, Copy)]
-pub struct PipelineSample {
-    pub writer_running: bool,
-    pub batcher_running: bool,
-    /// Milliseconds since the writer last executed a command successfully.
-    pub writer_idle_ms: u64,
-    /// Milliseconds since the batcher last received input or submitted a batch.
-    pub batcher_idle_ms: u64,
-    /// Depth of the bounded write-command queue.
-    pub queue_depth: usize,
-    /// Capacity of that queue; `0` disables the saturation rule.
-    pub queue_capacity: usize,
-    /// Records buffered inside the insert batcher (pending, unsent).
-    pub pending_records: usize,
-    /// Issued durability tickets that have neither completed nor voided.
-    /// In-flight records account for some of these; a ticket that stays
-    /// outstanding while nothing is queued or buffered is a leak that will
-    /// hold every durable ack behind it forever.
-    pub outstanding_tickets: u64,
-    /// Milliseconds since the contiguous commit watermark last advanced.
-    pub watermark_idle_ms: u64,
-    /// Whether the writer is currently executing a maintenance-class command
-    /// (checkpoint, prune, vacuum, FTS rebuild, quota eviction). Insert
-    /// commits legitimately pause during that window.
-    pub maintenance_in_progress: bool,
-    /// Milliseconds since the current maintenance command started; `0` when
-    /// none is in progress.
-    pub maintenance_elapsed_ms: u64,
-}
-
-impl PipelineSample {
-    /// Work accepted by the pipeline but not yet persisted: queued commands
-    /// plus records still buffered in the insert batcher.
-    pub fn pending_work(&self) -> usize {
-        self.queue_depth.saturating_add(self.pending_records)
     }
 }
 

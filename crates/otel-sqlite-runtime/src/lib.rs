@@ -98,7 +98,5 @@ mod watchdog;
 mod worker;
 
 pub use config::{MaintenanceConfig, WatchdogConfig};
-pub use watchdog::{
-    HealthSampleSource, HealthState, PipelineSample, Watchdog, WatchdogError, WatchdogHandle,
-};
+pub use watchdog::{HealthSampleSource, HealthState, Watchdog, WatchdogError, WatchdogHandle};
 pub use worker::{MaintenanceHandle, MaintenanceWorker, MaintenanceWorkerError};

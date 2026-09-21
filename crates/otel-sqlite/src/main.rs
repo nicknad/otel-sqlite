@@ -7,36 +7,25 @@ mod gencerts;
 mod healthcheck;
 
 use anyhow::{Context, Result};
+use otel_sqlite_core::PipelineSample;
 use otel_sqlite_ingress::{ServingCheck, expand_bind_address};
 use otel_sqlite_storage::{Storage, StorageHealth};
 use tokio::sync::watch;
 
 use config::Config;
-use otel_sqlite_runtime::{HealthSampleSource, MaintenanceWorker, PipelineSample, Watchdog};
+use otel_sqlite_runtime::{HealthSampleSource, MaintenanceWorker, Watchdog};
 
 /// Adapts the storage health probe to the watchdog's evidence contract.
 ///
-/// The watchdog stays decoupled from the storage crate; this mapping is the
-/// only place that knows both sides. Reads are lock-free atomic loads, so the
-/// watchdog can sample even while the pipeline is wedged.
+/// The watchdog stays decoupled from the storage crate; this adapter is the
+/// only place that knows both sides. Storage already produces the shared
+/// [`PipelineSample`] from lock-free atomic loads, so the watchdog can sample
+/// even while the pipeline is wedged.
 struct StorageHealthSource(StorageHealth);
 
 impl HealthSampleSource for StorageHealthSource {
     fn sample(&self) -> PipelineSample {
-        let sample = self.0.sample();
-        PipelineSample {
-            writer_running: sample.writer_running,
-            batcher_running: sample.batcher_running,
-            writer_idle_ms: sample.writer_idle_ms,
-            batcher_idle_ms: sample.batcher_idle_ms,
-            queue_depth: sample.queue_depth,
-            queue_capacity: sample.queue_capacity,
-            pending_records: sample.buffered_records,
-            outstanding_tickets: sample.outstanding_commit_tickets,
-            watermark_idle_ms: sample.watermark_idle_ms,
-            maintenance_in_progress: sample.maintenance_in_progress,
-            maintenance_elapsed_ms: sample.maintenance_elapsed_ms,
-        }
+        self.0.sample()
     }
 }
 

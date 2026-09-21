@@ -321,7 +321,7 @@ fn health_probe_reports_liveness_and_progress() -> Result<(), Box<dyn std::error
     let sample = storage.health().sample();
     assert!(sample.writer_running, "writer must report running");
     assert!(sample.batcher_running, "batcher must report running");
-    assert_eq!(sample.buffered_records, 0);
+    assert_eq!(sample.pending_records, 0);
 
     sender.send(sample_message())?;
     sender.send(IngestMessage::Flush)?;
