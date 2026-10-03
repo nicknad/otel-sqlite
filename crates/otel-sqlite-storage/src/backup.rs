@@ -649,9 +649,9 @@ pub fn encrypt_file(plain: &Path, out: &Path, key_path: &Path) -> Result<(), Bac
             if read == 0 {
                 break;
             }
-            let nonce = frame_nonce(&base_nonce, counter);
+            let nonce = Nonce::from(frame_nonce(&base_nonce, counter));
             let ciphertext = cipher
-                .encrypt(Nonce::from_slice(&nonce), &plaintext[..read])
+                .encrypt(&nonce, &plaintext[..read])
                 .map_err(|_| BackupError::CorruptBackup("AES-GCM encryption failed".to_owned()))?;
             let len = u32::try_from(ciphertext.len()).map_err(|_| {
                 BackupError::CorruptBackup("encrypted frame exceeds u32 range".to_owned())
@@ -747,13 +747,12 @@ fn decrypt_v1_body(
         ));
     }
     let (nonce, ciphertext) = rest.split_at(NONCE_LEN);
-    let plaintext = cipher
-        .decrypt(Nonce::from_slice(nonce), ciphertext)
-        .map_err(|_| {
-            BackupError::CorruptBackup(
-                "authentication failed: wrong key or corrupted backup".to_owned(),
-            )
-        })?;
+    let nonce = Nonce::try_from(nonce).expect("nonce length validated to 12 bytes");
+    let plaintext = cipher.decrypt(&nonce, ciphertext).map_err(|_| {
+        BackupError::CorruptBackup(
+            "authentication failed: wrong key or corrupted backup".to_owned(),
+        )
+    })?;
 
     match (|| -> Result<(), BackupError> {
         let mut file = fs::File::create(out)?;
@@ -813,14 +812,12 @@ fn decrypt_v2_body(
                     "truncated frame payload".to_owned(),
                 ));
             }
-            let nonce = frame_nonce(&base, counter);
-            let plaintext = cipher
-                .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
-                .map_err(|_| {
-                    BackupError::CorruptBackup(
-                        "authentication failed: wrong key or corrupted backup".to_owned(),
-                    )
-                })?;
+            let nonce = Nonce::from(frame_nonce(&base, counter));
+            let plaintext = cipher.decrypt(&nonce, ciphertext.as_ref()).map_err(|_| {
+                BackupError::CorruptBackup(
+                    "authentication failed: wrong key or corrupted backup".to_owned(),
+                )
+            })?;
             output.write_all(&plaintext)?;
             counter = counter.checked_add(1).ok_or_else(|| {
                 BackupError::CorruptBackup("backup exceeds 256 TiB frame limit".to_owned())
