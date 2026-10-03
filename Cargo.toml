@@ -39,7 +39,7 @@ rand = "0.9"
 rcgen = "0.13"
 sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
-criterion = { version = "0.7", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 # `gzip`: the OpenTelemetry Collector's OTLP exporter compresses with gzip
 # by default; without this feature the ingress answers `Unimplemented`
 # (permanent error) and the exporter drops the batch.
