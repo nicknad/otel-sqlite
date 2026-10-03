@@ -18,7 +18,7 @@ use otel_sqlite_ingress::mapping::pb::logs::v1::{
     LogRecord as ProtoLogRecord, ResourceLogs, ScopeLogs, SeverityNumber,
 };
 use otel_sqlite_ingress::mapping::pb::resource::v1::Resource as ProtoResource;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 
 pub const RUN_ID_KEY: &str = "bench.run_id";
