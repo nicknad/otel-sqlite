@@ -32,7 +32,9 @@ pub(super) fn fingerprint_into(parts: &[&str], out: &mut String) {
     }
     out.clear();
     // Writing hex into a String never fails.
-    let _ = write!(out, "{:x}", hasher.finalize());
+    for byte in hasher.finalize() {
+        let _ = write!(out, "{byte:02x}");
+    }
 }
 
 /// Resolves (and upserts) the resource dimension row. The id lands in
