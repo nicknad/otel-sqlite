@@ -13,7 +13,7 @@ description = "OTLP logs sink for SQLite with batched single-writer queues"
 rust-version = "1.89.0"
 
 [workspace.dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 anyhow = "1"
 crossbeam-channel = "0.5"
 hex = "0.4"
