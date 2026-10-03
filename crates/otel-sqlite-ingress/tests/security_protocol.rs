@@ -94,7 +94,7 @@ impl Pki {
         std::fs::write(self.path(name), contents).unwrap();
     }
 
-    fn generate_ca(name: &str) -> (rcgen::Certificate, rcgen::KeyPair) {
+    fn generate_ca(name: &str) -> rcgen::CertifiedIssuer<'static, KeyPair> {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params
@@ -106,15 +106,10 @@ impl Pki {
             KeyUsagePurpose::KeyCertSign,
             KeyUsagePurpose::CrlSign,
         ];
-        let cert = params.self_signed(&key).unwrap();
-        (cert, key)
+        rcgen::CertifiedIssuer::self_signed(params, key).unwrap()
     }
 
-    fn sign_server(
-        ca_cert: &rcgen::Certificate,
-        ca_key: &KeyPair,
-        hosts: &[&str],
-    ) -> (String, String) {
+    fn sign_server(ca: &rcgen::Issuer<'_, KeyPair>, hosts: &[&str]) -> (String, String) {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params
@@ -137,11 +132,11 @@ impl Pki {
             ExtendedKeyUsagePurpose::ClientAuth,
         ];
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+        let cert = params.signed_by(&key, ca).unwrap();
         (cert.pem(), key.serialize_pem())
     }
 
-    fn sign_client(ca_cert: &rcgen::Certificate, ca_key: &KeyPair, name: &str) -> (String, String) {
+    fn sign_client(ca: &rcgen::Issuer<'_, KeyPair>, name: &str) -> (String, String) {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(vec![name.to_owned()]).unwrap();
         params
@@ -149,7 +144,7 @@ impl Pki {
             .push(rcgen::DnType::CommonName, name);
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+        let cert = params.signed_by(&key, ca).unwrap();
         (cert.pem(), key.serialize_pem())
     }
 
@@ -157,11 +152,10 @@ impl Pki {
     /// and a client identity.
     fn generate() -> Self {
         let pki = Self::new();
-        let (ca_cert, ca_key) = Self::generate_ca("test CA");
-        let (server_pem, server_key) =
-            Self::sign_server(&ca_cert, &ca_key, &["localhost", "127.0.0.1"]);
-        let (client_pem, client_key) = Self::sign_client(&ca_cert, &ca_key, "collector-a");
-        pki.write("ca.pem", &ca_cert.pem());
+        let ca = Self::generate_ca("test CA");
+        let (server_pem, server_key) = Self::sign_server(&ca, &["localhost", "127.0.0.1"]);
+        let (client_pem, client_key) = Self::sign_client(&ca, "collector-a");
+        pki.write("ca.pem", &ca.pem());
         pki.write("server.pem", &server_pem);
         pki.write("server.key", &server_key);
         pki.write("client.pem", &client_pem);
@@ -173,9 +167,9 @@ impl Pki {
     /// case. Its `ca.pem` must never appear in the server's `client_ca`.
     fn generate_rogue() -> Self {
         let pki = Self::new();
-        let (ca_cert, ca_key) = Self::generate_ca("rogue CA");
-        let (client_pem, client_key) = Self::sign_client(&ca_cert, &ca_key, "imposter");
-        pki.write("ca.pem", &ca_cert.pem());
+        let ca = Self::generate_ca("rogue CA");
+        let (client_pem, client_key) = Self::sign_client(&ca, "imposter");
+        pki.write("ca.pem", &ca.pem());
         pki.write("client.pem", &client_pem);
         pki.write("client.key", &client_key);
         pki
@@ -186,7 +180,7 @@ impl Pki {
     /// must still reject the identity on validity, not just on trust.
     fn generate_expired_server() -> Self {
         let pki = Self::new();
-        let (ca_cert, ca_key) = Self::generate_ca("expired-server CA");
+        let ca = Self::generate_ca("expired-server CA");
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params
@@ -197,8 +191,8 @@ impl Pki {
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.not_before = rcgen::date_time_ymd(2000, 1, 1);
         params.not_after = rcgen::date_time_ymd(2001, 1, 1);
-        let cert = params.signed_by(&key, &ca_cert, &ca_key).unwrap();
-        pki.write("ca.pem", &ca_cert.pem());
+        let cert = params.signed_by(&key, &ca).unwrap();
+        pki.write("ca.pem", &ca.pem());
         pki.write("server.pem", &cert.pem());
         pki.write("server.key", &key.serialize_pem());
         pki
@@ -208,9 +202,8 @@ impl Pki {
     /// years ago — the mTLS server must refuse it at the handshake.
     fn generate_expired_client() -> Self {
         let pki = Self::new();
-        let (ca_cert, ca_key) = Self::generate_ca("expired-client CA");
-        let (server_pem, server_key) =
-            Self::sign_server(&ca_cert, &ca_key, &["localhost", "127.0.0.1"]);
+        let ca = Self::generate_ca("expired-client CA");
+        let (server_pem, server_key) = Self::sign_server(&ca, &["localhost", "127.0.0.1"]);
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(vec!["old-client".to_owned()]).unwrap();
         params
@@ -220,8 +213,8 @@ impl Pki {
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.not_before = rcgen::date_time_ymd(2000, 1, 1);
         params.not_after = rcgen::date_time_ymd(2001, 1, 1);
-        let client_cert = params.signed_by(&key, &ca_cert, &ca_key).unwrap();
-        pki.write("ca.pem", &ca_cert.pem());
+        let client_cert = params.signed_by(&key, &ca).unwrap();
+        pki.write("ca.pem", &ca.pem());
         pki.write("server.pem", &server_pem);
         pki.write("server.key", &server_key);
         pki.write("client.pem", &client_cert.pem());
