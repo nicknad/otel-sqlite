@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use rand::TryRngCore;
+use rand::TryRng;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -597,7 +597,7 @@ fn read_key(path: &Path) -> Result<Zeroizing<Vec<u8>>, BackupError> {
 
 fn random_base_nonce() -> Result<[u8; NONCE_LEN], BackupError> {
     let mut nonce = [0u8; NONCE_LEN];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut nonce)
         .map_err(|error| BackupError::Io(io::Error::other(error.to_string())))?;
     Ok(nonce)
