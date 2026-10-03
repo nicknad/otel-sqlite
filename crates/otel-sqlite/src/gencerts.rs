@@ -83,9 +83,11 @@ pub fn run(args: &GenCertsArgs) -> Result<()> {
     } else {
         rcgen::KeyPair::generate().context("generate CA key")?
     };
-    let ca_cert = make_ca_params()?
+    let ca_params = make_ca_params()?;
+    let ca_cert = ca_params
         .self_signed(&ca_key)
         .context("self-sign CA certificate")?;
+    let ca_issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
     if reuse_ca {
         println!("reusing existing CA {}", ca_pem_path.display());
     } else {
@@ -117,7 +119,7 @@ pub fn run(args: &GenCertsArgs) -> Result<()> {
         ];
         server_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
         let server_cert = server_params
-            .signed_by(&server_key, &ca_cert, &ca_key)
+            .signed_by(&server_key, &ca_issuer)
             .context("sign server certificate")?;
         write_pem(&server_pem_path, &server_cert.pem())?;
         write_pem(&server_key_path, &server_key.serialize_pem())?;
@@ -133,7 +135,7 @@ pub fn run(args: &GenCertsArgs) -> Result<()> {
         params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
         params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
         let cert = params
-            .signed_by(&key, &ca_cert, &ca_key)
+            .signed_by(&key, &ca_issuer)
             .context("sign client certificate")?;
         write_pem(&args.out_dir.join(format!("{client}.pem")), &cert.pem())?;
         write_pem(
