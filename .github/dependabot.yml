@@ -1,0 +1,50 @@
+# Dependabot version updates.
+#
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates
+#
+# Policy:
+# * Cargo bumps go through the committed Cargo.lock (CI builds with
+#   `--locked`), grouped into one minor/patch PR per week; major bumps stay
+#   separate for individual review.
+# * Workflow actions are pinned by commit SHA (see .github/workflows/ci.yml);
+#   Dependabot keeps both the SHA and the trailing `# vN` comment in sync.
+# * Only the production Dockerfile at the repository root is tracked here;
+#   the test-only images under tests/docker are intentionally left alone.
+
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
