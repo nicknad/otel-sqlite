@@ -14,7 +14,7 @@
 # or [tls]); the default binds loopback only.
 # ------------------------------------------------------------
 
-FROM rust:1.98-bookworm AS builder
+FROM rust:1.99-bookworm AS builder
 WORKDIR /app
 
 # The workspace spans crates/ and tests/: both must exist for cargo to
