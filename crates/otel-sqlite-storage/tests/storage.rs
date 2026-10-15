@@ -683,6 +683,55 @@ fn mapping_fidelity_persists_canonical_structured_values() -> Result<(), Box<dyn
     Ok(())
 }
 
+/// A group that carries no `resource` must still keep its OTLP
+/// `ResourceLogs.schema_url`: the mapping forwards it through the batch
+/// origin, and the writer falls back to it when there is no resource.
+#[test]
+fn resource_less_group_keeps_its_schema_url() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("test.db");
+
+    let (sender, receiver) = unbounded();
+    let mut storage = Storage::open(
+        receiver,
+        StorageConfig {
+            sqlite_path: db_path.clone(),
+            ..StorageConfig::default()
+        },
+    )?;
+
+    sender.send(IngestMessage::Logs(LogChunk {
+        origin: BatchOrigin {
+            resource: None,
+            schema_url: "https://example.test/schemas/logs".to_owned(),
+        },
+        records: vec![LogRecord {
+            time_unix_nano: 1_000,
+            body: "no resource".to_owned(),
+            ..LogRecord::default()
+        }],
+        commit_seq: 0,
+    }))?;
+    sender.send(IngestMessage::Flush)?;
+    drop(sender);
+    storage.join()?;
+
+    let conn = Connection::open(&db_path)?;
+    let (service_name, schema_url): (String, Option<String>) = conn.query_row(
+        "SELECT service_name, schema_url FROM log_resource",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(service_name, "");
+    assert_eq!(
+        schema_url.as_deref(),
+        Some("https://example.test/schemas/logs"),
+        "a resource-less group's schema URL must not be silently dropped"
+    );
+
+    Ok(())
+}
+
 /// Poll until `predicate` holds or `budget` elapses. The pipeline commits
 /// asynchronously, so tests observe effects, not internal ordering.
 fn wait_for(predicate: impl Fn() -> bool, budget: Duration) -> bool {

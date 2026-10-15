@@ -163,6 +163,13 @@ pub(crate) fn run(
         // The writer is still draining and closes the ledger itself at exit.
         close_ledger.disarm();
     } else {
+        let abandoned = logs.buffered() as u64;
+        if abandoned > 0 {
+            stats
+                .dropped_records
+                .fetch_add(abandoned, Ordering::Relaxed);
+            ::metrics::counter!("insert_batcher_dropped_records_total").increment(abandoned);
+        }
         tracing::error!(
             dropped_records = stats.dropped_records.load(Ordering::Relaxed),
             "command queue closed while the insert batcher still held records"
@@ -619,6 +626,47 @@ mod tests {
             ledger.watermark().closed,
             "writer death must close the ledger so durable-ack waiters fail fast"
         );
+    }
+
+    #[test]
+    fn writer_death_counts_buffered_records_as_dropped() {
+        let (commands_tx, commands_rx) = crossbeam_channel::bounded(2);
+        let (input, receiver) = crossbeam_channel::unbounded();
+        let stats = Arc::new(BatcherStats::default());
+        let ledger = Arc::new(CommitLedger::new());
+        let thread_stats = Arc::clone(&stats);
+        let thread_ledger = Arc::clone(&ledger);
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+        let handle = std::thread::spawn(move || {
+            run(
+                receiver,
+                commands_tx,
+                &thread_ledger,
+                config(2, 60_000),
+                &thread_stats,
+                ready_tx,
+            );
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("batcher publishes readiness");
+        drop(commands_rx); // the writer is gone
+
+        // 5 records with capacity 2: two full batches are submitted (and
+        // fail), while one record never reaches a submission. That abandoned
+        // remainder must be counted too, not just the failed batches.
+        input.send(chunk("a", 5)).unwrap();
+        drop(input);
+        handle
+            .join()
+            .expect("batcher exits when the command queue closes");
+
+        assert_eq!(
+            stats.dropped_records.load(Ordering::Relaxed),
+            5,
+            "every record must be accounted as dropped, including buffered ones"
+        );
+        assert!(ledger.watermark().closed);
     }
 
     /// A panic in the batcher must close the ledger on unwind, so durable-ack

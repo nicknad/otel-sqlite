@@ -18,6 +18,7 @@ impl Resource {
     pub fn get(&self, key: &str) -> Option<&AttributeValue> {
         self.attributes
             .iter()
+            .rev()
             .find(|attribute| attribute.key == key)
             .map(|attribute| &attribute.value)
     }

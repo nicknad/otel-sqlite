@@ -65,6 +65,23 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_resource_keys_resolve_to_the_last_like_the_canonical_json() {
+        let resource = Resource::new(vec![
+            ("service.name", "first").into(),
+            ("service.name", "last").into(),
+            ("host.name", "node-a").into(),
+            ("host.name", "node-b").into(),
+        ]);
+
+        assert_eq!(resource.service_name(), "last");
+        assert_eq!(resource.host_name(), "node-b");
+
+        let mut json = String::new();
+        write_attributes_json_into(&resource.attributes, &mut Vec::new(), &mut json);
+        assert_eq!(json, r#"{"host.name":"node-b","service.name":"last"}"#);
+    }
+
+    #[test]
     fn record_trace_context_presence() {
         let mut record = LogRecord {
             time_unix_nano: 1_000,

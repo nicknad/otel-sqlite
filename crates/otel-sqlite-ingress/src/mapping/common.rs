@@ -166,23 +166,26 @@ pub(crate) fn attributes(values: Vec<KeyValue>) -> Result<Vec<Attribute>, Ingres
         .collect()
 }
 
-/// Non-allocating depth probe over a borrowed `AnyValue`: returns the deepest
-/// nesting level without building any model values. Implemented iteratively
-/// with an explicit stack so the probe itself cannot overflow on hostile input
-/// (the converting path above is only reached after the request-level
-/// validator has already rejected over-deep payloads).
+/// Non-allocating depth probe over a borrowed `AnyValue`: returns the depth of
+/// the deepest `ArrayValue`/`KvlistValue` container (leaves do not count, so a
+/// scalar root reports zero). This is exactly the quantity the converter
+/// bounds (`attribute_value_with_depth` rejects a container at `depth >=
+/// MAX_NESTING_DEPTH`), keeping validator and converter in agreement.
+/// Implemented iteratively with an explicit stack so the probe itself cannot
+/// overflow on hostile input.
 pub(crate) fn any_value_depth(value: &AnyValue) -> usize {
     let mut deepest = 0usize;
     let mut stack: Vec<(&AnyValue, usize)> = vec![(value, 0)];
     while let Some((current, depth)) = stack.pop() {
-        deepest = deepest.max(depth);
         match &current.value {
             Some(AnyValueKind::ArrayValue(array)) => {
+                deepest = deepest.max(depth);
                 for nested in &array.values {
                     stack.push((nested, depth + 1));
                 }
             }
             Some(AnyValueKind::KvlistValue(list)) => {
+                deepest = deepest.max(depth);
                 for entry in &list.values {
                     if let Some(nested) = entry.value.as_ref() {
                         stack.push((nested, depth + 1));
@@ -227,7 +230,7 @@ pub(crate) fn check_any_value(
     limits: &IngressConfig,
     what: &str,
 ) -> Result<(), IngressError> {
-    if any_value_depth(value) > MAX_NESTING_DEPTH {
+    if any_value_depth(value) >= MAX_NESTING_DEPTH {
         return Err(IngressError::Mapping(format!(
             "{what} exceeds maximum nesting depth of {MAX_NESTING_DEPTH}"
         )));

@@ -230,6 +230,7 @@ pub(crate) fn validate_request(
     limits: &IngressConfig,
 ) -> Result<(), IngressError> {
     for group in resource_logs {
+        check_plain_string(&group.schema_url, limits, "resource.schema_url")?;
         check_attributes(
             group
                 .resource
@@ -779,6 +780,50 @@ mod tests {
     }
 
     #[test]
+    fn validate_and_mapping_agree_on_the_nesting_boundary() {
+        let deep = |wrappers: usize| {
+            let mut value = AnyValue {
+                value: Some(Value::KvlistValue(KeyValueList::default())),
+            };
+            for _ in 0..wrappers {
+                value = AnyValue {
+                    value: Some(Value::ArrayValue(ArrayValue {
+                        values: vec![value],
+                    })),
+                };
+            }
+            ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![ProtoLogRecord {
+                        attributes: vec![KeyValue {
+                            key: "deep".to_owned(),
+                            value: Some(value),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        };
+
+        // 31 wrappers place the innermost container at depth 31: legal, and
+        // mapping must succeed once validation accepted the request.
+        let legal = deep(31);
+        validate_request(std::slice::from_ref(&legal), &IngressConfig::default())
+            .expect("a container at depth 31 is within the limit");
+        map_chunks(vec![legal]).expect("mapping agrees with validation");
+
+        // 32 wrappers place it at depth 32 — the first depth the converter
+        // rejects — so the validator must refuse it before mapping runs.
+        assert!(
+            validate_request(&[deep(32)], &IngressConfig::default()).is_err(),
+            "a container at exactly MAX_NESTING_DEPTH must be rejected"
+        );
+    }
+
+    #[test]
     fn validate_rejects_oversized_scope_schema_url() {
         let proto = ResourceLogs {
             scope_logs: vec![ScopeLogs {
@@ -798,6 +843,26 @@ mod tests {
         assert!(
             validate_request(&[proto], &limits).is_err(),
             "over-long scope.schema_url must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_oversized_resource_schema_url() {
+        let proto = ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![ProtoLogRecord::default()],
+                ..Default::default()
+            }],
+            schema_url: "s".repeat(4096),
+            ..Default::default()
+        };
+        let limits = IngressConfig {
+            max_attribute_value_bytes: 512,
+            ..IngressConfig::default()
+        };
+        assert!(
+            validate_request(&[proto], &limits).is_err(),
+            "over-long ResourceLogs.schema_url must be rejected"
         );
     }
 

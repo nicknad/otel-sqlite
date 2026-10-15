@@ -58,7 +58,10 @@ fn insert_logs_inner(
     let batch_resource = if let Some(resource) = &batch.origin.resource {
         resource
     } else {
-        default_resource = Resource::default();
+        default_resource = Resource {
+            schema_url: batch.origin.schema_url.clone(),
+            ..Resource::default()
+        };
         &default_resource
     };
     resolve_resource(conn, batch_resource, &mut scratch)?;
