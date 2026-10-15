@@ -9,7 +9,7 @@
 //! ```text
 //! generated  = accepted + rejected + ambiguous
 //! persisted  must equal the set of accepted sequences exactly
-//! rejected   = definitively not enqueued (partial_success / error status)
+//! rejected   = definitively not enqueued (server INVALID_ARGUMENT / UNAVAILABLE)
 //! ambiguous  = fate unknown at client side (timeout, transport failure);
 //!              tolerated as present-or-absent without failing the run
 //! ```

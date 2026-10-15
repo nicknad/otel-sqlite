@@ -252,7 +252,7 @@ spec:
 YAML
 kubectl -n otel-sqlite wait --for=condition=complete job/otel-sqlite-verify
 kubectl -n otel-sqlite logs job/otel-sqlite-verify
-#    Confirm: integrity=ok, foreign keys=0, schema=003, rows match the backup.
+#    Confirm: integrity=ok, foreign keys=0, schema=005, rows match the backup.
 
 # 4. Put the restored database in place. The StatefulSet is still scaled to
 #    0, so there is no server pod to `kubectl exec` into: a one-shot job

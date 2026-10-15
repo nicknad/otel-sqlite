@@ -39,8 +39,8 @@ impl LogsIngress {
         }
     }
 
-    /// Shares `limit` with other OTLP services so all exports draw from one
-    /// process-wide concurrency budget.
+    /// Sets the process-wide export concurrency budget: all OTLP exports draw
+    /// from this one shared limit, not the per-connection stream cap.
     pub fn with_stream_limit(mut self, limit: Arc<Semaphore>) -> Self {
         self.stream_limit = limit;
         self

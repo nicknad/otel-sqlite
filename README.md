@@ -39,9 +39,10 @@ OTLP values are preserved into SQLite with no silent conversion:
 - **Scope attributes and schema URLs** are persisted (denormalized onto
   `log_event`), and the group-level schema URL is recorded on the resource.
 
-Malformed trace/span ids — wrong length, or present-but-all-zeroes — are
-**rejected** with `INVALID_ARGUMENT` for the whole request (all-or-nothing),
-never silently zero-filled.
+Malformed trace/span ids — wrong length, or present-but-all-zeroes — map to
+**no trace context** and are counted under `otlp_mapping_loss_total`
+(`reason="invalid_trace_id"` / `"invalid_span_id"`); per the OTLP spec's
+`SHOULD`, the request is accepted, not rejected.
 
 ### Intentional, documented limitations
 
@@ -64,17 +65,15 @@ silently turned into an unrelated value:
 The pipeline follows a strict **single-writer** design:
 
 ```text
-OTLP/gRPC
-   │
-   ▼
-Ingress ────────────┐
-                    │  Command Queue  ────▶ SQLite Writer ────▶ SQLite
-Maintenance Worker ─┘  (bounded mpsc)
+OTLP/gRPC ──▶ Ingress ──▶ ingest queue ──▶ insert batcher ─┐
+                                                           ├─▶ command queue ──▶ SQLite Writer ──▶ SQLite
+Maintenance Worker ────────────────────────────────────────┘
 ```
 
 Exactly one component — the SQLite writer (`otel-sqlite-storage`) — owns and
-mutates the SQLite connection. Everything else, including the maintenance
-worker (`otel-sqlite-runtime`), is a **producer** of the same bounded command
+mutates the SQLite connection. The insert batcher (same crate) and the
+maintenance worker (`otel-sqlite-runtime`) are **producers** of the shared
+bounded command queue; ingress reaches the batcher through the bounded ingest
 queue.
 
 ### Maintenance worker
@@ -137,7 +136,7 @@ request's chunks before any of them are enqueued, and every other producer
 no two requests can interleave. If the queue cannot fit the whole request, the
 server returns `UNAVAILABLE` and _nothing_ is accepted — a retrying exporter
 resends a request that was never partially applied, so duplicate telemetry is
-impossible even though log-event and data-point rows have no idempotency key.
+impossible even though log-event rows have no idempotency key.
 Rejected requests issue no commit tickets and never stall later commits.
 
 ### Observability
@@ -153,8 +152,8 @@ Rejected requests issue no commit tickets and never stall later commits.
   interface without such a front; it carries no authentication of its own
   (`[tls]` applies only to the OTLP listener).
 - **gRPC health** (`grpc.health.v1.Check`/`Watch`) runs on the same port as
-  OTLP. The overall status (empty service name) plus both OTLP services track
-  pipeline evidence sampled every second: anything other than a running
+  OTLP. The overall status (empty service name) plus the OTLP logs service
+  track pipeline evidence sampled every second: anything other than a running
   writer _and_ batcher reports `NOT_SERVING`, and shutdown flips to
   `NOT_SERVING` before draining so load balancers stop routing.
 - **Startup readiness**: `Storage::open` blocks until the database is open and

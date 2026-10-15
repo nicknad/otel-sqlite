@@ -11,11 +11,9 @@
 //! second database worker:
 //!
 //! ```text
-//!                     ┌───────────────────┐
-//! OTLP ──▶ Ingress ──▶│                   │
-//!                     │   Command Queue   │────▶ SQLite Writer ──▶ SQLite
-//! Maintenance Worker ▶│  (bounded mpsc)   │
-//!                     └───────────────────┘
+//! OTLP ──▶ Ingress ──▶ ingest queue ──▶ insert batcher ─┐
+//!                                                       ├─▶ command queue ──▶ SQLite Writer ──▶ SQLite
+//! Maintenance Worker ───────────────────────────────────┘
 //! ```
 //!
 //! The worker owns **scheduling only**:
@@ -42,9 +40,10 @@
 //!    equivalent is passed to it; this is enforced by its API (`new` accepts a
 //!    command-queue sender, not a connection) and its tests run without a
 //!    database.
-//! 5. **One command queue.** Maintenance shares the ingestion queue. A
-//!    priority-aware queue may be introduced later if backlogs ever starve
-//!    critical maintenance; no second queue/writer is created preemptively.
+//! 5. **One command queue.** Maintenance shares the command queue with the
+//!    insert batcher. A priority-aware queue may be introduced later if
+//!    backlogs ever starve critical maintenance; no second queue/writer is
+//!    created preemptively.
 //! 6. **The scheduler is not a writer.** The worker schedules work; the
 //!    writer performs work.
 //!

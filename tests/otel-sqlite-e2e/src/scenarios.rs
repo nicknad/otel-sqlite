@@ -120,7 +120,7 @@ pub fn sustained(overrides: &Overrides) -> Vec<StepParams> {
 }
 
 /// Scenario F - intentionally overloaded closed-loop run exercising the
-/// documented backpressure policy (`partial_success` rejections, queue-full
+/// documented backpressure policy (`UNAVAILABLE` rejections, queue-full
 /// events, bounded queues).
 pub fn backpressure(overrides: &Overrides) -> Vec<StepParams> {
     vec![StepParams {

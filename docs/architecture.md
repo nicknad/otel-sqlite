@@ -54,7 +54,8 @@ These properties must be preserved by all future work:
 - All-or-nothing request admission: no partial success is ever emitted, so a
   retried request is guaranteed clean.
 - OTLP values are preserved with no silent conversion; malformed identity
-  fields reject the whole request.
+  fields map to no trace context and are counted as mapping losses, not
+  request failures.
 
 ## 3. Internal design decisions
 
@@ -106,7 +107,8 @@ binding failures → Poison; everything else → Fatal by design (unknown shapes
 may be defects in our own SQL — fail loud rather than silently drop user data).
 
 - Retryable transactions re-attempt up to 4× with exponential backoff
-  (250 ms → 4 s), counted in `storage_transient_retries_total`.
+  (250 ms doubling per attempt, to 2 s), counted in
+  `storage_transient_retries_total`.
 - The salvage pass re-runs a poisoned batch in tolerant mode: healthy rows
   commit, offending rows are dropped-and-counted
   (`storage_quarantined_records_total`). All durability tickets complete either
@@ -150,5 +152,5 @@ runtime, one task per OTLP request) is the only genuinely parallel stage today.
 Instrumentation-scope metadata follows that principle: one `LogScope` is
 rendered per `ScopeLogs` group at mapping and shared by reference, so the
 writer binds precomputed bytes instead of re-serializing per row.
-The open performance backlog (PERF-006/007/009) and its measurement methodology
+The open performance backlog (PERF-006/007) and its measurement methodology
 are detailed in [`docs/performance.md`](performance.md).

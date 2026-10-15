@@ -1,6 +1,6 @@
 //! Storage-owned insert batcher driver.
 //!
-//! This thread owns the [`InsertBatcher`] instances for every signal and sits
+//! This thread owns the [`InsertBatcher`] instances (one per origin) and sits
 //! between ingress and the SQLite writer:
 //!
 //! ```text
@@ -20,8 +20,8 @@
 //!
 //! Submission uses a blocking send onto the bounded command queue so a slow
 //! SQLite writer propagates backpressure through this thread into the input
-//! channel (and finally to OTLP clients as `partial_success`), instead of ever
-//! dropping completed batches.
+//! channel (and finally to OTLP clients as a retryable `UNAVAILABLE`), instead
+//! of ever dropping completed batches.
 //!
 //! The per-origin accumulation state itself lives in `crate::origin_buffers`.
 

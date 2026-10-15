@@ -245,7 +245,7 @@ pub(crate) struct QuotaReport {
 }
 
 /// Maximum eviction rounds per enforcement call. Each round deletes one
-/// bounded batch per signal plus orphan dimensions; the cap bounds how long
+/// bounded batch of log events plus orphan dimensions; the cap bounds how long
 /// one insert batch can stall behind quota enforcement.
 const MAX_QUOTA_ROUNDS: usize = 8;
 

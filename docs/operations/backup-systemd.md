@@ -146,7 +146,7 @@ sudo -u otel-sqlite otel-sqlite restore \
 
 # 3. Verify the restored database before trusting it.
 otel-sqlite verify --db /data/restored/otel-logs.db
-#    Confirm: integrity=ok, foreign keys=0, schema=003 (current), rows match
+#    Confirm: integrity=ok, foreign keys=0, schema=005 (current), rows match
 #    the values printed by the matching `backup` run.
 
 # 4. Move it into place and start the server.

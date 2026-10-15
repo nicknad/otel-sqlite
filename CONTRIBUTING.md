@@ -27,7 +27,7 @@ Setup is one command per clone:
 
 ```sh
 lefthook install   # install lefthook itself via winget/scoop/brew/pipx/go
-uv tool install semgrep==1.175.0
+uv tool install semgrep==1.176.0
 ```
 
 Semgrep can be installed natively with `uv` on supported platforms. If it is
@@ -74,7 +74,7 @@ Rules live in `.semgrep.yml`; generated code and build artifacts are excluded
 via `.semgrepignore`. Justified findings are suppressed inline with
 `// nosemgrep: <rule-id>` plus a reason.
 
-Install the local CLI with `uv tool install semgrep==1.175.0`, then run
+Install the local CLI with `uv tool install semgrep==1.176.0`, then run
 `semgrep scan --config .semgrep.yml`. WSL or Docker remain alternatives:
 `docker run --rm -v "${PWD}:/src" semgrep/semgrep semgrep --config .semgrep.yml /src`.
 You can also push and let CI run it (`.github/workflows/ci.yml` on GitHub

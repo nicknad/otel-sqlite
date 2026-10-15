@@ -174,7 +174,8 @@ Each step reports:
   `storage_queue_depth`, `storage_commands_total{kind}`,
   `storage_records_written_total`, `storage_transaction_batch_size`,
   `storage_transaction_duration`, `storage_errors_total`,
-  `storage_dropped_records_total`.
+  `storage_quarantined_records_total`,
+  `insert_batcher_dropped_records_total`.
 * **Storage deltas** – writer/batcher counters before→after each step.
 * **Size trajectory** – sampled DB/WAL sizes during the window (growth,
   WAL pressure).

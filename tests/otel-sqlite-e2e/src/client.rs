@@ -2,14 +2,16 @@
 //!
 //! Latency measured here is **request latency**: the gRPC round-trip from the
 //! client's perspective, including server-side decode/validate/map/enqueue.
-//! It is *not* persistence latency: an OK response means records were accepted
-//! into the bounded ingress queue (or partially rejected via OTLP
-//! `partial_success` backpressure), not durably committed to SQLite.
+//! With the benchmark's `durability.mode = "commit"`, an OK response means the
+//! records are committed to SQLite (under `"enqueue"` it would only mean
+//! accepted into the bounded ingress queue).
 //!
 //! Outcome classification for correctness validation:
 //!
-//! * `AllAccepted` / `PartiallyRejected` - authoritative counts reported by
-//!   the server.
+//! * `AllAccepted`                       - server acknowledged every record.
+//! * `PartiallyRejected`                 - server reported partial rejections
+//!   through OTLP `partial_success`; handled defensively because the server's
+//!   all-or-nothing admission never emits it.
 //! * `Rejected`                          - the server answered definitively
 //!   with a status that carries no error source: `InvalidArgument`
 //!   (malformed request data) or server-generated `Unavailable` (ingress
@@ -60,7 +62,8 @@ impl SequenceAllocator {
 pub enum OutcomeKind {
     /// Server acknowledged every record without rejections.
     AllAccepted,
-    /// Server reported rejections through OTLP `partial_success`.
+    /// Server reported rejections through OTLP `partial_success` (defensive:
+    /// the all-or-nothing server never emits it).
     PartiallyRejected { accepted: u64, rejected: u64 },
     /// Definitively not enqueued: server `InvalidArgument` or server-generated
     /// `Unavailable` (admission-gate backpressure, queue closed).
