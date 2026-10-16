@@ -176,15 +176,20 @@ impl IngestSender {
     /// [`SendFailure::Disconnected`] when the storage side is gone.
     pub fn send(&self, mut message: IngestMessage) -> Result<(), SendFailure> {
         loop {
-            let _gate = self
-                .admission
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            match self.inner.try_send(message) {
-                Ok(()) => return Ok(()),
-                Err(crossbeam_channel::TrySendError::Full(back)) => message = back,
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                    return Err(SendFailure::Disconnected);
+            // Scope the gate to the try_send alone: the pause below runs with
+            // the gate released, so a retrying control send never blocks a
+            // concurrent `reserve`.
+            {
+                let _gate = self
+                    .admission
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                match self.inner.try_send(message) {
+                    Ok(()) => return Ok(()),
+                    Err(crossbeam_channel::TrySendError::Full(back)) => message = back,
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        return Err(SendFailure::Disconnected);
+                    }
                 }
             }
             std::thread::sleep(CONTROL_RETRY_PAUSE);
@@ -206,15 +211,19 @@ impl IngestSender {
     ) -> Result<(), SendTimeoutFailure> {
         let deadline = Instant::now() + timeout;
         loop {
-            let _gate = self
-                .admission
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            match self.inner.try_send(message) {
-                Ok(()) => return Ok(()),
-                Err(crossbeam_channel::TrySendError::Full(back)) => message = back,
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                    return Err(SendTimeoutFailure::Disconnected);
+            // Scope the gate to the try_send alone so the retry pause and the
+            // deadline check run without holding it (see `send`).
+            {
+                let _gate = self
+                    .admission
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                match self.inner.try_send(message) {
+                    Ok(()) => return Ok(()),
+                    Err(crossbeam_channel::TrySendError::Full(back)) => message = back,
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        return Err(SendTimeoutFailure::Disconnected);
+                    }
                 }
             }
             if Instant::now() >= deadline {

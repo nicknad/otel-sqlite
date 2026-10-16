@@ -77,6 +77,14 @@ impl IngestMessage {
             Self::Flush => None,
         }
     }
+
+    /// Number of records the message carries (zero for the `Flush` barrier).
+    pub fn record_count(&self) -> usize {
+        match self {
+            Self::Logs(chunk) => chunk.records.len(),
+            Self::Flush => 0,
+        }
+    }
 }
 
 /// A storage-ready batch of log records with its origin.
@@ -230,5 +238,16 @@ mod tests {
         let mut flush = IngestMessage::Flush;
         flush.set_commit_seq(11);
         assert_eq!(flush.commit_seq(), None);
+    }
+
+    #[test]
+    fn record_count_matches_payload_records_only() {
+        let logs = IngestMessage::Logs(LogChunk {
+            origin: BatchOrigin::default(),
+            records: vec![LogRecord::default(), LogRecord::default()],
+            commit_seq: 0,
+        });
+        assert_eq!(logs.record_count(), 2);
+        assert_eq!(IngestMessage::Flush.record_count(), 0);
     }
 }

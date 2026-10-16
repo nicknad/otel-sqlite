@@ -83,11 +83,12 @@ impl LogsIngress {
     ) -> Result<ExportLogsServiceResponse, Status> {
         // Process-wide export concurrency: the transport's per-connection
         // stream cap is not enough to bound in-flight memory across
-        // connections. Acquirable unless the semaphore is closed, which never
-        // happens here.
-        let _permit = self
-            .stream_limit
-            .acquire()
+        // connections. An *owned* permit is used so it can follow the request
+        // into the detached enqueue task below, keeping the bound even if the
+        // handler future is cancelled mid-enqueue. Acquirable unless the
+        // semaphore is closed, which never happens here.
+        let permit = Arc::clone(&self.stream_limit)
+            .acquire_owned()
             .await
             .map_err(|_| Status::internal("log stream limiter is closed"))?;
 
@@ -125,13 +126,28 @@ impl LogsIngress {
         .map_err(|error| Status::internal(format!("log mapping task failed: {error}")))?
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
 
+        // Enqueue runs on the blocking pool, not the async worker: it acquires
+        // the process-wide admission gate and can briefly wait on it under
+        // contention, so keeping it off the tokio workers stops one busy export
+        // from stalling unrelated RPCs. It is deliberately not wrapped in the
+        // mapping timeout — cancelling `spawn_blocking` is impossible, and a
+        // timed-out enqueue that then completed would break all-or-nothing.
+        // The owned concurrency permit moves into the task so the export bound
+        // holds for the whole enqueue even if this future is dropped.
         let outcome = {
-            let _span = tracing::info_span!("enqueue").entered();
-            // A request mapping to more chunks than the queue can ever hold
-            // is permanent: answer INVALID_ARGUMENT (via the mapping error)
-            // instead of a retryable UNAVAILABLE.
-            enqueue(&self.queue, &self.commit, work)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?
+            let queue = self.queue.clone();
+            let ledger = Arc::clone(&self.commit);
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let _span = tracing::info_span!("enqueue").entered();
+                // A request mapping to more chunks than the queue can ever
+                // hold is permanent: answer INVALID_ARGUMENT (via the mapping
+                // error) instead of a retryable UNAVAILABLE.
+                enqueue(&queue, &ledger, work)
+            })
+            .await
+            .map_err(|error| Status::internal(format!("enqueue task failed: {error}")))?
+            .map_err(|error| Status::invalid_argument(error.to_string()))?
         };
 
         // All-or-nothing admission: a request is either fully accepted or

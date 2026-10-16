@@ -53,10 +53,13 @@ pub(crate) struct EnqueueOutcome {
 pub(crate) fn enqueue(
     queue: &IngestSender,
     ledger: &CommitLedger,
-    work: Vec<(u64, IngestMessage)>,
+    work: Vec<IngestMessage>,
 ) -> Result<EnqueueOutcome, IngressError> {
     let mut outcome = EnqueueOutcome::default();
-    let total_records: u64 = work.iter().map(|(records, _)| *records).sum();
+    let total_records: u64 = work
+        .iter()
+        .map(|message| message.record_count() as u64)
+        .sum();
 
     // A request with more chunks than the queue can hold is permanently
     // unadmittable (an empty queue still has `capacity` slots), so a retry
@@ -80,26 +83,41 @@ pub(crate) fn enqueue(
         return Ok(outcome);
     };
 
-    for (records, mut message) in work {
-        ::metrics::histogram!("ingress_batch_size", "signal" => "logs").record(records as f64);
-
+    // Record metrics only after the gate is dropped: the admission hold must
+    // cover just the check-then-send sequence, never the metric recorder
+    // calls, which would otherwise extend the hold for every concurrent
+    // export. The queue-depth gauge keeps its per-chunk peak semantics by
+    // sampling `queue.len()` in the loop and publishing once below.
+    let mut samples: Vec<(u64, f64)> = Vec::with_capacity(work.len());
+    let mut peak_depth = 0usize;
+    for mut message in work {
+        let records = message.record_count() as u64;
         let started = Instant::now();
         let ticket = ledger.issue();
         message.set_commit_seq(ticket);
         // The admission gate is held, so no other producer can consume a
         // reserved slot; the consumer can only drain. This send therefore
         // succeeds unless the storage side disconnected.
+        let mut stop = false;
         match guard.try_send(message) {
             Ok(()) => {
                 outcome.accepted += records;
                 outcome.last_ticket = Some(ticket);
             }
             Err(SendFailure::Full) => {
-                // Unreachable while holding the gate (reserve checked the whole
-                // request's worth of slots); kept as a defensive void so a
-                // stray failure can never stall the watermark.
+                // Unreachable while holding the gate: `reserve` verified room
+                // for every chunk and no producer can interleave. If it ever
+                // fires the admission invariant is already broken and the
+                // chunks already sent cannot be recalled, so fail loudly in
+                // debug and stop accepting more; the request still leaves as
+                // rejected (`rejected > 0`) rather than half-admitted.
+                debug_assert!(
+                    false,
+                    "admission reserved a slot for every chunk, yet try_send reported Full"
+                );
                 ledger.void(ticket);
-                outcome.rejected += records;
+                outcome.rejected = total_records.saturating_sub(outcome.accepted);
+                stop = true;
             }
             Err(SendFailure::Disconnected) => {
                 // The storage side is gone mid-request: this ticket was issued
@@ -109,17 +127,23 @@ pub(crate) fn enqueue(
                 ledger.void(ticket);
                 outcome.rejected = total_records.saturating_sub(outcome.accepted);
                 outcome.disconnected = true;
+                stop = true;
             }
         }
-
-        ::metrics::gauge!("ingress_queue_depth", "signal" => "logs").set(queue.len() as f64);
-        ::metrics::histogram!("ingress_enqueue_duration", "signal" => "logs")
-            .record(started.elapsed().as_secs_f64());
-
-        if outcome.disconnected {
+        samples.push((records, started.elapsed().as_secs_f64()));
+        peak_depth = peak_depth.max(queue.len());
+        if stop {
             break;
         }
     }
+
+    drop(guard);
+
+    for (records, elapsed) in samples {
+        ::metrics::histogram!("ingress_batch_size", "signal" => "logs").record(records as f64);
+        ::metrics::histogram!("ingress_enqueue_duration", "signal" => "logs").record(elapsed);
+    }
+    ::metrics::gauge!("ingress_queue_depth", "signal" => "logs").set(peak_depth as f64);
 
     Ok(outcome)
 }
@@ -132,15 +156,12 @@ mod tests {
     use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, LogChunk};
     use std::sync::Arc;
 
-    fn log_chunk(records: usize) -> (u64, IngestMessage) {
-        (
-            records as u64,
-            IngestMessage::Logs(LogChunk {
-                origin: BatchOrigin::default(),
-                records: (0..records).map(|_| LogRecord::default()).collect(),
-                commit_seq: 0,
-            }),
-        )
+    fn log_chunk(records: usize) -> IngestMessage {
+        IngestMessage::Logs(LogChunk {
+            origin: BatchOrigin::default(),
+            records: (0..records).map(|_| LogRecord::default()).collect(),
+            commit_seq: 0,
+        })
     }
 
     #[test]

@@ -34,10 +34,9 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogChunk, IngressError> 
     let capacity: usize = scope_logs.iter().map(|scope| scope.log_records.len()).sum();
     let mut records = Vec::with_capacity(capacity);
 
-    let mut resource = resource.map(convert_resource).transpose()?;
-    if let Some(resource) = &mut resource {
-        resource.schema_url.clone_from(&schema_url);
-    }
+    let resource = resource
+        .map(|resource| convert_resource(resource, schema_url.clone()))
+        .transpose()?;
 
     for scope in scope_logs {
         let ScopeLogs {
@@ -104,15 +103,14 @@ pub(crate) fn count(resource_logs: &[ResourceLogs]) -> usize {
 /// a request failure.
 pub(crate) fn map_chunks(
     resource_logs: Vec<ResourceLogs>,
-) -> Result<Vec<(u64, IngestMessage)>, IngressError> {
+) -> Result<Vec<IngestMessage>, IngressError> {
     let mut chunks = Vec::with_capacity(resource_logs.len());
     for item in resource_logs {
         let chunk = try_convert_batch(item)?;
         if chunk.records.is_empty() {
             continue;
         }
-        let count = chunk.records.len() as u64;
-        chunks.push((count, IngestMessage::Logs(chunk)));
+        chunks.push(IngestMessage::Logs(chunk));
     }
     Ok(chunks)
 }
@@ -221,8 +219,9 @@ fn body_value(value: Option<super::AnyValue>) -> Result<(String, Option<String>)
 /// the blocking mapping task runs.
 ///
 /// Checked per `IngressConfig` limits: attribute-vector lengths, key/value
-/// byte lengths, scalar body bytes, and `AnyValue` nesting depth (via the
-/// non-recursive `any_value_depth` probe, so the check itself cannot overflow).
+/// byte lengths, scalar body bytes, and `AnyValue` nesting depth (folded into
+/// the same non-recursive walk as the leaf-size checks, so a nested container
+/// cannot overflow the worker stack).
 /// Trace/span id *validity* stays in `try_convert_batch`; this only bounds
 /// allocation/CPU.
 pub(crate) fn validate_request(
@@ -502,7 +501,7 @@ mod tests {
                 ..Default::default()
             };
             let chunks = map_chunks(vec![proto]).expect("an invalid id must not fail the request");
-            let IngestMessage::Logs(chunk) = &chunks[0].1 else {
+            let IngestMessage::Logs(chunk) = &chunks[0] else {
                 panic!("expected logs chunk");
             };
             (chunk.records[0].trace_id, chunk.records[0].span_id)
@@ -596,14 +595,13 @@ mod tests {
         // One chunk per OTLP group, in order; grouping/splitting is the
         // storage insert batcher's job, not ingress's.
         assert_eq!(chunks.len(), 3);
-        for (records, command) in &chunks {
-            assert_eq!(*records, 1);
+        for command in &chunks {
             match command {
                 IngestMessage::Logs(chunk) => assert_eq!(chunk.records.len(), 1),
                 IngestMessage::Flush => panic!("expected insert logs chunk"),
             }
         }
-        let IngestMessage::Logs(first) = &chunks[0].1 else {
+        let IngestMessage::Logs(first) = &chunks[0] else {
             panic!("expected logs chunk");
         };
         assert!(first.origin.resource.is_some());
@@ -619,9 +617,7 @@ mod tests {
 
         let chunks = map_chunks(vec![oversized]).expect("valid request");
         assert_eq!(chunks.len(), 1);
-        let (records, command) = &chunks[0];
-        assert_eq!(*records, 5);
-        match command {
+        match &chunks[0] {
             IngestMessage::Logs(chunk) => assert_eq!(chunk.records.len(), 5),
             IngestMessage::Flush => panic!("expected insert logs chunk"),
         }

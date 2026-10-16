@@ -9,7 +9,8 @@
 //!   old line later". No restart, no synchronized cutover.
 //! * **Hot reload**: the file is re-read when older than a small cache
 //!   interval; rotation takes effect within seconds without touching the
-//!   process.
+//!   process. In production a background thread performs the re-read, so the
+//!   request path never touches the filesystem.
 //! * **No plaintext retention**: lines are hashed (SHA-256) at load time and
 //!   only digests are compared — constant-time, so request timing does not
 //!   leak how much of a presented token matched. The raw file bytes are read
@@ -71,6 +72,11 @@ pub struct TokenFileVault {
     /// up more file reads. Released by an RAII guard so a panicking reload
     /// cannot wedge the vault into never reloading again.
     reloading: AtomicBool,
+    /// Set once a background reloader owns file I/O. `verify` then always
+    /// serves the cached snapshot on its slow path instead of reading the
+    /// file, so a slow — or hung — filesystem can never block the gRPC
+    /// request path.
+    background_reload: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -97,6 +103,7 @@ impl TokenFileVault {
             max_stale_age: MAX_STALE_TOKEN_AGE,
             cached: RwLock::new(CachedTokens::default()),
             reloading: AtomicBool::new(false),
+            background_reload: AtomicBool::new(false),
         };
         warn_if_token_file_over_permissive(&vault.path);
         let hashes = read_token_hashes(&vault.path)?;
@@ -157,23 +164,36 @@ impl TokenFileVault {
             }
         }
 
-        // Slow path: reload is due. Claim single-flight first so at most one
-        // thread reads the file per stale window; a loser checks the current
-        // set instead of queueing behind another read.
+        // File I/O is owned by a background reloader when one is running:
+        // serve the current snapshot and let it refresh out of band, so a slow
+        // (or hung) filesystem can never block a request thread.
+        if self.background_reload.load(Ordering::Acquire) {
+            let cached = self.read_cached();
+            return cached.hashes.iter().any(|known| ct_eq(known, &digest));
+        }
+
+        // No background reloader (tests and non-wired uses): reload inline.
+        self.refresh().iter().any(|known| ct_eq(known, &digest))
+    }
+
+    /// Reloads the token set if a reload is due, returning the resulting
+    /// snapshot. Single-flight: at most one caller reads the file per stale
+    /// window; the rest keep using the current set.
+    ///
+    /// The blocking file I/O runs *outside* any lock so concurrent exports
+    /// keep verifying against the old set on their read locks instead of
+    /// serializing behind us. The raw bytes are zeroized on drop; only
+    /// digests escape it.
+    fn refresh(&self) -> Vec<[u8; 32]> {
         if self
             .reloading
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            let cached = self.read_cached();
-            return cached.hashes.iter().any(|known| ct_eq(known, &digest));
+            return self.read_cached().hashes.clone();
         }
         let _claim = ReloadClaim(&self.reloading);
 
-        // The blocking file I/O runs *outside* any lock so concurrent exports
-        // keep verifying against the old set on their read locks instead of
-        // serializing behind us. The raw bytes are zeroized on drop; only
-        // digests escape it.
         let file_result = match read_token_file(&self.path) {
             Ok(parsed) => ReloadOutcome::Loaded(parsed),
             Err(LoadError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -297,10 +317,43 @@ impl TokenFileVault {
             ),
         }
 
-        hashes.iter().any(|known| ct_eq(known, &digest))
+        hashes
     }
 
-    /// Number of valid tokens currently known; used by tests and startup logs.
+    /// Starts a background thread that re-reads the token file every
+    /// `reload_interval`, so the request path (`verify`) never performs file
+    /// I/O. The thread holds only a weak reference to the vault, so it exits
+    /// once the vault is dropped.
+    fn spawn_background_reloader(self: &Arc<Self>) {
+        // Flip the flag first: `verify` only skips inline reloads once a
+        // reloader is actually responsible for the file.
+        if self.background_reload.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let interval = self.reload_interval;
+        let weak = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("token-reloader".to_owned())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(interval);
+                    // Upgrade only briefly: holding a strong reference across
+                    // the sleep would keep the vault alive after its owner
+                    // dropped it.
+                    let Some(vault) = weak.upgrade() else { break };
+                    if !vault.background_reload.load(Ordering::Acquire) {
+                        break;
+                    }
+                    vault.refresh();
+                }
+            });
+        if spawned.is_err() {
+            // No thread, no out-of-band I/O: fall back to inline reloads.
+            self.background_reload.store(false, Ordering::Release);
+        }
+    }
+
+    /// Number of valid tokens currently known; used by tests.
     #[cfg(test)]
     pub(crate) fn loaded_token_count(&self) -> usize {
         self.read_cached().hashes.len()
@@ -526,6 +579,11 @@ impl BearerInterceptor {
             .map(TokenFileVault::open)
             .transpose()?
             .map(Arc::new);
+        if let Some(vault) = &vault {
+            // Production wiring: reloads happen off the request path so a
+            // slow filesystem cannot stall a gRPC worker.
+            vault.spawn_background_reloader();
+        }
         Ok(Self { vault })
     }
 }
@@ -844,6 +902,54 @@ mod tests {
         // removal and revokes as usual.
         vault.reloading.store(false, Ordering::Release);
         assert!(intercept_bearer(&vault, request_with_token("keep-working")).is_err());
+    }
+
+    /// A running background reloader publishes rotations for the request path.
+    #[test]
+    fn background_reloader_publishes_rotations() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("tokens.txt");
+        write_tokens(&path, &["old-token"]);
+        let mut vault = Arc::new(TokenFileVault::open(&path).expect("open"));
+        Arc::get_mut(&mut vault)
+            .expect("sole owner before spawning")
+            .reload_interval = Duration::from_millis(20);
+        vault.spawn_background_reloader();
+
+        assert!(intercept_bearer(&vault, request_with_token("old-token")).is_ok());
+        write_tokens(&path, &["new-token"]);
+
+        // Only the background thread can pick this up: `verify` serves the
+        // snapshot once a reloader owns I/O.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while intercept_bearer(&vault, request_with_token("new-token")).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "background reloader did not publish the rotated token"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// With a reloader active, `verify` serves the cached snapshot and never
+    /// reads the file — pinned deterministically (no background thread: the
+    /// flag alone selects the snapshot path).
+    #[test]
+    fn background_verify_serves_the_cache_without_reading_the_file() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("tokens.txt");
+        write_tokens(&path, &["keep-working"]);
+        let mut vault = TokenFileVault::open(&path).expect("open");
+        vault.reload_interval = Duration::ZERO;
+        vault.background_reload.store(true, Ordering::Release);
+
+        // An inline reload would observe the removal and revoke; the
+        // snapshot path must keep serving the last known set.
+        fs::remove_file(&path).expect("remove");
+        assert!(
+            intercept_bearer(&vault, request_with_token("keep-working")).is_ok(),
+            "verify must serve the cached set, not read the removed file"
+        );
     }
 
     #[cfg(unix)]
