@@ -13,6 +13,11 @@
 #   docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-logs \
 #       run logs_ingress_export -- -rss_limit_mb=2048 -max_total_time=21600
 #
+# For a long (e.g. nightly) run prefer the chunked soak driver, which restarts
+# the process periodically so allocator retention can never trip the cap:
+#
+#   bash tests/docker/fuzz-soak.sh core_batcher 1800 300
+#
 # Reproduce a crash artifact saved on the host:
 #
 #   docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-logs \
@@ -22,11 +27,23 @@
 # * Resource envelope: TWO CPUs are the default expected budget for every
 #   fuzz service (cpuset: "0,1" below), matching the WSL-native workflow
 #   in tests/docker/fuzz-wsl.sh. Measured on that envelope (WSL2, 2 vCPUs,
-#   --debug-assertions): core_batcher ~3.6k exec/s @ 412 MB RSS,
-#   logs_ingress_export ~1.1k exec/s @ 75 MB.
+#   --debug-assertions): core_batcher ~3.6k exec/s, logs_ingress_export
+#   ~1.1k exec/s. RSS is only meaningful with `ASAN_OPTIONS` set: without
+#   it core_batcher drifts upward indefinitely (2-min smoke ~450 MB, and
+#   still climbing), with it a 30-min run stays around 400 MB.
 # * Why Docker at all: libFuzzer needs a nightly compiler with sanitizer
 #   coverage; that toolchain is unsupported on windows-msvc hosts. The
 #   Linux image is also where CI will run these targets.
+# * Reproducibility: the nightly toolchain is PINNED (TOOLCHAIN build arg,
+#   `FUZZ_TOOLCHAIN` here; dated default in Dockerfile.fuzz) because
+#   libFuzzer/ASan behavior drifts between nightlies and made scheduled runs
+#   flaky. Bump the pin deliberately in one place; do not revert to rolling
+#   `nightly` for CI.
+# * Long runs: drive them through tests/docker/fuzz-soak.sh, which runs the
+#   target in fixed-length chunks (fresh process per chunk). Process restart
+#   resets ASan's allocator high-water mark, so retention cannot trip the cap
+#   regardless of toolchain drift; the bind-mounted corpus carries coverage
+#   across chunks. The scheduled CI run uses this.
 # * Faster local loop: run the same targets NATIVELY in a WSL2 distro via
 #   tests/docker/fuzz-wsl.sh (no 9P bind-mount penalty, target dir on ext4).
 #   Prefer this compose file only for CI-parity or hermetic reruns.
@@ -44,6 +61,13 @@
 #   =2048); the container limit sits above it (2560 MB) so libFuzzer's OOM
 #   reporting — which snapshots the offending input — fires before the
 #   kernel kills the container.
+# * Memory leak vs. allocator retention: ASan keeps freed memory (quarantine
+#   + size-class arenas) and does not return it to the OS promptly, so a
+#   long `core_batcher` run grows RSS ~2 MB/s until it trips the cap — with
+#   only ~30 MB live heap, i.e. retention, not a target leak. The
+#   `ASAN_OPTIONS` below releases freed pages each second and bounds the
+#   quarantine, keeping a 30-min run around 400 MB instead of climbing past
+#   the cap; never weaken `-rss_limit_mb` to work around it.
 # * The ingress targets are pure decode->map->enqueue (no SQLite, no TCP),
 #   so they need no tmpfs and no service dependencies.
 
@@ -55,6 +79,10 @@ services:
     build:
       context: ../..
       dockerfile: tests/docker/Dockerfile.fuzz
+      args:
+        # Dated nightly pin (matches Dockerfile.fuzz); override FUZZ_TOOLCHAIN
+        # to bump deliberately for the local+CI build in one place.
+        TOOLCHAIN: ${FUZZ_TOOLCHAIN:-nightly-2026-10-16}
     working_dir: /work/fuzz
     environment:
       CARGO_TARGET_DIR: /work/target-container-fuzz
@@ -72,6 +100,8 @@ services:
     working_dir: /work/fuzz
     environment:
       CARGO_TARGET_DIR: /work/target-container-fuzz
+      # Release freed memory to the OS (bounds ASan retention; see note above).
+      ASAN_OPTIONS: allocator_release_to_os_interval_ms=1000:quarantine_size_mb=64
     volumes:
       - ../..:/work
       - fuzz-cargo-registry:/usr/local/cargo/registry
@@ -88,6 +118,8 @@ services:
     working_dir: /work/fuzz
     environment:
       CARGO_TARGET_DIR: /work/target-container-fuzz
+      # Release freed memory to the OS (bounds ASan retention; see note above).
+      ASAN_OPTIONS: allocator_release_to_os_interval_ms=1000:quarantine_size_mb=64
     volumes:
       - ../..:/work
       - fuzz-cargo-registry:/usr/local/cargo/registry

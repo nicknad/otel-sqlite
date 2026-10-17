@@ -12,15 +12,17 @@
 # (same workflow as compose.criterion.yml), so code edits take effect
 # without an image rebuild. Only toolchain changes need `docker build`.
 #
-# TOOLCHAIN is an ARG so a reproducible pin (e.g.
-# nightly-2026-07-01) can be baked for CI baselines; the default
-# tracks rolling nightly because cargo-fuzz regularly needs fresh
-# nightly features.
+# TOOLCHAIN is a dated nightly pin: libFuzzer/ASan behavior drifts between
+# nightlies (a rolling nightly turned the scheduled fuzz run red on
+# 2026-10-15 with no code change), which made pass/fail non-reproducible.
+# Bump this deliberately — and keep the `FUZZ_TOOLCHAIN` default in
+# tests/docker/compose.fuzz.yml in sync — when cargo-fuzz needs newer
+# nightly features. Override at build time with `--build-arg TOOLCHAIN=...`.
 # ------------------------------------------------------------
 
 FROM rust:1.89-bookworm
 
-ARG TOOLCHAIN=nightly
+ARG TOOLCHAIN=nightly-2026-10-16
 # Pinned cargo-fuzz release (installed with --locked) so the image is
 # reproducible and cannot pick up an unreviewed upstream version.
 ARG CARGO_FUZZ_VERSION=0.13.2

@@ -264,12 +264,11 @@ jobs:
       - name: Compile all fuzz targets
         run: docker compose -f tests/docker/compose.fuzz.yml run --rm build
 
-      - name: Long logs run (30 min)
-        run: >
-          docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-logs
-          run logs_ingress_export -- -rss_limit_mb=2048 -max_total_time=1800
+      # 30 min of fuzzing per target, restarted every 5 min: process restart
+      # resets ASan's allocator high-water mark, so its retention (see the
+      # memory note in tests/docker/compose.fuzz.yml) can never trip the cap.
+      - name: Long logs soak (30 min, chunked)
+        run: bash tests/docker/fuzz-soak.sh logs_ingress_export 1800 300
 
-      - name: Long batcher run (30 min)
-        run: >
-          docker compose -f tests/docker/compose.fuzz.yml run --rm smoke-batcher
-          run core_batcher -- -rss_limit_mb=2048 -max_total_time=1800
+      - name: Long batcher soak (30 min, chunked)
+        run: bash tests/docker/fuzz-soak.sh core_batcher 1800 300

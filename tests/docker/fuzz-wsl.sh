@@ -18,7 +18,7 @@
 # * Resource envelope: TWO CPUs are the default expected budget for fuzzing
 #   (matches tests/docker/compose.fuzz.yml, which pins cpuset "0,1"). Verified
 #   on a 2-vCPU WSL2 VM with --debug-assertions:
-#     core_batcher           ~3.6k exec/s   rss ~412 MB
+#     core_batcher           ~3.6k exec/s   rss bounded (see ASAN_OPTIONS below)
 #     logs_ingress_export    ~1.1k exec/s   rss ~75 MB
 #   Reproduce that verification by putting `processors=2` under [wsl2] in
 #   %UserProfile%\.wslconfig, running `wsl --shutdown`, then the three
@@ -45,6 +45,10 @@ FUZZ_DIR="${REPO_ROOT}/fuzz"
 # Pinned cargo-fuzz release (matches tests/docker/Dockerfile.fuzz); override
 # with CARGO_FUZZ_VERSION when deliberately bumping the tool.
 CARGO_FUZZ_VERSION="${CARGO_FUZZ_VERSION:-0.13.2}"
+# Pinned nightly toolchain (matches the TOOLCHAIN default in Dockerfile.fuzz);
+# libFuzzer/ASan behavior drifts between nightlies, so keep this dated and
+# bump deliberately with FUZZ_NIGHTLY.
+FUZZ_NIGHTLY="${FUZZ_NIGHTLY:-nightly-2026-10-16}"
 
 if [[ -z "${WSL_DISTRO_NAME:-}" ]] && ! grep -qi microsoft /proc/version 2>/dev/null; then
     echo "error: this script targets a WSL2 distro (got: $(uname -a))" >&2
@@ -60,9 +64,17 @@ export CXXFLAGS="${CXXFLAGS:--std=c++17}"
 # wsl.exe starts non-login shells without ~/.cargo/bin on PATH; source the
 # rustup environment up front so tool detection reflects reality.
 [[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"
-# Scope sancov builds to nightly WITHOUT changing the distro-wide default
-# (re-running rustup-init would otherwise flip it back to stable).
-export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly}"
+# Scope sancov builds to the pinned nightly WITHOUT changing the
+# distro-wide default (re-running rustup-init would otherwise flip it back to
+# stable).
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-$FUZZ_NIGHTLY}"
+
+# ASan retains freed memory (quarantine + arenas) and does not hand it back
+# to the OS promptly, so a multi-minute run's RSS climbs ~2 MB/s until
+# libFuzzer's -rss_limit_mb trips — retention, not a target leak. Release
+# freed pages each second and bound the quarantine (matches
+# tests/docker/compose.fuzz.yml) so long runs stay well under the cap.
+export ASAN_OPTIONS="${ASAN_OPTIONS:-allocator_release_to_os_interval_ms=1000:quarantine_size_mb=64}"
 
 setup() {
     if ! command -v cargo >/dev/null 2>&1; then
@@ -73,9 +85,9 @@ setup() {
         . "$HOME/.cargo/env"
     fi
 
-    if ! rustup toolchain list 2>/dev/null | grep -q nightly; then
-        echo "==> installing nightly (sancov requires it) + llvm-tools"
-        rustup toolchain install nightly \
+    if ! rustup toolchain list 2>/dev/null | grep -q "${FUZZ_NIGHTLY}"; then
+        echo "==> installing ${FUZZ_NIGHTLY} (sancov requires a nightly) + llvm-tools"
+        rustup toolchain install "${FUZZ_NIGHTLY}" \
             --profile minimal \
             --component llvm-tools-preview
     fi
