@@ -72,6 +72,9 @@ impl Default for MaintenanceConfig {
 #[derive(Debug, Clone)]
 pub struct WatchdogConfig {
     /// How often the watchdog samples pipeline evidence.
+    ///
+    /// Values below 10 ms are raised to that floor by [`crate::Watchdog::new`]
+    /// so a misconfiguration cannot turn observation into a busy loop.
     pub tick_interval: Duration,
     /// Progress age (while pending work exists) at which the pipeline is
     /// reported degraded.

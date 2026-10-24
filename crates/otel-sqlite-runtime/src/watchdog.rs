@@ -221,6 +221,17 @@ fn queue_pressure_threshold(capacity: usize, ratio: f32) -> usize {
     threshold.max(1)
 }
 
+/// Floor for the sampling interval. A zero or sub-millisecond interval would
+/// make the watchdog loop continuously, taking the commit ledger's locks and
+/// emitting metrics on every iteration. The binary rejects zero, but
+/// [`WatchdogConfig`] is a public type and callers may still pass tiny values.
+const MIN_TICK_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Clamps the configured interval into a range that cannot spin.
+fn normalized_tick_interval(interval: Duration) -> Duration {
+    interval.max(MIN_TICK_INTERVAL)
+}
+
 #[derive(Debug, Error)]
 pub enum WatchdogError {
     #[error("watchdog thread panicked")]
@@ -242,9 +253,10 @@ pub struct Watchdog {
 impl Watchdog {
     pub fn new(
         source: impl HealthSampleSource,
-        config: WatchdogConfig,
+        mut config: WatchdogConfig,
         halt: watch::Sender<bool>,
     ) -> Self {
+        config.tick_interval = normalized_tick_interval(config.tick_interval);
         Self {
             source: Box::new(source),
             config,
@@ -707,5 +719,20 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert!(!handle.requested_halt());
         handle.stop().expect("clean stop");
+    }
+
+    /// A zero (or sub-millisecond) interval would turn the tick loop into a
+    /// busy loop that also hammers the commit ledger and metrics registry.
+    #[test]
+    fn tick_interval_is_floored_to_avoid_a_busy_loop() {
+        assert_eq!(normalized_tick_interval(Duration::ZERO), MIN_TICK_INTERVAL);
+        assert_eq!(
+            normalized_tick_interval(Duration::from_nanos(1)),
+            MIN_TICK_INTERVAL
+        );
+        assert_eq!(
+            normalized_tick_interval(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
     }
 }
