@@ -236,6 +236,8 @@ fn normalized_tick_interval(interval: Duration) -> Duration {
 pub enum WatchdogError {
     #[error("watchdog thread panicked")]
     Panicked,
+    #[error(transparent)]
+    InvalidConfig(#[from] crate::config::WatchdogConfigError),
 }
 
 /// Observer-only supervisor over the storage pipeline.
@@ -251,17 +253,23 @@ pub struct Watchdog {
 }
 
 impl Watchdog {
+    /// Validates the configuration and creates a watchdog.
+    ///
+    /// Returns [`WatchdogError::InvalidConfig`] for threshold orderings or
+    /// ranges that cannot produce meaningful verdicts, instead of spawning an
+    /// observer that silently never degrades or halts.
     pub fn new(
         source: impl HealthSampleSource,
         mut config: WatchdogConfig,
         halt: watch::Sender<bool>,
-    ) -> Self {
+    ) -> Result<Self, WatchdogError> {
+        config.validate()?;
         config.tick_interval = normalized_tick_interval(config.tick_interval);
-        Self {
+        Ok(Self {
             source: Box::new(source),
             config,
             halt,
-        }
+        })
     }
 
     /// Starts the watchdog on its own thread and returns a handle controlling
@@ -647,7 +655,9 @@ mod tests {
     #[test]
     fn unhealthy_verdict_sends_the_halt_signal_once() {
         let (halt_tx, mut halt_rx) = watch::channel(false);
-        let handle = Watchdog::new(FixedSource(stalled_sample()), config(), halt_tx).spawn();
+        let handle = Watchdog::new(FixedSource(stalled_sample()), config(), halt_tx)
+            .expect("valid config")
+            .spawn();
 
         assert!(
             wait_until(Duration::from_secs(5), || *halt_rx.borrow_and_update()),
@@ -665,7 +675,9 @@ mod tests {
             let (halt_tx, mut halt_rx) = watch::channel(false);
             let mut cfg = config();
             cfg.halt_on_unhealthy = halt_on_unhealthy;
-            let handle = Watchdog::new(FixedSource(source), cfg, halt_tx).spawn();
+            let handle = Watchdog::new(FixedSource(source), cfg, halt_tx)
+                .expect("valid config")
+                .spawn();
 
             std::thread::sleep(Duration::from_millis(120));
             assert!(!handle.requested_halt());
@@ -687,7 +699,9 @@ mod tests {
         let (halt_tx, _halt_rx) = watch::channel(false);
         let mut cfg = config();
         cfg.halt_on_unhealthy = false; // keep the loop running for the test
-        let handle = Watchdog::new(FixedSource(stalled_sample()), cfg, halt_tx).spawn();
+        let handle = Watchdog::new(FixedSource(stalled_sample()), cfg, halt_tx)
+            .expect("valid config")
+            .spawn();
         std::thread::sleep(Duration::from_millis(50));
 
         let started = Instant::now();
@@ -713,7 +727,9 @@ mod tests {
     fn a_halt_nobody_receives_is_not_reported_as_requested() {
         let (halt_tx, halt_rx) = watch::channel(false);
         drop(halt_rx);
-        let handle = Watchdog::new(FixedSource(stalled_sample()), config(), halt_tx).spawn();
+        let handle = Watchdog::new(FixedSource(stalled_sample()), config(), halt_tx)
+            .expect("valid config")
+            .spawn();
 
         // The loop samples immediately; give it time to attempt the send.
         std::thread::sleep(Duration::from_millis(100));
@@ -734,5 +750,21 @@ mod tests {
             normalized_tick_interval(Duration::from_secs(5)),
             Duration::from_secs(5)
         );
+    }
+
+    /// Library callers bypass the binary's config-file validation, so an
+    /// unusable threshold ordering must fail at construction instead of
+    /// spawning an observer whose degraded state can never be reached.
+    #[test]
+    fn invalid_config_is_rejected_at_construction() {
+        let (halt_tx, _halt_rx) = watch::channel(false);
+        let config = WatchdogConfig {
+            degraded_after: Duration::from_secs(120),
+            ..config()
+        };
+        assert!(matches!(
+            Watchdog::new(FixedSource(running_sample()), config, halt_tx),
+            Err(WatchdogError::InvalidConfig(_))
+        ));
     }
 }

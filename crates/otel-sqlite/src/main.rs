@@ -176,6 +176,7 @@ async fn main() -> Result<()> {
         config.watchdog.clone(),
         halt_tx,
     )
+    .context("invalid watchdog configuration")?
     .spawn();
 
     println!("otel-sqlite starting with config: {config:?}");
