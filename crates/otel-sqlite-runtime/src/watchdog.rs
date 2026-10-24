@@ -105,6 +105,10 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     // during a legitimate VACUUM/rebuild under live traffic. Suspend them,
     // but keep one bound so a genuinely hung maintenance call is still
     // detected and reported.
+    //
+    // Saturation and durability stalls are still real during maintenance:
+    // they are surfaced as Degraded (informational, never a halt) so an
+    // operator sees them long before `maintenance_stall_after`.
     if sample.maintenance_in_progress {
         let elapsed = Duration::from_millis(sample.maintenance_elapsed_ms);
         if elapsed >= config.maintenance_stall_after {
@@ -114,6 +118,29 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
                     "maintenance has been running for {elapsed:.1?} without completing \
                      (limit {:.1?})",
                     config.maintenance_stall_after,
+                ),
+            };
+        }
+        let watermark_age = Duration::from_millis(sample.watermark_idle_ms);
+        if sample.outstanding_tickets > 0 && watermark_age >= config.ack_stall_after {
+            return Evaluation {
+                state: HealthState::Degraded,
+                reason: format!(
+                    "maintenance in progress ({elapsed:.1?}), {} durability ticket(s) \
+                     unsettled and the commit watermark has not advanced for {watermark_age:.1?}",
+                    sample.outstanding_tickets,
+                ),
+            };
+        }
+        let threshold =
+            queue_pressure_threshold(sample.queue_capacity, config.queue_pressure_ratio);
+        if sample.queue_depth >= threshold {
+            return Evaluation {
+                state: HealthState::Degraded,
+                reason: format!(
+                    "maintenance in progress ({elapsed:.1?}), command queue at {}/{} \
+                     (saturation pressure)",
+                    sample.queue_depth, sample.queue_capacity
                 ),
             };
         }
@@ -547,21 +574,42 @@ mod tests {
 
     /// A long VACUUM/rebuild under live traffic must not be mistaken for a
     /// lost-record stall; only exceeding the maintenance bound is unhealthy.
+    /// Durability stalls and saturation are still surfaced as Degraded.
     #[test]
     fn maintenance_suspends_stall_verdicts_until_its_own_bound() {
         let mut sample = running_sample();
         sample.maintenance_in_progress = true;
         sample.maintenance_elapsed_ms = 50;
         // Even a frozen watermark with outstanding tickets is expected while
-        // maintenance holds the writer.
+        // maintenance holds the writer, but it must not be invisible: report
+        // it as Degraded rather than halting.
         sample.writer_idle_ms = 50_000;
         sample.batcher_idle_ms = 50_000;
         sample.outstanding_tickets = 2;
         sample.watermark_idle_ms = 50_000;
-        assert_eq!(evaluate(&sample, &config()).state, HealthState::Healthy);
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Degraded);
 
         sample.maintenance_elapsed_ms = 500; // >= maintenance_stall_after (300)
         assert_eq!(evaluate(&sample, &config()).state, HealthState::Unhealthy);
+    }
+
+    /// Saturation behind a long maintenance call is a real capacity signal;
+    /// it must not be hidden by the maintenance window.
+    #[test]
+    fn saturated_queue_during_maintenance_is_degraded() {
+        let mut sample = running_sample();
+        sample.maintenance_in_progress = true;
+        sample.maintenance_elapsed_ms = 50;
+        sample.outstanding_tickets = 0;
+        sample.watermark_idle_ms = 0;
+        sample.queue_depth = 90; // >= 75% of capacity 100
+        sample.pending_records = 0;
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Degraded);
+
+        // Nothing pending behind it: maintenance alone stays Healthy.
+        sample.queue_depth = 0;
+        sample.pending_records = 0;
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Healthy);
     }
 
     /// The fresher of the two stages must not mask a wedged counterpart:

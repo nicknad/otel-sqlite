@@ -94,8 +94,9 @@ pub struct WatchdogConfig {
     /// FTS rebuild, quota eviction) may run before the watchdog treats it as
     /// a genuine hang. While maintenance is in progress the ordinary stall
     /// rules are suspended — the writer legitimately stops committing — so
-    /// this is the only bound on it. Must exceed the longest expected
-    /// `VACUUM`/rebuild.
+    /// this is the only bound on it. Saturation and frozen durability tickets
+    /// during maintenance are still reported as `Degraded`, never `Unhealthy`.
+    /// Must exceed the longest expected `VACUUM`/rebuild.
     pub maintenance_stall_after: Duration,
     /// Fraction of the command queue depth treated as saturation pressure
     /// (`0.0 < r <= 1.0`). Reaching it reports degraded even while progress
