@@ -40,6 +40,7 @@
 //! of scope: the supervisor owns process restarts, the watchdog only reports
 //! and requests.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -81,7 +82,143 @@ pub trait HealthSampleSource: Send + Sync + 'static {
 /// Outcome of evaluating one sample against the configured thresholds.
 struct Evaluation {
     state: HealthState,
-    reason: String,
+    reason: Reason,
+}
+
+/// Structured verdict detail.
+///
+/// Formatting is deferred to [`fmt::Display`], so the per-tick evaluation path
+/// allocates nothing; only an actual transition or unhealthy log builds a
+/// string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reason {
+    WriterNotRunning,
+    BatcherNotRunning,
+    MaintenanceRunning {
+        elapsed_ms: u64,
+        pending: usize,
+    },
+    MaintenanceStalled {
+        elapsed_ms: u64,
+        limit_ms: u64,
+    },
+    MaintenanceAckStall {
+        elapsed_ms: u64,
+        tickets: u64,
+        watermark_idle_ms: u64,
+    },
+    MaintenanceSaturated {
+        elapsed_ms: u64,
+        depth: usize,
+        capacity: usize,
+    },
+    AckStall {
+        tickets: u64,
+        watermark_idle_ms: u64,
+    },
+    Idle,
+    Stalled {
+        pending: usize,
+        writer_idle_ms: u64,
+        batcher_idle_ms: u64,
+    },
+    Draining {
+        pending: usize,
+        age_ms: u64,
+    },
+    Saturated {
+        depth: usize,
+        capacity: usize,
+    },
+    Progressing {
+        pending: usize,
+    },
+}
+
+impl fmt::Display for Reason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WriterNotRunning => f.write_str("sqlite writer thread is not running"),
+            Self::BatcherNotRunning => f.write_str("insert batcher thread is not running"),
+            Self::MaintenanceRunning {
+                elapsed_ms,
+                pending,
+            } => write!(
+                f,
+                "maintenance in progress ({:.1?}), {pending} work item(s) pending",
+                Duration::from_millis(*elapsed_ms)
+            ),
+            Self::MaintenanceStalled {
+                elapsed_ms,
+                limit_ms,
+            } => write!(
+                f,
+                "maintenance has been running for {:.1?} without completing (limit {:.1?})",
+                Duration::from_millis(*elapsed_ms),
+                Duration::from_millis(*limit_ms)
+            ),
+            Self::MaintenanceAckStall {
+                elapsed_ms,
+                tickets,
+                watermark_idle_ms,
+            } => write!(
+                f,
+                "maintenance in progress ({:.1?}), {tickets} durability ticket(s) unsettled \
+                 and the commit watermark has not advanced for {:.1?}",
+                Duration::from_millis(*elapsed_ms),
+                Duration::from_millis(*watermark_idle_ms)
+            ),
+            Self::MaintenanceSaturated {
+                elapsed_ms,
+                depth,
+                capacity,
+            } => write!(
+                f,
+                "maintenance in progress ({:.1?}), command queue at {depth}/{capacity} \
+                 (saturation pressure)",
+                Duration::from_millis(*elapsed_ms)
+            ),
+            Self::AckStall {
+                tickets,
+                watermark_idle_ms,
+            } => write!(
+                f,
+                "{tickets} durability ticket(s) unsettled on an otherwise empty pipeline; \
+                 the commit watermark has not advanced for {:.1?}, so accepted records were \
+                 lost and can never be acknowledged",
+                Duration::from_millis(*watermark_idle_ms)
+            ),
+            Self::Idle => f.write_str("pipeline idle"),
+            Self::Stalled {
+                pending,
+                writer_idle_ms,
+                batcher_idle_ms,
+            } => {
+                let age = Duration::from_millis((*writer_idle_ms).max(*batcher_idle_ms));
+                write!(
+                    f,
+                    "{pending} work item(s) pending but no pipeline progress for {age:.1?} \
+                     (writer {:.1?}, batcher {:.1?})",
+                    Duration::from_millis(*writer_idle_ms),
+                    Duration::from_millis(*batcher_idle_ms)
+                )
+            }
+            Self::Draining { pending, age_ms } => write!(
+                f,
+                "{pending} work item(s) pending, draining slowly ({:.1?} since last progress)",
+                Duration::from_millis(*age_ms)
+            ),
+            Self::Saturated { depth, capacity } => {
+                write!(
+                    f,
+                    "command queue at {depth}/{capacity} (saturation pressure)"
+                )
+            }
+            Self::Progressing { pending } => {
+                write!(f, "pipeline progressing, {pending} work item(s) pending")
+            }
+        }
+    }
 }
 
 /// Pure evaluator: maps evidence to a verdict. No I/O, no clocks beyond the
@@ -90,13 +227,13 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     if !sample.writer_running {
         return Evaluation {
             state: HealthState::Unhealthy,
-            reason: "sqlite writer thread is not running".to_owned(),
+            reason: Reason::WriterNotRunning,
         };
     }
     if !sample.batcher_running {
         return Evaluation {
             state: HealthState::Unhealthy,
-            reason: "insert batcher thread is not running".to_owned(),
+            reason: Reason::BatcherNotRunning,
         };
     }
 
@@ -110,26 +247,25 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     // they are surfaced as Degraded (informational, never a halt) so an
     // operator sees them long before `maintenance_stall_after`.
     if sample.maintenance_in_progress {
-        let elapsed = Duration::from_millis(sample.maintenance_elapsed_ms);
-        if elapsed >= config.maintenance_stall_after {
+        if Duration::from_millis(sample.maintenance_elapsed_ms) >= config.maintenance_stall_after {
             return Evaluation {
                 state: HealthState::Unhealthy,
-                reason: format!(
-                    "maintenance has been running for {elapsed:.1?} without completing \
-                     (limit {:.1?})",
-                    config.maintenance_stall_after,
-                ),
+                reason: Reason::MaintenanceStalled {
+                    elapsed_ms: sample.maintenance_elapsed_ms,
+                    limit_ms: config.maintenance_stall_after.as_millis() as u64,
+                },
             };
         }
-        let watermark_age = Duration::from_millis(sample.watermark_idle_ms);
-        if sample.outstanding_tickets > 0 && watermark_age >= config.ack_stall_after {
+        if sample.outstanding_tickets > 0
+            && Duration::from_millis(sample.watermark_idle_ms) >= config.ack_stall_after
+        {
             return Evaluation {
                 state: HealthState::Degraded,
-                reason: format!(
-                    "maintenance in progress ({elapsed:.1?}), {} durability ticket(s) \
-                     unsettled and the commit watermark has not advanced for {watermark_age:.1?}",
-                    sample.outstanding_tickets,
-                ),
+                reason: Reason::MaintenanceAckStall {
+                    elapsed_ms: sample.maintenance_elapsed_ms,
+                    tickets: sample.outstanding_tickets,
+                    watermark_idle_ms: sample.watermark_idle_ms,
+                },
             };
         }
         let threshold =
@@ -137,19 +273,19 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
         if sample.queue_depth >= threshold {
             return Evaluation {
                 state: HealthState::Degraded,
-                reason: format!(
-                    "maintenance in progress ({elapsed:.1?}), command queue at {}/{} \
-                     (saturation pressure)",
-                    sample.queue_depth, sample.queue_capacity
-                ),
+                reason: Reason::MaintenanceSaturated {
+                    elapsed_ms: sample.maintenance_elapsed_ms,
+                    depth: sample.queue_depth,
+                    capacity: sample.queue_capacity,
+                },
             };
         }
-        let pending = sample.pending_work();
         return Evaluation {
             state: HealthState::Healthy,
-            reason: format!(
-                "maintenance in progress ({elapsed:.1?}), {pending} work item(s) pending"
-            ),
+            reason: Reason::MaintenanceRunning {
+                elapsed_ms: sample.maintenance_elapsed_ms,
+                pending: sample.pending_work(),
+            },
         };
     }
 
@@ -173,13 +309,10 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     {
         return Evaluation {
             state: HealthState::Unhealthy,
-            reason: format!(
-                "{} durability ticket(s) unsettled on an otherwise empty pipeline; the \
-                 commit watermark has not advanced for {:.1?}, so accepted records were \
-                 lost and can never be acknowledged",
-                sample.outstanding_tickets,
-                Duration::from_millis(sample.watermark_idle_ms),
-            ),
+            reason: Reason::AckStall {
+                tickets: sample.outstanding_tickets,
+                watermark_idle_ms: sample.watermark_idle_ms,
+            },
         };
     }
 
@@ -187,7 +320,7 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
         // NO WORK: stale progress ages are expected and harmless.
         return Evaluation {
             state: HealthState::Healthy,
-            reason: "pipeline idle".to_owned(),
+            reason: Reason::Idle,
         };
     }
 
@@ -196,22 +329,23 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     // writer until its queue fills.
     let writer_age = Duration::from_millis(sample.writer_idle_ms);
     let batcher_age = Duration::from_millis(sample.batcher_idle_ms);
-    let age = writer_age.max(batcher_age);
     if writer_age >= config.unhealthy_after || batcher_age >= config.unhealthy_after {
         return Evaluation {
             state: HealthState::Unhealthy,
-            reason: format!(
-                "{pending} work item(s) pending but no pipeline progress for {age:.1?} \
-                 (writer {writer_age:.1?}, batcher {batcher_age:.1?})"
-            ),
+            reason: Reason::Stalled {
+                pending,
+                writer_idle_ms: sample.writer_idle_ms,
+                batcher_idle_ms: sample.batcher_idle_ms,
+            },
         };
     }
     if writer_age >= config.degraded_after || batcher_age >= config.degraded_after {
         return Evaluation {
             state: HealthState::Degraded,
-            reason: format!(
-                "{pending} work item(s) pending, draining slowly ({age:.1?} since last progress)"
-            ),
+            reason: Reason::Draining {
+                pending,
+                age_ms: sample.writer_idle_ms.max(sample.batcher_idle_ms),
+            },
         };
     }
 
@@ -219,16 +353,16 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     if sample.queue_depth >= threshold {
         return Evaluation {
             state: HealthState::Degraded,
-            reason: format!(
-                "command queue at {}/{} (saturation pressure)",
-                sample.queue_depth, sample.queue_capacity
-            ),
+            reason: Reason::Saturated {
+                depth: sample.queue_depth,
+                capacity: sample.queue_capacity,
+            },
         };
     }
 
     Evaluation {
         state: HealthState::Healthy,
-        reason: format!("pipeline progressing, {pending} work item(s) pending"),
+        reason: Reason::Progressing { pending },
     }
 }
 
@@ -475,7 +609,10 @@ fn run(
 
 fn emit_metrics(sample: &PipelineSample, state: HealthState) {
     ::metrics::gauge!("sidecar_health_state").set(state.as_metric());
-    ::metrics::gauge!("sidecar_pipeline_pending_records").set(sample.pending_work() as f64);
+    // Commands and records are different units, so they get separate gauges.
+    // The old `sidecar_pipeline_pending_records` mixed both into one value.
+    ::metrics::gauge!("sidecar_pending_work_items").set(sample.pending_work() as f64);
+    ::metrics::gauge!("sidecar_buffered_records").set(sample.pending_records as f64);
     ::metrics::gauge!("sidecar_queue_depth").set(sample.queue_depth as f64);
     ::metrics::gauge!("sidecar_queue_capacity").set(sample.queue_capacity as f64);
     ::metrics::gauge!("sidecar_outstanding_tickets").set(sample.outstanding_tickets as f64);
@@ -485,12 +622,12 @@ fn emit_metrics(sample: &PipelineSample, state: HealthState) {
         .set(sample.batcher_idle_ms as f64);
 }
 
-fn log_transition(from: HealthState, to: HealthState, reason: &str) {
+fn log_transition(from: HealthState, to: HealthState, reason: &Reason) {
     let detail = format!("health {from:?} -> {to:?}");
     match to {
-        HealthState::Unhealthy => tracing::error!(reason, "{detail}"),
-        HealthState::Degraded => tracing::warn!(reason, "{detail}"),
-        HealthState::Healthy => tracing::info!(reason, "{detail}"),
+        HealthState::Unhealthy => tracing::error!(reason = %reason, "{detail}"),
+        HealthState::Degraded => tracing::warn!(reason = %reason, "{detail}"),
+        HealthState::Healthy => tracing::info!(reason = %reason, "{detail}"),
     }
 }
 
@@ -814,5 +951,30 @@ mod tests {
             Watchdog::new(FixedSource(running_sample()), config, halt_tx),
             Err(WatchdogError::InvalidConfig(_))
         ));
+    }
+
+    /// Reasons are formatted lazily only when a verdict is logged; keep the
+    /// operator-facing text intact through the structured representation.
+    #[test]
+    fn verdict_reasons_render_units_and_context() {
+        let stalled = evaluate(&stalled_sample(), &config());
+        let reason = stalled.reason.to_string();
+        assert!(reason.contains("work item(s) pending"), "{reason}");
+        assert!(reason.contains("writer"), "{reason}");
+
+        let mut idle = running_sample();
+        idle.queue_depth = 0;
+        idle.pending_records = 0;
+        assert_eq!(
+            evaluate(&idle, &config()).reason.to_string(),
+            "pipeline idle"
+        );
+
+        let mut saturated = running_sample();
+        saturated.queue_depth = 90;
+        assert_eq!(
+            evaluate(&saturated, &config()).reason.to_string(),
+            "command queue at 90/100 (saturation pressure)"
+        );
     }
 }
