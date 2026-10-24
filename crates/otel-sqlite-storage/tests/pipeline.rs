@@ -483,3 +483,41 @@ fn voided_ticket_does_not_stall_subsequent_commits() {
     let conn = open_readonly(&db_path);
     assert_eq!(row_count(&conn), 10);
 }
+
+/// Regression: the health sample's queue depth is evidence for the watchdog's
+/// "WORK BUT NO PROGRESS" rule. A producer-side snapshot that was never reset
+/// used to keep reporting the last observed backlog after the queue drained,
+/// so an idle pipeline looked permanently busy and was halted.
+#[test]
+fn drained_pipeline_reports_no_pending_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("drained.db");
+
+    // One record per command and a small queue make the producer backlog
+    // observable at the moment the last batch is submitted.
+    let (sender, receiver) = crossbeam_channel::bounded(64);
+    let mut storage = Storage::open(receiver, config(db_path, 1, 600_000)).unwrap();
+
+    for chunk in 0..200 {
+        sender.send(logs_chunk(chunk * 10, 10)).unwrap();
+    }
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            storage.stats().records_written == 2_000
+        }),
+        "every record must be persisted before the drain check"
+    );
+
+    // The writer publishes its depth after the last command; once it blocks
+    // on an empty queue the sample must report zero pending work.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            storage.health().sample().pending_work() == 0
+        }),
+        "drained pipeline still reports pending work: {:?}",
+        storage.health().sample()
+    );
+
+    drop(sender);
+    storage.join().unwrap();
+}

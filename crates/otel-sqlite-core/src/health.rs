@@ -21,7 +21,9 @@ pub struct PipelineSample {
     pub writer_idle_ms: u64,
     /// Milliseconds since the batcher last received input or submitted a batch.
     pub batcher_idle_ms: u64,
-    /// Depth of the bounded write-command queue.
+    /// Commands still queued plus the one the writer is executing, if any.
+    /// Includes the in-flight command so a command wedged in SQLite stays
+    /// visible even when nothing is queued behind it.
     pub queue_depth: usize,
     /// Capacity of that queue; `0` disables the saturation rule.
     pub queue_capacity: usize,
@@ -46,8 +48,11 @@ pub struct PipelineSample {
 }
 
 impl PipelineSample {
-    /// Work accepted by the pipeline but not yet persisted: queued commands
-    /// plus records still buffered in the insert batcher.
+    /// Work accepted by the pipeline but not yet persisted: queued/executing
+    /// commands plus records still buffered in the insert batcher.
+    ///
+    /// Commands and records are different units; the sum is a "is there
+    /// anything left to do" indicator, not an exact record count.
     pub fn pending_work(&self) -> usize {
         self.queue_depth.saturating_add(self.pending_records)
     }

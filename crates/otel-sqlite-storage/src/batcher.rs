@@ -199,9 +199,6 @@ fn flush_buffers(
 
 fn submit(commands: &Sender<WriteCommand>, command: WriteCommand, stats: &BatcherStats) -> bool {
     let outcome = commands.send(command);
-    stats
-        .queued_commands
-        .store(commands.len(), Ordering::Relaxed);
     match outcome {
         Ok(()) => true,
         Err(SendError(command)) => {

@@ -45,6 +45,10 @@ pub(crate) struct WriterStats {
     /// Extra attempts made because of transient contention (BUSY/LOCKED).
     pub transient_retries: AtomicU64,
     pub queue_depth: AtomicUsize,
+    /// `1` while the writer is executing a command, `0` while it waits for
+    /// work. Counted as pending work so a command wedged in SQLite stays
+    /// visible to the watchdog even when the queue behind it is empty.
+    pub in_flight: AtomicUsize,
     /// Monotonic ms of the last successful command execution (commit,
     /// checkpoint or maintenance operation).
     pub last_progress_ms: AtomicU64,
@@ -83,6 +87,17 @@ impl WriterStats {
         RunningGuard::new(&self.running)
     }
 
+    /// Publishes the authoritative backlog while a command executes: commands
+    /// still queued after the dequeue plus the one now in flight. The guard
+    /// clears the in-flight marker on every exit path, including errors and
+    /// panics.
+    pub(crate) fn begin_command(&self, queued_after_dequeue: usize) -> InFlightGuard<'_> {
+        self.queue_depth
+            .store(queued_after_dequeue, Ordering::Relaxed);
+        self.in_flight.store(1, Ordering::Relaxed);
+        InFlightGuard(self)
+    }
+
     /// Publishes "maintenance in progress" until the returned guard is
     /// dropped (or unwound), timestamping the start for stall detection.
     pub(crate) fn maintenance_guard(&self) -> MaintenanceGuard<'_> {
@@ -90,6 +105,16 @@ impl WriterStats {
             .store(monotonic_millis(), Ordering::Relaxed);
         self.maintenance_in_progress.store(true, Ordering::Relaxed);
         MaintenanceGuard(self)
+    }
+}
+
+/// RAII in-flight marker for the writer's current command. See
+/// [`WriterStats::begin_command`].
+pub(crate) struct InFlightGuard<'a>(&'a WriterStats);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.store(0, Ordering::Relaxed);
     }
 }
 
@@ -121,11 +146,6 @@ pub struct BatcherStats {
     pub batches_emitted: AtomicU64,
     pub timer_flushes: AtomicU64,
     pub buffered_records: AtomicUsize,
-    /// Command-queue depth as observed by the producer after each submission.
-    /// The writer's own `queue_depth` is only refreshed at the top of its
-    /// loop, so it goes stale while a long command executes; the watchdog
-    /// takes the max of the two to avoid under-reporting backlog.
-    pub queued_commands: AtomicUsize,
     pub dropped_records: AtomicU64,
     /// Monotonic ms of the last chunk received or batch submitted.
     pub last_progress_ms: AtomicU64,
@@ -211,7 +231,7 @@ impl StorageHealth {
                 .writer
                 .queue_depth
                 .load(Ordering::Relaxed)
-                .max(self.batcher.queued_commands.load(Ordering::Relaxed)),
+                .saturating_add(self.writer.in_flight.load(Ordering::Relaxed)),
             queue_capacity: self.queue_capacity,
             pending_records: self.batcher.buffered_records.load(Ordering::Relaxed),
             outstanding_tickets: self.ledger.outstanding_tickets(),

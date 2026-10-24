@@ -120,7 +120,9 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
         let pending = sample.pending_work();
         return Evaluation {
             state: HealthState::Healthy,
-            reason: format!("maintenance in progress ({elapsed:.1?}), {pending} record(s) pending"),
+            reason: format!(
+                "maintenance in progress ({elapsed:.1?}), {pending} work item(s) pending"
+            ),
         };
     }
 
@@ -172,7 +174,7 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
         return Evaluation {
             state: HealthState::Unhealthy,
             reason: format!(
-                "{pending} record(s) pending but no pipeline progress for {age:.1?} \
+                "{pending} work item(s) pending but no pipeline progress for {age:.1?} \
                  (writer {writer_age:.1?}, batcher {batcher_age:.1?})"
             ),
         };
@@ -181,7 +183,7 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
         return Evaluation {
             state: HealthState::Degraded,
             reason: format!(
-                "{pending} record(s) pending, draining slowly ({age:.1?} since last progress)"
+                "{pending} work item(s) pending, draining slowly ({age:.1?} since last progress)"
             ),
         };
     }
@@ -199,7 +201,7 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
 
     Evaluation {
         state: HealthState::Healthy,
-        reason: format!("pipeline progressing, {pending} record(s) pending"),
+        reason: format!("pipeline progressing, {pending} work item(s) pending"),
     }
 }
 
@@ -207,7 +209,15 @@ fn queue_pressure_threshold(capacity: usize, ratio: f32) -> usize {
     if capacity == 0 {
         return usize::MAX;
     }
-    let threshold = (capacity as f32 * ratio.clamp(0.0, 1.0)) as usize;
+    // A non-finite ratio cannot express a threshold; treat it as "only a
+    // completely full queue is saturated". The binary rejects such values, but
+    // this is a public library type.
+    let ratio = if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let threshold = (capacity as f32 * ratio) as usize;
     threshold.max(1)
 }
 
@@ -317,6 +327,23 @@ impl Drop for WatchdogHandle {
     }
 }
 
+/// Publishes the watchdog's liveness for as long as the thread runs, including
+/// unwind paths (a panic must not leave the gauge stuck at 1).
+struct ActiveGauge;
+
+impl ActiveGauge {
+    fn new() -> Self {
+        ::metrics::gauge!("sidecar_watchdog_active").set(1.0);
+        Self
+    }
+}
+
+impl Drop for ActiveGauge {
+    fn drop(&mut self) {
+        ::metrics::gauge!("sidecar_watchdog_active").set(0.0);
+    }
+}
+
 fn run(
     source: Box<dyn HealthSampleSource>,
     config: WatchdogConfig,
@@ -325,7 +352,7 @@ fn run(
     shutdown: Receiver<()>,
 ) {
     tracing::info!(tick = ?config.tick_interval, "watchdog started");
-    ::metrics::gauge!("sidecar_watchdog_active").set(1.0);
+    let _active = ActiveGauge::new();
 
     let mut previous = HealthState::Healthy;
     loop {
@@ -348,10 +375,21 @@ fn run(
             tracing::error!(reason = %evaluation.reason, "watchdog: pipeline unhealthy");
         }
 
-        if evaluation.state == HealthState::Unhealthy
-            && config.halt_on_unhealthy
-            && !halted.swap(true, Ordering::Relaxed)
-        {
+        if evaluation.state == HealthState::Unhealthy && config.halt_on_unhealthy {
+            // Teardown may have started while this sample was evaluated: a
+            // component that stopped because we are shutting down is not a
+            // fault, and a halt nobody receives is not a halt.
+            if shutdown_signalled(&shutdown) {
+                break;
+            }
+            if halt.send(true).is_err() {
+                tracing::error!(
+                    reason = %evaluation.reason,
+                    "watchdog: pipeline unhealthy but the halt receiver is gone; stopping observation"
+                );
+                break;
+            }
+            halted.store(true, Ordering::Relaxed);
             // Observation stops here, but the drain this triggers is exactly
             // what a post-mortem needs to see: record the complete final
             // sample alongside the verdict so the evidence outlives the loop.
@@ -370,7 +408,6 @@ fn run(
                 maintenance_elapsed_ms = sample.maintenance_elapsed_ms,
                 "watchdog initiating graceful shutdown"
             );
-            let _ = halt.send(true);
             break;
         }
 
@@ -381,7 +418,6 @@ fn run(
         }
     }
 
-    ::metrics::gauge!("sidecar_watchdog_active").set(0.0);
     if !halted.load(Ordering::Relaxed) {
         // After an unhealthy halt the last verdict must stay visible until the
         // process exits; only a clean observer shutdown resets it.
@@ -393,6 +429,9 @@ fn run(
 fn emit_metrics(sample: &PipelineSample, state: HealthState) {
     ::metrics::gauge!("sidecar_health_state").set(state.as_metric());
     ::metrics::gauge!("sidecar_pipeline_pending_records").set(sample.pending_work() as f64);
+    ::metrics::gauge!("sidecar_queue_depth").set(sample.queue_depth as f64);
+    ::metrics::gauge!("sidecar_queue_capacity").set(sample.queue_capacity as f64);
+    ::metrics::gauge!("sidecar_outstanding_tickets").set(sample.outstanding_tickets as f64);
     ::metrics::gauge!("sidecar_component_idle_ms", "component" => "writer")
         .set(sample.writer_idle_ms as f64);
     ::metrics::gauge!("sidecar_component_idle_ms", "component" => "batcher")
@@ -645,5 +684,28 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "stop must not wait out the next tick deadline"
         );
+    }
+
+    #[test]
+    fn non_finite_queue_pressure_ratio_degrades_only_on_a_full_queue() {
+        assert_eq!(queue_pressure_threshold(100, f32::NAN), 100);
+        assert_eq!(queue_pressure_threshold(100, f32::INFINITY), 100);
+        assert_eq!(queue_pressure_threshold(100, 0.75), 75);
+        assert_eq!(queue_pressure_threshold(0, 0.75), usize::MAX);
+    }
+
+    /// A halt sent to a channel nobody listens on is not a halt: the handle
+    /// must not claim one, or `main` reports an unrecoverable fault that never
+    /// triggered a shutdown.
+    #[test]
+    fn a_halt_nobody_receives_is_not_reported_as_requested() {
+        let (halt_tx, halt_rx) = watch::channel(false);
+        drop(halt_rx);
+        let handle = Watchdog::new(FixedSource(stalled_sample()), config(), halt_tx).spawn();
+
+        // The loop samples immediately; give it time to attempt the send.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!handle.requested_halt());
+        handle.stop().expect("clean stop");
     }
 }

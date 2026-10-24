@@ -548,6 +548,30 @@ fn validation_rejects_unsafe_or_out_of_range_values() {
     );
 }
 
+/// A buffered batch legitimately keeps the writer idle until its age deadline;
+/// if that can outlive the first health threshold, the watchdog would halt a
+/// healthy low-volume pipeline.
+#[test]
+fn validation_rejects_a_batch_age_that_outlives_the_watchdog_threshold() {
+    let mut config = Config {
+        batcher_max_batch_age: Duration::from_secs(60),
+        ..Config::default()
+    };
+    let error = config
+        .validate()
+        .expect_err("a batch age above degraded_after must fail");
+    assert!(
+        error.to_string().contains("batcher_max_batch_age"),
+        "{error}"
+    );
+
+    // Raising the threshold above the batch age makes the same config valid.
+    config.watchdog.degraded_after = Duration::from_secs(90);
+    config
+        .validate()
+        .expect("60s batch age is below the 90s degraded threshold");
+}
+
 #[test]
 fn validation_requires_readable_tls_and_auth_files() {
     let dir = tempfile::tempdir().expect("temp directory");
