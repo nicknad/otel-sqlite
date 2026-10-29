@@ -18,7 +18,7 @@ anyhow = "1"
 crossbeam-channel = "0.5"
 hex = "0.4"
 zeroize = "1"
-tokio = { version = "1", features = [
+tokio = { version = "1.54.1", features = [
     "macros",
     "rt-multi-thread",
     "signal",
@@ -29,7 +29,7 @@ tokio-stream = "0.1"
 thiserror = "2"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
-rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
@@ -43,8 +43,8 @@ criterion = { version = "0.8", features = ["html_reports"] }
 # `gzip`: the OpenTelemetry Collector's OTLP exporter compresses with gzip
 # by default; without this feature the ingress answers `Unimplemented`
 # (permanent error) and the exporter drops the batch.
-tonic = { version = "0.14", features = ["tls-ring", "gzip"] }
-tonic-health = "0.14"
+tonic = { version = "0.14.8", features = ["tls-ring", "gzip"] }
+tonic-health = "0.14.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 otel-sqlite-core = { path = "crates/otel-sqlite-core", version = "0.2.0" }
 otel-sqlite-ingress = { path = "crates/otel-sqlite-ingress", version = "0.2.0" }
