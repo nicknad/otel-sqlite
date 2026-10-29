@@ -105,12 +105,15 @@ fn run_inner(
                 // Depth *after* dequeue approximates the backlog that heavy
                 // maintenance would stall behind it.
                 let backlog = receiver.len();
+                // Publish the authoritative backlog plus the command now
+                // executing. The top-of-loop depth alone would hide a wedged
+                // in-flight command whose queue is already empty.
+                let _in_flight = stats.begin_command(backlog);
                 // Size quota precedes the insert so an over-budget database
                 // evicts its oldest rows before accepting new ones.
                 if command.record_count() != 0
                     && let Some(quota) = config.max_db_bytes
                 {
-                    let _maintenance = stats.maintenance_guard();
                     enforce_quota(&mut conn, &config.sqlite_path, quota, stats);
                 }
                 execute(&mut conn, command, ledger, stats, backlog)?;
@@ -131,6 +134,7 @@ fn run_inner(
         }
     }
 
+    stats.queue_depth.store(0, Ordering::Relaxed);
     ::metrics::gauge!("storage_queue_depth").set(0.0);
     maintenance::checkpoint(&conn, CheckpointMode::Truncate)?;
     tracing::info!(
@@ -423,6 +427,10 @@ fn enforce_quota(
     if size <= quota_bytes {
         return;
     }
+    // Only a real eviction is maintenance-class work. Taking the guard around
+    // the size probe would make every insert look like maintenance to the
+    // watchdog, masking saturation and ack-stall verdicts.
+    let _maintenance = stats.maintenance_guard();
     match maintenance::enforce_size_quota(conn, db_path, quota_bytes) {
         Ok(report) => {
             ::metrics::counter!("storage_quota_enforcements_total").increment(1);

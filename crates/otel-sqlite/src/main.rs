@@ -176,6 +176,7 @@ async fn main() -> Result<()> {
         config.watchdog.clone(),
         halt_tx,
     )
+    .context("invalid watchdog configuration")?
     .spawn();
 
     println!("otel-sqlite starting with config: {config:?}");
@@ -196,22 +197,23 @@ async fn main() -> Result<()> {
 
     // Shutdown order: ingress stopped (serve returned) -> stop observation ->
     // stop maintenance scheduling -> let the writer drain and exit.
-    if watchdog.requested_halt() {
+    //
+    // Every step runs even if an earlier one failed: aborting here would leave
+    // the maintenance worker holding the command queue open and the writer
+    // undrained, so records already buffered in the pipeline would be lost
+    // when the process exits.
+    let halt_requested = watchdog.requested_halt();
+    let watchdog_error = watchdog.stop().err();
+    let maintenance_error = maintenance.stop().err();
+    // Bounded drain: a wedged SQLite (stalled I/O, oversized final
+    // checkpoint) must not hang process shutdown forever. The timeout is
+    // reported after teardown so the OS reaps the stuck threads and the
+    // container supervisor restarts a clean process.
+    let storage_error = storage.join_timeout(storage_shutdown_timeout).err();
+
+    if halt_requested {
         eprintln!("watchdog halted ingestion: unrecoverable pipeline fault detected");
     }
-    watchdog
-        .stop()
-        .context("watchdog terminated with failure")?;
-    maintenance
-        .stop()
-        .context("maintenance worker terminated with failure")?;
-    // Bounded drain: a wedged SQLite (stalled I/O, oversized final
-    // checkpoint) must not hang process shutdown forever. On timeout the
-    // error aborts main, the OS reaps the stuck threads, and the container
-    // supervisor restarts a clean process.
-    storage
-        .join_timeout(storage_shutdown_timeout)
-        .context("sqlite storage writer terminated with failure")?;
 
     let stats = storage.stats();
     println!(
@@ -220,5 +222,16 @@ async fn main() -> Result<()> {
     );
 
     serve_result.context("ingress server terminated unexpectedly")?;
+    if let Some(error) = watchdog_error {
+        return Err(anyhow::Error::new(error).context("watchdog terminated with failure"));
+    }
+    if let Some(error) = maintenance_error {
+        return Err(anyhow::Error::new(error).context("maintenance worker terminated with failure"));
+    }
+    if let Some(error) = storage_error {
+        return Err(
+            anyhow::Error::new(error).context("sqlite storage writer terminated with failure")
+        );
+    }
     Ok(())
 }

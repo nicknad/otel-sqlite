@@ -40,6 +40,7 @@
 //! of scope: the supervisor owns process restarts, the watchdog only reports
 //! and requests.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -81,7 +82,143 @@ pub trait HealthSampleSource: Send + Sync + 'static {
 /// Outcome of evaluating one sample against the configured thresholds.
 struct Evaluation {
     state: HealthState,
-    reason: String,
+    reason: Reason,
+}
+
+/// Structured verdict detail.
+///
+/// Formatting is deferred to [`fmt::Display`], so the per-tick evaluation path
+/// allocates nothing; only an actual transition or unhealthy log builds a
+/// string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reason {
+    WriterNotRunning,
+    BatcherNotRunning,
+    MaintenanceRunning {
+        elapsed_ms: u64,
+        pending: usize,
+    },
+    MaintenanceStalled {
+        elapsed_ms: u64,
+        limit_ms: u64,
+    },
+    MaintenanceAckStall {
+        elapsed_ms: u64,
+        tickets: u64,
+        watermark_idle_ms: u64,
+    },
+    MaintenanceSaturated {
+        elapsed_ms: u64,
+        depth: usize,
+        capacity: usize,
+    },
+    AckStall {
+        tickets: u64,
+        watermark_idle_ms: u64,
+    },
+    Idle,
+    Stalled {
+        pending: usize,
+        writer_idle_ms: u64,
+        batcher_idle_ms: u64,
+    },
+    Draining {
+        pending: usize,
+        age_ms: u64,
+    },
+    Saturated {
+        depth: usize,
+        capacity: usize,
+    },
+    Progressing {
+        pending: usize,
+    },
+}
+
+impl fmt::Display for Reason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WriterNotRunning => f.write_str("sqlite writer thread is not running"),
+            Self::BatcherNotRunning => f.write_str("insert batcher thread is not running"),
+            Self::MaintenanceRunning {
+                elapsed_ms,
+                pending,
+            } => write!(
+                f,
+                "maintenance in progress ({:.1?}), {pending} work item(s) pending",
+                Duration::from_millis(*elapsed_ms)
+            ),
+            Self::MaintenanceStalled {
+                elapsed_ms,
+                limit_ms,
+            } => write!(
+                f,
+                "maintenance has been running for {:.1?} without completing (limit {:.1?})",
+                Duration::from_millis(*elapsed_ms),
+                Duration::from_millis(*limit_ms)
+            ),
+            Self::MaintenanceAckStall {
+                elapsed_ms,
+                tickets,
+                watermark_idle_ms,
+            } => write!(
+                f,
+                "maintenance in progress ({:.1?}), {tickets} durability ticket(s) unsettled \
+                 and the commit watermark has not advanced for {:.1?}",
+                Duration::from_millis(*elapsed_ms),
+                Duration::from_millis(*watermark_idle_ms)
+            ),
+            Self::MaintenanceSaturated {
+                elapsed_ms,
+                depth,
+                capacity,
+            } => write!(
+                f,
+                "maintenance in progress ({:.1?}), command queue at {depth}/{capacity} \
+                 (saturation pressure)",
+                Duration::from_millis(*elapsed_ms)
+            ),
+            Self::AckStall {
+                tickets,
+                watermark_idle_ms,
+            } => write!(
+                f,
+                "{tickets} durability ticket(s) unsettled on an otherwise empty pipeline; \
+                 the commit watermark has not advanced for {:.1?}, so accepted records were \
+                 lost and can never be acknowledged",
+                Duration::from_millis(*watermark_idle_ms)
+            ),
+            Self::Idle => f.write_str("pipeline idle"),
+            Self::Stalled {
+                pending,
+                writer_idle_ms,
+                batcher_idle_ms,
+            } => {
+                let age = Duration::from_millis((*writer_idle_ms).max(*batcher_idle_ms));
+                write!(
+                    f,
+                    "{pending} work item(s) pending but no pipeline progress for {age:.1?} \
+                     (writer {:.1?}, batcher {:.1?})",
+                    Duration::from_millis(*writer_idle_ms),
+                    Duration::from_millis(*batcher_idle_ms)
+                )
+            }
+            Self::Draining { pending, age_ms } => write!(
+                f,
+                "{pending} work item(s) pending, draining slowly ({:.1?} since last progress)",
+                Duration::from_millis(*age_ms)
+            ),
+            Self::Saturated { depth, capacity } => {
+                write!(
+                    f,
+                    "command queue at {depth}/{capacity} (saturation pressure)"
+                )
+            }
+            Self::Progressing { pending } => {
+                write!(f, "pipeline progressing, {pending} work item(s) pending")
+            }
+        }
+    }
 }
 
 /// Pure evaluator: maps evidence to a verdict. No I/O, no clocks beyond the
@@ -90,13 +227,13 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     if !sample.writer_running {
         return Evaluation {
             state: HealthState::Unhealthy,
-            reason: "sqlite writer thread is not running".to_owned(),
+            reason: Reason::WriterNotRunning,
         };
     }
     if !sample.batcher_running {
         return Evaluation {
             state: HealthState::Unhealthy,
-            reason: "insert batcher thread is not running".to_owned(),
+            reason: Reason::BatcherNotRunning,
         };
     }
 
@@ -105,22 +242,50 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     // during a legitimate VACUUM/rebuild under live traffic. Suspend them,
     // but keep one bound so a genuinely hung maintenance call is still
     // detected and reported.
+    //
+    // Saturation and durability stalls are still real during maintenance:
+    // they are surfaced as Degraded (informational, never a halt) so an
+    // operator sees them long before `maintenance_stall_after`.
     if sample.maintenance_in_progress {
-        let elapsed = Duration::from_millis(sample.maintenance_elapsed_ms);
-        if elapsed >= config.maintenance_stall_after {
+        if Duration::from_millis(sample.maintenance_elapsed_ms) >= config.maintenance_stall_after {
             return Evaluation {
                 state: HealthState::Unhealthy,
-                reason: format!(
-                    "maintenance has been running for {elapsed:.1?} without completing \
-                     (limit {:.1?})",
-                    config.maintenance_stall_after,
-                ),
+                reason: Reason::MaintenanceStalled {
+                    elapsed_ms: sample.maintenance_elapsed_ms,
+                    limit_ms: config.maintenance_stall_after.as_millis() as u64,
+                },
             };
         }
-        let pending = sample.pending_work();
+        if sample.outstanding_tickets > 0
+            && Duration::from_millis(sample.watermark_idle_ms) >= config.ack_stall_after
+        {
+            return Evaluation {
+                state: HealthState::Degraded,
+                reason: Reason::MaintenanceAckStall {
+                    elapsed_ms: sample.maintenance_elapsed_ms,
+                    tickets: sample.outstanding_tickets,
+                    watermark_idle_ms: sample.watermark_idle_ms,
+                },
+            };
+        }
+        let threshold =
+            queue_pressure_threshold(sample.queue_capacity, config.queue_pressure_ratio);
+        if sample.queue_depth >= threshold {
+            return Evaluation {
+                state: HealthState::Degraded,
+                reason: Reason::MaintenanceSaturated {
+                    elapsed_ms: sample.maintenance_elapsed_ms,
+                    depth: sample.queue_depth,
+                    capacity: sample.queue_capacity,
+                },
+            };
+        }
         return Evaluation {
             state: HealthState::Healthy,
-            reason: format!("maintenance in progress ({elapsed:.1?}), {pending} record(s) pending"),
+            reason: Reason::MaintenanceRunning {
+                elapsed_ms: sample.maintenance_elapsed_ms,
+                pending: sample.pending_work(),
+            },
         };
     }
 
@@ -144,13 +309,10 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     {
         return Evaluation {
             state: HealthState::Unhealthy,
-            reason: format!(
-                "{} durability ticket(s) unsettled on an otherwise empty pipeline; the \
-                 commit watermark has not advanced for {:.1?}, so accepted records were \
-                 lost and can never be acknowledged",
-                sample.outstanding_tickets,
-                Duration::from_millis(sample.watermark_idle_ms),
-            ),
+            reason: Reason::AckStall {
+                tickets: sample.outstanding_tickets,
+                watermark_idle_ms: sample.watermark_idle_ms,
+            },
         };
     }
 
@@ -158,7 +320,7 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
         // NO WORK: stale progress ages are expected and harmless.
         return Evaluation {
             state: HealthState::Healthy,
-            reason: "pipeline idle".to_owned(),
+            reason: Reason::Idle,
         };
     }
 
@@ -167,22 +329,23 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     // writer until its queue fills.
     let writer_age = Duration::from_millis(sample.writer_idle_ms);
     let batcher_age = Duration::from_millis(sample.batcher_idle_ms);
-    let age = writer_age.max(batcher_age);
     if writer_age >= config.unhealthy_after || batcher_age >= config.unhealthy_after {
         return Evaluation {
             state: HealthState::Unhealthy,
-            reason: format!(
-                "{pending} record(s) pending but no pipeline progress for {age:.1?} \
-                 (writer {writer_age:.1?}, batcher {batcher_age:.1?})"
-            ),
+            reason: Reason::Stalled {
+                pending,
+                writer_idle_ms: sample.writer_idle_ms,
+                batcher_idle_ms: sample.batcher_idle_ms,
+            },
         };
     }
     if writer_age >= config.degraded_after || batcher_age >= config.degraded_after {
         return Evaluation {
             state: HealthState::Degraded,
-            reason: format!(
-                "{pending} record(s) pending, draining slowly ({age:.1?} since last progress)"
-            ),
+            reason: Reason::Draining {
+                pending,
+                age_ms: sample.writer_idle_ms.max(sample.batcher_idle_ms),
+            },
         };
     }
 
@@ -190,16 +353,16 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     if sample.queue_depth >= threshold {
         return Evaluation {
             state: HealthState::Degraded,
-            reason: format!(
-                "command queue at {}/{} (saturation pressure)",
-                sample.queue_depth, sample.queue_capacity
-            ),
+            reason: Reason::Saturated {
+                depth: sample.queue_depth,
+                capacity: sample.queue_capacity,
+            },
         };
     }
 
     Evaluation {
         state: HealthState::Healthy,
-        reason: format!("pipeline progressing, {pending} record(s) pending"),
+        reason: Reason::Progressing { pending },
     }
 }
 
@@ -207,14 +370,35 @@ fn queue_pressure_threshold(capacity: usize, ratio: f32) -> usize {
     if capacity == 0 {
         return usize::MAX;
     }
-    let threshold = (capacity as f32 * ratio.clamp(0.0, 1.0)) as usize;
+    // A non-finite ratio cannot express a threshold; treat it as "only a
+    // completely full queue is saturated". The binary rejects such values, but
+    // this is a public library type.
+    let ratio = if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let threshold = (capacity as f32 * ratio) as usize;
     threshold.max(1)
+}
+
+/// Floor for the sampling interval. A zero or sub-millisecond interval would
+/// make the watchdog loop continuously, taking the commit ledger's locks and
+/// emitting metrics on every iteration. The binary rejects zero, but
+/// [`WatchdogConfig`] is a public type and callers may still pass tiny values.
+const MIN_TICK_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Clamps the configured interval into a range that cannot spin.
+fn normalized_tick_interval(interval: Duration) -> Duration {
+    interval.max(MIN_TICK_INTERVAL)
 }
 
 #[derive(Debug, Error)]
 pub enum WatchdogError {
     #[error("watchdog thread panicked")]
     Panicked,
+    #[error(transparent)]
+    InvalidConfig(#[from] crate::config::WatchdogConfigError),
 }
 
 /// Observer-only supervisor over the storage pipeline.
@@ -230,16 +414,23 @@ pub struct Watchdog {
 }
 
 impl Watchdog {
+    /// Validates the configuration and creates a watchdog.
+    ///
+    /// Returns [`WatchdogError::InvalidConfig`] for threshold orderings or
+    /// ranges that cannot produce meaningful verdicts, instead of spawning an
+    /// observer that silently never degrades or halts.
     pub fn new(
         source: impl HealthSampleSource,
-        config: WatchdogConfig,
+        mut config: WatchdogConfig,
         halt: watch::Sender<bool>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, WatchdogError> {
+        config.validate()?;
+        config.tick_interval = normalized_tick_interval(config.tick_interval);
+        Ok(Self {
             source: Box::new(source),
             config,
             halt,
-        }
+        })
     }
 
     /// Starts the watchdog on its own thread and returns a handle controlling
@@ -317,6 +508,23 @@ impl Drop for WatchdogHandle {
     }
 }
 
+/// Publishes the watchdog's liveness for as long as the thread runs, including
+/// unwind paths (a panic must not leave the gauge stuck at 1).
+struct ActiveGauge;
+
+impl ActiveGauge {
+    fn new() -> Self {
+        ::metrics::gauge!("sidecar_watchdog_active").set(1.0);
+        Self
+    }
+}
+
+impl Drop for ActiveGauge {
+    fn drop(&mut self) {
+        ::metrics::gauge!("sidecar_watchdog_active").set(0.0);
+    }
+}
+
 fn run(
     source: Box<dyn HealthSampleSource>,
     config: WatchdogConfig,
@@ -325,7 +533,7 @@ fn run(
     shutdown: Receiver<()>,
 ) {
     tracing::info!(tick = ?config.tick_interval, "watchdog started");
-    ::metrics::gauge!("sidecar_watchdog_active").set(1.0);
+    let _active = ActiveGauge::new();
 
     let mut previous = HealthState::Healthy;
     loop {
@@ -348,10 +556,21 @@ fn run(
             tracing::error!(reason = %evaluation.reason, "watchdog: pipeline unhealthy");
         }
 
-        if evaluation.state == HealthState::Unhealthy
-            && config.halt_on_unhealthy
-            && !halted.swap(true, Ordering::Relaxed)
-        {
+        if evaluation.state == HealthState::Unhealthy && config.halt_on_unhealthy {
+            // Teardown may have started while this sample was evaluated: a
+            // component that stopped because we are shutting down is not a
+            // fault, and a halt nobody receives is not a halt.
+            if shutdown_signalled(&shutdown) {
+                break;
+            }
+            if halt.send(true).is_err() {
+                tracing::error!(
+                    reason = %evaluation.reason,
+                    "watchdog: pipeline unhealthy but the halt receiver is gone; stopping observation"
+                );
+                break;
+            }
+            halted.store(true, Ordering::Relaxed);
             // Observation stops here, but the drain this triggers is exactly
             // what a post-mortem needs to see: record the complete final
             // sample alongside the verdict so the evidence outlives the loop.
@@ -370,7 +589,6 @@ fn run(
                 maintenance_elapsed_ms = sample.maintenance_elapsed_ms,
                 "watchdog initiating graceful shutdown"
             );
-            let _ = halt.send(true);
             break;
         }
 
@@ -381,7 +599,6 @@ fn run(
         }
     }
 
-    ::metrics::gauge!("sidecar_watchdog_active").set(0.0);
     if !halted.load(Ordering::Relaxed) {
         // After an unhealthy halt the last verdict must stay visible until the
         // process exits; only a clean observer shutdown resets it.
@@ -392,19 +609,25 @@ fn run(
 
 fn emit_metrics(sample: &PipelineSample, state: HealthState) {
     ::metrics::gauge!("sidecar_health_state").set(state.as_metric());
-    ::metrics::gauge!("sidecar_pipeline_pending_records").set(sample.pending_work() as f64);
+    // Commands and records are different units, so they get separate gauges.
+    // The old `sidecar_pipeline_pending_records` mixed both into one value.
+    ::metrics::gauge!("sidecar_pending_work_items").set(sample.pending_work() as f64);
+    ::metrics::gauge!("sidecar_buffered_records").set(sample.pending_records as f64);
+    ::metrics::gauge!("sidecar_queue_depth").set(sample.queue_depth as f64);
+    ::metrics::gauge!("sidecar_queue_capacity").set(sample.queue_capacity as f64);
+    ::metrics::gauge!("sidecar_outstanding_tickets").set(sample.outstanding_tickets as f64);
     ::metrics::gauge!("sidecar_component_idle_ms", "component" => "writer")
         .set(sample.writer_idle_ms as f64);
     ::metrics::gauge!("sidecar_component_idle_ms", "component" => "batcher")
         .set(sample.batcher_idle_ms as f64);
 }
 
-fn log_transition(from: HealthState, to: HealthState, reason: &str) {
+fn log_transition(from: HealthState, to: HealthState, reason: &Reason) {
     let detail = format!("health {from:?} -> {to:?}");
     match to {
-        HealthState::Unhealthy => tracing::error!(reason, "{detail}"),
-        HealthState::Degraded => tracing::warn!(reason, "{detail}"),
-        HealthState::Healthy => tracing::info!(reason, "{detail}"),
+        HealthState::Unhealthy => tracing::error!(reason = %reason, "{detail}"),
+        HealthState::Degraded => tracing::warn!(reason = %reason, "{detail}"),
+        HealthState::Healthy => tracing::info!(reason = %reason, "{detail}"),
     }
 }
 
@@ -488,21 +711,42 @@ mod tests {
 
     /// A long VACUUM/rebuild under live traffic must not be mistaken for a
     /// lost-record stall; only exceeding the maintenance bound is unhealthy.
+    /// Durability stalls and saturation are still surfaced as Degraded.
     #[test]
     fn maintenance_suspends_stall_verdicts_until_its_own_bound() {
         let mut sample = running_sample();
         sample.maintenance_in_progress = true;
         sample.maintenance_elapsed_ms = 50;
         // Even a frozen watermark with outstanding tickets is expected while
-        // maintenance holds the writer.
+        // maintenance holds the writer, but it must not be invisible: report
+        // it as Degraded rather than halting.
         sample.writer_idle_ms = 50_000;
         sample.batcher_idle_ms = 50_000;
         sample.outstanding_tickets = 2;
         sample.watermark_idle_ms = 50_000;
-        assert_eq!(evaluate(&sample, &config()).state, HealthState::Healthy);
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Degraded);
 
         sample.maintenance_elapsed_ms = 500; // >= maintenance_stall_after (300)
         assert_eq!(evaluate(&sample, &config()).state, HealthState::Unhealthy);
+    }
+
+    /// Saturation behind a long maintenance call is a real capacity signal;
+    /// it must not be hidden by the maintenance window.
+    #[test]
+    fn saturated_queue_during_maintenance_is_degraded() {
+        let mut sample = running_sample();
+        sample.maintenance_in_progress = true;
+        sample.maintenance_elapsed_ms = 50;
+        sample.outstanding_tickets = 0;
+        sample.watermark_idle_ms = 0;
+        sample.queue_depth = 90; // >= 75% of capacity 100
+        sample.pending_records = 0;
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Degraded);
+
+        // Nothing pending behind it: maintenance alone stays Healthy.
+        sample.queue_depth = 0;
+        sample.pending_records = 0;
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Healthy);
     }
 
     /// The fresher of the two stages must not mask a wedged counterpart:
@@ -596,7 +840,9 @@ mod tests {
     #[test]
     fn unhealthy_verdict_sends_the_halt_signal_once() {
         let (halt_tx, mut halt_rx) = watch::channel(false);
-        let handle = Watchdog::new(FixedSource(stalled_sample()), config(), halt_tx).spawn();
+        let handle = Watchdog::new(FixedSource(stalled_sample()), config(), halt_tx)
+            .expect("valid config")
+            .spawn();
 
         assert!(
             wait_until(Duration::from_secs(5), || *halt_rx.borrow_and_update()),
@@ -614,7 +860,9 @@ mod tests {
             let (halt_tx, mut halt_rx) = watch::channel(false);
             let mut cfg = config();
             cfg.halt_on_unhealthy = halt_on_unhealthy;
-            let handle = Watchdog::new(FixedSource(source), cfg, halt_tx).spawn();
+            let handle = Watchdog::new(FixedSource(source), cfg, halt_tx)
+                .expect("valid config")
+                .spawn();
 
             std::thread::sleep(Duration::from_millis(120));
             assert!(!handle.requested_halt());
@@ -636,7 +884,9 @@ mod tests {
         let (halt_tx, _halt_rx) = watch::channel(false);
         let mut cfg = config();
         cfg.halt_on_unhealthy = false; // keep the loop running for the test
-        let handle = Watchdog::new(FixedSource(stalled_sample()), cfg, halt_tx).spawn();
+        let handle = Watchdog::new(FixedSource(stalled_sample()), cfg, halt_tx)
+            .expect("valid config")
+            .spawn();
         std::thread::sleep(Duration::from_millis(50));
 
         let started = Instant::now();
@@ -644,6 +894,87 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "stop must not wait out the next tick deadline"
+        );
+    }
+
+    #[test]
+    fn non_finite_queue_pressure_ratio_degrades_only_on_a_full_queue() {
+        assert_eq!(queue_pressure_threshold(100, f32::NAN), 100);
+        assert_eq!(queue_pressure_threshold(100, f32::INFINITY), 100);
+        assert_eq!(queue_pressure_threshold(100, 0.75), 75);
+        assert_eq!(queue_pressure_threshold(0, 0.75), usize::MAX);
+    }
+
+    /// A halt sent to a channel nobody listens on is not a halt: the handle
+    /// must not claim one, or `main` reports an unrecoverable fault that never
+    /// triggered a shutdown.
+    #[test]
+    fn a_halt_nobody_receives_is_not_reported_as_requested() {
+        let (halt_tx, halt_rx) = watch::channel(false);
+        drop(halt_rx);
+        let handle = Watchdog::new(FixedSource(stalled_sample()), config(), halt_tx)
+            .expect("valid config")
+            .spawn();
+
+        // The loop samples immediately; give it time to attempt the send.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!handle.requested_halt());
+        handle.stop().expect("clean stop");
+    }
+
+    /// A zero (or sub-millisecond) interval would turn the tick loop into a
+    /// busy loop that also hammers the commit ledger and metrics registry.
+    #[test]
+    fn tick_interval_is_floored_to_avoid_a_busy_loop() {
+        assert_eq!(normalized_tick_interval(Duration::ZERO), MIN_TICK_INTERVAL);
+        assert_eq!(
+            normalized_tick_interval(Duration::from_nanos(1)),
+            MIN_TICK_INTERVAL
+        );
+        assert_eq!(
+            normalized_tick_interval(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
+
+    /// Library callers bypass the binary's config-file validation, so an
+    /// unusable threshold ordering must fail at construction instead of
+    /// spawning an observer whose degraded state can never be reached.
+    #[test]
+    fn invalid_config_is_rejected_at_construction() {
+        let (halt_tx, _halt_rx) = watch::channel(false);
+        let config = WatchdogConfig {
+            degraded_after: Duration::from_secs(120),
+            ..config()
+        };
+        assert!(matches!(
+            Watchdog::new(FixedSource(running_sample()), config, halt_tx),
+            Err(WatchdogError::InvalidConfig(_))
+        ));
+    }
+
+    /// Reasons are formatted lazily only when a verdict is logged; keep the
+    /// operator-facing text intact through the structured representation.
+    #[test]
+    fn verdict_reasons_render_units_and_context() {
+        let stalled = evaluate(&stalled_sample(), &config());
+        let reason = stalled.reason.to_string();
+        assert!(reason.contains("work item(s) pending"), "{reason}");
+        assert!(reason.contains("writer"), "{reason}");
+
+        let mut idle = running_sample();
+        idle.queue_depth = 0;
+        idle.pending_records = 0;
+        assert_eq!(
+            evaluate(&idle, &config()).reason.to_string(),
+            "pipeline idle"
+        );
+
+        let mut saturated = running_sample();
+        saturated.queue_depth = 90;
+        assert_eq!(
+            evaluate(&saturated, &config()).reason.to_string(),
+            "command queue at 90/100 (saturation pressure)"
         );
     }
 }

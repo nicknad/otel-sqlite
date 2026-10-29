@@ -85,7 +85,7 @@
 //! # Lifecycle
 //!
 //! ```text
-//! Watchdog::new(source, config, halt).spawn()  ─▶ started thread
+//! Watchdog::new(source, config, halt)?.spawn() ─▶ started thread
 //!                                               ─▶ periodic sample/verdict loop
 //! unhealthy verdict                             ─▶ one-shot halt, loop ends
 //! handle.stop()                                 ─▶ clean exit + join()
@@ -96,6 +96,6 @@ mod scheduler;
 mod watchdog;
 mod worker;
 
-pub use config::{MaintenanceConfig, WatchdogConfig};
+pub use config::{MaintenanceConfig, WatchdogConfig, WatchdogConfigError};
 pub use watchdog::{HealthSampleSource, HealthState, Watchdog, WatchdogError, WatchdogHandle};
 pub use worker::{MaintenanceHandle, MaintenanceWorker, MaintenanceWorkerError};

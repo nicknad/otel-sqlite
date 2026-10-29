@@ -19,9 +19,15 @@
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Sender, TrySendError};
+use otel_sqlite_core::saturating_deadline;
 use otel_sqlite_core::storage::{MaintenanceOperation, WriteCommand};
 
 use crate::config::MaintenanceConfig;
+
+/// Floor for the full-queue retry delay. A zero delay would make the worker
+/// spin against a saturated queue instead of yielding; the binary rejects
+/// zero, but this is a public library type.
+const MIN_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// Periodic maintenance operations supported by the worker.
 ///
@@ -73,30 +79,29 @@ pub(crate) struct TickReport {
     pub disconnected: bool,
 }
 
-/// `now + duration`, saturated to the representable range instead of
-/// panicking on extreme configuration values.
-fn schedule_instant(now: Instant, duration: Duration) -> Instant {
-    const TEN_YEARS: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
-    now.checked_add(duration)
-        .or_else(|| now.checked_add(TEN_YEARS))
-        .unwrap_or(now)
-}
-
+/// One periodic maintenance operation and its schedule state.
 struct Task {
     operation: Operation,
     /// `None` disables the operation entirely.
     interval: Option<Duration>,
     next_due: Option<Instant>,
+    /// True while the last enqueue was deferred by queue pressure. Used to
+    /// emit the warning on the transition instead of on every retry.
+    deferred: bool,
 }
 
 impl Task {
     fn new(operation: Operation, interval: Option<Duration>, now: Instant) -> Self {
+        // A zero interval would keep the task permanently due and spin the
+        // worker. The binary rejects zero, but library callers may not.
+        let interval = interval.filter(|interval| !interval.is_zero());
         Self {
             operation,
             interval,
             // First fire happens one full interval after startup: no burst of
             // maintenance work colliding with ingestion ramp-up.
-            next_due: interval.map(|interval| schedule_instant(now, interval)),
+            next_due: interval.map(|interval| saturating_deadline(now, interval)),
+            deferred: false,
         }
     }
 
@@ -108,15 +113,17 @@ impl Task {
     /// enqueued after a full interval. This is what keeps at most one
     /// outstanding instance per operation.
     fn reschedule(&mut self, now: Instant) {
+        self.deferred = false;
         if let Some(interval) = self.interval {
-            self.next_due = Some(schedule_instant(now, interval));
+            self.next_due = Some(saturating_deadline(now, interval));
         }
     }
 
     /// Failed enqueue: keep the operation due, but retry only after the
     /// configured delay instead of hammering a full queue.
     fn defer(&mut self, now: Instant, retry_delay: Duration) {
-        self.next_due = Some(schedule_instant(now, retry_delay));
+        self.deferred = true;
+        self.next_due = Some(saturating_deadline(now, retry_delay));
     }
 }
 
@@ -126,7 +133,10 @@ pub(crate) struct Scheduler {
 }
 
 impl Scheduler {
-    pub(crate) fn new(config: MaintenanceConfig, now: Instant) -> Self {
+    pub(crate) fn new(mut config: MaintenanceConfig, now: Instant) -> Self {
+        // See `MIN_RETRY_DELAY`: a zero delay would spin `tick` against a full
+        // queue. Clamp here so both the worker and the tests share one rule.
+        config.retry_delay = config.retry_delay.max(MIN_RETRY_DELAY);
         let tasks = vec![
             Task::new(Operation::Purge, purge_interval(&config), now),
             Task::new(Operation::Checkpoint, config.checkpoint_interval, now),
@@ -160,6 +170,12 @@ impl Scheduler {
 
             match sink.try_send(command) {
                 Ok(()) => {
+                    if task.deferred {
+                        tracing::info!(
+                            operation = operation.label(),
+                            "maintenance enqueue recovered after queue pressure"
+                        );
+                    }
                     task.reschedule(now);
                     report.scheduled += 1;
                     ::metrics::counter!(
@@ -173,6 +189,7 @@ impl Scheduler {
                     );
                 }
                 Err(TrySendError::Full(command)) => {
+                    let first_deferral = !task.deferred;
                     task.defer(now, self.config.retry_delay);
                     report.deferred += 1;
                     ::metrics::counter!(
@@ -181,12 +198,22 @@ impl Scheduler {
                         "reason" => "queue_full"
                     )
                     .increment(1);
-                    tracing::warn!(
-                        operation = operation.label(),
-                        retry_in_ms = self.config.retry_delay.as_millis() as u64,
-                        "maintenance enqueue deferred; command queue full ({})",
-                        command.kind()
-                    );
+                    // Warn once per deferral episode: a long saturation would
+                    // otherwise emit a warning every `retry_delay`.
+                    if first_deferral {
+                        tracing::warn!(
+                            operation = operation.label(),
+                            retry_in_ms = self.config.retry_delay.as_millis() as u64,
+                            "maintenance enqueue deferred; command queue full ({})",
+                            command.kind()
+                        );
+                    } else {
+                        tracing::debug!(
+                            operation = operation.label(),
+                            "maintenance enqueue still deferred; command queue full ({})",
+                            command.kind()
+                        );
+                    }
                 }
                 Err(TrySendError::Disconnected(command)) => {
                     report.disconnected = true;
@@ -500,5 +527,87 @@ mod tests {
             vec![WriteCommand::Maintenance(MaintenanceOperation::RebuildFts)]
         );
         assert_eq!(scheduler.enabled_task_count(), 1);
+    }
+
+    /// The binary rejects zero durations, but `MaintenanceConfig` is public:
+    /// a zero interval must disable the task, never make it permanently due.
+    #[test]
+    fn zero_intervals_are_disabled_instead_of_spinning() {
+        let cfg = MaintenanceConfig {
+            retention: Some(Duration::from_secs(60)),
+            purge_interval: Some(Duration::ZERO),
+            checkpoint_interval: Some(Duration::ZERO),
+            optimize_interval: Some(Duration::ZERO),
+            vacuum_interval: Some(Duration::ZERO),
+            rebuild_fts_interval: Some(Duration::ZERO),
+            checkpoint_mode: CheckpointMode::Passive,
+            retry_delay: Duration::ZERO,
+        };
+        let base = Instant::now();
+        let mut scheduler = Scheduler::new(cfg, base);
+        let (sink, enqueued) = bounded::<WriteCommand>(16);
+
+        assert_eq!(scheduler.enabled_task_count(), 0);
+        assert_eq!(scheduler.next_deadline(), None);
+        assert_eq!(scheduler.tick(base, &sink), TickReport::default());
+        assert!(drain(&enqueued).is_empty());
+    }
+
+    /// A zero retry delay would spin `tick` against a full queue; the
+    /// scheduler lifts it to `MIN_RETRY_DELAY`.
+    #[test]
+    fn zero_retry_delay_is_lifted_to_a_floor() {
+        let base = Instant::now();
+        let mut scheduler = Scheduler::new(
+            MaintenanceConfig {
+                retention: Some(Duration::from_secs(60)),
+                purge_interval: Some(Duration::from_secs(1)),
+                checkpoint_interval: None,
+                optimize_interval: None,
+                vacuum_interval: None,
+                rebuild_fts_interval: None,
+                checkpoint_mode: CheckpointMode::Passive,
+                retry_delay: Duration::ZERO,
+            },
+            base,
+        );
+        let (saturated, _idle) = bounded::<WriteCommand>(0);
+
+        let report = scheduler.tick(base + Duration::from_secs(1), &saturated);
+        assert_eq!(report.deferred, 1);
+        assert_eq!(
+            scheduler.next_deadline(),
+            Some(base + Duration::from_secs(1) + MIN_RETRY_DELAY)
+        );
+    }
+
+    /// A long saturation must warn once per episode, not once per retry; the
+    /// recovery is reported when the queue drains.
+    #[test]
+    fn repeated_deferrals_do_not_repeat_the_warning() {
+        let base = Instant::now();
+        let mut scheduler = Scheduler::new(
+            MaintenanceConfig {
+                retention: Some(Duration::from_secs(60)),
+                purge_interval: Some(Duration::from_secs(1)),
+                checkpoint_interval: None,
+                optimize_interval: None,
+                vacuum_interval: None,
+                rebuild_fts_interval: None,
+                checkpoint_mode: CheckpointMode::Passive,
+                retry_delay: Duration::from_millis(100),
+            },
+            base,
+        );
+        let (saturated, _idle) = bounded::<WriteCommand>(0);
+        for tick in 1..=5u64 {
+            let report = scheduler.tick(base + Duration::from_secs(tick), &saturated);
+            assert_eq!(report.deferred, 1, "tick {tick}");
+        }
+
+        let (sink, enqueued) = bounded::<WriteCommand>(16);
+        let report = scheduler.tick(base + Duration::from_secs(6), &sink);
+        assert_eq!(report.scheduled, 1);
+        assert_eq!(drain(&enqueued).len(), 1);
     }
 }

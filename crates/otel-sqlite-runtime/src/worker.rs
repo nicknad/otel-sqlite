@@ -97,6 +97,23 @@ impl Drop for MaintenanceHandle {
     }
 }
 
+/// Publishes the worker's liveness for as long as the thread runs, including
+/// unwind paths (a panic must not leave the gauge stuck at 1).
+struct ActiveGauge;
+
+impl ActiveGauge {
+    fn new() -> Self {
+        ::metrics::gauge!("maintenance_worker_active").set(1.0);
+        Self
+    }
+}
+
+impl Drop for ActiveGauge {
+    fn drop(&mut self) {
+        ::metrics::gauge!("maintenance_worker_active").set(0.0);
+    }
+}
+
 fn run(sink: Sender<WriteCommand>, config: MaintenanceConfig, shutdown: Receiver<()>) {
     // The scheduler owns the schedule; derive the startup log count from it
     // instead of duplicating the enabled-operation rules here.
@@ -104,7 +121,7 @@ fn run(sink: Sender<WriteCommand>, config: MaintenanceConfig, shutdown: Receiver
     let enabled = scheduler.enabled_task_count();
 
     tracing::info!(tasks = enabled, "maintenance worker started");
-    ::metrics::gauge!("maintenance_worker_active").set(1.0);
+    let _active = ActiveGauge::new();
 
     loop {
         // Drain a shutdown requested while the previous cycle was running so
@@ -133,7 +150,6 @@ fn run(sink: Sender<WriteCommand>, config: MaintenanceConfig, shutdown: Receiver
         }
     }
 
-    ::metrics::gauge!("maintenance_worker_active").set(0.0);
     tracing::info!("maintenance worker stopped");
 }
 

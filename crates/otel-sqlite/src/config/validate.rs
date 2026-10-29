@@ -197,6 +197,18 @@ fn validate_watchdog(config: &Config) -> Result<()> {
     if config.watchdog.degraded_after >= config.watchdog.unhealthy_after {
         bail!("watchdog.degraded_after must be less than unhealthy_after");
     }
+    // A partial batch legitimately keeps the writer idle until its age
+    // deadline expires. If that deadline can outlive the first health
+    // threshold, a low-volume stream looks stalled and the watchdog would halt
+    // a healthy process.
+    if config.batcher_max_batch_age >= config.watchdog.degraded_after {
+        bail!(
+            "batcher_max_batch_age ({:?}) must be less than watchdog.degraded_after ({:?}); \
+             a buffered batch keeps the writer idle until it expires",
+            config.batcher_max_batch_age,
+            config.watchdog.degraded_after,
+        );
+    }
     if !config.watchdog.queue_pressure_ratio.is_finite()
         || !(0.0..=1.0).contains(&config.watchdog.queue_pressure_ratio)
         || config.watchdog.queue_pressure_ratio == 0.0
