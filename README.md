@@ -87,9 +87,10 @@ recovery for a corrupted index only.
 ### Durability & acknowledgement
 
 Default (`durability.mode = "commit"`): the export response waits until the
-writer has committed every accepted record. Each chunk carries a commit
-ticket; the writer publishes a contiguous watermark per transaction and
-handlers wait on it — a 2xx survives an application crash. Cost: bounded
+writer has committed every record it reports as accepted. Each chunk carries
+a commit ticket; the writer publishes a contiguous watermark and completes a
+ticket only when its last record is durable — a 2xx survives an application
+crash, including when a chunk was split across storage batches. Cost: bounded
 ack latency (batching + queue drain).
 
 ```toml
@@ -101,14 +102,18 @@ synchronous = "normal" # "normal" | "full" (fsync WAL per commit)
 - `"enqueue"`: lowest latency, but acked records may be lost on crash.
 - `synchronous = "full"`: extends guarantee from app crashes to power loss.
 - Writer/batcher death fails pending requests with `UNAVAILABLE` (retryable)
-  instead of hanging.
+  instead of hanging. If part of the request was already durable, the
+  response is instead a 2xx with OTLP `partial_success` and a rejected-record
+  count, so the client only retries the uncommitted remainder.
 
-Backpressure is **all-or-nothing**: the ingress admission guard reserves
+Queue admission is **all-or-nothing**: the ingress admission guard reserves
 room for a whole request before enqueueing any chunk; control messages pass
 the same gate, so requests never interleave. If the queue can't fit the
 request, the server returns `UNAVAILABLE` and accepts **nothing** — safe to
-retry, no duplicates (log rows have no idempotency key). Rejections issue
-no tickets and never stall later commits.
+retry, no duplicates. Rejections issue no tickets and never stall later
+commits. A storage disconnect after some chunks were already sent cannot be
+rolled back, so those chunks are reported via `partial_success` rather than
+a retryable error.
 
 ### Observability
 
@@ -126,8 +131,10 @@ no tickets and never stall later commits.
 - **Failure policy**: per batch — transient (`BUSY`/`LOCKED`) retries 4×
   with backoff; poisonous rows (constraints, binding failures) salvage:
   healthy rows commit, offenders drop-and-count (`quarantined_records`,
-  warn-logged); unknown/environmental (disk full, IO, corruption) is fatal:
-  writer halts, ledger closes, watchdog/supervisor takes over.
+  warn-logged), and the affected export is reported as `partial_success`
+  with a rejected-record count; unknown/environmental (disk full, IO,
+  corruption) is fatal: writer halts, ledger closes, watchdog/supervisor
+  takes over.
   **Page on** `storage_quarantined_records_total` (dropped rows never return)
   **and** `storage_errors_total` growth.
 

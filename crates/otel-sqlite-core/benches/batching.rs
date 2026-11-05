@@ -134,6 +134,7 @@ fn bench_command_construction(c: &mut Criterion) {
                         origin: origin(),
                         records: WriteBatch::from_vec(records),
                         commit_seqs: Vec::new(),
+                        segments: Vec::new(),
                     });
                     black_box(command.record_count());
                     black_box(command.kind());

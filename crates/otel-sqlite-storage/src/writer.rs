@@ -164,18 +164,14 @@ fn execute(
                 return Ok(());
             }
             stats.batches_received.fetch_add(1, Ordering::Relaxed);
-            persist_with_policy(
+            let salvage = persist_with_policy(
                 conn,
                 stats,
                 "logs",
                 |tx| command::insert_logs(tx, &batch),
                 |tx| command::insert_logs_tolerant(tx, &batch),
             )?;
-            // The batch is durable (fully or after salvage): release every
-            // folded ticket.
-            for commit_seq in &batch.commit_seqs {
-                ledger.complete(*commit_seq);
-            }
+            settle_log_batch(ledger, &batch, salvage);
         }
         WriteCommand::Flush => {}
         WriteCommand::Checkpoint(mode) => {
@@ -193,6 +189,67 @@ fn execute(
         }
     }
     Ok(())
+}
+
+/// Publishes a persisted batch to the commit ledger.
+///
+/// A ticket settles only when the batch contains its final segment. Records
+/// written by an earlier segment are reported as progress, so a close midway
+/// through a split chunk can still tell the handler how much is durable.
+fn settle_log_batch(
+    ledger: &CommitLedger,
+    batch: &otel_sqlite_core::storage::LogWriteBatch,
+    salvage: Option<command::SalvageOutcome>,
+) {
+    if batch.segments.is_empty() {
+        // Legacy/bench batches carry no per-record ticket map. Treat every
+        // referenced ticket as complete; a salvage drop fails all of them.
+        match salvage {
+            None => {
+                for commit_seq in &batch.commit_seqs {
+                    ledger.complete(*commit_seq);
+                }
+            }
+            Some(outcome) => {
+                for commit_seq in &batch.commit_seqs {
+                    if outcome.dropped > 0 {
+                        ledger.note_dropped(*commit_seq, outcome.dropped);
+                    }
+                    ledger.complete(*commit_seq);
+                }
+            }
+        }
+        return;
+    }
+
+    match salvage {
+        None => {
+            for segment in &batch.segments {
+                ledger.note_committed(segment.commit_seq, segment.records as u64);
+                if segment.complete {
+                    ledger.complete(segment.commit_seq);
+                }
+            }
+        }
+        Some(outcome) => {
+            // `by_ticket` is already summed for the whole batch, so note it
+            // once per ticket rather than once per segment.
+            for commit_seq in &batch.commit_seqs {
+                let (kept, dropped) = outcome.by_ticket.get(commit_seq).copied().unwrap_or((0, 0));
+                if kept > 0 {
+                    ledger.note_committed(*commit_seq, kept);
+                }
+                if dropped > 0 {
+                    ledger.note_dropped(*commit_seq, dropped);
+                }
+            }
+            for segment in &batch.segments {
+                if segment.complete {
+                    ledger.complete(segment.commit_seq);
+                }
+            }
+        }
+    }
 }
 
 /// How often a [`FailureClass::Retryable`] transaction is re-attempted
@@ -213,8 +270,9 @@ fn backoff_delay(attempt: u32) -> Duration {
 /// * strict pass first; on success the batch is done.
 /// * **Poison** errors (constraint violations, bad inputs) trigger exactly
 ///   one salvage pass in tolerant mode: healthy rows commit, offending rows
-///   are dropped-and-counted as `quarantined_records`. Every ticket still
-///   completes — nothing is lost silently, nothing stalls.
+///   are dropped-and-counted as `quarantined_records`. The affected tickets
+///   settle as failed so their handlers report `partial_success`; nothing is
+///   lost silently and nothing stalls.
 /// * **Retryable** errors (BUSY/LOCKED) are retried up to
 ///   `MAX_TRANSIENT_RETRIES` times with exponential backoff; exhaustion
 ///   escalates to fatal.
@@ -226,13 +284,13 @@ fn persist_with_policy(
     stats: &WriterStats,
     signal: &'static str,
     strict: impl Fn(&rusqlite::Transaction<'_>) -> Result<u64, StorageError>,
-    salvage: impl Fn(&rusqlite::Transaction<'_>) -> Result<(u64, u64), StorageError>,
-) -> Result<(), StorageError> {
+    salvage: impl Fn(&rusqlite::Transaction<'_>) -> Result<command::SalvageOutcome, StorageError>,
+) -> Result<Option<command::SalvageOutcome>, StorageError> {
     let mut attempt = 0u32;
     loop {
         let outcome = run_transaction(conn, stats, &strict);
         match outcome {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(None),
             Err((error, class)) => match class {
                 FailureClass::Poison => {
                     tracing::warn!(
@@ -240,7 +298,7 @@ fn persist_with_policy(
                         %error,
                         "poisonous batch rejected by sqlite; attempting salvage pass"
                     );
-                    return finish_salvage(conn, stats, signal, salvage, error);
+                    return finish_salvage(conn, stats, signal, salvage, error).map(Some);
                 }
                 FailureClass::Retryable if attempt < MAX_TRANSIENT_RETRIES => {
                     let delay = backoff_delay(attempt);
@@ -318,31 +376,33 @@ fn finish_salvage(
     conn: &mut Connection,
     stats: &WriterStats,
     signal: &'static str,
-    salvage: impl Fn(&rusqlite::Transaction<'_>) -> Result<(u64, u64), StorageError>,
+    salvage: impl Fn(&rusqlite::Transaction<'_>) -> Result<command::SalvageOutcome, StorageError>,
     cause: StorageError,
-) -> Result<(), StorageError> {
+) -> Result<command::SalvageOutcome, StorageError> {
     let started = Instant::now();
     let tx = conn.transaction()?;
     match salvage(&tx) {
-        Ok((kept, dropped)) => {
+        Ok(outcome) => {
             tx.commit().map_err(StorageError::from)?;
-            stats.records_written.fetch_add(kept, Ordering::Relaxed);
+            stats
+                .records_written
+                .fetch_add(outcome.kept, Ordering::Relaxed);
             stats
                 .quarantined_records
-                .fetch_add(dropped, Ordering::Relaxed);
+                .fetch_add(outcome.dropped, Ordering::Relaxed);
             stats.transactions_committed.fetch_add(1, Ordering::Relaxed);
             stats.mark_progress();
-            ::metrics::counter!("storage_quarantined_records_total").increment(dropped);
+            ::metrics::counter!("storage_quarantined_records_total").increment(outcome.dropped);
             ::metrics::histogram!("storage_transaction_duration")
                 .record(started.elapsed().as_secs_f64());
             tracing::warn!(
                 signal,
-                kept,
-                dropped,
+                kept = outcome.kept,
+                dropped = outcome.dropped,
                 cause = %cause,
                 "salvage pass complete: healthy rows committed, poisonous rows quarantined"
             );
-            Ok(())
+            Ok(outcome)
         }
         Err(salvage_error) => {
             let _ = tx.rollback();

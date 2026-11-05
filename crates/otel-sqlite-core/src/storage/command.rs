@@ -25,8 +25,9 @@ pub struct BatchOrigin {
 /// [`CommitLedger`](super::commit::CommitLedger): it identifies the chunk on
 /// the commit watermark so OTLP handlers in `durability = "commit"` mode can
 /// wait for this exact data to be persisted before acknowledging. Batching
-/// merges tickets with `max`, so every emitted write batch claims the highest
-/// ticket among its records.
+/// keeps each ticket's records in ordered [`RecordSegment`]s; a ticket is
+/// settled only by the segment carrying its last record, even when the chunk
+/// spans several write batches.
 #[derive(Debug)]
 pub struct LogChunk {
     pub origin: BatchOrigin,
@@ -87,18 +88,32 @@ impl IngestMessage {
     }
 }
 
+/// One run of records that belong to the same durability ticket.
+///
+/// A chunk may be split across several storage batches. `complete` is true
+/// only on the segment that carries the chunk's last record; the writer must
+/// settle the ticket then, never on an earlier segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordSegment {
+    pub commit_seq: u64,
+    pub records: usize,
+    pub complete: bool,
+}
+
 /// A storage-ready batch of log records with its origin.
 ///
-/// `commit_seqs` lists every durability ticket folded into this batch (sorted
-/// ascending). Merging chunks of one origin folds their tickets together, so
-/// the writer must settle *all* of them once the transaction commits —
-/// claiming only the maximum would strand the intermediate tickets on the
-/// commit watermark forever.
+/// `commit_seqs` lists every durability ticket referenced by this batch
+/// (sorted ascending). `segments` partitions `records` in order and says which
+/// ticket each run belongs to; only a segment with `complete = true` may
+/// settle its ticket. A ticket whose chunk is split across batches therefore
+/// stays outstanding until its last record is written, so a durable ack can
+/// never be released for records still buffered.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogWriteBatch {
     pub origin: BatchOrigin,
     pub records: WriteBatch<LogRecord>,
     pub commit_seqs: Vec<u64>,
+    pub segments: Vec<RecordSegment>,
 }
 
 /// Commands consumed by the single SQLite writer. Insert variants carry fully
@@ -185,6 +200,7 @@ mod tests {
             },
             records: WriteBatch::from_vec((0..records).map(|_| LogRecord::default()).collect()),
             commit_seqs: vec![7],
+            segments: Vec::new(),
         }
     }
 

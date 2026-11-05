@@ -161,6 +161,7 @@ fn logs_write_command(count: usize) -> WriteCommand {
         origin: BatchOrigin::default(),
         records: WriteBatch::from_vec(records(0, count, unix_nano_now())),
         commit_seqs: Vec::new(),
+        segments: Vec::new(),
     })
 }
 
@@ -285,6 +286,7 @@ fn populate(pipeline: &Pipeline, count: usize, time_unix_nano: i64) {
                 origin: BatchOrigin::default(),
                 records: WriteBatch::from_vec(records(sent, batch, time_unix_nano)),
                 commit_seqs: Vec::new(),
+                segments: Vec::new(),
             }))
             .expect("writer alive");
         wait_written(&pipeline.storage, target);

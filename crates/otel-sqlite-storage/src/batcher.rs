@@ -222,6 +222,7 @@ fn submit_log_batch(
         origin: submission.origin,
         records: submission.records,
         commit_seqs: submission.commit_seqs,
+        segments: submission.segments,
     });
     let submitted = submit(commands, command, stats);
     if submitted {

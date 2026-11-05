@@ -14,7 +14,7 @@
 mod identity;
 mod logs;
 
-pub(crate) use logs::{insert_logs, insert_logs_tolerant};
+pub(crate) use logs::{SalvageOutcome, insert_logs, insert_logs_tolerant};
 
 /// Empty strings are stored as NULL so sparse columns compress better and
 /// queries can distinguish "absent" from "empty".

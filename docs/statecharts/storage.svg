@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="pele pele-state" viewBox="0 0 1893 891" width="1893" height="891" style="max-width:100%;height:auto;--_bg:var(--pele-bg,#fff);--_fg:var(--pele-fg,#1f1f1f);--_m:var(--pele-muted,#6e6e6e);--_l:var(--pele-line,#1f1f1f);--_s:var(--pele-surface,#f3f3f3);--_a:var(--pele-surface-alt,#e6e6e6);--_b:var(--pele-border,#8a8a8a);--_c:var(--pele-accent,#5b7bd5);color:var(--_fg);--_tw:var(--pele-title-weight,bold);--_fm:var(--pele-font-mono,monospace);font:16px sans-serif;letter-spacing:normal;word-spacing:normal;text-transform:none;direction:ltr;font-family:var(--pele-font,sans-serif)" fill="var(--_fg)" role="graphics-document document" aria-roledescription="state">
+<style>
+.pele {
+  --pele-bg: #ffffff;
+  --pele-fg: #1c1c1c;
+  --pele-muted: #656565;
+  --pele-line: #808080;
+  --pele-surface: #fcfcfc;
+  --pele-surface-alt: #f1f1f1;
+  --pele-border: #c9c9c9;
+}
+.pele .blue rect { fill: #c3e0ff; }
+.pele .orange rect { fill: #f0d3bf; }
+.pele .purple rect { fill: #e3d5ff; }
+.pele .yellow rect { fill: #f0dcbf; }
+.pele .teal rect { fill: #bfe3df; }
+.pele .tan rect { fill: #e5d9ce; }
+.pele .pink rect { fill: #ffcbe6; }
+.pele .breaks rect {
+  fill: #ffecee !important;
+  stroke: #e72e3b !important;
+  stroke-width: 2.5px !important;
+}
+.pele .breaks text {
+  fill: #cd2834 !important;
+}
+.pele .mayBreak rect {
+  fill: #fff3e6 !important;
+  stroke: #e8730c !important;
+  stroke-width: 2.5px !important;
+}
+.pele .mayBreak text {
+  fill: #b85a06 !important;
+}
+.pele .bugPath rect {
+  stroke: #1680f3 !important;
+  stroke-width: 2.5px !important;
+}
+.pele .repeats rect {
+  stroke: #9b35d6 !important;
+  stroke-width: 2.5px !important;
+  stroke-dasharray: 6 3;
+}
+@media (prefers-color-scheme: dark) {
+  .pele {
+    --pele-bg: #1f1f1f;
+    --pele-fg: #f5f5f5;
+    --pele-muted: #acacac;
+    --pele-line: #939393;
+    --pele-surface: #121212;
+    --pele-surface-alt: #2c2c2c;
+    --pele-border: #4e4e4e;
+  }
+  .pele .blue rect { fill: #1b3857; }
+  .pele .orange rect { fill: #573117; }
+  .pele .purple rect { fill: #3c2e57; }
+  .pele .yellow rect { fill: #573d17; }
+  .pele .teal rect { fill: #174641; }
+  .pele .tan rect { fill: #3d3127; }
+  .pele .pink rect { fill: #57233e; }
+  .pele .breaks rect {
+    fill: #2e2021 !important;
+    stroke: #cf2b35 !important;
+  }
+  .pele .breaks text {
+    fill: #ff6463 !important;
+  }
+  .pele .mayBreak rect {
+    fill: #2e2619 !important;
+    stroke: #d0700f !important;
+  }
+  .pele .mayBreak text {
+    fill: #ffa257 !important;
+  }
+  .pele .bugPath rect {
+    stroke: #116dd2 !important;
+  }
+  .pele .repeats rect {
+    stroke: #9a3fcf !important;
+  }
+}</style><text class="pele-title" font-weight="var(--_tw)" text-anchor="middle" xml:space="preserve"><tspan x="946.5" y="25.6">otel-sqlite storage: one chunk to a durable acknowledgement</tspan></text><g transform="translate(0,36)"><g class="pele-clusters"><g class="pele-cluster pele-state-composite" data-id="legend"><rect x="1008.71" y="8" width="738.77" height="112" rx="10" fill="var(--_a)" fill-opacity="0.5" stroke="var(--_b)"/><path d="M1008.71,44H1747.47" fill="none" stroke="var(--_b)"/><text class="pele-cluster-label" x="1378.09" y="31.6" text-anchor="middle">Legend</text></g></g><g class="pele-edges" fill="none" stroke="var(--_l)" stroke-linecap="round"><g class="pele-edge pele-transition" data-id="edge0"><path d="M961.71,120L961.71,157"/><path class="pele-marker" d="M961.71,164L958.35,156L965.07,156Z" fill="var(--_l)" stroke="none"/></g><g class="pele-edge pele-transition" data-id="edge1"><path d="M961.71,208L961.71,285"/><path class="pele-marker" d="M961.71,292L958.35,284L965.07,284Z" fill="var(--_l)" stroke="none"/></g><g class="pele-edge pele-transition" data-id="edge2"><path d="M914.55,354C914.55,362.26 748.82,364.24 748.82,372.5L748.82,431"/><path class="pele-marker" d="M748.82,438L745.46,430L752.18,430Z" fill="var(--_l)" stroke="none"/></g><g class="pele-edge pele-transition" data-id="edge3"><path d="M988.97,354L988.97,562"/><path class="pele-marker" d="M988.97,569L985.61,561L992.33,561Z" fill="var(--_l)" stroke="none"/></g><g class="pele-edge pele-transition" data-id="edge4"><path d="M748.82,500L748.82,543.5C748.82,547.44 944.35,553.44 944.35,557.38L944.35,562"/><path class="pele-marker" d="M944.35,569L940.99,561L947.71,561Z" fill="var(--_l)" stroke="none"/></g><g class="pele-edge pele-transition" data-id="edge5"><path d="M904.35,613L904.35,625.25C904.35,635.02 755.08,641 511.53,641C267.97,641 118.7,665.32 118.7,705L118.7,778"/><path class="pele-marker" d="M118.7,785L115.34,777L122.06,777Z" fill="var(--_l)" stroke="none"/></g><g class="pele-edge pele-transition" data-id="edge6"><path d="M918.69,613L918.69,626C918.69,642.74 805.94,653 621.97,653C438,653 325.25,672.76 325.25,705L325.25,778"/><path class="pele-marker" d="M325.25,785L321.89,777L328.61,777Z" fill="var(--_l)" stroke="none"/></g><g class="pele-edge pele-transition" data-id="edge7"><path d="M947.37,613L947.37,626C947.37,657.62 909.14,677 846.77,677C784.4,677 746.18,687.64 746.18,705L746.18,778"/><path class="pele-marker" d="M746.18,785L742.82,777L749.54,777Z" fill="var(--_l)" stroke="none"/></g><g class="pele-edge pele-transition" data-id="edge8"><path d="M976.04,613L976.04,626C976.04,657.62 1010.57,677 1066.91,677C1123.24,677 1157.77,687.64 1157.77,705L1157.77,778"/><path class="pele-marker" d="M1157.77,785L1154.41,777L1161.13,777Z" fill="var(--_l)" stroke="none"/></g><g class="pele-edge pele-transition" data-id="edge9"><path d="M1268.2,785L1268.2,775.38C1268.2,769.19 1360.06,769.19 1360.06,763L1360.06,705C1360.06,680.2 1289.82,665 1175.22,665C1060.62,665 990.38,650.18 990.38,626L990.38,620"/><path class="pele-marker" d="M990.38,613L993.74,621L987.02,621Z" fill="var(--_l)" stroke="none"/></g><g class="pele-edge pele-transition" data-id="edge10"><path d="M448.56,785L448.56,775.38C448.56,769.19 530.65,769.19 530.65,763L530.65,705C530.65,680.2 607.1,665 731.84,665C856.58,665 933.03,650.18 933.03,626L933.03,620"/><path class="pele-marker" d="M933.03,613L936.39,621L929.67,621Z" fill="var(--_l)" stroke="none"/></g><g class="pele-edge pele-transition" data-id="edge11"><path d="M853.95,785L853.95,775.38C853.95,769.69 961.71,768.68 961.71,763L961.71,620"/><path class="pele-marker" d="M961.71,613L965.07,621L958.35,621Z" fill="var(--_l)" stroke="none"/></g><g class="pele-edge pele-transition" data-id="edge12"><path d="M1004.72,613L1004.72,626C1004.72,642.74 1113.8,653 1291.78,653C1469.76,653 1578.84,672.76 1578.84,705L1578.84,778"/><path class="pele-marker" d="M1578.84,785L1575.48,777L1582.2,777Z" fill="var(--_l)" stroke="none"/></g><g class="pele-edge pele-transition" data-id="edge13"><path d="M1019.06,613L1019.06,625.25C1019.06,635.02 1166.04,641 1405.86,641C1645.68,641 1792.67,665.32 1792.67,705L1792.67,778"/><path class="pele-marker" d="M1792.67,785L1789.31,777L1796.03,777Z" fill="var(--_l)" stroke="none"/></g></g><g class="pele-edge-labels" font-size="14"><g class="pele-edge-label" data-id="edge1"><rect x="861.6" y="228.5" width="200.22" height="36" rx="3" fill="var(--_bg)"/><text text-anchor="middle" xml:space="preserve"><tspan x="961.71" y="242.4">the chunk enters its origin</tspan><tspan x="961.71" y="260.4">buffer, the first batch is queued</tspan></text></g><g class="pele-edge-label" data-id="edge2"><rect x="654.93" y="374.5" width="187.77" height="36" rx="3" fill="var(--_bg)"/><text text-anchor="middle" xml:space="preserve"><tspan x="748.82" y="388.4">the age deadline expires, the</tspan><tspan x="748.82" y="406.4">last record is queued</tspan></text></g><g class="pele-edge-label" data-id="edge3"><rect x="893.55" y="458.5" width="190.85" height="21" rx="3" fill="var(--_bg)"/><text x="988.97" y="473.9" text-anchor="middle">the writer takes the first batch</text></g><g class="pele-edge-label" data-id="edge4"><rect x="653.39" y="520.5" width="190.85" height="21" rx="3" fill="var(--_bg)"/><text x="748.82" y="535.9" text-anchor="middle">the writer takes the first batch</text></g><g class="pele-edge-label" data-id="edge5"><rect x="71.52" y="723.5" width="94.35" height="21" rx="3" fill="var(--_bg)"/><text x="118.7" y="738.9" text-anchor="middle">the writer fails</text></g><g class="pele-edge-label" data-id="edge6"><rect x="237.6" y="716" width="175.29" height="36" rx="3" fill="var(--_bg)"/><text text-anchor="middle" xml:space="preserve"><tspan x="325.25" y="729.9">the first batch commits, the</tspan><tspan x="325.25" y="747.9">ticket stays open</tspan></text></g><g class="pele-edge-label" data-id="edge7"><rect x="648.4" y="707" width="195.54" height="54" rx="3" fill="var(--_bg)"/><text text-anchor="middle" xml:space="preserve"><tspan x="746.18" y="720.9">salvage keeps one record and</tspan><tspan x="746.18" y="738.9">quarantines one, so the ticket</tspan><tspan x="746.18" y="756.9">stays open</tspan></text></g><g class="pele-edge-label" data-id="edge8"><rect x="1079.46" y="716" width="156.61" height="36" rx="3" fill="var(--_bg)"/><text text-anchor="middle" xml:space="preserve"><tspan x="1157.77" y="729.9">SQLite reports BUSY or</tspan><tspan x="1157.77" y="747.9">LOCKED</tspan></text></g><g class="pele-edge-label" data-id="edge9"><rect x="1256.07" y="723.5" width="207.96" height="21" rx="3" fill="var(--_bg)"/><text x="1360.06" y="738.9" text-anchor="middle">the writer retries the same batch</text></g><g class="pele-edge-label" data-id="edge10"><rect x="432.89" y="723.5" width="195.52" height="21" rx="3" fill="var(--_bg)"/><text x="530.65" y="738.9" text-anchor="middle">the writer takes the last record</text></g><g class="pele-edge-label" data-id="edge11"><rect x="863.95" y="723.5" width="195.52" height="21" rx="3" fill="var(--_bg)"/><text x="961.71" y="738.9" text-anchor="middle">the writer takes the last record</text></g><g class="pele-edge-label" data-id="edge12"><rect x="1488.87" y="716" width="179.95" height="36" rx="3" fill="var(--_bg)"/><text text-anchor="middle" xml:space="preserve"><tspan x="1578.84" y="729.9">the last record commits, the</tspan><tspan x="1578.84" y="747.9">ticket completes</tspan></text></g><g class="pele-edge-label" data-id="edge13"><rect x="1702.69" y="716" width="179.95" height="36" rx="3" fill="var(--_bg)"/><text text-anchor="middle" xml:space="preserve"><tspan x="1792.67" y="729.9">the last record commits, the</tspan><tspan x="1792.67" y="747.9">ticket fails</tspan></text></g></g><g class="pele-nodes"><g class="pele-node pele-state orange" data-id="s0" transform="translate(961.71,186)"><rect x="-72.02" y="-22" width="144.05" height="44" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" x="0" y="5.6" text-anchor="middle">Chunk admitted</text></g><g class="pele-node pele-state orange" data-id="s1" transform="translate(961.71,323)"><rect x="-99.15" y="-31" width="198.3" height="62" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" text-anchor="middle" xml:space="preserve"><tspan x="0" y="-4.9">First batch queued, last</tspan><tspan x="0" y="16.1">record buffered</tspan></text></g><g class="pele-node pele-state orange" data-id="s2" transform="translate(748.82,469)"><rect x="-114.73" y="-31" width="229.46" height="62" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" text-anchor="middle" xml:space="preserve"><tspan x="0" y="-4.9">Both batches queued, ticket</tspan><tspan x="0" y="16.1">open</tspan></text></g><g class="pele-node pele-state purple" data-id="s3" transform="translate(961.71,591)"><rect x="-69.35" y="-22" width="138.7" height="44" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" x="0" y="5.6" text-anchor="middle">Writing a batch</text></g><g class="pele-node pele-state tan" data-id="s4" transform="translate(118.7,807)"><rect x="-110.7" y="-22" width="221.39" height="44" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" x="0" y="5.6" text-anchor="middle">Writer failed, ledger closed</text></g><g class="pele-node pele-state blue" data-id="s5" transform="translate(384.98,816)"><rect x="-115.58" y="-31" width="231.17" height="62" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" text-anchor="middle" xml:space="preserve"><tspan x="0" y="-4.9">First batch committed, ticket</tspan><tspan x="0" y="16.1">open</tspan></text></g><g class="pele-node pele-state yellow" data-id="s6" transform="translate(805.91,816)"><rect x="-100.04" y="-31" width="200.08" height="62" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" text-anchor="middle" xml:space="preserve"><tspan x="0" y="-4.9">First batch quarantined,</tspan><tspan x="0" y="16.1">ticket open</tspan></text></g><g class="pele-node pele-state purple" data-id="s7" transform="translate(1217.5,816)"><rect x="-102.7" y="-31" width="205.41" height="62" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" text-anchor="middle" xml:space="preserve"><tspan x="0" y="-4.9">Retrying the same batch</tspan><tspan x="0" y="16.1">after BUSY/LOCKED</tspan></text></g><g class="pele-node pele-state teal" data-id="s8" transform="translate(1578.84,816)"><rect x="-88.91" y="-31" width="177.82" height="62" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" text-anchor="middle" xml:space="preserve"><tspan x="0" y="-4.9">Ticket completed, all</tspan><tspan x="0" y="16.1">records durable</tspan></text></g><g class="pele-node pele-state yellow" data-id="s9" transform="translate(1792.67,816)"><rect x="-84.91" y="-31" width="169.82" height="62" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" text-anchor="middle" xml:space="preserve"><tspan x="0" y="-4.9">Ticket failed, partial</tspan><tspan x="0" y="16.1">success</tspan></text></g><g class="pele-node pele-state-start" data-id="root_start" transform="translate(961.71,113)"><circle r="7" fill="var(--_l)"/></g><g class="pele-node pele-state orange" data-id="lg0" transform="translate(1071.83,82)"><rect x="-47.13" y="-22" width="94.26" height="44" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" x="0" y="5.6" text-anchor="middle">Batching</text></g><g class="pele-node pele-state purple" data-id="lg1" transform="translate(1199.85,82)"><rect x="-40.89" y="-22" width="81.78" height="44" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" x="0" y="5.6" text-anchor="middle">Writing</text></g><g class="pele-node pele-state blue" data-id="lg2" transform="translate(1328.75,82)"><rect x="-48.01" y="-22" width="96.02" height="44" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" x="0" y="5.6" text-anchor="middle">Progress</text></g><g class="pele-node pele-state yellow" data-id="lg3" transform="translate(1455.43,82)"><rect x="-38.67" y="-22" width="77.34" height="44" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" x="0" y="5.6" text-anchor="middle">Partial</text></g><g class="pele-node pele-state teal" data-id="lg4" transform="translate(1575,82)"><rect x="-40.9" y="-22" width="81.81" height="44" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" x="0" y="5.6" text-anchor="middle">Settled</text></g><g class="pele-node pele-state tan" data-id="lg5" transform="translate(1693.69,82)"><rect x="-37.78" y="-22" width="75.57" height="44" rx="10" fill="var(--_s)" stroke="var(--_b)"/><text class="pele-label" x="0" y="5.6" text-anchor="middle">Failed</text></g></g></g></svg>

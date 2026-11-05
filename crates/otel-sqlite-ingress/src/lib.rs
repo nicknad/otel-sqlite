@@ -37,12 +37,16 @@ pub use mapping::pb;
 /// Mapped record chunks cross this boundary by ownership transfer; a full
 /// channel applies backpressure to OTLP clients instead of dropping records.
 ///
-/// Unlike the raw crossbeam channel it wraps, this sender admits messages
-/// **all-or-nothing**: [`IngestSender::reserve`] either reserves room for an
-/// entire request's chunks up front or rejects the request wholesale, so a
-/// request can never be partially accepted. That is what keeps retries
-/// duplicate-free — a client told to retry (`UNAVAILABLE`) has had none of its
-/// records accepted.
+/// Unlike the raw crossbeam channel it wraps, this sender reserves room for
+/// an entire request's chunks up front or rejects the request wholesale. A
+/// client told to retry a queue-full rejection (`UNAVAILABLE`) has had none
+/// of its records accepted.
+///
+/// A storage disconnect after some chunks were sent cannot recall them. The
+/// sender leaves the accepted chunks in the queue, voids only the unsent
+/// ticket, and the handler reports the accepted prefix with OTLP
+/// `partial_success` instead of a retryable error, so accepted records are
+/// not resent.
 ///
 /// crossbeam's bounded channel has no multi-slot reservation primitive, so
 /// atomicity is provided by an admission gate: an `Arc<Mutex<()>>` shared by

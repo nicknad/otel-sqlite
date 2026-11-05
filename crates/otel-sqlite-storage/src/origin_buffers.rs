@@ -9,51 +9,120 @@
 //! the list only ever holds the handful of origins active inside one batching
 //! window.
 //!
-//! Each buffer also accumulates the durability tickets (`commit_seq`) of the
-//! chunks folded into it. Emitted batches claim *all* buffered tickets — not
-//! just their maximum — because a batch that merges tickets 1 and 3 commits
-//! both, and leaving ticket 1 unsettled would stall the contiguous commit
-//! watermark forever. Claiming is idempotent: a buffer keeps its ticket set
-//! until it is drained, so later partial flushes re-claim already-settled
-//! tickets harmlessly.
+//! Each buffer also tracks the durability tickets (`commit_seq`) of the
+//! records still buffered, as an ordered queue of `(ticket, records)`
+//! segments. An emitted batch consumes the segments covering its first
+//! records; the segment that carries a ticket's last record is marked
+//! complete. A split chunk therefore stays outstanding across batches, and a
+//! batch that merges tickets 1 and 3 settles each on its own final segment
+//! rather than stranding ticket 1 behind the watermark.
 //!
 //! This module is pure data-structure logic: it knows nothing about channels,
 //! threads or metrics. The driver loop lives in `crate::batcher`.
 
-use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::time::Instant;
 
-use otel_sqlite_core::storage::{BatchOrigin, InsertBatcher, InsertBatcherConfig, WriteBatch};
+use otel_sqlite_core::storage::{
+    BatchOrigin, InsertBatcher, InsertBatcherConfig, RecordSegment, WriteBatch,
+};
 
 /// Batches produced by one origin buffer, paired with the origin shared by
-/// all records inside them and every durability ticket they carry. This is
-/// the driver-side counterpart of the core [`WriteBatch`]: same records,
-/// plus the metadata needed to build a `LogWriteBatch` command.
+/// all records inside them and the ticket segments they carry. This is the
+/// driver-side counterpart of the core [`WriteBatch`]: same records, plus the
+/// metadata needed to build a `LogWriteBatch` command.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Submission<T> {
     pub(crate) origin: BatchOrigin,
     pub(crate) records: WriteBatch<T>,
-    /// Sorted ascending; may repeat across successive submissions of the
-    /// same buffer (settlement downstream is idempotent).
+    /// Every ticket referenced by this submission, sorted ascending.
     pub(crate) commit_seqs: Vec<u64>,
+    /// Ordered partition of `records`; `complete` marks the segment carrying
+    /// the last record of its ticket.
+    pub(crate) segments: Vec<RecordSegment>,
 }
 
 impl<T> Submission<T> {
-    pub(crate) fn new(origin: BatchOrigin, records: WriteBatch<T>, commit_seqs: Vec<u64>) -> Self {
+    pub(crate) fn new(
+        origin: BatchOrigin,
+        records: WriteBatch<T>,
+        segments: Vec<RecordSegment>,
+    ) -> Self {
+        let mut commit_seqs = segments
+            .iter()
+            .map(|segment| segment.commit_seq)
+            .collect::<Vec<_>>();
+        commit_seqs.sort_unstable();
+        commit_seqs.dedup();
         Self {
             origin,
             records,
             commit_seqs,
+            segments,
         }
+    }
+}
+
+/// One origin's batcher plus the tickets of the records still buffered.
+struct OriginBuffer<T> {
+    /// FIFO `(ticket, records remaining in the buffer)` for every record
+    /// currently buffered, in the same order as the batcher's buffer.
+    segments: VecDeque<(u64, usize)>,
+    batcher: InsertBatcher<T>,
+}
+
+impl<T> OriginBuffer<T> {
+    fn new(config: InsertBatcherConfig) -> Self {
+        Self {
+            segments: VecDeque::new(),
+            batcher: InsertBatcher::new(config),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.batcher.is_empty() && self.segments.is_empty()
+    }
+
+    /// Maps the first `count` records of the batcher's FIFO buffer to their
+    /// tickets, consuming the segments they cover. A segment is marked
+    /// complete only when its last record is in this batch.
+    fn consume(&mut self, count: usize) -> Vec<RecordSegment> {
+        debug_assert!(
+            self.segments
+                .iter()
+                .map(|(_, records)| *records)
+                .sum::<usize>()
+                >= count,
+            "a batch cannot consume more records than the segments hold"
+        );
+        let mut out = Vec::new();
+        let mut left = count;
+        while left > 0 {
+            let (commit_seq, remaining) = self
+                .segments
+                .front_mut()
+                .expect("every buffered record has a ticket segment");
+            let take = (*remaining).min(left);
+            *remaining -= take;
+            left -= take;
+            let complete = *remaining == 0;
+            out.push(RecordSegment {
+                commit_seq: *commit_seq,
+                records: take,
+                complete,
+            });
+            if complete {
+                self.segments.pop_front();
+            }
+        }
+        out
     }
 }
 
 pub(crate) struct OriginBuffers<T> {
     config: InsertBatcherConfig,
-    /// One buffer per active origin. The set holds every durability ticket
-    /// absorbed since the buffer was created; emitted batches claim a sorted
-    /// snapshot of it.
-    buffers: Vec<(BatchOrigin, BTreeSet<u64>, InsertBatcher<T>)>,
+    /// One buffer per active origin.
+    buffers: Vec<(BatchOrigin, OriginBuffer<T>)>,
 }
 
 impl<T> OriginBuffers<T> {
@@ -67,60 +136,52 @@ impl<T> OriginBuffers<T> {
     pub(crate) fn deadline(&self) -> Option<Instant> {
         self.buffers
             .iter()
-            .filter_map(|(_, _, batcher)| batcher.deadline())
+            .filter_map(|(_, buffer)| buffer.batcher.deadline())
             .min()
     }
 
     pub(crate) fn buffered(&self) -> usize {
         self.buffers
             .iter()
-            .map(|(_, _, batcher)| batcher.buffered())
+            .map(|(_, buffer)| buffer.batcher.buffered())
             .sum()
     }
 
     /// Pushes a mapped chunk, emitting any full batches that became ready.
     ///
-    /// The chunk's ticket joins the buffer's accumulated set before any
-    /// emission snapshot is taken, so a full batch emitted by this push
-    /// already claims the incoming ticket. Returns the ready submissions in
-    /// emission order; an empty vector means everything stayed buffered.
+    /// The chunk's ticket joins the buffer before any emission, so a full
+    /// batch emitted by this push carries segments for the incoming chunk.
+    /// If the chunk is split, only the batch containing its last record marks
+    /// the ticket complete. Returns the ready submissions in emission order;
+    /// an empty vector means everything stayed buffered.
     pub(crate) fn push(
         &mut self,
         origin: BatchOrigin,
         records: Vec<T>,
         commit_seq: u64,
     ) -> Vec<Submission<T>> {
-        let index = if let Some(index) = self
-            .buffers
-            .iter()
-            .position(|(known, _, _)| *known == origin)
+        let index = if let Some(index) = self.buffers.iter().position(|(known, _)| *known == origin)
         {
-            self.buffers[index].1.insert(commit_seq);
             index
         } else {
-            let mut tickets = BTreeSet::new();
-            tickets.insert(commit_seq);
             self.buffers
-                .push((origin.clone(), tickets, InsertBatcher::new(self.config)));
+                .push((origin.clone(), OriginBuffer::new(self.config)));
             self.buffers.len() - 1
         };
 
-        let output = self.buffers[index].2.push(records);
-        if output.is_empty() {
-            if self.buffers[index].2.is_empty() {
-                self.buffers.remove(index);
-            }
-            return Vec::new();
+        let buffer = &mut self.buffers[index].1;
+        if !records.is_empty() {
+            buffer.segments.push_back((commit_seq, records.len()));
         }
-        let claimed = self.buffers[index].1.iter().copied().collect::<Vec<_>>();
-        let emitted = output
-            .into_iter()
-            .map(|batch| Submission::new(origin.clone(), batch, claimed.clone()))
-            .collect();
-        if self.buffers[index].2.is_empty() {
+        let output = buffer.batcher.push(records);
+        let mut emitted = Vec::with_capacity(output.len());
+        for batch in output {
+            let segments = buffer.consume(batch.len());
+            emitted.push(Submission::new(origin.clone(), batch, segments));
+        }
+        if buffer.is_empty() {
             self.buffers.remove(index);
         }
-
         emitted
     }
 
@@ -140,10 +201,10 @@ impl<T> OriginBuffers<T> {
         mut flush_one: impl FnMut(&mut InsertBatcher<T>) -> Option<WriteBatch<T>>,
     ) -> Vec<Submission<T>> {
         let mut submissions = Vec::new();
-        for (origin, tickets, batcher) in &mut self.buffers {
-            if let Some(records) = flush_one(batcher) {
-                let claimed = tickets.iter().copied().collect::<Vec<_>>();
-                submissions.push(Submission::new(origin.clone(), records, claimed));
+        for (origin, buffer) in &mut self.buffers {
+            if let Some(records) = flush_one(&mut buffer.batcher) {
+                let segments = buffer.consume(records.len());
+                submissions.push(Submission::new(origin.clone(), records, segments));
             }
         }
         self.retain_active();
@@ -151,7 +212,7 @@ impl<T> OriginBuffers<T> {
     }
 
     fn retain_active(&mut self) {
-        self.buffers.retain(|(_, _, batcher)| !batcher.is_empty());
+        self.buffers.retain(|(_, buffer)| !buffer.is_empty());
     }
 }
 
@@ -210,10 +271,33 @@ mod tests {
             vec![4, 4]
         );
         assert!(submissions.iter().all(|s| s.origin.schema_url == "a"));
-        // Both emissions claim the origin's whole accumulated ticket set
-        // {3, 7}: settlement downstream must cover every folded ticket, not
-        // just the maximum.
-        assert!(submissions.iter().all(|s| s.commit_seqs == vec![3, 7]));
+        // Ticket 3 ends inside the first full batch; ticket 7 is split, so
+        // only its final flush may complete it.
+        assert_eq!(submissions[0].commit_seqs, vec![3, 7]);
+        assert_eq!(
+            submissions[0].segments,
+            vec![
+                RecordSegment {
+                    commit_seq: 3,
+                    records: 2,
+                    complete: true
+                },
+                RecordSegment {
+                    commit_seq: 7,
+                    records: 2,
+                    complete: false
+                },
+            ]
+        );
+        assert_eq!(submissions[1].commit_seqs, vec![7]);
+        assert_eq!(
+            submissions[1].segments,
+            vec![RecordSegment {
+                commit_seq: 7,
+                records: 4,
+                complete: false
+            }]
+        );
         // 3 records of "a" plus the untouched 3 of "b" remain.
         assert_eq!(buffers.buffered(), 6);
 
@@ -227,7 +311,23 @@ mod tests {
                     s.commit_seqs.as_slice()
                 ))
                 .collect::<Vec<_>>(),
-            vec![("a", 3, [3, 7].as_slice()), ("b", 3, [5].as_slice())]
+            vec![("a", 3, [7].as_slice()), ("b", 3, [5].as_slice())]
+        );
+        assert_eq!(
+            submissions[0].segments,
+            vec![RecordSegment {
+                commit_seq: 7,
+                records: 3,
+                complete: true
+            }]
+        );
+        assert_eq!(
+            submissions[1].segments,
+            vec![RecordSegment {
+                commit_seq: 5,
+                records: 3,
+                complete: true
+            }]
         );
         assert_eq!(buffers.buffered(), 0);
         assert!(buffers.flush_all().is_empty());
@@ -261,5 +361,20 @@ mod tests {
         assert!(pushed.is_empty());
         assert_eq!(submissions.len(), 1);
         assert_eq!(submissions[0].commit_seqs, vec![1, 3]);
+        assert_eq!(
+            submissions[0].segments,
+            vec![
+                RecordSegment {
+                    commit_seq: 1,
+                    records: 2,
+                    complete: true
+                },
+                RecordSegment {
+                    commit_seq: 3,
+                    records: 2,
+                    complete: true
+                },
+            ]
+        );
     }
 }

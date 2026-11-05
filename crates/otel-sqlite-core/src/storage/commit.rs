@@ -4,26 +4,31 @@
 //!
 //! 1. **Issuance** — ingress stamps every accepted chunk with a ticket from
 //!    [`CommitLedger::issue`] before handing it to the ingest queue.
-//! 2. **Completion** — the SQLite writer calls [`CommitLedger::complete`]
-//!    after the transaction containing that chunk's records has committed.
+//! 2. **Progress and completion** — the SQLite writer calls
+//!    [`CommitLedger::note_committed`] for every batch segment it persists and
+//!    [`CommitLedger::complete`] only when that ticket's last record has
+//!    committed. A chunk split across storage batches therefore stays
+//!    outstanding until all its records are durable.
 //! 3. **Waiting** — an OTLP handler that must acknowledge durably awaits
-//!    [`CommitLedger::committed`], which resolves once the writer has
-//!    published a commit covering the request's highest ticket.
+//!    [`CommitLedger::wait`], which resolves when the ticket completes, fails
+//!    (some records were quarantined), or the pipeline closes.
 //!
 //! Tickets may complete out of order: per-origin batching emits batches in
 //! arrival order per origin, but two origins can emit in either order, and a
 //! rejected enqueue voids its ticket ([`CommitLedger::void`]). The published
 //! [`Watermark::committed_through`] therefore advances *contiguously* — past
-//! ticket `N` only once tickets `1..=N` are all completed or voided — so a
-//! waiter can never be released while any of its own accepted records are
-//! still uncommitted.
+//! ticket `N` only once tickets `1..=N` are all completed, voided, or failed —
+//! so a waiter can never be released while any of its own accepted records are
+//! still uncommitted. A ticket that ends in salvage is kept in
+//! [`TicketState::Failed`] so its handler can distinguish lost records from a
+//! clean commit.
 //!
 //! The ledger doubles as a liveness signal: [`CommitLedger::close`] marks the
 //! pipeline as gone (writer exited, or the batcher lost records), which fails
 //! every pending and future waiter immediately instead of leaving requests
 //! hanging until the server drain deadline.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -43,8 +48,41 @@ pub struct Watermark {
     pub closed: bool,
 }
 
+/// Progress recorded for a ticket before it is settled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TicketProgress {
+    /// Records of this ticket that a transaction has committed.
+    pub committed: u64,
+    /// Records of this ticket that salvage has quarantined (dropped).
+    pub dropped: u64,
+}
+
+/// Current state of one commit ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketState {
+    /// Neither completed nor failed yet. `progress` reports the records that
+    /// are already durable even though the ticket is not settled.
+    Unsettled { progress: TicketProgress },
+    /// The ticket is settled and none of its records were quarantined.
+    Completed,
+    /// The ticket is settled, but salvage dropped at least one of its records.
+    Failed { progress: TicketProgress },
+}
+
+/// Result of waiting for one ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// Every record behind the ticket is durable.
+    Committed,
+    /// The ticket settled, but salvage quarantined some of its records.
+    Failed { committed: u64, dropped: u64 },
+    /// The pipeline closed before the ticket settled.
+    Closed,
+}
+
 /// Resolved by [`CommitLedger::committed`] when the pipeline shut down before
-/// the requested ticket was committed.
+/// the requested ticket was committed, or when the ticket's records were
+/// quarantined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitLedgerClosed;
 
@@ -63,12 +101,25 @@ struct Inner {
     /// practice: entries leave as soon as the missing predecessor arrives.
     settled_above: BTreeSet<u64>,
     committed_through: u64,
+    /// Records already durable (or quarantined) for tickets that are not
+    /// settled yet. Entries for completed/voided tickets are removed; failed
+    /// entries stay so a waiter can report how many records were lost.
+    progress: BTreeMap<u64, TicketProgress>,
+    /// Settled tickets that ended in quarantine. Kept after the watermark
+    /// passes them so a waiter can still distinguish failure from success.
+    failed: BTreeSet<u64>,
     /// Monotonic ms of the last time `committed_through` advanced. Evidence
     /// for stall detection: a frozen watermark while tickets are outstanding
     /// means some accepted chunk's records were lost without its ticket
     /// being voided.
     last_advance_ms: u64,
     closed: bool,
+}
+
+impl Inner {
+    fn is_settled(&self, ticket: u64) -> bool {
+        ticket <= self.committed_through || self.settled_above.contains(&ticket)
+    }
 }
 
 /// Shared registry of commit tickets; cheap to clone via [`Arc`].
@@ -103,6 +154,8 @@ impl CommitLedger {
             inner: Mutex::new(Inner {
                 settled_above: BTreeSet::new(),
                 committed_through: 0,
+                progress: BTreeMap::new(),
+                failed: BTreeSet::new(),
                 last_advance_ms: monotonic_millis(),
                 closed: false,
             }),
@@ -130,25 +183,68 @@ impl CommitLedger {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Marks `ticket` as committed. Called by the writer after the
-    /// transaction carrying the ticket's records has committed.
+    /// Records that `records` of `ticket` are durable. Called for every
+    /// segment written, including segments of a ticket whose chunk was split
+    /// across batches. It does not settle the ticket.
+    pub fn note_committed(&self, ticket: u64, records: u64) {
+        if ticket == 0 || records == 0 {
+            return;
+        }
+        let mut inner = self.lock_inner();
+        if inner.is_settled(ticket) {
+            return;
+        }
+        let progress = inner.progress.entry(ticket).or_default();
+        progress.committed = progress.committed.saturating_add(records);
+    }
+
+    /// Records that salvage quarantined `records` of `ticket`. The ticket is
+    /// settled as failed when its final segment completes.
+    pub fn note_dropped(&self, ticket: u64, records: u64) {
+        if ticket == 0 || records == 0 {
+            return;
+        }
+        let mut inner = self.lock_inner();
+        if inner.is_settled(ticket) {
+            return;
+        }
+        let progress = inner.progress.entry(ticket).or_default();
+        progress.dropped = progress.dropped.saturating_add(records);
+    }
+
+    /// Marks `ticket` as committed. Called by the writer only after the last
+    /// record belonging to the ticket committed. If salvage dropped any of
+    /// those records, the ticket settles as failed instead.
     pub fn complete(&self, ticket: u64) {
-        self.settle(ticket);
+        self.settle(ticket, false);
     }
 
     /// Marks `ticket` as never going to carry records (enqueue rejected, or
     /// an empty chunk skipped downstream). Voided tickets release the
     /// watermark exactly like committed ones — there is nothing to lose.
     pub fn void(&self, ticket: u64) {
-        self.settle(ticket);
+        self.settle(ticket, true);
     }
 
-    fn settle(&self, ticket: u64) {
+    fn settle(&self, ticket: u64, voided: bool) {
         if ticket == 0 {
             return;
         }
         let watermark = {
             let mut inner = self.lock_inner();
+            if inner.is_settled(ticket) {
+                return;
+            }
+
+            let progress = inner.progress.get(&ticket).copied().unwrap_or_default();
+            let failed = !voided && progress.dropped > 0;
+            if failed {
+                inner.failed.insert(ticket);
+            }
+            if voided || !failed {
+                inner.progress.remove(&ticket);
+            }
+
             if ticket == inner.committed_through + 1 {
                 inner.committed_through = ticket;
                 inner.last_advance_ms = monotonic_millis();
@@ -166,6 +262,22 @@ impl CommitLedger {
             }
         };
         self.updates.send_replace(watermark);
+    }
+
+    /// Returns the current state of `ticket`, including partial progress.
+    pub fn state(&self, ticket: u64) -> TicketState {
+        if ticket == 0 {
+            return TicketState::Completed;
+        }
+        let inner = self.lock_inner();
+        let progress = inner.progress.get(&ticket).copied().unwrap_or_default();
+        if inner.failed.contains(&ticket) {
+            TicketState::Failed { progress }
+        } else if inner.is_settled(ticket) {
+            TicketState::Completed
+        } else {
+            TicketState::Unsettled { progress }
+        }
     }
 
     /// Marks the owning pipeline as gone. Every pending and future
@@ -213,30 +325,68 @@ impl CommitLedger {
         self.lock_inner().last_advance_ms
     }
 
-    /// Waits until every record behind `ticket` is durably committed, or the
-    /// pipeline closes first. Resolves immediately when the watermark already
-    /// covers the ticket.
-    ///
-    /// A dropped ledger also reports [`CommitLedgerClosed`] — without an
-    /// owner nobody can complete anything anymore.
-    pub async fn committed(&self, ticket: u64) -> Result<(), CommitLedgerClosed> {
+    /// Waits until `ticket` settles, or the pipeline closes first. Resolves
+    /// immediately when the ticket is already completed or failed.
+    pub async fn wait(&self, ticket: u64) -> CommitOutcome {
         if ticket == 0 {
-            return Ok(());
+            return CommitOutcome::Committed;
         }
         let mut updates = self.updates.subscribe();
         loop {
-            let state = *updates.borrow_and_update();
+            let watermark = *updates.borrow_and_update();
             // Commit evidence outranks closure: a ticket whose data already
             // committed must resolve Ok even when the pipeline has since shut
             // down, otherwise a waiter that wakes after `close` observes a
             // spurious failure for durable data.
-            if state.committed_through >= ticket {
-                return Ok(());
+            match self.state(ticket) {
+                TicketState::Completed => return CommitOutcome::Committed,
+                TicketState::Failed { progress } => {
+                    return CommitOutcome::Failed {
+                        committed: progress.committed,
+                        dropped: progress.dropped,
+                    };
+                }
+                TicketState::Unsettled { .. } if watermark.closed => {
+                    return CommitOutcome::Closed;
+                }
+                TicketState::Unsettled { .. } => {}
             }
-            if state.closed {
-                return Err(CommitLedgerClosed);
+            if updates.changed().await.is_err() {
+                return CommitOutcome::Closed;
             }
-            updates.changed().await.map_err(|_| CommitLedgerClosed)?;
+        }
+    }
+
+    /// Waits until the contiguous watermark covers `ticket`, or the pipeline
+    /// closes. Unlike [`CommitLedger::wait`], this does not return early when
+    /// `ticket` itself failed out of order: a request must wait for every
+    /// lower ticket too before it can report a truthful partial result.
+    pub async fn wait_watermark(&self, ticket: u64) -> Watermark {
+        if ticket == 0 {
+            return self.watermark();
+        }
+        let mut updates = self.updates.subscribe();
+        loop {
+            let watermark = *updates.borrow_and_update();
+            if watermark.committed_through >= ticket || watermark.closed {
+                return watermark;
+            }
+            if updates.changed().await.is_err() {
+                return Watermark {
+                    committed_through: watermark.committed_through,
+                    closed: true,
+                };
+            }
+        }
+    }
+
+    /// Compatibility wrapper for callers that only need "durable or not".
+    /// Use [`CommitLedger::wait`] when a quarantined ticket must be told
+    /// apart from a closed pipeline.
+    pub async fn committed(&self, ticket: u64) -> Result<(), CommitLedgerClosed> {
+        match self.wait(ticket).await {
+            CommitOutcome::Committed => Ok(()),
+            CommitOutcome::Failed { .. } | CommitOutcome::Closed => Err(CommitLedgerClosed),
         }
     }
 }
@@ -585,6 +735,145 @@ mod tests {
             ledger.watermark().committed_through,
             second - 1,
             "the outstanding ticket keeps holding the watermark back"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_ticket_progress_does_not_release_the_waiter() {
+        let ledger = CommitLedger::new();
+        let ticket = ledger.issue();
+        ledger.note_committed(ticket, 2);
+
+        assert_eq!(
+            ledger.state(ticket),
+            TicketState::Unsettled {
+                progress: TicketProgress {
+                    committed: 2,
+                    dropped: 0
+                }
+            }
+        );
+        let waiter = {
+            let ledger = Arc::new(ledger);
+            let ledger = Arc::clone(&ledger);
+            tokio::spawn(async move { ledger.committed(ticket).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a split ticket must wait for its final segment"
+        );
+        waiter.abort();
+    }
+
+    #[tokio::test]
+    async fn quarantined_ticket_fails_instead_of_committing() {
+        let ledger = CommitLedger::new();
+        let ticket = ledger.issue();
+        ledger.note_committed(ticket, 1);
+        ledger.note_dropped(ticket, 1);
+        ledger.complete(ticket);
+
+        assert_eq!(ledger.watermark().committed_through, ticket);
+        assert_eq!(
+            ledger.state(ticket),
+            TicketState::Failed {
+                progress: TicketProgress {
+                    committed: 1,
+                    dropped: 1
+                }
+            }
+        );
+        assert_eq!(
+            ledger.wait(ticket).await,
+            CommitOutcome::Failed {
+                committed: 1,
+                dropped: 1
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn close_preserves_partial_progress_for_the_handler() {
+        let ledger = CommitLedger::new();
+        let ticket = ledger.issue();
+        ledger.note_committed(ticket, 2);
+        ledger.close();
+
+        assert_eq!(
+            ledger.state(ticket),
+            TicketState::Unsettled {
+                progress: TicketProgress {
+                    committed: 2,
+                    dropped: 0
+                }
+            }
+        );
+        assert_eq!(ledger.wait(ticket).await, CommitOutcome::Closed);
+    }
+
+    #[tokio::test]
+    async fn watermark_waits_for_a_gap_even_when_a_later_ticket_failed() {
+        let ledger = Arc::new(CommitLedger::new());
+        let first = ledger.issue();
+        let second = ledger.issue();
+
+        // The later ticket fails and settles out of order; the first is still
+        // buffered. A request must not report until the gap closes.
+        ledger.note_dropped(second, 1);
+        ledger.complete(second);
+        assert_eq!(
+            ledger.wait(second).await,
+            CommitOutcome::Failed {
+                committed: 0,
+                dropped: 1
+            }
+        );
+
+        let waiter = {
+            let ledger = Arc::clone(&ledger);
+            tokio::spawn(async move { ledger.wait_watermark(second).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the failed later ticket must wait for the earlier gap"
+        );
+
+        ledger.complete(first);
+        let watermark = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("watermark waiter finishes")
+            .expect("no panic");
+        assert_eq!(watermark.committed_through, second);
+    }
+
+    #[tokio::test]
+    async fn failed_ticket_stays_failed_after_later_commits_advance_the_watermark() {
+        let ledger = CommitLedger::new();
+        let failed = ledger.issue();
+        let later = ledger.issue();
+        ledger.note_dropped(failed, 1);
+        ledger.complete(failed);
+        ledger.complete(later);
+
+        assert_eq!(ledger.watermark().committed_through, later);
+        assert_eq!(
+            ledger.state(failed),
+            TicketState::Failed {
+                progress: TicketProgress {
+                    committed: 0,
+                    dropped: 1
+                }
+            }
+        );
+        assert_eq!(ledger.state(later), TicketState::Completed);
+        assert_eq!(
+            ledger.wait(failed).await,
+            CommitOutcome::Failed {
+                committed: 0,
+                dropped: 1
+            }
         );
     }
 }

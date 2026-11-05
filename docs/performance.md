@@ -80,9 +80,10 @@ Key overrides: `--clients`, `--records-per-request`, `--rate`,
 Validation per step: producers stop → drain (Flush barrier embedded, row
 poll external) → open DB read-only → assert
 `persisted == generated − rejected − ambiguous`, no duplicate seq,
-`record_id == seq`. Rejected = whole-request `UNAVAILABLE` (all-or-nothing,
-positions exact); ambiguous = timeout/transport (may be present or absent,
-never loss). Failures abort non-zero.
+`record_id == seq`. Rejected = whole-request `UNAVAILABLE` (queue
+admission) or the `partial_success.rejected_log_records` count (storage
+disconnect/quarantine); ambiguous = timeout/transport (may be present or
+absent, never loss). Failures abort non-zero.
 
 ### 3.1 Durability A/B: `synchronous = NORMAL` vs `FULL`
 

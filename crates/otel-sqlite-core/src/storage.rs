@@ -48,7 +48,9 @@ pub use batcher::{
 };
 pub use command::{
     BatchOrigin, CheckpointMode, IngestMessage, LogChunk, LogWriteBatch, MaintenanceOperation,
-    WriteCommand,
+    RecordSegment, WriteCommand,
 };
-pub use commit::{CommitLedger, CommitLedgerClosed, Watermark};
+pub use commit::{
+    CommitLedger, CommitLedgerClosed, CommitOutcome, TicketProgress, TicketState, Watermark,
+};
 pub use durability::{DurabilityMode, SyncMode};

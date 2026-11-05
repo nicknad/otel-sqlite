@@ -8,18 +8,21 @@
 //! mapping error instead: retrying can never succeed, so handlers answer
 //! `INVALID_ARGUMENT` and tell the client to split the request.
 //!
-//! All-or-nothing admission is what makes retries safe. A handler that answers
-//! `UNAVAILABLE` has had *none* of the request's records accepted, so a
-//! retrying exporter resends the full request with nothing to duplicate —
-//! there is no idempotency key on event or data-point rows, so partial
-//! acceptance would otherwise convert a retry into duplicate telemetry.
+//! Queue admission is all-or-nothing, which is what makes a queue-full retry
+//! safe: a handler that answers `UNAVAILABLE` has had *none* of the request's
+//! records accepted. There is no idempotency key on event rows, so a retry
+//! must not resend accepted data.
+//!
+//! A storage disconnect mid-batch cannot recall chunks already sent. Their
+//! tickets stay issued; only the unsent ticket is voided. The handler then
+//! reports the accepted prefix with OTLP `partial_success` instead of a
+//! retryable `UNAVAILABLE`, so the client does not duplicate the chunks that
+//! may already be durable. The outcome carries the total record count and
+//! every accepted `(ticket, records)` pair for that decision.
 //!
 //! Accepted chunks are stamped with a durability ticket from `ledger` before
 //! the send, and the highest ticket is returned as
 //! [`EnqueueOutcome::last_ticket`] so durable acks can wait for the commit.
-//! Because acceptance is all-or-nothing, a rejected request issues no tickets
-//! at all and never moves the watermark; a request disconnected mid-batch
-//! voids every ticket it issued before giving up.
 
 use std::time::Instant;
 
@@ -28,15 +31,20 @@ use otel_sqlite_core::storage::{CommitLedger, IngestMessage};
 use crate::error::IngressError;
 use crate::{IngestSender, SendFailure};
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct EnqueueOutcome {
     pub accepted: u64,
     pub rejected: u64,
     pub disconnected: bool,
     /// Highest durability ticket among *accepted* chunks; `None` when nothing
-    /// was accepted. Waiting for this single ticket covers every record this
-    /// request had accepted.
+    /// was accepted.
     pub last_ticket: Option<u64>,
+    /// Total records in the request, including chunks never accepted.
+    pub total_records: u64,
+    /// Accepted tickets with the number of records each covers, in send
+    /// order. Lets the handler report exactly how much of a partially
+    /// accepted request committed.
+    pub tickets: Vec<(u64, u64)>,
 }
 
 /// Hands mapped ingest chunks to the storage insert batcher through the
@@ -55,11 +63,14 @@ pub(crate) fn enqueue(
     ledger: &CommitLedger,
     work: Vec<IngestMessage>,
 ) -> Result<EnqueueOutcome, IngressError> {
-    let mut outcome = EnqueueOutcome::default();
     let total_records: u64 = work
         .iter()
         .map(|message| message.record_count() as u64)
         .sum();
+    let mut outcome = EnqueueOutcome {
+        total_records,
+        ..EnqueueOutcome::default()
+    };
 
     // A request with more chunks than the queue can hold is permanently
     // unadmittable (an empty queue still has `capacity` slots), so a retry
@@ -103,6 +114,7 @@ pub(crate) fn enqueue(
             Ok(()) => {
                 outcome.accepted += records;
                 outcome.last_ticket = Some(ticket);
+                outcome.tickets.push((ticket, records));
             }
             Err(SendFailure::Full) => {
                 // Unreachable while holding the gate: `reserve` verified room
@@ -178,7 +190,9 @@ mod tests {
 
         assert_eq!(outcome.accepted, 0);
         assert_eq!(outcome.rejected, 5);
+        assert_eq!(outcome.total_records, 5);
         assert_eq!(outcome.last_ticket, None);
+        assert!(outcome.tickets.is_empty());
         assert!(!outcome.disconnected);
         assert_eq!(
             receiver.len(),
@@ -220,6 +234,8 @@ mod tests {
 
         assert_eq!(outcome.accepted, 5);
         assert_eq!(outcome.rejected, 0);
+        assert_eq!(outcome.total_records, 5);
+        assert_eq!(outcome.tickets, vec![(1, 2), (2, 3)]);
         assert_eq!(outcome.last_ticket, Some(2));
 
         let first = receiver.recv().expect("first chunk in flight");
@@ -241,8 +257,10 @@ mod tests {
 
         assert!(outcome.disconnected);
         assert_eq!(outcome.rejected, 2);
+        assert_eq!(outcome.total_records, 2);
         assert_eq!(outcome.accepted, 0);
         assert_eq!(outcome.last_ticket, None);
+        assert!(outcome.tickets.is_empty());
         assert!(
             !ledger.watermark().closed,
             "a rejected enqueue must not look like pipeline shutdown"

@@ -29,7 +29,8 @@ use std::time::Duration;
 use crossbeam_channel::TrySendError;
 use otel_sqlite_core::model::{LogRecord, Resource, Severity};
 use otel_sqlite_core::storage::{
-    BatchOrigin, IngestMessage, InsertBatcherConfig, LogChunk, SyncMode,
+    BatchOrigin, IngestMessage, InsertBatcherConfig, LogChunk, SyncMode, TicketProgress,
+    TicketState,
 };
 use otel_sqlite_storage::{Storage, StorageConfig};
 use otel_sqlite_test_support::{open_readonly, wait_until};
@@ -520,4 +521,124 @@ fn drained_pipeline_reports_no_pending_work() {
 
     drop(sender);
     storage.join().unwrap();
+}
+
+/// A chunk split across storage batches must not settle its ticket on the
+/// first full batch. The durable ack waits for the buffered remainder.
+#[test]
+fn split_chunk_ticket_waits_for_the_last_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("split-ticket.db");
+
+    let (sender, receiver) = crossbeam_channel::bounded(8);
+    let mut storage = Storage::open(receiver, config(db_path.clone(), 2, 600_000)).unwrap();
+    let ledger = storage.commit_ledger();
+
+    // Ticket 1 covers a whole two-record chunk; ticket 2 covers three records,
+    // so its first two fill a batch and its last record stays buffered.
+    let mut first = into_log_chunk(logs_chunk(0, 2));
+    first.commit_seq = 1;
+    sender.send(IngestMessage::Logs(first)).unwrap();
+    let mut split = into_log_chunk(logs_chunk(2, 3));
+    split.commit_seq = 2;
+    sender.send(IngestMessage::Logs(split)).unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            ledger.watermark().committed_through == 1
+                && ledger.state(2)
+                    == TicketState::Unsettled {
+                        progress: TicketProgress {
+                            committed: 2,
+                            dropped: 0,
+                        },
+                    }
+        }),
+        "ticket 2 settled before its buffered third record: {:?}",
+        ledger.state(2)
+    );
+    assert_eq!(storage.stats().records_written, 4);
+
+    // The age deadline / barrier releases the remainder; only then may the
+    // ticket complete and the watermark reach 2.
+    sender.send(IngestMessage::Flush).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            ledger.watermark().committed_through == 2 && ledger.state(2) == TicketState::Completed
+        }),
+        "ticket 2 never completed after the remainder flushed: {:?}",
+        ledger.state(2)
+    );
+
+    drop(sender);
+    storage.join().unwrap();
+    let conn = open_readonly(&db_path);
+    assert_eq!(row_count(&conn), 5);
+}
+
+/// Poison salvage must fail the ticket, not release a durable ack for the
+/// dropped row. Progress from the healthy part of a split chunk is preserved.
+#[test]
+fn quarantined_record_fails_the_ticket_after_the_remainder_flushes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("quarantine-ticket.db");
+
+    let (sender, receiver) = crossbeam_channel::bounded(8);
+    let mut storage = Storage::open(receiver, config(db_path.clone(), 2, 600_000)).unwrap();
+    let ledger = storage.commit_ledger();
+
+    let trigger = Connection::open(&db_path).unwrap();
+    trigger
+        .execute_batch(
+            "CREATE TRIGGER poison_log BEFORE INSERT ON log_event
+             WHEN NEW.body = 'poison'
+             BEGIN SELECT RAISE(ABORT, 'poison row'); END;",
+        )
+        .unwrap();
+
+    // Three records: the first full batch is [healthy, poison], the remainder
+    // is [healthy]. Salvage drops the poison row in the first batch; the
+    // ticket may only fail once the remainder has also been written.
+    let mut message = logs_chunk(0, 3);
+    if let IngestMessage::Logs(chunk) = &mut message {
+        chunk.commit_seq = 1;
+        chunk.records[1].body = "poison".to_owned();
+    }
+    sender.send(message).unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            ledger.state(1)
+                == TicketState::Unsettled {
+                    progress: TicketProgress {
+                        committed: 1,
+                        dropped: 1,
+                    },
+                }
+        }),
+        "first split batch was not salvaged: {:?}",
+        ledger.state(1)
+    );
+
+    sender.send(IngestMessage::Flush).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            ledger.state(1)
+                == TicketState::Failed {
+                    progress: TicketProgress {
+                        committed: 2,
+                        dropped: 1,
+                    },
+                }
+        }),
+        "ticket did not fail after the remainder committed: {:?}",
+        ledger.state(1)
+    );
+    assert_eq!(ledger.watermark().committed_through, 1);
+    assert_eq!(storage.stats().quarantined_records, 1);
+
+    drop(sender);
+    storage.join().unwrap();
+    let conn = open_readonly(&db_path);
+    assert_eq!(row_count(&conn), 2);
 }

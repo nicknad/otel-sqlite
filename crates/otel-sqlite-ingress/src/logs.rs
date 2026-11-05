@@ -1,17 +1,18 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use otel_sqlite_core::storage::{CommitLedger, DurabilityMode};
+use otel_sqlite_core::storage::{CommitLedger, DurabilityMode, TicketState};
 use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
 use crate::IngestSender;
 use crate::config::IngressConfig;
-use crate::enqueue::enqueue;
+use crate::enqueue::{EnqueueOutcome, enqueue};
 use crate::error::IngressError;
 use crate::mapping::logs::{count, map_chunks, validate_request};
 use crate::mapping::pb::collector::logs::v1::{
-    ExportLogsServiceRequest, ExportLogsServiceResponse, logs_service_server::LogsService,
+    ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
+    logs_service_server::LogsService,
 };
 
 #[derive(Debug, Clone)]
@@ -150,35 +151,109 @@ impl LogsIngress {
             .map_err(|error| Status::invalid_argument(error.to_string()))?
         };
 
-        // All-or-nothing admission: a request is either fully accepted or
-        // fully rejected. Both failure checks run before the durable-ack wait
-        // so a failed request returns promptly instead of waiting on a commit
-        // that cannot come (nothing was accepted, no ticket was issued).
-        if outcome.disconnected {
-            return Err(Status::unavailable("ingress queue is closed"));
+        self.finish(outcome).await
+    }
+
+    /// Turns an enqueue outcome into the wire response.
+    ///
+    /// A partially accepted request is reported with OTLP `partial_success`:
+    /// records that committed are not retried, so a retrying exporter cannot
+    /// duplicate them. A retryable `UNAVAILABLE` is reserved for requests with
+    /// no durable records at all.
+    async fn finish(&self, outcome: EnqueueOutcome) -> Result<ExportLogsServiceResponse, Status> {
+        if outcome.accepted == 0 {
+            if outcome.disconnected {
+                return Err(Status::unavailable("ingress queue is closed"));
+            }
+            if outcome.rejected > 0 {
+                tracing::warn!(
+                    accepted = outcome.accepted,
+                    rejected = outcome.rejected,
+                    "ingress queue backpressure"
+                );
+                return Err(Status::unavailable("ingress queue is full"));
+            }
+            // Empty request: nothing was accepted and nothing was rejected.
+            return Ok(ExportLogsServiceResponse::default());
         }
 
+        if self.config.durability_mode == DurabilityMode::Commit {
+            if let Some(ticket) = outcome.last_ticket {
+                // Wait for the contiguous watermark, not just this ticket's
+                // own outcome: a later ticket can fail while an earlier
+                // split chunk is still buffered, and reporting early would
+                // reject records that are about to commit.
+                let _ = self.commit.wait_watermark(ticket).await;
+            }
+
+            let mut committed = 0u64;
+            let mut any_failed = false;
+            for (ticket, records) in &outcome.tickets {
+                match self.commit.state(*ticket) {
+                    TicketState::Completed => committed += records,
+                    TicketState::Failed { progress } => {
+                        committed += progress.committed;
+                        any_failed = true;
+                    }
+                    TicketState::Unsettled { progress } => {
+                        committed += progress.committed;
+                    }
+                }
+            }
+
+            let rejected = outcome.total_records.saturating_sub(committed);
+            if rejected == 0 {
+                return Ok(ExportLogsServiceResponse::default());
+            }
+            if any_failed || committed > 0 {
+                tracing::warn!(accepted = committed, rejected, "export partially accepted");
+                ::metrics::counter!(
+                    "otlp_records_rejected_total",
+                    "signal" => "logs",
+                    "reason" => if any_failed { "quarantined" } else { "not_committed" }
+                )
+                .increment(rejected);
+                return Ok(partial_success(
+                    rejected,
+                    "storage accepted part of the request; retry only the rejected records",
+                ));
+            }
+            return Err(Status::unavailable(
+                "storage pipeline shut down before commit",
+            ));
+        }
+
+        // Enqueue mode acknowledges at queue entry. A tail that could not be
+        // queued is reported as rejected without asking the sender to resend
+        // the chunks that were queued.
         if outcome.rejected > 0 {
             tracing::warn!(
                 accepted = outcome.accepted,
                 rejected = outcome.rejected,
                 "ingress queue backpressure"
             );
-            return Err(Status::unavailable("ingress queue is full"));
-        }
-
-        if let Some(ticket) = outcome.last_ticket
-            && self.config.durability_mode == DurabilityMode::Commit
-        {
-            // Durable ack: hold the response until this request's records
-            // are committed (or the pipeline died, which fails the wait).
-            self.commit
-                .committed(ticket)
-                .await
-                .map_err(|_| Status::unavailable("storage pipeline shut down before commit"))?;
+            ::metrics::counter!(
+                "otlp_records_rejected_total",
+                "signal" => "logs",
+                "reason" => "queue"
+            )
+            .increment(outcome.rejected);
+            return Ok(partial_success(
+                outcome.rejected,
+                "ingress accepted part of the request; retry only the rejected records",
+            ));
         }
 
         Ok(ExportLogsServiceResponse::default())
+    }
+}
+
+fn partial_success(rejected: u64, message: &str) -> ExportLogsServiceResponse {
+    ExportLogsServiceResponse {
+        partial_success: Some(ExportLogsPartialSuccess {
+            rejected_log_records: i64::try_from(rejected).unwrap_or(i64::MAX),
+            error_message: message.to_owned(),
+        }),
     }
 }
 
@@ -413,5 +488,112 @@ mod tests {
         };
         assert_eq!(chunk.records[0].trace_id, [0; 16]);
         assert_eq!(chunk.records[0].span_id, [9; 8]);
+    }
+
+    fn outcome(accepted: u64, rejected: u64, tickets: &[(u64, u64)]) -> EnqueueOutcome {
+        EnqueueOutcome {
+            accepted,
+            rejected,
+            total_records: accepted + rejected,
+            disconnected: rejected > 0,
+            last_ticket: tickets.last().map(|(ticket, _)| *ticket),
+            tickets: tickets.to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_admission_reports_committed_records_as_partial_success() {
+        let ledger = Arc::new(CommitLedger::new());
+        let (ingress, _) = ingress_with(8, DurabilityMode::Commit, Arc::clone(&ledger));
+        ledger.complete(1);
+
+        let response = ingress
+            .finish(outcome(1, 1, &[(1, 1)]))
+            .await
+            .expect("a request with a committed chunk must not ask for a full retry");
+        let partial = response.partial_success.expect("partial success");
+        assert_eq!(partial.rejected_log_records, 1);
+    }
+
+    #[tokio::test]
+    async fn partial_commit_reports_only_uncommitted_records() {
+        let ledger = Arc::new(CommitLedger::new());
+        let (ingress, _) = ingress_with(8, DurabilityMode::Commit, Arc::clone(&ledger));
+        ledger.complete(1);
+        ledger.close();
+
+        let response = ingress
+            .finish(outcome(2, 0, &[(1, 1), (2, 1)]))
+            .await
+            .expect("committed records must not be resent");
+        let partial = response.partial_success.expect("partial success");
+        assert_eq!(partial.rejected_log_records, 1);
+    }
+
+    #[tokio::test]
+    async fn quarantine_reports_dropped_records_as_partial_success() {
+        let ledger = Arc::new(CommitLedger::new());
+        let (ingress, _) = ingress_with(8, DurabilityMode::Commit, Arc::clone(&ledger));
+        ledger.note_committed(1, 1);
+        ledger.note_dropped(1, 1);
+        ledger.complete(1);
+
+        let response = ingress
+            .finish(outcome(2, 0, &[(1, 2)]))
+            .await
+            .expect("a quarantined ticket is a completed request, not a retryable failure");
+        let partial = response.partial_success.expect("partial success");
+        assert_eq!(partial.rejected_log_records, 1);
+    }
+
+    #[tokio::test]
+    async fn no_durable_records_stays_retryable() {
+        let ledger = Arc::new(CommitLedger::new());
+        let (ingress, _) = ingress_with(8, DurabilityMode::Commit, Arc::clone(&ledger));
+        ledger.close();
+
+        let status = ingress
+            .finish(outcome(1, 1, &[(1, 1)]))
+            .await
+            .expect_err("nothing committed must stay retryable");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn out_of_order_failure_waits_for_the_earlier_ticket() {
+        let ledger = Arc::new(CommitLedger::new());
+        let (ingress, _) = ingress_with(8, DurabilityMode::Commit, Arc::clone(&ledger));
+        ledger.note_dropped(2, 1);
+        ledger.complete(2);
+
+        let handle =
+            tokio::spawn(async move { ingress.finish(outcome(2, 0, &[(1, 1), (2, 1)])).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !handle.is_finished(),
+            "the handler must wait for ticket 1 before reporting ticket 2's failure"
+        );
+
+        ledger.complete(1);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("handler finishes after the gap closes")
+            .expect("no panic")
+            .expect("partial success");
+        let partial = response.partial_success.expect("partial success");
+        assert_eq!(partial.rejected_log_records, 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_mode_reports_a_rejected_tail_as_partial_success() {
+        let ledger = Arc::new(CommitLedger::new());
+        let (ingress, _) = ingress_with(8, DurabilityMode::Enqueue, ledger);
+
+        let response = ingress
+            .finish(outcome(1, 1, &[(1, 1)]))
+            .await
+            .expect("queued records must not be resent");
+        let partial = response.partial_success.expect("partial success");
+        assert_eq!(partial.rejected_log_records, 1);
     }
 }
