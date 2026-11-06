@@ -143,6 +143,7 @@ listen_address = "0.0.0.0:4317"
 allow_insecure_remote = true         # isolated/trusted net only; prefer [tls]
 # metrics_address = "127.0.0.1:8888" # off by default
 max_records_per_request = 100000
+# mapping_concurrency = 128       # max mapping jobs; bounds abandoned-work memory
 # allow_remote_metrics = true        # explicit opt-in; prefer protected proxy
 ```
 

@@ -45,6 +45,7 @@ pub mod benchmark_profile {
     use otel_sqlite_ingress::{
         DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_MAX_RECV_MSG_SIZE,
         DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES, DEFAULT_SHUTDOWN_TIMEOUT,
+        MAX_MAPPING_CONCURRENCY,
     };
 
     pub const INGEST_QUEUE_CAPACITY: usize = 50_000;
@@ -65,6 +66,8 @@ pub mod benchmark_profile {
             // Production default is 64; raised so ramp scenarios can hold
             // more simultaneous clients.
             max_concurrent_streams: 256,
+            // 2 × the raised stream cap, clamped to the accepted maximum.
+            mapping_concurrency: MAX_MAPPING_CONCURRENCY,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT, // production
             max_records_per_request: DEFAULT_MAX_RECORDS_PER_REQUEST, // production
             max_attributes_per_record: 128,             // production 1_000
@@ -130,11 +133,10 @@ impl EmbeddedServer {
             .map_err(|error| anyhow::anyhow!("failed to start sqlite storage: {error}"))?;
         let commit_ledger = storage.commit_ledger();
 
-        let logs_service = LogsServiceServer::new(LogsIngress::new(
-            ingest_tx.clone(),
-            Arc::clone(&config),
-            commit_ledger,
-        ))
+        let logs_service = LogsServiceServer::new(
+            LogsIngress::new(ingest_tx.clone(), Arc::clone(&config), commit_ledger)
+                .with_mapping_limit(config.mapping_concurrency),
+        )
         .max_decoding_message_size(config.max_recv_msg_size);
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);

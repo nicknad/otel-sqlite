@@ -80,9 +80,14 @@ async fn run(
             .max(1),
     ));
 
+    // Process-wide mapping budget: `spawn_blocking` cannot be cancelled, so
+    // the permit is held by the blocking job (not the request future) and
+    // bounds the mapping work a burst of timed-out requests can retain.
     let logs_service = tonic::codegen::InterceptedService::new(
         LogsServiceServer::new(
-            LogsIngress::new(queue, Arc::clone(&config), commit).with_stream_limit(stream_limit),
+            LogsIngress::new(queue, Arc::clone(&config), commit)
+                .with_stream_limit(stream_limit)
+                .with_mapping_limit(config.mapping_concurrency),
         )
         // The OTLP spec expects receivers to accept gzip and the OpenTelemetry
         // Collector's exporters send it by default; without this the request

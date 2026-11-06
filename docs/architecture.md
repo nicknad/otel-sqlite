@@ -130,8 +130,13 @@ same volume.
 Defaults centralize through shared ingress/storage constants.
 `Config::from_env` / `from_file` validates before metrics, listeners,
 storage, or workers start. `max_records_per_request` propagates into
-ingress. Remote metrics need `allow_remote_metrics = true`. TLS/auth files
-are readability-checked. Effective config prints as JSON at startup.
+ingress. Mapping runs under a process-wide `mapping_concurrency` budget:
+because tokio cannot cancel `spawn_blocking`, the permit is held by the
+blocking job until it really finishes, so a timed-out export frees its
+stream slot while its abandoned mapping stays counted — retained mapping
+memory is bounded by `mapping_concurrency × grpc_max_recv_msg_size`.
+Remote metrics need `allow_remote_metrics = true`. TLS/auth files are
+readability-checked. Effective config prints as JSON at startup.
 
 ### 3.6 Performance model
 

@@ -165,38 +165,34 @@ Single writer is CPU-bound under `normal`/WAL (commit = WAL append + lock,
 no fsync). Every µs in-transaction is throughput loss; batcher is nearly
 idle and overlaps for free; ingest is the only parallel stage.
 
-### Resource resolve per record on writer
-
-Log path still resolves a resource row per record (`resolve_resource`):
-hash + hex `String` + `prepare_cached` + upsert, even for existing rows.
-Telemetry is repetitive — should scale with distinct identities, not rows.
-
-Fix (log-scoped): transaction-local resource cache per insert call, cleared
-between batches (bounded by batch cardinality). Keys cover all fingerprint
-inputs; fingerprint/JSON bytes stay byte-identical (IDs are SHA-256 over
-encoded bytes — replacing the serializer needs byte-identical proof or ID
-versioning). Tolerant/quarantine + ticket behavior unchanged.
-Validate: `inserts` bench A/B, `storage_transaction_duration` p50/p99 on
-repetitive identities (e.g. 10k rec / 4 resources), no cross-batch leaks.
-
 ### CPU serialized behind single writer (staged)
 
 Hashing, JSON/hex, param prep all run inside the writer transaction.
 
-- Stage 1 = resource cache above. Do first, re-profile; may suffice.
-- Stage 2 — prepared rows on batcher: batcher computes final columns for
+- Stage 1 — prepared rows on batcher: batcher computes final columns for
   N+1 while writer commits N; writer becomes bind/step/commit. Salvage
   migrates: `ToSqlConversionFailure` drops-and-counts in batcher (ticket
   rides batch); constraints stay in writer salvage. Ordering/barriers/
   tickets untouched.
-- Stage 3 — parallel prep at mapping: only with profile proof batcher is
+- Stage 2 — parallel prep at mapping: only with profile proof batcher is
   saturated (couples transport to storage encodings).
 
 Validate: Criterion A/B per stage (`storage_transaction_duration` →
 bind+step+commit, batcher CPU up); fuzz + e2e unchanged (quarantine/ticket
 assertions guard salvage).
 
-Already done (regression suites only): batcher timer alloc → `recv_timeout`
-in `batcher.rs`; scope JSON rendered once per `ScopeLogs` group as shared
-`Arc<LogScope>` (`core/src/model/attribute.rs`).
-Next: resource cache above → re-profile → prepared-rows stage only on evidence.
+Already done (regression suites only):
+
+- **Resource resolve is per batch, not per record.**
+  `insert_logs_inner` calls `resolve_resource` once for the batch origin
+  before the row loop (`storage/src/command/logs.rs`), and origin isolation
+  keeps exactly one resource per write batch
+  (`storage/src/origin_buffers.rs`). The SHA-256 fingerprint, hex render,
+  `prepare_cached` and upsert therefore scale with batches, not records; an
+  extra transaction-local cache would add bookkeeping without reducing the
+  number of upserts in the common case.
+- Batcher timer alloc → `recv_timeout` in `batcher.rs`.
+- Scope JSON rendered once per `ScopeLogs` group as shared `Arc<LogScope>`
+  (`core/src/model/attribute.rs`).
+
+Next: re-profile before the prepared-rows stage; do it only on evidence.

@@ -19,12 +19,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use otel_sqlite_core::storage::{DurabilityMode, InsertBatcherConfig, SyncMode};
 use otel_sqlite_ingress::{
-    AuthConfig, DEFAULT_LISTEN_ADDRESS, DEFAULT_MAX_ATTRIBUTE_KEY_BYTES,
-    DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES, DEFAULT_MAX_ATTRIBUTES_PER_RECORD, DEFAULT_MAX_BODY_BYTES,
-    DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_MAX_RECV_MSG_SIZE,
+    AuthConfig, DEFAULT_LISTEN_ADDRESS, DEFAULT_MAPPING_CONCURRENCY,
+    DEFAULT_MAX_ATTRIBUTE_KEY_BYTES, DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES,
+    DEFAULT_MAX_ATTRIBUTES_PER_RECORD, DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_CONCURRENT_STREAMS,
+    DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_MAX_RECV_MSG_SIZE,
     DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES, DEFAULT_SHUTDOWN_TIMEOUT, IngressConfig,
     MAX_ATTRIBUTE_KEY_BYTES, MAX_ATTRIBUTE_VALUE_BYTES, MAX_ATTRIBUTES_PER_RECORD, MAX_BODY_BYTES,
-    MAX_SCOPE_METADATA_EXPANSION_BYTES, TlsConfig, expand_bind_address,
+    MAX_MAPPING_CONCURRENCY, MAX_SCOPE_METADATA_EXPANSION_BYTES, TlsConfig, expand_bind_address,
 };
 use otel_sqlite_runtime::{MaintenanceConfig, WatchdogConfig};
 use otel_sqlite_storage::StorageConfig;
@@ -69,6 +70,10 @@ pub struct Config {
     pub batcher_max_batch_age: Duration,
     pub grpc_max_recv_msg_size: usize,
     pub grpc_max_concurrent_streams: u32,
+    /// Maximum proto→model mapping jobs (running or queued) on the blocking
+    /// pool. Bounds memory retained by mapping work that outlives its request
+    /// deadline.
+    pub mapping_concurrency: usize,
     pub max_records_per_request: usize,
     /// Max attributes on one log record (H2). See ingress
     /// `DEFAULT_MAX_ATTRIBUTES_PER_RECORD`.
@@ -131,6 +136,7 @@ impl Default for Config {
             batcher_max_batch_age: otel_sqlite_core::storage::DEFAULT_MAX_INSERT_BATCH_AGE,
             grpc_max_recv_msg_size: DEFAULT_MAX_RECV_MSG_SIZE,
             grpc_max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
+            mapping_concurrency: DEFAULT_MAPPING_CONCURRENCY,
             max_records_per_request: DEFAULT_MAX_RECORDS_PER_REQUEST,
             max_attributes_per_record: DEFAULT_MAX_ATTRIBUTES_PER_RECORD,
             max_attribute_key_bytes: DEFAULT_MAX_ATTRIBUTE_KEY_BYTES,
@@ -214,6 +220,7 @@ impl Config {
             "batcher_max_batch_age_ms": self.batcher_max_batch_age.as_millis(),
             "grpc_max_recv_msg_size": self.grpc_max_recv_msg_size,
             "grpc_max_concurrent_streams": self.grpc_max_concurrent_streams,
+            "mapping_concurrency": self.mapping_concurrency,
             "max_records_per_request": self.max_records_per_request,
             "max_attributes_per_record": self.max_attributes_per_record,
             "max_attribute_key_bytes": self.max_attribute_key_bytes,
@@ -240,6 +247,7 @@ impl Config {
             listen_address: self.listen_address.clone(),
             max_recv_msg_size: self.grpc_max_recv_msg_size,
             max_concurrent_streams: self.grpc_max_concurrent_streams,
+            mapping_concurrency: self.mapping_concurrency,
             shutdown_timeout: self.shutdown_timeout,
             max_records_per_request: self.max_records_per_request,
             max_attributes_per_record: self.max_attributes_per_record,

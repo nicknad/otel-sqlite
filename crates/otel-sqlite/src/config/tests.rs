@@ -5,9 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use otel_sqlite_core::storage::{CheckpointMode, DurabilityMode, SyncMode};
 use otel_sqlite_ingress::{
-    AuthConfig, DEFAULT_LISTEN_ADDRESS, DEFAULT_MAX_CONCURRENT_STREAMS,
-    DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_SHUTDOWN_TIMEOUT, MAX_ATTRIBUTE_KEY_BYTES,
-    MAX_ATTRIBUTE_VALUE_BYTES, MAX_ATTRIBUTES_PER_RECORD, MAX_BODY_BYTES, TlsConfig,
+    AuthConfig, DEFAULT_LISTEN_ADDRESS, DEFAULT_MAPPING_CONCURRENCY,
+    DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_SHUTDOWN_TIMEOUT,
+    MAX_ATTRIBUTE_KEY_BYTES, MAX_ATTRIBUTE_VALUE_BYTES, MAX_ATTRIBUTES_PER_RECORD, MAX_BODY_BYTES,
+    MAX_MAPPING_CONCURRENCY, TlsConfig,
 };
 use otel_sqlite_runtime::WatchdogConfig;
 
@@ -47,6 +48,7 @@ fn empty_overlay_keeps_defaults() {
         config.grpc_max_concurrent_streams,
         DEFAULT_MAX_CONCURRENT_STREAMS
     );
+    assert_eq!(config.mapping_concurrency, DEFAULT_MAPPING_CONCURRENCY);
     assert_eq!(
         config.max_records_per_request,
         DEFAULT_MAX_RECORDS_PER_REQUEST
@@ -72,6 +74,7 @@ fn top_level_keys_override_defaults() {
         batcher_max_batch_age = "250ms"
          grpc_max_recv_msg_size = 1024
          grpc_max_concurrent_streams = 8
+         mapping_concurrency = 64
          max_records_per_request = 777
          max_attributes_per_record = 111
          max_attribute_key_bytes = 222
@@ -91,6 +94,7 @@ fn top_level_keys_override_defaults() {
     assert_eq!(config.batcher_max_batch_age, Duration::from_millis(250));
     assert_eq!(config.grpc_max_recv_msg_size, 1024);
     assert_eq!(config.grpc_max_concurrent_streams, 8);
+    assert_eq!(config.mapping_concurrency, 64);
     assert_eq!(config.max_records_per_request, 777);
     assert_eq!(config.max_attributes_per_record, 111);
     assert_eq!(config.max_attribute_key_bytes, 222);
@@ -461,6 +465,20 @@ fn validation_rejects_unsafe_or_out_of_range_values() {
         "grpc_max_concurrent_streams",
         Config {
             grpc_max_concurrent_streams: 0,
+            ..Config::default()
+        }
+    );
+    assert_invalid!(
+        "mapping_concurrency",
+        Config {
+            mapping_concurrency: 0,
+            ..Config::default()
+        }
+    );
+    assert_invalid!(
+        "mapping_concurrency",
+        Config {
+            mapping_concurrency: MAX_MAPPING_CONCURRENCY + 1,
             ..Config::default()
         }
     );

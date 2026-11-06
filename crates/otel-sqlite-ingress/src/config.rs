@@ -40,6 +40,17 @@ pub const DEFAULT_MAX_RECV_MSG_SIZE: usize = 16 * 1024 * 1024;
 /// is bounded separately by the per-record caps below plus the mapping
 /// timeout.
 pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 64;
+/// Maximum number of proto→model mapping jobs admitted to tokio's blocking
+/// pool at once. `spawn_blocking` cannot be cancelled, so a timed-out request
+/// keeps its mapping job (and the request it owns) alive; this bounds that
+/// retained work to `mapping_concurrency × grpc_max_recv_msg_size`. The
+/// default is twice the default stream cap, which stays well inside the
+/// blocking pool.
+pub const DEFAULT_MAPPING_CONCURRENCY: usize = 2 * DEFAULT_MAX_CONCURRENT_STREAMS as usize;
+/// Upper bound accepted for `mapping_concurrency`; tokio's blocking pool
+/// defaults to 512 threads, so more permits only grow the queue and the
+/// memory it can retain.
+pub const MAX_MAPPING_CONCURRENCY: usize = 512;
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bound on how long one export handler waits for its proto→model
 /// mapping task (M5). A wedged or hostile mapping job must fail its RPC
@@ -92,6 +103,10 @@ pub struct IngressConfig {
     pub listen_address: String,
     pub max_recv_msg_size: usize,
     pub max_concurrent_streams: u32,
+    /// Maximum mapping jobs (running or queued) on the blocking pool at once.
+    /// Bounds memory retained by mapping work that outlives its request
+    /// deadline. See [`DEFAULT_MAPPING_CONCURRENCY`].
+    pub mapping_concurrency: usize,
     pub shutdown_timeout: Duration,
     pub max_records_per_request: usize,
     /// See `DEFAULT_MAX_ATTRIBUTES_PER_RECORD`.
@@ -119,6 +134,7 @@ impl Default for IngressConfig {
             listen_address: DEFAULT_LISTEN_ADDRESS.to_owned(),
             max_recv_msg_size: DEFAULT_MAX_RECV_MSG_SIZE,
             max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
+            mapping_concurrency: DEFAULT_MAPPING_CONCURRENCY,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             max_records_per_request: DEFAULT_MAX_RECORDS_PER_REQUEST,
             max_attributes_per_record: DEFAULT_MAX_ATTRIBUTES_PER_RECORD,

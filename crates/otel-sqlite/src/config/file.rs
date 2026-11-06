@@ -25,6 +25,7 @@ pub(crate) struct FileConfig {
     batcher_max_batch_age: Option<RawDuration>,
     grpc_max_recv_msg_size: Option<usize>,
     grpc_max_concurrent_streams: Option<u32>,
+    mapping_concurrency: Option<usize>,
     max_records_per_request: Option<usize>,
     max_attributes_per_record: Option<usize>,
     max_attribute_key_bytes: Option<usize>,
@@ -70,6 +71,9 @@ impl FileConfig {
         }
         if let Some(value) = self.grpc_max_concurrent_streams {
             config.grpc_max_concurrent_streams = value;
+        }
+        if let Some(value) = self.mapping_concurrency {
+            config.mapping_concurrency = value;
         }
         if let Some(value) = self.max_records_per_request {
             config.max_records_per_request = value;

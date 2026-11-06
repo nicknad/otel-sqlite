@@ -9,6 +9,7 @@ use crate::IngestSender;
 use crate::config::IngressConfig;
 use crate::enqueue::{EnqueueOutcome, enqueue};
 use crate::error::IngressError;
+use crate::mapping::budget::{MappingBudget, MappingError};
 use crate::mapping::logs::{count, map_chunks, validate_request};
 use crate::mapping::pb::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
@@ -28,6 +29,12 @@ pub struct LogsIngress {
     /// is what bounds in-flight exports across all connections. `new` leaves
     /// it effectively unlimited; production wiring attaches the shared one.
     stream_limit: Arc<Semaphore>,
+    /// Process-wide budget for proto→model mapping jobs. Because tokio
+    /// cannot cancel `spawn_blocking`, the permit is held by the blocking
+    /// closure rather than this request future; a timed-out export therefore
+    /// frees its stream slot while its mapping job stays counted. `new` leaves
+    /// it unlimited; production wiring attaches the configured bound.
+    mapping_budget: MappingBudget,
 }
 
 impl LogsIngress {
@@ -37,6 +44,7 @@ impl LogsIngress {
             config,
             commit,
             stream_limit: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
+            mapping_budget: MappingBudget::unlimited(crate::config::MAPPING_TIMEOUT),
         }
     }
 
@@ -44,6 +52,13 @@ impl LogsIngress {
     /// from this one shared limit, not the per-connection stream cap.
     pub fn with_stream_limit(mut self, limit: Arc<Semaphore>) -> Self {
         self.stream_limit = limit;
+        self
+    }
+
+    /// Sets the process-wide mapping-job budget from a concurrency limit,
+    /// using the standard mapping deadline.
+    pub fn with_mapping_limit(mut self, concurrency: usize) -> Self {
+        self.mapping_budget = MappingBudget::new(concurrency, crate::config::MAPPING_TIMEOUT);
         self
     }
 }
@@ -97,11 +112,16 @@ impl LogsIngress {
         // the CPU-heavy mapping: the async path only ever does channel and
         // ledger work, so a walk of borrowed proto fields cannot stall a tokio
         // worker. The record cap is checked before mapping allocates chunks.
+        //
+        // The mapping budget is acquired *before* `spawn_blocking` and moved
+        // into the closure. tokio cannot cancel a blocking task, so a timed-out
+        // export releases its stream slot but the abandoned mapping keeps its
+        // permit until it really finishes; that is what bounds retained work.
         let resource_logs = request.resource_logs;
         let limits = Arc::clone(&self.config);
-        let work = tokio::time::timeout(
-            crate::config::MAPPING_TIMEOUT,
-            tokio::task::spawn_blocking(move || {
+        let work = self
+            .mapping_budget
+            .run(move || {
                 let _span = tracing::info_span!("map").entered();
                 let total = count(&resource_logs);
                 if total > limits.max_records_per_request {
@@ -114,18 +134,23 @@ impl LogsIngress {
                 ::metrics::counter!("otlp_records_received_total", "signal" => "logs")
                     .increment(total as u64);
                 map_chunks(resource_logs)
-            }),
-        )
-        .await
-        .map_err(|_| {
-            // tokio cannot cancel `spawn_blocking`; the mapping task keeps
-            // running in the background, but the future, stream slot and
-            // concurrency permit are released so the exporter can retry.
-            ::metrics::counter!("otlp_mapping_timeout_total", "signal" => "logs").increment(1);
-            Status::unavailable("log mapping timed out")
-        })?
-        .map_err(|error| Status::internal(format!("log mapping task failed: {error}")))?
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            })
+            .await
+            .map_err(|error| match error {
+                MappingError::Timeout => {
+                    // The abandoned job keeps its mapping permit until it
+                    // finishes, but the future and stream slot are released so
+                    // the exporter can retry.
+                    ::metrics::counter!("otlp_mapping_timeout_total", "signal" => "logs")
+                        .increment(1);
+                    Status::unavailable("log mapping timed out")
+                }
+                MappingError::Closed => Status::internal("log mapping budget is closed"),
+                MappingError::Join(error) => {
+                    Status::internal(format!("log mapping task failed: {error}"))
+                }
+            })?
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
 
         // Enqueue runs on the blocking pool, not the async worker: it acquires
         // the process-wide admission gate and can briefly wait on it under
@@ -325,6 +350,38 @@ mod tests {
             "the response must not be released before the ticket committed"
         );
         assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn mapping_permit_is_released_before_the_durable_ack_waits() {
+        let ledger = Arc::new(CommitLedger::new());
+        let config = Arc::new(IngressConfig {
+            durability_mode: DurabilityMode::Commit,
+            ..IngressConfig::default()
+        });
+        let (queue, receiver) = channel(8);
+        let ingress = LogsIngress::new(queue, config, Arc::clone(&ledger)).with_mapping_limit(1);
+        let probe = ingress.mapping_budget.clone();
+
+        let handle = tokio::spawn(async move { ingress.handle(request_with(2)).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "the request waits for the durable ack"
+        );
+        assert_eq!(
+            probe.available_permits(),
+            1,
+            "the mapping permit must not be held while waiting for a commit"
+        );
+
+        ledger.complete(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("released after commit")
+            .expect("handler did not panic")
+            .expect("export succeeds");
+        drop(receiver);
     }
 
     #[tokio::test]

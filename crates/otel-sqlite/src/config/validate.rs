@@ -8,8 +8,8 @@ use otel_sqlite_storage::warn_if_world_readable;
 use super::{
     Config, MAX_ATTRIBUTE_KEY_BYTES, MAX_ATTRIBUTE_VALUE_BYTES, MAX_ATTRIBUTES_PER_RECORD,
     MAX_BODY_BYTES, MAX_GRPC_CONCURRENT_STREAMS, MAX_GRPC_RECV_MSG_SIZE, MAX_INGEST_QUEUE_CAPACITY,
-    MAX_RECORDS_PER_REQUEST, MAX_RETENTION, MAX_SCOPE_METADATA_EXPANSION_BYTES, MAX_TIMEOUT,
-    MIN_DB_QUOTA_BYTES, is_loopback_listen,
+    MAX_MAPPING_CONCURRENCY, MAX_RECORDS_PER_REQUEST, MAX_RETENTION,
+    MAX_SCOPE_METADATA_EXPANSION_BYTES, MAX_TIMEOUT, MIN_DB_QUOTA_BYTES, is_loopback_listen,
 };
 
 /// Validates the complete effective configuration before any listener or
@@ -87,6 +87,12 @@ fn validate_queues_and_grpc(config: &Config) -> Result<()> {
         config.grpc_max_concurrent_streams,
         1,
         MAX_GRPC_CONCURRENT_STREAMS,
+    )?;
+    validate_range(
+        "mapping_concurrency",
+        config.mapping_concurrency,
+        1,
+        MAX_MAPPING_CONCURRENCY,
     )?;
     // Very large wire budgets multiply by the stream count into gigabytes
     // of worst-case inbound buffering; make sure operators raising them
