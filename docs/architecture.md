@@ -137,6 +137,9 @@ stream slot while its abandoned mapping stays counted — retained mapping
 memory is bounded by `mapping_concurrency × grpc_max_recv_msg_size`.
 Remote metrics need `allow_remote_metrics = true`. TLS/auth files are
 readability-checked. Effective config prints as JSON at startup.
+`otel-sqlite check` runs the same validation plus PEM parsing and a
+read-only schema inspection as a non-mutating preflight (`check --json` for
+automation).
 
 ### 3.6 Performance model
 

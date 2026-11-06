@@ -173,4 +173,19 @@ fn server_tls_config(tls: &TlsConfig) -> Result<ServerTlsConfig, IngressError> {
     Ok(config)
 }
 
+/// Validates TLS material exactly as server startup does, without binding a
+/// listener or spawning anything.
+///
+/// [`server_tls_config`] only reads the PEM files; deriving the rustls
+/// configuration is where certificates and keys are actually parsed, so a
+/// corrupt or mismatched pair must pass through `Server::tls_config` to be
+/// caught. This is what makes the preflight more than a readability check.
+pub fn validate_tls_material(tls: &TlsConfig) -> Result<(), IngressError> {
+    let config = server_tls_config(tls)?;
+    Server::builder()
+        .tls_config(config)
+        .map_err(|source| IngressError::Tls(source.to_string()))?;
+    Ok(())
+}
+
 // `wait_for_halt` is defined in `shutdown` and shared with `health`.

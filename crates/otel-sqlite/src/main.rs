@@ -2,6 +2,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod backup_cli;
+mod check_cli;
 mod config;
 mod gencerts;
 mod healthcheck;
@@ -72,6 +73,7 @@ Commands:
   backup        take an online SQLite snapshot (optionally encrypted)
   restore       restore a backup into a clean directory
   verify        run integrity/foreign-key/row-count checks on a database
+  check         non-mutating preflight: config, TLS, tokens and DB schema
 
 Options:
   -h, --help    print this help
@@ -115,6 +117,25 @@ async fn main() -> Result<()> {
             let rest = cli_args.collect::<Vec<_>>();
             let args = backup_cli::parse_verify_args(&rest)?;
             return backup_cli::run_verify(&args);
+        }
+        Some("check") => {
+            let rest = cli_args.collect::<Vec<_>>();
+            let args = match check_cli::parse_args(&rest) {
+                Ok(args) => args,
+                Err(error) => {
+                    eprintln!("{error:#}");
+                    eprintln!("run `otel-sqlite check --help` for usage");
+                    std::process::exit(2);
+                }
+            };
+            if args.help {
+                check_cli::print_usage();
+                return Ok(());
+            }
+            if !check_cli::run(&args)? {
+                std::process::exit(1);
+            }
+            return Ok(());
         }
         Some(unknown) => {
             eprintln!("unknown argument `{unknown}`; run `otel-sqlite --help` for usage");

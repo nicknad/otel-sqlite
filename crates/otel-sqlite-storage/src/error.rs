@@ -46,6 +46,16 @@ pub(crate) fn classify_sqlite(error: &rusqlite::Error) -> FailureClass {
 }
 
 impl StorageError {
+    /// SQLite refused the file as "not a database" rather than as a
+    /// transient or structural failure.
+    pub fn is_not_a_database(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ffi::ErrorCode::NotADatabase
+        )
+    }
+
     /// Classification driving the writer's retry/salvage/halt policy.
     pub(crate) fn class(&self) -> FailureClass {
         match self {

@@ -178,13 +178,18 @@ otel-sqlite backup   --db otel-logs.db --out /backups --keep 30
 otel-sqlite backup   --db otel-logs.db --out /backups --key-file /keys/backup.key
 otel-sqlite restore  --backup /backups/otel-logs.db.<UTC>.otsb --dir /data/restored --key-file /keys/backup.key
 otel-sqlite verify   --db otel-logs.db
+otel-sqlite check    --config otel-sqlite.toml
 ```
 
 `backup` copies a consistent snapshot through the WAL, normalizes to one
 self-contained file, verifies integrity/foreign-keys/row-counts, prunes
 beyond `--keep`. `restore` refuses non-empty dirs and verifies before/after.
-`verify` exits non-zero on corruption. Encryption is optional AES-256-GCM
-(32-byte key file).
+`verify` exits non-zero on corruption. `check` is a non-mutating preflight:
+it loads and validates the effective config, parses TLS certificates/keys,
+validates the bearer-token file, and inspects the schema read-only (reporting
+pending migrations and refusing a database newer than the binary) without
+binding a listener or touching the database. Encryption is optional
+AES-256-GCM (32-byte key file).
 
 - Runbook: [docs/operations/backup-restore.md](docs/operations/backup-restore.md)
 - Setup: [systemd](docs/operations/backup-systemd.md),

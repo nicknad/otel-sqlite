@@ -38,6 +38,21 @@ Incompatible changes:
 
 ## Upgrade procedure
 
+Before replacing the binary, run the non-mutating preflight:
+
+```sh
+otel-sqlite check --config /etc/otel-sqlite/otel-sqlite.toml
+```
+
+It loads the effective config exactly like the server, parses the TLS
+certificate/key (and client CA), loads the token file, and inspects the
+database schema **read-only** — no listener, no workers, no `-wal`/`-shm`
+sidecars, no schema change. Exit status is `0` when nothing blocks startup,
+`1` when config/TLS/auth/downgrade checks fail, and `2` for usage errors.
+`--json` emits the same report machine-readably; pending migrations are
+reported as warnings (startup will apply them), while a database stamped by a
+newer binary is a hard failure.
+
 1. Backup + record version:
    ```sh
    otel-sqlite backup --db /data/otel-logs.db --out /backups --keep 30
@@ -46,8 +61,9 @@ Incompatible changes:
 2. Stop gracefully (systemd/K8s/SIGTERM) — drains, commits acked records,
    truncates WAL.
 3. Replace binary / image.
-4. Start — `Storage::open` applies pending migrations in order, one txn
-   each; readiness waits for current schema.
+4. Run `otel-sqlite check --config ...` against the new binary before
+   starting; then start — `Storage::open` applies pending migrations in order,
+   one txn each; readiness waits for current schema.
 5. Verify: `otel-sqlite verify --db /data/otel-logs.db` shows `schema: 005`,
    `integrity: ok`, 0 FK violations, row counts matching pre-upgrade (+
    restart-window traffic).

@@ -157,6 +157,47 @@ pub fn open_readonly(db_path: &Path) -> Result<Connection, BackupError> {
         .map_err(|error| map_sqlite_error(db_path, error))
 }
 
+/// Opens a database for side-effect-free inspection.
+///
+/// Unlike [`open_readonly`], which may create `-wal`/`-shm` sidecars for a WAL
+/// database, this sets SQLite's `immutable=1` URI flag: no sidecars, no locks,
+/// no bytes written. It is intended for a preflight before rollout, when no
+/// process is writing; because it bypasses the WAL, it reports the last
+/// checkpointed state rather than a live snapshot.
+pub fn open_immutable(db_path: &Path) -> Result<Connection, BackupError> {
+    let uri = format!("file:{}?immutable=1", encode_uri_path(db_path));
+    Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|error| map_sqlite_error(db_path, error))
+}
+
+/// Percent-encodes a filesystem path for use in a `file:` URI. Keeps the
+/// unreserved characters and `/` literal, which covers ordinary POSIX paths.
+fn encode_uri_path(path: &Path) -> String {
+    #[cfg(windows)]
+    let path = std::borrow::Cow::Owned(path.to_string_lossy().replace('\\', "/"));
+    #[cfg(not(windows))]
+    let path = path.to_string_lossy();
+
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0F) as usize] as char);
+            }
+        }
+    }
+    encoded
+}
+
 /// Maps a SQLite failure to a meaningful [`BackupError`]: a file that is not
 /// a SQLite database or does not exist deserves a specific message, not a raw
 /// result code.

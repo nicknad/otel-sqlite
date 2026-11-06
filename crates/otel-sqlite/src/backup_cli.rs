@@ -170,7 +170,7 @@ pub fn parse_verify_args(args: &[String]) -> Result<VerifyArgs> {
 
 /// Records a value for `flag`, rejecting a second occurrence instead of
 /// silently letting the last one win.
-fn set_once<T>(slot: &mut Option<T>, value: T, flag: &str) -> Result<()> {
+pub(crate) fn set_once<T>(slot: &mut Option<T>, value: T, flag: &str) -> Result<()> {
     if slot.is_some() {
         bail!("flag {flag} was given more than once");
     }
@@ -178,7 +178,7 @@ fn set_once<T>(slot: &mut Option<T>, value: T, flag: &str) -> Result<()> {
     Ok(())
 }
 
-fn value<'a>(flag: &str, iter: &mut impl Iterator<Item = &'a String>) -> Result<String> {
+pub(crate) fn value<'a>(flag: &str, iter: &mut impl Iterator<Item = &'a String>) -> Result<String> {
     let value = iter
         .next()
         .cloned()

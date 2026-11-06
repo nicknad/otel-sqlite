@@ -57,7 +57,7 @@ use otel_sqlite_ingress::mapping::pb::logs::v1::{
 };
 use otel_sqlite_ingress::{
     AuthConfig, IngestReceiver, IngestSender, IngressConfig, IngressError, ServingCheck, TlsConfig,
-    channel,
+    channel, validate_tls_material,
 };
 use otel_sqlite_storage::{Storage, StorageConfig};
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
@@ -1334,5 +1334,39 @@ async fn bearer_credentials_never_escape_into_logs_metrics_status_or_database() 
     assert!(
         !metric_labels.iter().any(|entry| entry.contains(token)),
         "bearer token leaked into metric names or labels"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Non-mutating TLS material validation (used by `otel-sqlite check`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tls_material_preflight_accepts_a_valid_identity() {
+    let pki = Pki::generate();
+    let tls = TlsConfig {
+        cert: pki.path("server.pem"),
+        key: pki.path("server.key"),
+        client_ca: Some(pki.path("ca.pem")),
+    };
+
+    validate_tls_material(&tls).expect("valid server + client CA material parses");
+}
+
+#[test]
+fn tls_material_preflight_rejects_garbage_pem_without_binding() {
+    let pki = Pki::generate();
+    pki.write("garbage.pem", "this is not a certificate");
+
+    let tls = TlsConfig {
+        cert: pki.path("garbage.pem"),
+        key: pki.path("server.key"),
+        client_ca: None,
+    };
+
+    let error = validate_tls_material(&tls).expect_err("garbage certificate must fail");
+    assert!(
+        matches!(error, IngressError::Tls(_)),
+        "expected a TLS error, got {error:?}"
     );
 }

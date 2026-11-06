@@ -29,7 +29,7 @@ pub use config::{
     MAX_MAPPING_CONCURRENCY, MAX_SCOPE_METADATA_EXPANSION_BYTES, TlsConfig, expand_bind_address,
 };
 pub use error::IngressError;
-pub use grpc::{serve, serve_with_shutdown};
+pub use grpc::{serve, serve_with_shutdown, validate_tls_material};
 pub use logs::LogsIngress;
 pub use mapping::pb;
 

@@ -34,7 +34,7 @@ pub use error::StorageError;
 /// upgrade tests, which build databases stamped at every historical schema
 /// version and then let [`Storage::open`] migrate them to the current schema.
 #[doc(hidden)]
-pub use migration::migrate_up_to;
+pub use migration::{SchemaStatus, inspect_schema, latest_schema_version, migrate_up_to};
 pub use permissions::{restrict_permissions, warn_if_world_readable};
 pub use stats::{BatcherStats, StorageHealth, StorageStatsSnapshot};
 // The health sample returned by `StorageHealth::sample` is core vocabulary so
