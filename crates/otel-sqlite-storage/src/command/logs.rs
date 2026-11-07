@@ -93,13 +93,12 @@ fn insert_logs_inner(
     let mut written = 0u64;
     let mut dropped = 0u64;
     let mut by_ticket: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
-    let mut segment = 0usize;
-    let mut segment_left = batch.segments.first().map_or(0, |segment| segment.records);
-    for record in batch.records.records() {
-        let ticket = batch
-            .segments
-            .get(segment)
-            .map_or(0, |segment| segment.commit_seq);
+    let tickets = batch
+        .segments
+        .iter()
+        .flat_map(|segment| std::iter::repeat_n(segment.commit_seq, segment.records))
+        .chain(std::iter::repeat_n(0, batch.records.len()));
+    for (record, ticket) in batch.records.records().iter().zip(tickets) {
         write_attributes_json_into(&record.attributes, &mut scratch.order, &mut scratch.json);
         let body = record
             .body_json
@@ -150,17 +149,6 @@ fn insert_logs_inner(
                 );
             }
             Err(error) => return Err(error.into()),
-        }
-
-        if segment < batch.segments.len() {
-            segment_left -= 1;
-            if segment_left == 0 {
-                segment += 1;
-                segment_left = batch
-                    .segments
-                    .get(segment)
-                    .map_or(0, |segment| segment.records);
-            }
         }
     }
     Ok(SalvageOutcome {

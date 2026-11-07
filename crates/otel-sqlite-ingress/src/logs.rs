@@ -552,9 +552,9 @@ mod tests {
             accepted,
             rejected,
             total_records: accepted + rejected,
-            disconnected: rejected > 0,
             last_ticket: tickets.last().map(|(ticket, _)| *ticket),
             tickets: tickets.to_vec(),
+            ..EnqueueOutcome::default()
         }
     }
 

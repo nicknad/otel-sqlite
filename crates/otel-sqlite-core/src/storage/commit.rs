@@ -241,7 +241,7 @@ impl CommitLedger {
             if failed {
                 inner.failed.insert(ticket);
             }
-            if voided || !failed {
+            if !failed {
                 inner.progress.remove(&ticket);
             }
 
@@ -753,11 +753,11 @@ mod tests {
                 }
             }
         );
-        let waiter = {
-            let ledger = Arc::new(ledger);
+        let ledger = Arc::new(ledger);
+        let waiter = tokio::spawn({
             let ledger = Arc::clone(&ledger);
-            tokio::spawn(async move { ledger.committed(ticket).await })
-        };
+            async move { ledger.committed(ticket).await }
+        });
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
             !waiter.is_finished(),

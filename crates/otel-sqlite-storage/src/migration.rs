@@ -82,9 +82,10 @@ pub fn inspect_schema(conn: &Connection) -> Result<SchemaStatus, StorageError> {
     let mut applied = read_applied_versions(conn)?;
     applied.sort();
 
-    let latest_known = newest_known();
-    let newest_applied = applied.last().cloned().unwrap_or_default();
-    let newer_than_binary = newest_applied.as_str() > latest_known;
+    let latest_known = latest_schema_version();
+    let newer_than_binary = applied
+        .last()
+        .is_some_and(|version| version.as_str() > latest_known);
     let pending = MIGRATIONS
         .iter()
         .filter(|migration| !applied.iter().any(|version| version == migration.version))
@@ -100,16 +101,12 @@ pub fn inspect_schema(conn: &Connection) -> Result<SchemaStatus, StorageError> {
     })
 }
 
-fn newest_known() -> &'static str {
+/// Newest schema version compiled into this binary.
+pub fn latest_schema_version() -> &'static str {
     MIGRATIONS
         .last()
         .map(|migration| migration.version)
         .unwrap_or_default()
-}
-
-/// Newest schema version compiled into this binary.
-pub fn latest_schema_version() -> &'static str {
-    newest_known()
 }
 
 /// Whether `name` is a table in the opened database. Uses `sqlite_master`
@@ -159,7 +156,7 @@ fn migrate_inner(conn: &mut Connection, target_version: Option<&str>) -> Result<
     // Downgrade guard: an older binary must refuse to run against a database
     // stamped by a newer one. Proceeding would silently write a schema that
     // the newer binary cannot reason about (or worse, misread).
-    let newest_known = newest_known();
+    let newest_known = latest_schema_version();
     if let Some(newest_applied) = applied.iter().max()
         && newest_applied.as_str() > newest_known
     {

@@ -204,20 +204,12 @@ fn settle_log_batch(
     if batch.segments.is_empty() {
         // Legacy/bench batches carry no per-record ticket map. Treat every
         // referenced ticket as complete; a salvage drop fails all of them.
-        match salvage {
-            None => {
-                for commit_seq in &batch.commit_seqs {
-                    ledger.complete(*commit_seq);
-                }
+        let dropped = salvage.as_ref().map_or(0, |outcome| outcome.dropped);
+        for commit_seq in &batch.commit_seqs {
+            if dropped > 0 {
+                ledger.note_dropped(*commit_seq, dropped);
             }
-            Some(outcome) => {
-                for commit_seq in &batch.commit_seqs {
-                    if outcome.dropped > 0 {
-                        ledger.note_dropped(*commit_seq, outcome.dropped);
-                    }
-                    ledger.complete(*commit_seq);
-                }
-            }
+            ledger.complete(*commit_seq);
         }
         return;
     }

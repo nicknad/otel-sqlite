@@ -427,8 +427,9 @@ fn commit_watermark_tracks_accepted_tickets_through_the_real_pipeline() {
     assert!(
         wait_until(Duration::from_secs(5), || {
             storage.stats().records_written == 40
+                && ledger.watermark().committed_through == last_ticket
         }),
-        "all records must be persisted before the watermark check"
+        "all records must be persisted and settled before the watermark check"
     );
 
     // Every accepted ticket is now committed at once: the contiguous

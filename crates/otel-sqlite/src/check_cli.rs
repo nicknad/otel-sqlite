@@ -159,14 +159,6 @@ impl MaterialCheck {
             error: Some(error),
         }
     }
-
-    fn not_checked() -> Self {
-        Self {
-            configured: false,
-            valid: None,
-            error: None,
-        }
-    }
 }
 
 /// Read-only schema state of the configured database.
@@ -207,8 +199,8 @@ impl CheckReport {
             config_source: source,
             config_path: path.map(|path| path.display().to_string()),
             effective_config: None,
-            tls: MaterialCheck::not_checked(),
-            auth: MaterialCheck::not_checked(),
+            tls: MaterialCheck::not_configured(),
+            auth: MaterialCheck::not_configured(),
             database: None,
             warnings: Vec::new(),
             errors: vec![error],
@@ -347,20 +339,19 @@ fn check_database(
         }
     };
 
-    let applied_version = status.applied.last().cloned();
     let base = DatabaseCheck {
         path: display,
         state: "current",
-        applied_version: applied_version.clone(),
+        applied_version: status.applied.last().cloned(),
         binary_version,
-        applied: status.applied.clone(),
-        pending: status.pending.clone(),
+        applied: status.applied,
+        pending: status.pending,
     };
 
     if !status.is_otel_schema {
-        let display = base.path.clone();
         errors.push(format!(
-            "{display} is a SQLite database but not otel-sqlite storage (no log_event table)"
+            "{} is a SQLite database but not otel-sqlite storage (no log_event table)",
+            base.path
         ));
         return DatabaseCheck {
             state: "not_otel",
@@ -372,7 +363,7 @@ fn check_database(
         errors.push(format!(
             "database schema version {} is newer than the newest supported version {}; \
              upgrade this binary before opening it",
-            applied_version.as_deref().unwrap_or("(unknown)"),
+            base.applied_version.as_deref().unwrap_or("(unknown)"),
             status.latest_known
         ));
         return DatabaseCheck {
@@ -381,12 +372,12 @@ fn check_database(
         };
     }
 
-    if status.pending.is_empty() {
+    if base.pending.is_empty() {
         base
     } else {
         warnings.push(format!(
             "database will apply pending migration(s) on startup: {}",
-            status.pending.join(", ")
+            base.pending.join(", ")
         ));
         DatabaseCheck {
             state: "pending",
@@ -438,17 +429,8 @@ fn check_parent_directory(path: &Path, warnings: &mut Vec<String>) {
 }
 
 fn nearest_existing(path: &Path) -> Option<&Path> {
-    let mut current = Some(path);
-    while let Some(candidate) = current {
-        if candidate.as_os_str().is_empty() {
-            return None;
-        }
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        current = candidate.parent();
-    }
-    None
+    path.ancestors()
+        .find(|candidate| !candidate.as_os_str().is_empty() && candidate.exists())
 }
 
 /// Rough write-bit test. Permission models do not let a non-mutating check
