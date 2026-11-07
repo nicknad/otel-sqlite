@@ -2,44 +2,68 @@ use rusqlite::Connection;
 
 use crate::error::StorageError;
 
+/// Frozen upgrade history, in ascending version order.
+///
+/// New databases do not execute these files: [`BASELINE_SQL`] already
+/// produces the schema this ladder ends at. They remain the forward-upgrade
+/// path for databases stamped by an older binary, and the source for
+/// [`migrate_up_to`]'s historical snapshots.
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: "000",
         description: "Canonical OTLP SQLite schema: logs, resources, contentless FTS5, metrics and read-side views",
-        sql: include_str!("../migrations/000_baseline.sql"),
+        sql: include_str!("../migrations/upgrades/000_baseline.sql"),
         disable_foreign_keys: false,
     },
     Migration {
         version: "001",
         description: "Incrementally maintained log search index: triggers keep FTS5 consistent with inserts and retention prunes",
-        sql: include_str!("../migrations/001_log_fts_incremental.sql"),
+        sql: include_str!("../migrations/upgrades/001_log_fts_incremental.sql"),
         disable_foreign_keys: false,
     },
     Migration {
         version: "002",
         description: "Metric retention access path: timestamp index for age-based data-point prunes",
-        sql: include_str!("../migrations/002_metric_retention_index.sql"),
+        sql: include_str!("../migrations/upgrades/002_metric_retention_index.sql"),
         disable_foreign_keys: false,
     },
     Migration {
         version: "003",
         description: "Mapping fidelity: scope attributes/schema URL on log events and scopes, metric metadata, exemplar persistence columns exposed on the read-side views",
-        sql: include_str!("../migrations/003_mapping_fidelity.sql"),
+        sql: include_str!("../migrations/upgrades/003_mapping_fidelity.sql"),
         disable_foreign_keys: false,
     },
     Migration {
         version: "004",
         description: "Metric identity includes is_monotonic and aggregation_temporality in the dimension UNIQUE constraint (table rebuild)",
-        sql: include_str!("../migrations/004_metric_identity_temporality.sql"),
+        sql: include_str!("../migrations/upgrades/004_metric_identity_temporality.sql"),
         disable_foreign_keys: true,
     },
     Migration {
         version: "005",
         description: "Logs-only sink: drop metric tables, views and indexes",
-        sql: include_str!("../migrations/005_drop_metrics_signal.sql"),
+        sql: include_str!("../migrations/upgrades/005_drop_metrics_signal.sql"),
         disable_foreign_keys: false,
     },
 ];
+
+/// Newest schema version this baseline is equivalent to.
+///
+/// A fresh database executes [`BASELINE_SQL`] once and is stamped as satisfying
+/// every migration up to and including this version. Keep this equal to the
+/// last legacy migration that the baseline folds in; a unit test enforces it.
+const BASELINE_VERSION: &str = "005";
+
+/// Complete logs-only schema for a brand-new database.
+///
+/// It is the frozen result of the historical ladder at [`BASELINE_VERSION`],
+/// with the metric signal removed rather than created and then dropped.
+const BASELINE_SQL: &str = include_str!("../migrations/000_baseline.sql");
+
+/// Stamp text for versions satisfied by [`BASELINE_SQL`]. Their historical
+/// DDL never ran, so this deliberately does not reuse the per-version
+/// descriptions that mention the metric schema.
+const BASELINE_DESCRIPTION: &str = "Satisfied by squashed logs-only baseline";
 
 struct Migration {
     version: &'static str,
@@ -143,15 +167,11 @@ pub fn migrate_up_to(conn: &mut Connection, target_version: &str) -> Result<(), 
 }
 
 fn migrate_inner(conn: &mut Connection, target_version: Option<&str>) -> Result<(), StorageError> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-            version     TEXT PRIMARY KEY,
-            applied_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            description TEXT
-        );",
-    )?;
-
-    let applied: Vec<String> = read_applied_versions(conn)?;
+    // Probe before creating anything: a database is fresh only when it has
+    // neither migration stamps nor the canonical log table. An existing
+    // otel-sqlite database with missing stamps is legacy, not fresh.
+    let mut applied: Vec<String> = read_applied_versions(conn)?;
+    let fresh = applied.is_empty() && !table_exists(conn, "log_event")?;
 
     // Downgrade guard: an older binary must refuse to run against a database
     // stamped by a newer one. Proceeding would silently write a schema that
@@ -166,6 +186,22 @@ fn migrate_inner(conn: &mut Connection, target_version: Option<&str>) -> Result<
                  version {newest_known}; upgrade this binary before opening it"
             ),
         });
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version     TEXT PRIMARY KEY,
+            applied_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            description TEXT
+        );",
+    )?;
+
+    // A fresh database goes straight to the squashed baseline, unless the
+    // caller is explicitly building a historical snapshot below it.
+    let baseline_eligible = target_version.is_none_or(|target| target >= BASELINE_VERSION);
+    if fresh && baseline_eligible {
+        apply_baseline(conn)?;
+        applied = read_applied_versions(conn)?;
     }
 
     for migration in MIGRATIONS {
@@ -197,4 +233,86 @@ fn migrate_inner(conn: &mut Connection, target_version: Option<&str>) -> Result<
     }
 
     Ok(())
+}
+
+/// Creates a brand-new database from [`BASELINE_SQL`] and records every
+/// migration version the baseline satisfies.
+///
+/// One transaction: a crash leaves the database empty rather than half
+/// created, so the next open retries the same baseline path.
+fn apply_baseline(conn: &mut Connection) -> Result<(), StorageError> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(BASELINE_SQL)?;
+    for migration in MIGRATIONS {
+        if migration.version > BASELINE_VERSION {
+            break;
+        }
+        tx.execute(
+            "INSERT INTO schema_migrations (version, description) VALUES (?1, ?2)",
+            rusqlite::params![migration.version, BASELINE_DESCRIPTION],
+        )?;
+    }
+    tx.commit()?;
+
+    tracing::info!(
+        version = BASELINE_VERSION,
+        "applied squashed logs-only schema baseline"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_versions_are_strictly_ascending_and_unique() {
+        for pair in MIGRATIONS.windows(2) {
+            assert!(
+                pair[0].version < pair[1].version,
+                "migration versions must ascend: {} then {}",
+                pair[0].version,
+                pair[1].version
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_version_is_part_of_the_migration_ladder() {
+        assert!(
+            MIGRATIONS
+                .iter()
+                .any(|migration| migration.version == BASELINE_VERSION),
+            "baseline version {BASELINE_VERSION} must name a real migration"
+        );
+    }
+
+    #[test]
+    fn baseline_sql_is_logs_only_and_folds_in_fts_and_scope_columns() {
+        for metric_object in [
+            "metric_data_point",
+            "metric_series",
+            "CREATE TABLE metric",
+            "CREATE VIEW metrics",
+            "CREATE TABLE scope",
+        ] {
+            assert!(
+                !BASELINE_SQL.contains(metric_object),
+                "baseline must not contain metric object `{metric_object}`"
+            );
+        }
+        assert!(
+            BASELINE_SQL.contains("contentless_delete = 1"),
+            "baseline must create the incremental FTS index"
+        );
+        assert!(
+            BASELINE_SQL.contains("logs_fts_ai") && BASELINE_SQL.contains("logs_fts_ad"),
+            "baseline must install both FTS maintenance triggers"
+        );
+        assert!(
+            BASELINE_SQL.contains("scope_attributes_json")
+                && BASELINE_SQL.contains("scope_schema_url"),
+            "baseline must fold in the log scope columns"
+        );
+    }
 }

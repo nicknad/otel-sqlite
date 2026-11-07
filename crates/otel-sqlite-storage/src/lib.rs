@@ -106,12 +106,13 @@ impl Storage {
     /// persists one transaction at a time.
     ///
     /// **Storage-ready guarantee:** this call blocks until the writer thread
-    /// finished bootstrapping (database opened, schema migrated) and the
-    /// insert batcher publishes its liveness guard. A broken backend
-    /// therefore surfaces as `Err` at boot instead of on first traffic. On
-    /// failure nothing is detached: the input receiver never left this call,
-    /// so dropping it disconnects ingress, and the writer is reaped with a
-    /// short budget before the error returns.
+    /// finished bootstrapping (database opened, schema migrated, the startup
+    /// WAL checkpoint completed, and every database file/sidecar hardened)
+    /// and the insert batcher publishes its liveness guard. A broken backend
+    /// therefore surfaces as `Err` at boot instead of on first traffic or
+    /// shutdown. On failure nothing is detached: the input receiver never
+    /// left this call, so dropping it disconnects ingress, and the writer is
+    /// reaped with a short budget before the error returns.
     pub fn open(
         input: Receiver<IngestMessage>,
         config: StorageConfig,

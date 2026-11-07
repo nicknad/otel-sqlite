@@ -8,9 +8,9 @@ use crate::error::StorageError;
 /// Schema of the log search index, including the sync triggers that keep it
 /// consistent with `log_event`.
 ///
-/// This mirrors migration `001_log_fts_incremental.sql` on purpose:
+/// This mirrors the FTS section of `migrations/000_baseline.sql` on purpose:
 /// `rebuild_fts` drops and recreates the table, so it must recreate the
-/// identical trigger shape the migration installed. Change both together.
+/// identical trigger shape the baseline installs. Change both together.
 const FTS_SCHEMA: &str = "
 CREATE VIRTUAL TABLE logs_fts USING fts5(
     body,

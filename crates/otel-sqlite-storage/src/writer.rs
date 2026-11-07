@@ -31,10 +31,11 @@ use crate::stats::WriterStats;
 /// acks in `durability = "commit"` mode may be released. On any exit path the
 /// ledger is closed so pending waiters fail instead of hanging.
 ///
-/// `ready_tx` receives exactly one result once bootstrap (open + migrations)
-/// finished — `Ok` when storage is usable, otherwise an error message — so
-/// [`crate::Storage::open`] can block until storage is genuinely ready and
-/// fail fast at boot otherwise.
+/// `ready_tx` receives exactly one result once bootstrap finished — open,
+/// migrations, the startup checkpoint and permission hardening — `Ok` when
+/// storage is usable, otherwise an error message. [`crate::Storage::open`]
+/// therefore blocks until storage is genuinely ready and fails fast at boot
+/// instead of surfacing a startup failure on first traffic or shutdown.
 pub(crate) fn run(
     receiver: Receiver<WriteCommand>,
     config: StorageConfig,
@@ -49,11 +50,20 @@ pub(crate) fn run(
     run_inner(receiver, config, ledger, stats, ready_tx)
 }
 
-/// Opens the database and applies migrations. Kept separate so the ready
-/// signal in [`run`] wraps exactly this step.
+/// Prepares storage for traffic: open, migrate, fold the initial WAL and
+/// harden the files.
+///
+/// Kept separate so the ready signal in [`run`] wraps every step that can
+/// fail at startup. Publishing readiness before the checkpoint used to let
+/// [`crate::Storage::open`] return success and the writer die immediately
+/// afterwards, surfacing the failure only on first traffic or shutdown.
 fn bootstrap(config: &StorageConfig) -> Result<Connection, StorageError> {
     let mut conn = sqlite::open(&config.sqlite_path, config.synchronous)?;
     migration::migrate(&mut conn)?;
+    maintenance::checkpoint(&conn, CheckpointMode::Truncate)?;
+    // Sidecars materialize on first write, possibly after `sqlite::open`
+    // hardened the paths — repeat here now that they are known to exist.
+    crate::permissions::harden_database_files(&config.sqlite_path);
     Ok(conn)
 }
 
@@ -70,6 +80,8 @@ fn run_inner(
 
     let mut conn = match bootstrap(&config) {
         Ok(conn) => {
+            // Every startup failure path is behind us: the schema is current,
+            // the WAL is folded, and the database files are owner-only.
             let _ = ready_tx.send(Ok(()));
             conn
         }
@@ -79,10 +91,6 @@ fn run_inner(
             return Err(error);
         }
     };
-    maintenance::checkpoint(&conn, CheckpointMode::Truncate)?;
-    // Sidecars materialize on first write, possibly after `sqlite::open`
-    // hardened the paths — repeat here now that they are known to exist.
-    crate::permissions::harden_database_files(&config.sqlite_path);
     tracing::info!(
         path = %config.sqlite_path.display(),
         synchronous = config.synchronous.as_str(),

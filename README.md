@@ -17,9 +17,10 @@ insert batcher → bounded command queue → single SQLite writer (WAL)`.
 **Logs** are the supported end-to-end pipeline (ingest, storage,
 durability, performance).
 
-- **Metrics: unsupported since migration 005.** Service removed from the
-  gRPC endpoint; all metric tables/views/indexes dropped. Exports return
-  `UNIMPLEMENTED`.
+- **Metrics: unsupported.** Service removed from the gRPC endpoint; exports
+  return `UNIMPLEMENTED`. The schema is logs-only: new databases use the
+  squashed baseline with no metric objects, and legacy databases drop the
+  metric tables at migration `005`.
 - **Traces: unsupported and out of scope.** No `TraceService` served;
   `ResourceSpans` not handled. Calls return `UNIMPLEMENTED`; send
   operational telemetry as logs.

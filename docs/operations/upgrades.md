@@ -6,12 +6,27 @@ Applies to the SQLite schema in `crates/otel-sqlite-storage/migrations/*`.
 
 Forward-only, additive snapshots applied by the SQLite writer at startup.
 Each is stamped in `schema_migrations` (`version`, `applied_at`,
-`description`). `Storage::open` blocks until open **and** migrated — schema
-problems fail startup, not first traffic.
+`description`). `Storage::open` blocks until open, migration, the startup
+`wal_checkpoint(TRUNCATE)` and owner-only permission hardening all succeed —
+schema or checkpoint problems fail startup, not first traffic or shutdown.
 
-Once stamped, never re-run. **Never edit an applied migration** — SQLite
-can't tell an edited `001` from the original; evolution always adds a new
-`NNN_*.sql`.
+There are two paths, both ending at the same schema:
+
+- **Fresh database:** applies the squashed logs-only baseline
+  (`migrations/000_baseline.sql`) once. It never creates the metric signal
+  that the old `000`-`004` chain used to build and `005` used to drop. The
+  baseline is then stamped as satisfying every migration through `005`, with
+  description `Satisfied by squashed logs-only baseline` — those historical
+  DDL statements did not run.
+- **Existing database:** replays the missing files in
+  `migrations/upgrades/` (the frozen `000`-`005` chain), then any newer
+  migrations. Databases stamped `005` take no upgrade action.
+
+Once stamped, never re-run. **Never edit an applied migration or the
+baseline** — SQLite can't tell an edited `001` from the original; evolution
+always adds a new `NNN_*.sql` under `migrations/upgrades/`. Squashing again
+means a new baseline plus a deliberate version bump, not an edit to the
+current one.
 
 ## Supported versions
 
@@ -20,13 +35,16 @@ Binary is compatible when its `MIGRATIONS` contains every stamped version
 
 | Version | Contents |
 |---|---|
-| `000` | Baseline: resources, log events, FTS, scope/metric tables, views |
+| `000` | Legacy baseline (frozen, `migrations/upgrades/`): resources, log events, FTS, scope/metric tables, views |
 | `001` | FTS rebuild as contentless FTS5 (`contentless_delete=1`) + triggers + backfill (**breaking** FTS shape) |
 | `003` | New log/scope columns (`scope_attributes_json`, `scope_schema_url`, …) with defaults; views gain columns (old `SELECT`s keep working) |
 | `005` | **Drops OTLP metrics signal** (views `metrics`/`metric_buckets`, tables `scope`/`metric`/`metric_series`/`metric_data_point). **Destructive, irreversible.** Logs, `logs` view, FTS untouched. |
 
-(`002`/`004` were metrics-only and are gone with `005`. Full DDL history
-in `migrations/` + git.)
+Fresh databases do not execute `000`-`005`; they apply the logs-only baseline
+(`migrations/000_baseline.sql`) and stamp the versions it satisfies. That file
+already contains the `001` FTS triggers and the `003` scope columns.
+(`002`/`004` were metrics-only and are gone with `005`. Full upgrade history
+lives in `migrations/upgrades/` + git.)
 
 Incompatible changes:
 
@@ -63,7 +81,8 @@ newer binary is a hard failure.
 3. Replace binary / image.
 4. Run `otel-sqlite check --config ...` against the new binary before
    starting; then start — `Storage::open` applies pending migrations in order,
-   one txn each; readiness waits for current schema.
+   one txn each, then folds the startup WAL and hardens the files. Readiness
+   is published only after all of those succeed.
 5. Verify: `otel-sqlite verify --db /data/otel-logs.db` shows `schema: 005`,
    `integrity: ok`, 0 FK violations, row counts matching pre-upgrade (+
    restart-window traffic).
@@ -78,6 +97,8 @@ No `downgrade` path — DDL is not rolled back. Only mechanism is restore:
    start the **old** binary, verify. Restore replaces the DB; it never
    downgrades a schema in place.
 
-Coverage: `storage/tests/migrations.rs` replays `000`–`004` → `005` through
-`Storage::open`: order + stamp, log rows survive, metric objects gone, FTS
-backfilled/searchable, `integrity_check` ok, FK clean, idempotent reopen.
+Coverage: `storage/tests/migrations.rs` creates fresh databases from the
+logs-only baseline (no metric objects, FTS triggers and scope columns present)
+and replays `000`–`004` → `005` through `Storage::open`: order + stamp, log
+rows survive, metric objects gone, FTS backfilled/searchable, `integrity_check`
+ok, FK clean, idempotent reopen.

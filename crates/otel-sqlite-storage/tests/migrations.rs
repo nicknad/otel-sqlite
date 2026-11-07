@@ -257,6 +257,68 @@ fn fresh_database_has_no_metric_objects() {
         .unwrap();
     assert_eq!(metric_objects, 0, "a fresh schema is logs-only");
     assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM log_event"), 0);
+
+    // The baseline must fold in what 001 and 003 used to add, not just omit
+    // metrics: incremental FTS triggers and the log scope columns.
+    let fts_triggers: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'trigger' AND name IN ('logs_fts_ai', 'logs_fts_ad')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(fts_triggers, 2, "baseline must install both FTS triggers");
+
+    let scope_column = |name: &str| -> bool {
+        conn.prepare("PRAGMA table_info(log_event)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .any(|column| column.unwrap() == name)
+    };
+    assert!(scope_column("scope_attributes_json"));
+    assert!(scope_column("scope_schema_url"));
+
+    let view_columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(logs)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        view_columns
+            .iter()
+            .any(|column| column == "scope_attributes_json")
+    );
+    assert!(
+        view_columns
+            .iter()
+            .any(|column| column == "scope_schema_url")
+    );
+
+    // The fresh database records that the baseline satisfies the historical
+    // ladder, so later binaries see a complete, current stamp.
+    let applied: Vec<String> = conn
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(applied, vec!["000", "001", "002", "003", "004", "005"]);
+    let descriptions: Vec<String> = conn
+        .prepare("SELECT DISTINCT description FROM schema_migrations")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        descriptions,
+        vec!["Satisfied by squashed logs-only baseline"]
+    );
 }
 
 /// Reopening a current-schema database is a no-op: the stamp stays 005 and the
