@@ -8,7 +8,6 @@
 //! so the permit is held until the work actually finishes — bounding both
 //! running and queued-but-not-yet-started mapping work.
 
-use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,16 +31,6 @@ pub(crate) enum MappingError {
     Join(JoinError),
     /// The budget is closed. Production never closes it.
     Closed,
-}
-
-impl fmt::Display for MappingError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Timeout => f.write_str("mapping deadline expired"),
-            Self::Join(error) => write!(f, "mapping task failed: {error}"),
-            Self::Closed => f.write_str("mapping budget is closed"),
-        }
-    }
 }
 
 impl MappingBudget {

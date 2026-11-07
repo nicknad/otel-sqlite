@@ -87,10 +87,11 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     // Subcommands: `healthcheck` is the Docker HEALTHCHECK probe,
-    // `gen-certs` bootstraps the in-house PKI, and `backup`/`restore`/`verify`
+    // `gen-certs` bootstraps the in-house PKI, `backup`/`restore`/`verify`
     // provide the online backup contract (the slim runtime image ships no
-    // curl/bash/openssl/sqlite3, so the binary must answer for itself).
-    // Anything else starts the server.
+    // curl/bash/openssl/sqlite3, so the binary must answer for itself), and
+    // `check` validates a rollout without mutating anything. Anything else
+    // starts the server.
     let mut cli_args = std::env::args().skip(1);
     match cli_args.next().as_deref() {
         Some("--help" | "-h" | "help") => {

@@ -41,8 +41,9 @@ use crate::time::monotonic_millis;
 /// Published progress of the SQLite writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Watermark {
-    /// Every ticket `<= committed_through` is completed (its transaction
-    /// committed) or voided (it never carried records).
+    /// Every ticket `<= committed_through` is settled: completed (its
+    /// transaction committed), voided (it never carried records), or failed
+    /// (salvage quarantined some of its records).
     pub committed_through: u64,
     /// The owning pipeline is gone; no further completions will arrive.
     pub closed: bool,
@@ -88,7 +89,7 @@ pub struct CommitLedgerClosed;
 
 impl fmt::Display for CommitLedgerClosed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("storage pipeline shut down before the records were committed")
+        f.write_str("storage pipeline did not durably commit the records")
     }
 }
 
@@ -280,8 +281,8 @@ impl CommitLedger {
         }
     }
 
-    /// Marks the owning pipeline as gone. Every pending and future
-    /// [`CommitLedger::committed`] call resolves with [`CommitLedgerClosed`].
+    /// Marks the owning pipeline as gone. Pending and future
+    /// [`CommitLedger::wait`] calls resolve with [`CommitOutcome::Closed`].
     pub fn close(&self) {
         let watermark = {
             let mut inner = self.lock_inner();
@@ -299,7 +300,8 @@ impl CommitLedger {
         *self.updates.borrow()
     }
 
-    /// Number of issued tickets that have been neither completed nor voided.
+    /// Number of issued tickets that are still unsettled (neither completed,
+    /// voided, nor failed).
     ///
     /// In steady operation this counts only records currently in flight
     /// (buffered in the insert batcher, queued for the writer, or mid-

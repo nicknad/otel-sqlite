@@ -112,11 +112,6 @@ impl LogsIngress {
         // the CPU-heavy mapping: the async path only ever does channel and
         // ledger work, so a walk of borrowed proto fields cannot stall a tokio
         // worker. The record cap is checked before mapping allocates chunks.
-        //
-        // The mapping budget is acquired *before* `spawn_blocking` and moved
-        // into the closure. tokio cannot cancel a blocking task, so a timed-out
-        // export releases its stream slot but the abandoned mapping keeps its
-        // permit until it really finishes; that is what bounds retained work.
         let resource_logs = request.resource_logs;
         let limits = Arc::clone(&self.config);
         let work = self

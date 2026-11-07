@@ -18,8 +18,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use otel_sqlite_ingress::{TokenFileVault, validate_tls_material};
-use otel_sqlite_storage::backup;
-use otel_sqlite_storage::latest_schema_version;
+use otel_sqlite_storage::{backup, latest_schema_version};
 use serde::Serialize;
 
 use crate::backup_cli::{set_once, value};
@@ -402,18 +401,14 @@ fn check_parent_directory(path: &Path, warnings: &mut Vec<String>) {
     };
 
     if !parent.exists() {
-        match nearest_existing(parent) {
-            Some(ancestor) if !is_readonly(ancestor) => warnings.push(format!(
-                "database directory {} does not exist yet; the server will create it",
-                parent.display()
-            )),
+        match nearest_existing(parent).filter(|ancestor| is_readonly(ancestor)) {
             Some(ancestor) => warnings.push(format!(
                 "database directory {} does not exist and {} is read-only; creating it may fail",
                 parent.display(),
                 ancestor.display()
             )),
             None => warnings.push(format!(
-                "database directory {} does not exist; the server will create it",
+                "database directory {} does not exist yet; the server will create it",
                 parent.display()
             )),
         }
@@ -474,7 +469,7 @@ fn material_line(label: &str, check: &MaterialCheck) -> String {
     match (check.configured, check.valid, &check.error) {
         (false, _, _) => format!("{label} not configured"),
         (true, Some(true), _) => format!("{label} configured, valid"),
-        (true, _, Some(error)) => format!("{label} configured, INVALID: {error}"),
+        (true, _, Some(error)) => error.clone(),
         (true, _, None) => format!("{label} configured"),
     }
 }
