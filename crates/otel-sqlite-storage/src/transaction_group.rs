@@ -427,7 +427,9 @@ fn settle_log_batch(
 mod tests {
     use super::*;
     use otel_sqlite_core::model::LogRecord;
-    use otel_sqlite_core::storage::{BatchOrigin, RecordSegment, SyncMode, WriteBatch};
+    use otel_sqlite_core::storage::{
+        BatchOrigin, RecordSegment, SyncMode, TicketState, WriteBatch,
+    };
     use std::collections::VecDeque;
 
     fn batch(records: usize) -> LogWriteBatch {
@@ -436,6 +438,27 @@ mod tests {
             records: WriteBatch::from_vec((0..records).map(|_| LogRecord::default()).collect()),
             commit_seqs: Vec::new(),
             segments: Vec::new(),
+        }
+    }
+
+    fn ticket_batch(bodies: &[&str], ticket: u64) -> LogWriteBatch {
+        LogWriteBatch {
+            origin: BatchOrigin::default(),
+            records: WriteBatch::from_vec(
+                bodies
+                    .iter()
+                    .map(|body| LogRecord {
+                        body: (*body).to_owned(),
+                        ..LogRecord::default()
+                    })
+                    .collect(),
+            ),
+            commit_seqs: vec![ticket],
+            segments: vec![RecordSegment {
+                commit_seq: ticket,
+                records: bodies.len(),
+                complete: true,
+            }],
         }
     }
 
@@ -561,5 +584,59 @@ mod tests {
             ),
             "an empty batch settles its ticket without a transaction"
         );
+    }
+
+    #[test]
+    fn poison_in_a_group_falls_back_and_keeps_ticket_attribution() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("group-poison.db");
+        let mut conn = crate::sqlite::open(&path, SyncMode::default()).expect("open database");
+        crate::migration::migrate(&mut conn).expect("migrate");
+        conn.execute_batch(
+            "CREATE TRIGGER poison_row BEFORE INSERT ON log_event
+             WHEN NEW.body = 'poison'
+             BEGIN SELECT RAISE(ABORT, 'poison row'); END;",
+        )
+        .expect("create poison trigger");
+
+        let stats = WriterStats::new();
+        let ledger = CommitLedger::new();
+        let mut group = InsertGroup::new(100);
+        group
+            .try_push(ticket_batch(&["healthy one", "poison"], 1))
+            .expect("first batch fits");
+        group
+            .try_push(ticket_batch(&["healthy two"], 2))
+            .expect("second batch fits");
+
+        persist_group(&mut conn, &stats, &ledger, &group)
+            .expect("fallback persists every healthy row");
+
+        assert_eq!(
+            stats.records_written.load(Ordering::Relaxed),
+            2,
+            "healthy rows from both batches survive"
+        );
+        assert_eq!(stats.quarantined_records.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stats.transactions_committed.load(Ordering::Relaxed),
+            2,
+            "the fallback commits one transaction per batch"
+        );
+        assert!(
+            matches!(ledger.state(1), TicketState::Failed { .. }),
+            "the batch containing the poison row must fail its ticket"
+        );
+        assert_eq!(ledger.state(2), TicketState::Completed);
+        assert_eq!(ledger.watermark().committed_through, 2);
+
+        let bodies: Vec<String> = conn
+            .prepare("SELECT body FROM log_event ORDER BY id")
+            .expect("query rows")
+            .query_map([], |row| row.get(0))
+            .expect("map rows")
+            .collect::<Result<_, _>>()
+            .expect("collect rows");
+        assert_eq!(bodies, vec!["healthy one", "healthy two"]);
     }
 }
