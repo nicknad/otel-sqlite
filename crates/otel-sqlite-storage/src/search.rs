@@ -129,13 +129,18 @@ impl FtsMode {
         }
     }
 
-    /// Parses the operator vocabulary at the config boundary.
+    /// Parses the operator vocabulary at the config boundary without
+    /// allocating a lowercased copy.
     pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "off" => Some(Self::Off),
-            "body" => Some(Self::Body),
-            "full" => Some(Self::Full),
-            _ => None,
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("off") {
+            Some(Self::Off)
+        } else if raw.eq_ignore_ascii_case("body") {
+            Some(Self::Body)
+        } else if raw.eq_ignore_ascii_case("full") {
+            Some(Self::Full)
+        } else {
+            None
         }
     }
 
@@ -430,27 +435,26 @@ impl SearchIndex {
         };
         let max_rows = i64::try_from(max_rows.max(1)).unwrap_or(i64::MAX);
         let tx = conn.transaction()?;
-        let next: Option<i64> = tx.query_row(
-            "SELECT MAX(id) FROM (
-                 SELECT id FROM log_event
-                  WHERE id > ?1 AND id <= ?2
-                  ORDER BY id
-                  LIMIT ?3
-             )",
-            params![cursor.last_rowid, cursor.until, max_rows],
-            |row| row.get(0),
-        )?;
+
+        // The previous step covered the whole range; finish without scanning
+        // for a next row that cannot exist.
+        let next = if cursor.last_rowid >= cursor.until {
+            None
+        } else {
+            tx.query_row(
+                "SELECT MAX(id) FROM (
+                     SELECT id FROM log_event
+                      WHERE id > ?1 AND id <= ?2
+                      ORDER BY id
+                      LIMIT ?3
+                 )",
+                params![cursor.last_rowid, cursor.until, max_rows],
+                |row| row.get(0),
+            )?
+        };
 
         let Some(next) = next else {
-            tx.execute(
-                "UPDATE search_index_state
-                    SET status = 'ready',
-                        last_rowid = rebuild_until,
-                        rebuild_until = NULL,
-                        updated_at = CURRENT_TIMESTAMP
-                  WHERE id = 1",
-                [],
-            )?;
+            complete_rebuild(&tx)?;
             tx.commit()?;
             self.cursor = None;
             set_rebuilding_gauge(false);
@@ -501,6 +505,19 @@ impl SearchIndex {
         });
         Ok(RebuildStep::Progress { rows: inserted })
     }
+}
+
+fn complete_rebuild(tx: &rusqlite::Transaction<'_>) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "UPDATE search_index_state
+            SET status = 'ready',
+                last_rowid = rebuild_until,
+                rebuild_until = NULL,
+                updated_at = CURRENT_TIMESTAMP
+          WHERE id = 1",
+        [],
+    )?;
+    Ok(())
 }
 
 fn warn_rebuilding(mode: FtsMode) {

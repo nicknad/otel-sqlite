@@ -48,12 +48,24 @@ impl<T> Submission<T> {
         records: WriteBatch<T>,
         segments: Vec<RecordSegment>,
     ) -> Self {
-        let mut commit_seqs = segments
-            .iter()
-            .map(|segment| segment.commit_seq)
-            .collect::<Vec<_>>();
-        commit_seqs.sort_unstable();
-        commit_seqs.dedup();
+        // Segment order follows ingestion order, so tickets are normally
+        // already sorted and duplicates are adjacent. Only pay for a sort when
+        // an unusual producer breaks that order.
+        let mut commit_seqs = Vec::with_capacity(segments.len());
+        let mut sorted = true;
+        for segment in &segments {
+            if let Some(&last) = commit_seqs.last() {
+                sorted &= last <= segment.commit_seq;
+                if last == segment.commit_seq {
+                    continue;
+                }
+            }
+            commit_seqs.push(segment.commit_seq);
+        }
+        if !sorted {
+            commit_seqs.sort_unstable();
+            commit_seqs.dedup();
+        }
         Self {
             origin,
             records,
@@ -68,6 +80,9 @@ struct OriginBuffer<T> {
     /// FIFO `(ticket, records remaining in the buffer)` for every record
     /// currently buffered, in the same order as the batcher's buffer.
     segments: VecDeque<(u64, usize)>,
+    /// Cached sum of `segments`, so consume never re-scans the queue to
+    /// validate a known count.
+    segment_records: usize,
     batcher: InsertBatcher<T>,
 }
 
@@ -75,12 +90,13 @@ impl<T> OriginBuffer<T> {
     fn new(config: InsertBatcherConfig) -> Self {
         Self {
             segments: VecDeque::new(),
+            segment_records: 0,
             batcher: InsertBatcher::new(config),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.batcher.is_empty() && self.segments.is_empty()
+        self.batcher.is_empty() && self.segment_records == 0
     }
 
     /// Maps the first `count` records of the batcher's FIFO buffer to their
@@ -88,13 +104,12 @@ impl<T> OriginBuffer<T> {
     /// complete only when its last record is in this batch.
     fn consume(&mut self, count: usize) -> Vec<RecordSegment> {
         debug_assert!(
-            self.segments
-                .iter()
-                .map(|(_, records)| *records)
-                .sum::<usize>()
-                >= count,
+            self.segment_records >= count,
             "a batch cannot consume more records than the segments hold"
         );
+        if count == 0 {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         let mut left = count;
         while left > 0 {
@@ -115,6 +130,7 @@ impl<T> OriginBuffer<T> {
                 self.segments.pop_front();
             }
         }
+        self.segment_records -= count;
         out
     }
 }
@@ -123,6 +139,8 @@ pub(crate) struct OriginBuffers<T> {
     config: InsertBatcherConfig,
     /// One buffer per active origin.
     buffers: Vec<(BatchOrigin, OriginBuffer<T>)>,
+    /// Cached total so the driver's per-event health sample stays O(1).
+    buffered_records: usize,
 }
 
 impl<T> OriginBuffers<T> {
@@ -130,6 +148,7 @@ impl<T> OriginBuffers<T> {
         Self {
             config,
             buffers: Vec::new(),
+            buffered_records: 0,
         }
     }
 
@@ -141,10 +160,7 @@ impl<T> OriginBuffers<T> {
     }
 
     pub(crate) fn buffered(&self) -> usize {
-        self.buffers
-            .iter()
-            .map(|(_, buffer)| buffer.batcher.buffered())
-            .sum()
+        self.buffered_records
     }
 
     /// Pushes a mapped chunk, emitting any full batches that became ready.
@@ -160,6 +176,11 @@ impl<T> OriginBuffers<T> {
         records: Vec<T>,
         commit_seq: u64,
     ) -> Vec<Submission<T>> {
+        // An empty chunk must not create an origin buffer or arm a deadline.
+        if records.is_empty() {
+            return Vec::new();
+        }
+        let incoming = records.len();
         let index = if let Some(index) = self.buffers.iter().position(|(known, _)| *known == origin)
         {
             index
@@ -170,13 +191,15 @@ impl<T> OriginBuffers<T> {
         };
 
         let buffer = &mut self.buffers[index].1;
-        if !records.is_empty() {
-            buffer.segments.push_back((commit_seq, records.len()));
-        }
+        buffer.segments.push_back((commit_seq, incoming));
+        buffer.segment_records += incoming;
+        self.buffered_records += incoming;
         let output = buffer.batcher.push(records);
         let mut emitted = Vec::with_capacity(output.len());
         for batch in output {
-            let segments = buffer.consume(batch.len());
+            let len = batch.len();
+            self.buffered_records -= len;
+            let segments = buffer.consume(len);
             emitted.push(Submission::new(origin.clone(), batch, segments));
         }
         if buffer.is_empty() {
@@ -201,12 +224,20 @@ impl<T> OriginBuffers<T> {
         mut flush_one: impl FnMut(&mut InsertBatcher<T>) -> Option<WriteBatch<T>>,
     ) -> Vec<Submission<T>> {
         let mut submissions = Vec::new();
+        let mut flushed_records = 0usize;
         for (origin, buffer) in &mut self.buffers {
+            // Buffers that hold nothing cannot produce a submission.
+            if buffer.batcher.is_empty() {
+                continue;
+            }
             if let Some(records) = flush_one(&mut buffer.batcher) {
-                let segments = buffer.consume(records.len());
+                let len = records.len();
+                flushed_records += len;
+                let segments = buffer.consume(len);
                 submissions.push(Submission::new(origin.clone(), records, segments));
             }
         }
+        self.buffered_records -= flushed_records;
         self.retain_active();
         submissions
     }

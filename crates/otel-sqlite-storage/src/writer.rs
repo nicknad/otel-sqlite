@@ -33,6 +33,7 @@ use rusqlite::Connection;
 
 use crate::LedgerCloseOnDrop;
 use crate::StorageConfig;
+use crate::command::InsertScratch;
 use crate::error::StorageError;
 use crate::fault;
 use crate::maintenance;
@@ -120,6 +121,9 @@ fn run_inner(
     };
     let mut commands_processed = 0u64;
     let mut pending: Option<WriteCommand> = None;
+    // Reused across transactions: statement lookups, resource fingerprints and
+    // JSON/hex buffers are invariant work, not per-group work.
+    let mut insert_scratch = InsertScratch::new();
     let mut last_rebuild_step = Instant::now();
 
     loop {
@@ -159,6 +163,7 @@ fn run_inner(
                 stats,
                 &config,
                 group_budget,
+                &mut insert_scratch,
             )?
         };
         commands_processed = commands_processed.saturating_add(consumed);
@@ -213,6 +218,7 @@ fn execute_next(
     stats: &WriterStats,
     config: &StorageConfig,
     group_budget: usize,
+    insert_scratch: &mut InsertScratch,
 ) -> Result<u64, StorageError> {
     match command {
         WriteCommand::InsertLogs(batch) => {
@@ -227,21 +233,19 @@ fn execute_next(
             let consumed = group.len() as u64;
             ::metrics::counter!("storage_commands_total", "kind" => "insert_logs")
                 .increment(consumed);
-            let non_empty = group
-                .iter()
-                .filter(|batch| !batch.records.is_empty())
-                .count() as u64;
             stats
                 .batches_received
-                .fetch_add(non_empty, Ordering::Relaxed);
+                .fetch_add(group.non_empty() as u64, Ordering::Relaxed);
             stats.observe_queue_depth(receiver.len() + usize::from(pending.is_some()));
 
+            // Quota probes, transactions and statement work all belong only to
+            // groups that actually carry rows.
             if group.records() > 0
                 && let Some(quota) = config.max_db_bytes
             {
                 enforce_quota(conn, &config.sqlite_path, quota, stats);
             }
-            transaction_group::persist_group(conn, stats, ledger, &group)?;
+            transaction_group::persist_group(conn, stats, ledger, &group, insert_scratch)?;
             Ok(consumed)
         }
         other => {
