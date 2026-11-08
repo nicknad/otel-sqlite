@@ -150,17 +150,14 @@ impl TokenFileVault {
         if presented_token.is_empty() {
             return false;
         }
-        // Hash outside the lock: pure CPU, no shared state. The digest is
-        // zeroized on drop; the borrowed `presented_token` itself belongs to
-        // the tonic request and cannot be cleared by us.
-        let digest: Zeroizing<[u8; 32]> =
-            Zeroizing::new(Sha256::digest(presented_token.as_bytes()).into());
 
-        // Fast path: shared read lock, no I/O. Covers >99% of requests.
+        // Fast path: shared read lock, no I/O. Covers >99% of requests. An
+        // empty set can never match, so a revoked vault also avoids hashing
+        // the presented token.
         {
             let cached = self.read_cached();
             if !is_stale(cached.loaded_at, self.reload_interval) {
-                return cached.hashes.iter().any(|known| ct_eq(known, &digest));
+                return !cached.hashes.is_empty() && matches_any(&cached.hashes, presented_token);
             }
         }
 
@@ -169,11 +166,12 @@ impl TokenFileVault {
         // (or hung) filesystem can never block a request thread.
         if self.background_reload.load(Ordering::Acquire) {
             let cached = self.read_cached();
-            return cached.hashes.iter().any(|known| ct_eq(known, &digest));
+            return !cached.hashes.is_empty() && matches_any(&cached.hashes, presented_token);
         }
 
         // No background reloader (tests and non-wired uses): reload inline.
-        self.refresh().iter().any(|known| ct_eq(known, &digest))
+        let hashes = self.refresh();
+        !hashes.is_empty() && matches_any(&hashes, presented_token)
     }
 
     /// Reloads the token set if a reload is due, returning the resulting
@@ -393,7 +391,7 @@ fn read_token_hashes(path: &Path) -> Result<Vec<[u8; 32]>, AuthError> {
 }
 
 /// What one bounded read of the token file produced.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ParsedTokens {
     hashes: Vec<[u8; 32]>,
     skipped_long_lines: usize,
@@ -435,6 +433,10 @@ fn read_token_file(path: &Path) -> Result<ParsedTokens, LoadError> {
         .map_err(LoadError::Io)?;
     if bytes.len() as u64 > MAX_TOKEN_FILE_BYTES {
         return Err(LoadError::TooLarge(bytes.len() as u64));
+    }
+    // An empty file has nothing to decode or parse.
+    if bytes.is_empty() {
+        return Ok(ParsedTokens::default());
     }
     // Invalid UTF-8 fails exactly like the previous `read_to_string` path.
     let text = std::str::from_utf8(&bytes).map_err(|error| {
@@ -534,6 +536,17 @@ fn warn_if_token_file_over_permissive(path: &Path) {
 #[cfg(unix)]
 fn token_file_permissions_are_over_permissive(mode: u32) -> bool {
     mode & 0o077 != 0
+}
+
+/// Hashes `presented_token` and compares it against every known digest.
+///
+/// The digest is zeroized on drop; the borrowed token itself belongs to the
+/// tonic request and cannot be cleared by us. Callers short-circuit an empty
+/// set so a revoked vault does no hashing at all.
+fn matches_any(hashes: &[[u8; 32]], presented_token: &str) -> bool {
+    let digest: Zeroizing<[u8; 32]> =
+        Zeroizing::new(Sha256::digest(presented_token.as_bytes()).into());
+    hashes.iter().any(|known| ct_eq(known, &digest))
 }
 
 /// Constant-time equality over equal-length digests: XOR-folds all bytes so

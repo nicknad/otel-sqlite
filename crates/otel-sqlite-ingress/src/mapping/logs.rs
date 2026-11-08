@@ -32,6 +32,20 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogChunk, IngressError> 
     } = value;
 
     let capacity: usize = scope_logs.iter().map(|scope| scope.log_records.len()).sum();
+    // A group with no records is discarded by `map_chunks`. Decide that before
+    // converting the resource or allocating any model value, so empty groups
+    // cost one length scan and nothing else.
+    if capacity == 0 {
+        return Ok(LogChunk {
+            origin: BatchOrigin {
+                resource: None,
+                schema_url,
+            },
+            records: Vec::new(),
+            commit_seq: 0,
+        });
+    }
+
     let mut records = Vec::with_capacity(capacity);
 
     let resource = resource
@@ -44,6 +58,13 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogChunk, IngressError> 
             log_records,
             schema_url: scope_schema_url,
         } = scope;
+        // Record-less groups are dropped by `map_chunks`, so their scope
+        // metadata can never reach storage. Check that before extracting the
+        // scope fields: materializing the metadata and rendering its canonical
+        // JSON would be work with no possible consumer.
+        if log_records.is_empty() {
+            continue;
+        }
         let (scope_name, scope_version, scope_attributes) = scope
             .map(
                 |InstrumentationScope {
@@ -55,11 +76,6 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogChunk, IngressError> 
             )
             .unwrap_or_default();
         let scope_attributes = attributes(scope_attributes)?;
-        // Record-less groups are dropped by `map_chunks`; skip the canonical
-        // JSON render (the attribute conversion above still enforces bounds).
-        if log_records.is_empty() {
-            continue;
-        }
         // One shared scope per `ScopeLogs` group: every record references the
         // same allocation and reuses the canonical attributes JSON rendered
         // here instead of cloning/serializing per record.
@@ -84,14 +100,6 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogChunk, IngressError> 
     })
 }
 
-pub(crate) fn count(resource_logs: &[ResourceLogs]) -> usize {
-    resource_logs
-        .iter()
-        .flat_map(|resource| resource.scope_logs.iter())
-        .flat_map(|scope| scope.log_records.iter())
-        .count()
-}
-
 /// Maps an OTLP export request into mapped log chunks, one per
 /// `ResourceLogs` group.
 ///
@@ -104,7 +112,9 @@ pub(crate) fn count(resource_logs: &[ResourceLogs]) -> usize {
 pub(crate) fn map_chunks(
     resource_logs: Vec<ResourceLogs>,
 ) -> Result<Vec<IngestMessage>, IngressError> {
-    let mut chunks = Vec::with_capacity(resource_logs.len());
+    // Groups may be empty and are dropped below, so allocate on the first
+    // emitted chunk instead of reserving for groups that cannot produce one.
+    let mut chunks = Vec::new();
     for item in resource_logs {
         let chunk = try_convert_batch(item)?;
         if chunk.records.is_empty() {
@@ -131,9 +141,27 @@ fn convert_record(value: ProtoLogRecord, scope: &Arc<LogScope>) -> Result<LogRec
         ..
     } = value;
 
-    let trace_id = parse_trace_id(trace_id).into_id("invalid_trace_id");
-    let span_id = parse_span_id(span_id).into_id("invalid_span_id");
-    let (body, body_json) = body_value(body)?;
+    // Absent ids are the common case for non-tracing logs; do not walk the
+    // parser for a value that is already known to carry no trace context.
+    let trace_id = if trace_id.is_empty() {
+        [0; 16]
+    } else {
+        parse_trace_id(trace_id)
+            .into_id("invalid_trace_id")
+            .unwrap_or_default()
+    };
+    let span_id = if span_id.is_empty() {
+        [0; 8]
+    } else {
+        parse_span_id(span_id)
+            .into_id("invalid_span_id")
+            .unwrap_or_default()
+    };
+    // Likewise, only decode a body when the record actually has one.
+    let (body, body_json) = match body {
+        Some(body) => body_value(body)?,
+        None => (String::new(), None),
+    };
 
     let observed_time_unix_nano = timestamp(observed_time_unix_nano);
     // OTLP: an unset `time_unix_nano` is to be treated as
@@ -149,8 +177,8 @@ fn convert_record(value: ProtoLogRecord, scope: &Arc<LogScope>) -> Result<LogRec
         observed_time_unix_nano,
         severity_number: severity(severity_number),
         severity_text,
-        trace_id: trace_id.unwrap_or_default(),
-        span_id: span_id.unwrap_or_default(),
+        trace_id,
+        span_id,
         body,
         body_json,
         attributes: attributes(record_attributes)?,
@@ -186,14 +214,27 @@ fn severity(value: i32) -> Severity {
 ///
 /// Depth-limited like `attribute_value`: over-deep bodies fail instead of
 /// overflowing the worker stack.
-fn body_value(value: Option<super::AnyValue>) -> Result<(String, Option<String>), IngressError> {
-    match value.and_then(|any| any.value) {
+fn body_value(value: super::AnyValue) -> Result<(String, Option<String>), IngressError> {
+    match value.value {
         Some(super::AnyValueKind::StringValue(value)) => Ok((value, None)),
         Some(super::AnyValueKind::IntValue(value)) => Ok((value.to_string(), None)),
         Some(super::AnyValueKind::DoubleValue(value)) => Ok((value.to_string(), None)),
         Some(super::AnyValueKind::BoolValue(value)) => Ok((value.to_string(), None)),
         Some(super::AnyValueKind::BytesValue(value)) => {
-            Ok((String::from_utf8_lossy(&value).into_owned(), None))
+            // Nothing to decode for an empty payload.
+            if value.is_empty() {
+                return Ok((String::new(), None));
+            }
+            // Body bytes are usually valid UTF-8. Decode in place so the
+            // proto buffer becomes the destination `String`; only the uncommon
+            // invalid case needs the lossy copy.
+            Ok((
+                match String::from_utf8(value) {
+                    Ok(text) => text,
+                    Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+                },
+                None,
+            ))
         }
         Some(super::AnyValueKind::ArrayValue(values)) => {
             let items = values
@@ -221,13 +262,19 @@ fn body_value(value: Option<super::AnyValue>) -> Result<(String, Option<String>)
 /// Checked per `IngressConfig` limits: attribute-vector lengths, key/value
 /// byte lengths, scalar body bytes, and `AnyValue` nesting depth (folded into
 /// the same non-recursive walk as the leaf-size checks, so a nested container
-/// cannot overflow the worker stack).
-/// Trace/span id *validity* stays in `try_convert_batch`; this only bounds
-/// allocation/CPU.
+/// cannot overflow the worker stack). Trace/span id *validity* stays in
+/// `try_convert_batch`; this only bounds allocation/CPU.
+///
+/// Also returns the request's total record count, so the caller does not need
+/// a separate pass just to know how much work it represents. The record cap is
+/// checked as each scope is reached, before its records are validated: a
+/// request that cannot be admitted stops early instead of paying for
+/// validation it will throw away.
 pub(crate) fn validate_request(
     resource_logs: &[ResourceLogs],
     limits: &IngressConfig,
-) -> Result<(), IngressError> {
+) -> Result<usize, IngressError> {
+    let mut total = 0usize;
     for group in resource_logs {
         check_plain_string(&group.schema_url, limits, "resource.schema_url")?;
         check_attributes(
@@ -239,6 +286,13 @@ pub(crate) fn validate_request(
             "resource.attributes",
         )?;
         for scope in &group.scope_logs {
+            total = total.saturating_add(scope.log_records.len());
+            if total > limits.max_records_per_request {
+                return Err(IngressError::Mapping(format!(
+                    "request contains {total} log records, limit is {}",
+                    limits.max_records_per_request
+                )));
+            }
             let scope_view = scope.scope.as_ref();
             if let Some(s) = scope_view {
                 check_attributes(&s.attributes, limits, "scope.attributes")?;
@@ -246,21 +300,28 @@ pub(crate) fn validate_request(
                 check_plain_string(&s.version, limits, "scope.version")?;
             }
             check_plain_string(&scope.schema_url, limits, "scope.schema_url")?;
-            check_scope_expansion(
-                scope_metadata_bytes(scope_view, &scope.schema_url),
-                scope.log_records.len(),
-                limits,
-                "log",
-            )?;
+            // An empty group is dropped by mapping, so its metadata cannot be
+            // amplified. Skip the metadata walk entirely instead of computing
+            // a size that can never exceed the expansion budget.
+            if !scope.log_records.is_empty() {
+                check_scope_expansion(
+                    scope_metadata_bytes(scope_view, &scope.schema_url),
+                    scope.log_records.len(),
+                    limits,
+                    "log",
+                )?;
+            }
             for record in &scope.log_records {
-                check_attributes(&record.attributes, limits, "log.attributes")?;
+                // Cheap scalar bounds first; the value walk is the expensive
+                // part and only runs once the fixed-size fields fit.
                 check_plain_string(&record.severity_text, limits, "severity_text")?;
                 check_plain_string(&record.event_name, limits, "event_name")?;
                 check_body(record.body.as_ref(), limits)?;
+                check_attributes(&record.attributes, limits, "log.attributes")?;
             }
         }
     }
-    Ok(())
+    Ok(total)
 }
 
 fn check_body(body: Option<&AnyValue>, limits: &IngressConfig) -> Result<(), IngressError> {
@@ -483,7 +544,7 @@ mod tests {
             batch.records[1].body_json.as_deref(),
             Some(r#"[true,{"n":1.5}]"#)
         );
-        assert!(batch.records[0].body.is_empty());
+        assert_eq!(batch.records[0].body, "");
     }
 
     #[test]
@@ -551,26 +612,6 @@ mod tests {
     }
 
     #[test]
-    fn count_sums_all_scope_records() {
-        let proto = ResourceLogs {
-            scope_logs: vec![
-                ScopeLogs {
-                    log_records: vec![sample_record(), sample_record()],
-                    ..Default::default()
-                },
-                ScopeLogs {
-                    log_records: vec![sample_record()],
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let empty = ResourceLogs::default();
-
-        assert_eq!(count(&[proto, empty]), 3);
-    }
-
-    #[test]
     fn maps_one_chunk_per_resource_logs_group_without_batching_policy() {
         let shared = || ResourceLogs {
             resource: sample_resource(),
@@ -627,6 +668,116 @@ mod tests {
     fn empty_groups_produce_no_chunks() {
         let chunks = map_chunks(vec![ResourceLogs::default()]).expect("valid request");
         assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn record_less_groups_skip_resource_and_scope_conversion() {
+        // This metadata is far past the nesting bound. Materializing it would
+        // fail, but the group carries no records and is dropped by
+        // `map_chunks`, so mapping must not walk it at all.
+        let mut deep = AnyValue {
+            value: Some(Value::KvlistValue(KeyValueList::default())),
+        };
+        for _ in 0..40 {
+            deep = AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue { values: vec![deep] })),
+            };
+        }
+        let attribute = KeyValue {
+            key: "deep".to_owned(),
+            value: Some(deep),
+            ..Default::default()
+        };
+        let proto = ResourceLogs {
+            resource: Some(ProtoResource {
+                attributes: vec![attribute.clone()],
+                ..Default::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "scope-a".to_owned(),
+                    attributes: vec![attribute],
+                    ..Default::default()
+                }),
+                log_records: Vec::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let batch = try_convert_batch(proto).expect("an empty group is not mapped");
+        assert_eq!(batch.records.len(), 0);
+        assert!(
+            batch.origin.resource.is_none(),
+            "the resource is not converted for a group that produces no chunk"
+        );
+    }
+
+    #[test]
+    fn bytes_bodies_decode_valid_utf8_and_replace_invalid_sequences() {
+        let text = |bytes: &[u8]| {
+            Some(AnyValue {
+                value: Some(Value::BytesValue(bytes.to_vec())),
+            })
+        };
+        let proto = ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![
+                    ProtoLogRecord {
+                        body: text(b"hello"),
+                        ..Default::default()
+                    },
+                    ProtoLogRecord {
+                        body: text(&[0xff, b'a']),
+                        ..Default::default()
+                    },
+                    ProtoLogRecord {
+                        body: text(b""),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let batch = try_convert_batch(proto).expect("bytes bodies are valid");
+        assert_eq!(batch.records[0].body, "hello");
+        assert_eq!(
+            batch.records[1].body, "\u{fffd}a",
+            "invalid byte sequences must keep the lossy replacement"
+        );
+        assert_eq!(batch.records[2].body, "");
+    }
+
+    #[test]
+    fn validate_returns_the_total_and_enforces_the_record_cap_in_one_pass() {
+        let proto = ResourceLogs {
+            scope_logs: vec![
+                ScopeLogs {
+                    log_records: vec![sample_record(), sample_record()],
+                    ..Default::default()
+                },
+                ScopeLogs {
+                    log_records: vec![sample_record()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            validate_request(std::slice::from_ref(&proto), &IngressConfig::default())
+                .expect("bounded request"),
+            3
+        );
+
+        let limits = IngressConfig {
+            max_records_per_request: 2,
+            ..IngressConfig::default()
+        };
+        let error = validate_request(&[proto], &limits).expect_err("3 records exceed the cap");
+        assert!(error.to_string().contains("3 log records"), "{error}");
     }
 
     #[test]

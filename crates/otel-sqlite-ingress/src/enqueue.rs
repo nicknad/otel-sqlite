@@ -68,6 +68,25 @@ pub(crate) fn enqueue(
     ledger: &CommitLedger,
     work: Vec<IngestMessage>,
 ) -> Result<EnqueueOutcome, IngressError> {
+    // Nothing to admit: skip the admission gate and the per-chunk walk.
+    if work.is_empty() {
+        return Ok(EnqueueOutcome::default());
+    }
+
+    // A request with more chunks than the queue can hold is permanently
+    // unadmittable (an empty queue still has `capacity` slots), so a retry
+    // loop would spin forever. Check this before counting records: a request
+    // that can never fit has no outcome to report, so counting its records
+    // would be wasted work.
+    let capacity = queue.capacity();
+    if work.len() > capacity {
+        return Err(IngressError::Mapping(format!(
+            "request maps to {} chunks, which exceeds the ingest queue capacity of {}; split the request",
+            work.len(),
+            capacity
+        )));
+    }
+
     let total_records: u64 = work
         .iter()
         .map(|message| message.record_count() as u64)
@@ -76,18 +95,6 @@ pub(crate) fn enqueue(
         total_records,
         ..EnqueueOutcome::default()
     };
-
-    // A request with more chunks than the queue can hold is permanently
-    // unadmittable (an empty queue still has `capacity` slots), so a retry
-    // loop would spin forever. Surface it as a permanent mapping error and
-    // tell the client to split the request.
-    if work.len() > queue.capacity() {
-        return Err(IngressError::Mapping(format!(
-            "request maps to {} chunks, which exceeds the ingest queue capacity of {}; split the request",
-            work.len(),
-            queue.capacity()
-        )));
-    }
 
     // Reserve room for the whole request up front. Failing here rejects the
     // request wholesale: no tickets were issued, nothing was enqueued, and the
@@ -181,6 +188,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_request_skips_admission_without_touching_the_queue() {
+        let ledger = Arc::new(CommitLedger::new());
+        let (queue, receiver) = channel(1);
+
+        let outcome = enqueue(&queue, &ledger, Vec::new()).expect("nothing to admit");
+
+        assert_eq!(outcome.accepted, 0);
+        assert_eq!(outcome.rejected, 0);
+        assert_eq!(outcome.total_records, 0);
+        assert_eq!(outcome.tickets.len(), 0);
+        assert!(receiver.is_empty());
+        assert_eq!(ledger.watermark().committed_through, 0);
+    }
+
+    #[test]
     fn whole_request_is_rejected_when_it_cannot_all_fit() {
         let ledger = Arc::new(CommitLedger::new());
         let (queue, receiver) = channel(2);
@@ -196,7 +218,7 @@ mod tests {
         assert_eq!(outcome.rejected, 5);
         assert_eq!(outcome.total_records, 5);
         assert_eq!(outcome.last_ticket(), None);
-        assert!(outcome.tickets.is_empty());
+        assert_eq!(outcome.tickets.len(), 0);
         assert!(!outcome.disconnected);
         assert_eq!(
             receiver.len(),
@@ -264,7 +286,7 @@ mod tests {
         assert_eq!(outcome.total_records, 2);
         assert_eq!(outcome.accepted, 0);
         assert_eq!(outcome.last_ticket(), None);
-        assert!(outcome.tickets.is_empty());
+        assert_eq!(outcome.tickets.len(), 0);
         assert!(
             !ledger.watermark().closed,
             "a rejected enqueue must not look like pipeline shutdown"
