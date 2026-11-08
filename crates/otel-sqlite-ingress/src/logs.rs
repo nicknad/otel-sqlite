@@ -8,9 +8,8 @@ use tonic::{Request, Response, Status};
 use crate::IngestSender;
 use crate::config::IngressConfig;
 use crate::enqueue::{EnqueueOutcome, enqueue};
-use crate::error::IngressError;
 use crate::mapping::budget::{MappingBudget, MappingError};
-use crate::mapping::logs::{count, map_chunks, validate_request};
+use crate::mapping::logs::{map_chunks, validate_request};
 use crate::mapping::pb::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
     logs_service_server::LogsService,
@@ -97,6 +96,13 @@ impl LogsIngress {
         &self,
         request: ExportLogsServiceRequest,
     ) -> Result<ExportLogsServiceResponse, Status> {
+        let resource_logs = request.resource_logs;
+        // An empty export has nothing to map, admit, or acknowledge. Return
+        // before taking a stream permit or scheduling blocking work.
+        if resource_logs.is_empty() {
+            return Ok(ExportLogsServiceResponse::default());
+        }
+
         // Process-wide export concurrency: the transport's per-connection
         // stream cap is not enough to bound in-flight memory across
         // connections. An *owned* permit is used so it can follow the request
@@ -112,22 +118,18 @@ impl LogsIngress {
         // the CPU-heavy mapping: the async path only ever does channel and
         // ledger work, so a walk of borrowed proto fields cannot stall a tokio
         // worker. The record cap is checked before mapping allocates chunks.
-        let resource_logs = request.resource_logs;
         let limits = Arc::clone(&self.config);
         let work = self
             .mapping_budget
             .run(move || {
                 let _span = tracing::info_span!("map").entered();
-                let total = count(&resource_logs);
-                if total > limits.max_records_per_request {
-                    return Err(IngressError::Mapping(format!(
-                        "request contains {total} log records, limit is {}",
-                        limits.max_records_per_request
-                    )));
-                }
-                validate_request(&resource_logs, &limits)?;
+                let total = validate_request(&resource_logs, &limits)?;
                 ::metrics::counter!("otlp_records_received_total", "signal" => "logs")
                     .increment(total as u64);
+                // Every group may be empty; mapping would only drop them.
+                if total == 0 {
+                    return Ok(Vec::new());
+                }
                 map_chunks(resource_logs)
             })
             .await
@@ -205,6 +207,11 @@ impl LogsIngress {
             let mut committed = 0u64;
             let mut any_failed = false;
             for (ticket, records) in &outcome.tickets {
+                // Once every record is committed, no remaining ticket can
+                // change `rejected`, so stop inspecting settlements.
+                if committed == outcome.total_records {
+                    break;
+                }
                 match self.commit.state(*ticket) {
                     TicketState::Completed => committed += records,
                     TicketState::Failed { progress } => {
