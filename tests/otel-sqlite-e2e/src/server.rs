@@ -47,6 +47,7 @@ pub mod benchmark_profile {
         DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES, DEFAULT_SHUTDOWN_TIMEOUT,
         MAX_MAPPING_CONCURRENCY,
     };
+    use otel_sqlite_storage::FtsMode;
 
     pub const INGEST_QUEUE_CAPACITY: usize = 50_000;
     pub const COMMAND_QUEUE_CAPACITY: usize = 50_000;
@@ -96,16 +97,36 @@ pub mod benchmark_profile {
         }
     }
 
+    /// Distinct insert-command record budget for one writer transaction,
+    /// overridable with `OTEL_SQLITE_E2E_GROUP_COMMIT` (default: production
+    /// default). `0` restores one transaction per insert command.
+    pub fn group_commit_max_records() -> usize {
+        std::env::var("OTEL_SQLITE_E2E_GROUP_COMMIT")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(otel_sqlite_storage::DEFAULT_GROUP_COMMIT_RECORDS)
+    }
+
+    /// Installed log search-index mode, overridable with
+    /// `OTEL_SQLITE_E2E_SEARCH_MODE=off|body|full` (default `body`).
+    pub fn search_mode() -> FtsMode {
+        std::env::var("OTEL_SQLITE_E2E_SEARCH_MODE")
+            .ok()
+            .and_then(|value| FtsMode::parse(&value))
+            .unwrap_or_default()
+    }
+
     pub fn storage_config(sqlite_path: PathBuf) -> StorageConfig {
         StorageConfig {
             sqlite_path,
             insert_batcher: InsertBatcherConfig::new(MAX_BATCH_RECORDS, MAX_BATCH_AGE),
             command_queue_capacity: COMMAND_QUEUE_CAPACITY,
+            group_commit_max_records: group_commit_max_records(),
+            fts_mode: search_mode(),
             max_db_bytes: None,
             synchronous: sync_mode(),
             startup_timeout: otel_sqlite_storage::DEFAULT_STARTUP_TIMEOUT,
             shutdown_timeout: otel_sqlite_storage::DEFAULT_SHUTDOWN_TIMEOUT,
-            ..StorageConfig::default()
         }
     }
 }

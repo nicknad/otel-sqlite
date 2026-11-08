@@ -255,6 +255,7 @@ pub fn print_step_summary(report: &StepReport) {
     println!("  WAL size:             {} bytes", report.storage.wal_bytes);
     if let Some(deltas) = &report.storage_deltas {
         println!("  transactions:         {}", deltas.transactions_committed);
+        println!("  batches received:     {}", deltas.batches_received);
         println!("  records written:      {}", deltas.records_written);
         println!("  writer errors:        {}", deltas.errors);
     }
