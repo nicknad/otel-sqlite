@@ -19,7 +19,10 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use otel_sqlite_storage::backup::{self, BackupReport, RestoreReport, VerifyReport};
+use otel_sqlite_storage::{
+    SearchIndexStatus,
+    backup::{self, BackupReport, RestoreReport, VerifyReport},
+};
 
 /// Default live-database path, matching the server's default `otel-logs.db`.
 const DEFAULT_DB_PATH: &str = "otel-logs.db";
@@ -244,6 +247,17 @@ pub fn run_backup(args: &BackupArgs) -> Result<()> {
     Ok(())
 }
 
+fn print_search_state(search: Option<&SearchIndexStatus>) {
+    if let Some(search) = search {
+        println!(
+            "  search:      mode={} status={} indexed_through={}",
+            search.mode.as_str(),
+            search.status.as_str(),
+            search.indexed_through
+        );
+    }
+}
+
 fn print_backup_summary(report: &BackupReport) {
     println!(
         "backup written to {} (encrypted: {})",
@@ -266,14 +280,7 @@ fn print_backup_summary(report: &BackupReport) {
         report.verify.row_counts.log_resources,
         report.verify.row_counts.fts_rows,
     );
-    if let Some(search) = &report.verify.search {
-        println!(
-            "  search:      mode={} status={} indexed_through={}",
-            search.mode.as_str(),
-            search.status.as_str(),
-            search.indexed_through
-        );
-    }
+    print_search_state(report.verify.search.as_ref());
 }
 
 /// Runs `restore`: install a (possibly encrypted) backup into a clean
@@ -378,14 +385,7 @@ fn print_verify_summary(report: &VerifyReport) {
         "  rows:        log_events={} log_resources={} fts={}",
         report.row_counts.log_events, report.row_counts.log_resources, report.row_counts.fts_rows,
     );
-    if let Some(search) = &report.search {
-        println!(
-            "  search:      mode={} status={} indexed_through={}",
-            search.mode.as_str(),
-            search.status.as_str(),
-            search.indexed_through
-        );
-    }
+    print_search_state(report.search.as_ref());
     println!("  sha256:      {}", report.sha256);
 }
 

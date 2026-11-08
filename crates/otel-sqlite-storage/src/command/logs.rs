@@ -42,7 +42,7 @@ INSERT INTO log_event (
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
 
 /// Persists one storage-sized log write batch. Called from the writer inside
-/// an open transaction; every call belongs to exactly one transaction.
+/// an open transaction that may also carry other batches.
 pub(crate) fn insert_logs(conn: &Connection, batch: &LogWriteBatch) -> Result<u64, StorageError> {
     insert_logs_inner(conn, batch, false).map(|outcome| outcome.kept)
 }

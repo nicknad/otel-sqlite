@@ -2,9 +2,10 @@
 //!
 //! A [`WriteBatch`] is a batch of records that is ready for persistence. It is
 //! produced by the storage-owned [`InsertBatcher`](super::batcher::InsertBatcher)
-//! and consumed by the SQLite writer, which persists each batch in exactly one
-//! transaction. Records are moved into (and out of) the batch by ownership
-//! transfer; nothing on this path clones record payloads.
+//! and consumed by the SQLite writer, which commits it in one transaction,
+//! possibly together with consecutive batches. Records are moved into (and out
+//! of) the batch by ownership transfer; nothing on this path clones record
+//! payloads.
 
 /// A batch of records sized for one storage transaction.
 ///

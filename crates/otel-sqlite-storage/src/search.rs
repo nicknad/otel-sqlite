@@ -49,6 +49,10 @@ CREATE VIRTUAL TABLE logs_fts USING fts5(
     contentless_delete = 1
 );";
 
+const DELETE_TRIGGER: &str = "CREATE TRIGGER logs_fts_ad AFTER DELETE ON log_event BEGIN
+    DELETE FROM logs_fts WHERE rowid = old.id;
+END;";
+
 const BODY_TRIGGERS: &[(&str, &str)] = &[
     (
         "logs_fts_ai",
@@ -57,12 +61,7 @@ const BODY_TRIGGERS: &[(&str, &str)] = &[
     VALUES (new.id, COALESCE(new.body, ''));
 END;",
     ),
-    (
-        "logs_fts_ad",
-        "CREATE TRIGGER logs_fts_ad AFTER DELETE ON log_event BEGIN
-    DELETE FROM logs_fts WHERE rowid = old.id;
-END;",
-    ),
+    ("logs_fts_ad", DELETE_TRIGGER),
 ];
 
 const FULL_TABLE: &str = "
@@ -97,12 +96,7 @@ const FULL_TRIGGERS: &[(&str, &str)] = &[
     WHERE lr.id = new.resource_id;
 END;",
     ),
-    (
-        "logs_fts_ad",
-        "CREATE TRIGGER logs_fts_ad AFTER DELETE ON log_event BEGIN
-    DELETE FROM logs_fts WHERE rowid = old.id;
-END;",
-    ),
+    ("logs_fts_ad", DELETE_TRIGGER),
 ];
 
 const DROP_INDEX: &str = "

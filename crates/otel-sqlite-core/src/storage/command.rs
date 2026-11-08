@@ -117,8 +117,8 @@ pub struct LogWriteBatch {
 }
 
 /// Commands consumed by the single SQLite writer. Insert variants carry fully
-/// formed storage batches produced by the insert batcher; the writer persists
-/// each of them in exactly one transaction without further accumulation.
+/// formed storage batches produced by the insert batcher; the writer may
+/// commit consecutive insert commands together in one transaction.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WriteCommand {
     InsertLogs(LogWriteBatch),

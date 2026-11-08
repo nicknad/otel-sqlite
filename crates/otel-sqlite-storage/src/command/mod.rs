@@ -1,8 +1,8 @@
 //! SQL persistence for storage-sized write batches.
 //!
 //! Every function here is called from the writer thread inside an open
-//! transaction; each call belongs to exactly one transaction. The module is
-//! split by concern:
+//! transaction; the transaction may include several consecutive batches. The
+//! module is split by concern:
 //!
 //! * `logs` - log-event inserts,
 //! * `identity` - stable SHA-256 fingerprint IDs and the resource upsert
