@@ -36,6 +36,13 @@ Preserved by all future work:
   enqueue and exposes backpressure.
 - Insert batching supports size and age limits, oversized splitting, FIFO
   ordering, and origin isolation.
+- The writer may commit several consecutive insert commands in one transaction
+  up to `group_commit_max_records`; collection never waits, `Flush`/checkpoint/
+  maintenance are hard boundaries, and ticket settlement still happens only
+  after the shared commit.
+- The log search index is derived data with an operator-selected mode
+  (`off`, `body`, `full`). Insert triggers keep the configured shape current;
+  a bounded, resumable rebuild covers rows that predate a mode change.
 - Commit ledger provides contiguous durable-ack watermarks, tracks
   per-ticket partial progress, fails tickets whose rows were quarantined,
   and fails pending waiters when the pipeline closes.
@@ -136,7 +143,9 @@ blocking job until it really finishes, so a timed-out export frees its
 stream slot while its abandoned mapping stays counted — retained mapping
 memory is bounded by `mapping_concurrency × grpc_max_recv_msg_size`.
 Remote metrics need `allow_remote_metrics = true`. TLS/auth files are
-readability-checked. Effective config prints as JSON at startup.
+readability-checked. `group_commit_max_records` and `[search] mode` propagate
+into the storage writer; `check` also reports a rebuilding search index or a
+configured/installed mode mismatch. Effective config prints as JSON at startup.
 `otel-sqlite check` runs the same validation plus PEM parsing and a
 read-only schema inspection as a non-mutating preflight (`check --json` for
 automation).
@@ -151,5 +160,25 @@ the batcher overlaps almost for free. The ingest boundary (tokio
 multi-thread runtime, one task per request) is the only parallel stage.
 Scope metadata follows this: one `LogScope` renders per `ScopeLogs` group
 at mapping and is shared by reference, so the writer binds precomputed
-bytes. Open bottlenecks and methodology:
+bytes. The writer also coalesces consecutive insert commands already in the
+command queue into one transaction up to `group_commit_max_records`, which
+amortises the fixed commit cost when high resource cardinality produces many
+small per-origin batches. Collection never waits, so a writer that keeps up
+still commits one command at a time. Open bottlenecks and methodology:
 [`docs/performance.md`](performance.md).
+
+### 3.7 Search index modes
+
+The log search index is derived data and never part of the canonical
+contract. `[search] mode` selects it: `off` keeps `logs_fts` present but empty
+with no triggers, `body` (default) indexes only `log_event.body`, and `full`
+keeps the legacy six-column index. Startup reconciliation compares the
+configured mode with `search_index_state` and installs a matching shape
+without scanning `log_event`. A mode change or the async `006` upgrade marks
+the index `rebuilding`; the writer then backfills in bounded, resumable
+transactions (range delete then authoritative insert, cursor advanced in the
+same commit) whenever the command queue is idle, plus one small step per
+second under sustained load. `RebuildFts` restarts that background rebuild and
+is a no-op when the index is disabled. Search results are partial while the
+state row says `rebuilding`; `otel-sqlite check` and `verify` report that state
+instead of treating the derived index as corruption.

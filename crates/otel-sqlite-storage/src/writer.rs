@@ -1,41 +1,56 @@
+//! The single SQLite writer.
+//!
+//! The writer performs no record accumulation of its own: every insert
+//! command it receives already carries a storage-sized [`WriteBatch`] built by
+//! the insert batcher. Consecutive insert commands already sitting in the
+//! bounded command queue are coalesced into one transaction up to
+//! `group_commit_max_records`; collection never waits to fill a group.
+//!
+//! When the queue is empty the thread blocks inside `recv()` — there is no
+//! polling. While a search-index rebuild is pending it uses a short
+//! `recv_timeout` instead, so the derived index makes progress without a
+//! second writer.
+//!
+//! After every successful transaction the writer publishes the command's
+//! durability tickets on `ledger`; that is the exact moment durable acks in
+//! `durability = "commit"` mode may be released. On any exit path the ledger is
+//! closed so pending waiters fail instead of hanging.
+//!
+//! `ready_tx` receives exactly one result once bootstrap finished — open,
+//! migrations, search-index reconciliation, the startup checkpoint and
+//! permission hardening — `Ok` when storage is usable, otherwise an error
+//! message. [`crate::Storage::open`] therefore blocks until storage is
+//! genuinely ready and fails fast at boot instead of surfacing a startup
+//! failure on first traffic or shutdown.
+
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use otel_sqlite_core::storage::{CheckpointMode, CommitLedger, MaintenanceOperation, WriteCommand};
 use otel_sqlite_core::unix_nano_now;
 use rusqlite::Connection;
-use std::sync::atomic::Ordering;
 
 use crate::LedgerCloseOnDrop;
 use crate::StorageConfig;
-use crate::command;
-use crate::error::{FailureClass, StorageError};
+use crate::error::StorageError;
 use crate::fault;
 use crate::maintenance;
 use crate::migration;
+use crate::search::{RebuildStep, SearchIndex};
 use crate::sqlite;
 use crate::stats::WriterStats;
+use crate::transaction_group::{self, Pull, collect_group};
 
-/// Single SQLite writer.
-///
-/// The writer performs no record accumulation of its own: every insert
-/// command it receives already carries a storage-sized [`WriteBatch`] built by
-/// the insert batcher, and each one is persisted in exactly one transaction.
-/// When the queue is empty the thread blocks inside `recv()` — there is no
-/// polling and no timeout-driven grouping left at this layer. Closing the
-/// channel (all senders dropped) drains the queued commands in order and then
-/// shuts the writer down cleanly.
-///
-/// After every successful insert transaction the writer publishes the
-/// command's durability ticket on `ledger`; that is the exact moment durable
-/// acks in `durability = "commit"` mode may be released. On any exit path the
-/// ledger is closed so pending waiters fail instead of hanging.
-///
-/// `ready_tx` receives exactly one result once bootstrap finished — open,
-/// migrations, the startup checkpoint and permission hardening — `Ok` when
-/// storage is usable, otherwise an error message. [`crate::Storage::open`]
-/// therefore blocks until storage is genuinely ready and fails fast at boot
-/// instead of surfacing a startup failure on first traffic or shutdown.
+/// Search-index work done while the command queue is idle.
+const SEARCH_REBUILD_IDLE_ROWS: usize = 2_000;
+/// Search-index work done periodically under sustained ingestion.
+const SEARCH_REBUILD_UNDER_LOAD_ROWS: usize = 500;
+/// Slowest cadence for an under-load rebuild step.
+const SEARCH_REBUILD_UNDER_LOAD_INTERVAL: Duration = Duration::from_secs(1);
+/// Wake-up interval while a rebuild is pending and the queue is empty.
+const SEARCH_REBUILD_TICK: Duration = Duration::from_millis(10);
+
 pub(crate) fn run(
     receiver: Receiver<WriteCommand>,
     config: StorageConfig,
@@ -50,21 +65,17 @@ pub(crate) fn run(
     run_inner(receiver, config, ledger, stats, ready_tx)
 }
 
-/// Prepares storage for traffic: open, migrate, fold the initial WAL and
-/// harden the files.
-///
-/// Kept separate so the ready signal in [`run`] wraps every step that can
-/// fail at startup. Publishing readiness before the checkpoint used to let
-/// [`crate::Storage::open`] return success and the writer die immediately
-/// afterwards, surfacing the failure only on first traffic or shutdown.
-fn bootstrap(config: &StorageConfig) -> Result<Connection, StorageError> {
+/// Prepares storage for traffic: open, migrate, reconcile the derived search
+/// index, fold the initial WAL and harden the files.
+fn bootstrap(config: &StorageConfig) -> Result<(Connection, SearchIndex), StorageError> {
     let mut conn = sqlite::open(&config.sqlite_path, config.synchronous)?;
     migration::migrate(&mut conn)?;
+    let search = SearchIndex::reconcile(&mut conn, config.fts_mode)?;
     maintenance::checkpoint(&conn, CheckpointMode::Truncate)?;
     // Sidecars materialize on first write, possibly after `sqlite::open`
     // hardened the paths — repeat here now that they are known to exist.
     crate::permissions::harden_database_files(&config.sqlite_path);
-    Ok(conn)
+    Ok((conn, search))
 }
 
 fn run_inner(
@@ -78,12 +89,12 @@ fn run_inner(
     // a dead writer thread from a merely idle one.
     let _running = stats.running_guard();
 
-    let mut conn = match bootstrap(&config) {
-        Ok(conn) => {
+    let (mut conn, mut search) = match bootstrap(&config) {
+        Ok(ready) => {
             // Every startup failure path is behind us: the schema is current,
             // the WAL is folded, and the database files are owner-only.
             let _ = ready_tx.send(Ok(()));
-            conn
+            ready
         }
         Err(error) => {
             tracing::error!(%error, "storage bootstrap failed");
@@ -94,56 +105,90 @@ fn run_inner(
     tracing::info!(
         path = %config.sqlite_path.display(),
         synchronous = config.synchronous.as_str(),
+        fts_mode = search.mode().as_str(),
         "storage writer ready (wal mode)"
     );
     stats.mark_progress();
 
     let fault_after = fault::armed_after(fault::WRITER_AFTER_N);
+    // A zero budget makes every group hold exactly the command being executed,
+    // so fault injection keeps counting one command at a time.
+    let group_budget = if fault_after.is_some() {
+        0
+    } else {
+        config.group_commit_max_records
+    };
     let mut commands_processed = 0u64;
+    let mut pending: Option<WriteCommand> = None;
+    let mut last_rebuild_step = Instant::now();
 
     loop {
-        let depth = receiver.len();
-        stats.queue_depth.store(depth, Ordering::Relaxed);
-        ::metrics::gauge!("storage_queue_depth").set(depth as f64);
+        let depth = receiver.len() + usize::from(pending.is_some());
+        stats.observe_queue_depth(depth);
 
-        match receiver.recv() {
-            Ok(command) => {
-                ::metrics::counter!("storage_commands_total", "kind" => command.kind())
-                    .increment(1);
-                // Depth *after* dequeue approximates the backlog that heavy
-                // maintenance would stall behind it.
-                let backlog = receiver.len();
-                // Publish the authoritative backlog plus the command now
-                // executing. The top-of-loop depth alone would hide a wedged
-                // in-flight command whose queue is already empty.
-                let _in_flight = stats.begin_command(backlog);
-                // Size quota precedes the insert so an over-budget database
-                // evicts its oldest rows before accepting new ones.
-                if command.record_count() != 0
-                    && let Some(quota) = config.max_db_bytes
-                {
-                    enforce_quota(&mut conn, &config.sqlite_path, quota, stats);
+        let command = match pending.take() {
+            Some(command) => command,
+            None if search.is_rebuilding() => match receiver.recv_timeout(SEARCH_REBUILD_TICK) {
+                Ok(command) => command,
+                Err(RecvTimeoutError::Timeout) => {
+                    rebuild_while_idle(&mut conn, &mut search, &receiver, stats)?;
+                    continue;
                 }
-                execute(&mut conn, command, ledger, stats, backlog)?;
-                commands_processed += 1;
-                if let Some(limit) = fault_after
-                    && commands_processed >= limit
-                {
-                    tracing::error!(
-                        limit,
-                        "fault injection: sqlite writer exiting after {limit} commands"
-                    );
-                    return Err(StorageError::FaultInjected {
-                        component: "writer",
-                    });
-                }
-            }
-            Err(crossbeam_channel::RecvError) => break,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match receiver.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            },
+        };
+
+        // Depth *after* dequeue approximates the backlog that heavy
+        // maintenance would stall behind it. The in-flight guard spans group
+        // collection, the transaction and settlement, so a wedged group stays
+        // visible to the watchdog.
+        let backlog = receiver.len() + usize::from(pending.is_some());
+        let consumed = {
+            let _in_flight = stats.begin_command(backlog);
+            execute_next(
+                &mut conn,
+                command,
+                &receiver,
+                &mut pending,
+                &mut search,
+                ledger,
+                stats,
+                &config,
+                group_budget,
+            )?
+        };
+        commands_processed = commands_processed.saturating_add(consumed);
+
+        if search.is_rebuilding()
+            && last_rebuild_step.elapsed() >= SEARCH_REBUILD_UNDER_LOAD_INTERVAL
+        {
+            run_rebuild_step(
+                &mut conn,
+                &mut search,
+                SEARCH_REBUILD_UNDER_LOAD_ROWS,
+                stats,
+            )?;
+            last_rebuild_step = Instant::now();
+        }
+
+        if let Some(limit) = fault_after
+            && commands_processed >= limit
+        {
+            tracing::error!(
+                limit,
+                "fault injection: sqlite writer exiting after {limit} commands"
+            );
+            return Err(StorageError::FaultInjected {
+                component: "writer",
+            });
         }
     }
 
-    stats.queue_depth.store(0, Ordering::Relaxed);
-    ::metrics::gauge!("storage_queue_depth").set(0.0);
+    stats.observe_queue_depth(0);
     maintenance::checkpoint(&conn, CheckpointMode::Truncate)?;
     tracing::info!(
         records = stats.records_written.load(Ordering::Relaxed),
@@ -154,33 +199,70 @@ fn run_inner(
     Ok(())
 }
 
-fn execute(
+/// Executes one dequeued command. Consecutive insert commands are coalesced
+/// into one transaction up to `group_budget`; everything else is a hard group
+/// boundary. Returns the number of queue commands consumed.
+#[allow(clippy::too_many_arguments)]
+fn execute_next(
     conn: &mut Connection,
     command: WriteCommand,
+    receiver: &Receiver<WriteCommand>,
+    pending: &mut Option<WriteCommand>,
+    search: &mut SearchIndex,
     ledger: &CommitLedger,
+    stats: &WriterStats,
+    config: &StorageConfig,
+    group_budget: usize,
+) -> Result<u64, StorageError> {
+    match command {
+        WriteCommand::InsertLogs(batch) => {
+            let (group, boundary) =
+                collect_group(batch, group_budget, || match receiver.try_recv() {
+                    Ok(WriteCommand::InsertLogs(batch)) => Pull::Insert(batch),
+                    Ok(other) => Pull::Boundary(other),
+                    Err(TryRecvError::Empty) => Pull::Empty,
+                    Err(TryRecvError::Disconnected) => Pull::Disconnected,
+                });
+            *pending = boundary;
+            let consumed = group.len() as u64;
+            ::metrics::counter!("storage_commands_total", "kind" => "insert_logs")
+                .increment(consumed);
+            let non_empty = group
+                .iter()
+                .filter(|batch| !batch.records.is_empty())
+                .count() as u64;
+            stats
+                .batches_received
+                .fetch_add(non_empty, Ordering::Relaxed);
+            stats.observe_queue_depth(receiver.len() + usize::from(pending.is_some()));
+
+            if group.records() > 0
+                && let Some(quota) = config.max_db_bytes
+            {
+                enforce_quota(conn, &config.sqlite_path, quota, stats);
+            }
+            transaction_group::persist_group(conn, stats, ledger, &group)?;
+            Ok(consumed)
+        }
+        other => {
+            ::metrics::counter!("storage_commands_total", "kind" => other.kind()).increment(1);
+            execute_non_insert(conn, other, search, stats, receiver.len())?;
+            Ok(1)
+        }
+    }
+}
+
+/// Handles barriers and maintenance commands. They never share an insert
+/// transaction and never let collection cross them.
+fn execute_non_insert(
+    conn: &mut Connection,
+    command: WriteCommand,
+    search: &mut SearchIndex,
     stats: &WriterStats,
     queue_backlog: usize,
 ) -> Result<(), StorageError> {
     match command {
-        WriteCommand::InsertLogs(batch) => {
-            if batch.records.is_empty() {
-                // Defensive: nothing persisted, but the tickets must not
-                // stall the watermark either.
-                for commit_seq in &batch.commit_seqs {
-                    ledger.void(*commit_seq);
-                }
-                return Ok(());
-            }
-            stats.batches_received.fetch_add(1, Ordering::Relaxed);
-            let salvage = persist_with_policy(
-                conn,
-                stats,
-                "logs",
-                |tx| command::insert_logs(tx, &batch),
-                |tx| command::insert_logs_tolerant(tx, &batch),
-            )?;
-            settle_log_batch(ledger, &batch, salvage);
-        }
+        WriteCommand::InsertLogs(_) => unreachable!("insert commands are handled by execute_next"),
         WriteCommand::Flush => {}
         WriteCommand::Checkpoint(mode) => {
             let _maintenance = stats.maintenance_guard();
@@ -190,7 +272,7 @@ fn execute(
         }
         WriteCommand::Maintenance(operation) => {
             let _maintenance = stats.maintenance_guard();
-            if run_maintenance(conn, operation, queue_backlog)? {
+            if run_maintenance(conn, operation, search, queue_backlog)? {
                 stats.maintenance_runs.fetch_add(1, Ordering::Relaxed);
                 stats.mark_progress();
             }
@@ -199,224 +281,36 @@ fn execute(
     Ok(())
 }
 
-/// Publishes a persisted batch to the commit ledger.
-///
-/// A ticket settles only when the batch contains its final segment. Records
-/// written by an earlier segment are reported as progress, so a close midway
-/// through a split chunk can still tell the handler how much is durable.
-fn settle_log_batch(
-    ledger: &CommitLedger,
-    batch: &otel_sqlite_core::storage::LogWriteBatch,
-    salvage: Option<command::SalvageOutcome>,
-) {
-    if batch.segments.is_empty() {
-        // Legacy/bench batches carry no per-record ticket map. Treat every
-        // referenced ticket as complete; a salvage drop fails all of them.
-        let dropped = salvage.as_ref().map_or(0, |outcome| outcome.dropped);
-        for commit_seq in &batch.commit_seqs {
-            if dropped > 0 {
-                ledger.note_dropped(*commit_seq, dropped);
-            }
-            ledger.complete(*commit_seq);
-        }
-        return;
-    }
-
-    match salvage {
-        None => {
-            for segment in &batch.segments {
-                ledger.note_committed(segment.commit_seq, segment.records as u64);
-                if segment.complete {
-                    ledger.complete(segment.commit_seq);
-                }
-            }
-        }
-        Some(outcome) => {
-            // `by_ticket` is already summed for the whole batch, so note it
-            // once per ticket rather than once per segment.
-            for commit_seq in &batch.commit_seqs {
-                let (kept, dropped) = outcome.by_ticket.get(commit_seq).copied().unwrap_or((0, 0));
-                if kept > 0 {
-                    ledger.note_committed(*commit_seq, kept);
-                }
-                if dropped > 0 {
-                    ledger.note_dropped(*commit_seq, dropped);
-                }
-            }
-            for segment in &batch.segments {
-                if segment.complete {
-                    ledger.complete(segment.commit_seq);
-                }
-            }
-        }
-    }
-}
-
-/// How often a [`FailureClass::Retryable`] transaction is re-attempted
-/// before its error is treated as fatal. Backoff grows exponentially from
-/// [`RETRY_BACKOFF_BASE`].
-const MAX_TRANSIENT_RETRIES: u32 = 4;
-const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(250);
-
-fn backoff_delay(attempt: u32) -> Duration {
-    // attempt 0..MAX-1 -> 250ms, 500ms, 1s, 2s (capped at 4s for safety).
-    RETRY_BACKOFF_BASE
-        .saturating_mul(1u32 << attempt.min(4))
-        .min(Duration::from_secs(4))
-}
-
-/// Persistence policy for one write batch (= one transaction).
-///
-/// * strict pass first; on success the batch is done.
-/// * **Poison** errors (constraint violations, bad inputs) trigger exactly
-///   one salvage pass in tolerant mode: healthy rows commit, offending rows
-///   are dropped-and-counted as `quarantined_records`. The affected tickets
-///   settle as failed so their handlers report `partial_success`; nothing is
-///   lost silently and nothing stalls.
-/// * **Retryable** errors (BUSY/LOCKED) are retried up to
-///   `MAX_TRANSIENT_RETRIES` times with exponential backoff; exhaustion
-///   escalates to fatal.
-/// * **Fatal** errors propagate immediately: the writer exits, closes the
-///   ledger and lets watchdog/supervisor handle restart.
-#[allow(clippy::too_many_arguments)]
-fn persist_with_policy(
+/// Advances the search-index rebuild while the command queue is idle.
+fn rebuild_while_idle(
     conn: &mut Connection,
+    search: &mut SearchIndex,
+    receiver: &Receiver<WriteCommand>,
     stats: &WriterStats,
-    signal: &'static str,
-    strict: impl Fn(&rusqlite::Transaction<'_>) -> Result<u64, StorageError>,
-    salvage: impl Fn(&rusqlite::Transaction<'_>) -> Result<command::SalvageOutcome, StorageError>,
-) -> Result<Option<command::SalvageOutcome>, StorageError> {
-    let mut attempt = 0u32;
-    loop {
-        let outcome = run_transaction(conn, stats, &strict);
-        match outcome {
-            Ok(()) => return Ok(None),
-            Err((error, class)) => match class {
-                FailureClass::Poison => {
-                    tracing::warn!(
-                        signal,
-                        %error,
-                        "poisonous batch rejected by sqlite; attempting salvage pass"
-                    );
-                    return finish_salvage(conn, stats, signal, salvage, error).map(Some);
-                }
-                FailureClass::Retryable if attempt < MAX_TRANSIENT_RETRIES => {
-                    let delay = backoff_delay(attempt);
-                    attempt += 1;
-                    stats.transient_retries.fetch_add(1, Ordering::Relaxed);
-                    ::metrics::counter!("storage_transient_retries_total").increment(1);
-                    tracing::warn!(
-                        signal,
-                        %error,
-                        attempt,
-                        ?delay,
-                        "transient sqlite failure; retrying batch"
-                    );
-                    std::thread::sleep(delay);
-                }
-                FailureClass::Retryable | FailureClass::Fatal => return Err(error),
-            },
-        }
+) -> Result<(), StorageError> {
+    while search.is_rebuilding() && receiver.is_empty() {
+        run_rebuild_step(conn, search, SEARCH_REBUILD_IDLE_ROWS, stats)?;
     }
+    Ok(())
 }
 
-/// Runs one strict transaction, mapping failures to their classification so
-/// the policy loop above can decide without re-matching errors.
-fn run_transaction(
+fn run_rebuild_step(
     conn: &mut Connection,
+    search: &mut SearchIndex,
+    max_rows: usize,
     stats: &WriterStats,
-    persist: impl Fn(&rusqlite::Transaction<'_>) -> Result<u64, StorageError>,
-) -> Result<(), (StorageError, FailureClass)> {
-    let started = Instant::now();
-    let tx = match conn.transaction() {
-        Ok(tx) => tx,
-        Err(error) => {
-            let error = StorageError::from(error);
-            let class = error.class();
-            return Err((error, class));
+) -> Result<(), StorageError> {
+    let _maintenance = stats.maintenance_guard();
+    match search.step(conn, max_rows)? {
+        RebuildStep::Progress { rows } => {
+            ::metrics::counter!("storage_search_index_rebuild_rows_total").increment(rows as u64);
         }
-    };
-    match persist(&tx) {
-        Ok(written) => {
-            if let Err(error) = tx.commit() {
-                let error = StorageError::from(error);
-                let class = error.class();
-                return Err((error, class));
-            }
-            stats.records_written.fetch_add(written, Ordering::Relaxed);
-            stats.transactions_committed.fetch_add(1, Ordering::Relaxed);
-            stats.mark_progress();
-            ::metrics::counter!("storage_records_written_total").increment(written);
-            ::metrics::histogram!("storage_transaction_batch_size").record(written as f64);
-            ::metrics::histogram!("storage_transaction_duration")
-                .record(started.elapsed().as_secs_f64());
-            tracing::info_span!("storage.commit").in_scope(|| {
-                tracing::info!(
-                    records = written,
-                    duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    "transaction committed"
-                );
-            });
-            Ok(())
-        }
-        Err(error) => {
-            let _ = tx.rollback();
-            stats.errors.fetch_add(1, Ordering::Relaxed);
-            ::metrics::counter!("storage_errors_total").increment(1);
-            let class = error.class();
-            tracing::error!(%error, ?class, "transaction failed, rolled back");
-            Err((error, class))
+        RebuildStep::Complete => {
+            tracing::info!("search index rebuild complete");
         }
     }
-}
-
-/// Second-chance pass for poisoned batches: tolerant mode keeps healthy rows
-/// and drops-and-counts only the offending ones.
-fn finish_salvage(
-    conn: &mut Connection,
-    stats: &WriterStats,
-    signal: &'static str,
-    salvage: impl Fn(&rusqlite::Transaction<'_>) -> Result<command::SalvageOutcome, StorageError>,
-    cause: StorageError,
-) -> Result<command::SalvageOutcome, StorageError> {
-    let started = Instant::now();
-    let tx = conn.transaction()?;
-    match salvage(&tx) {
-        Ok(outcome) => {
-            tx.commit().map_err(StorageError::from)?;
-            stats
-                .records_written
-                .fetch_add(outcome.kept, Ordering::Relaxed);
-            stats
-                .quarantined_records
-                .fetch_add(outcome.dropped, Ordering::Relaxed);
-            stats.transactions_committed.fetch_add(1, Ordering::Relaxed);
-            stats.mark_progress();
-            ::metrics::counter!("storage_quarantined_records_total").increment(outcome.dropped);
-            ::metrics::histogram!("storage_transaction_duration")
-                .record(started.elapsed().as_secs_f64());
-            tracing::warn!(
-                signal,
-                kept = outcome.kept,
-                dropped = outcome.dropped,
-                cause = %cause,
-                "salvage pass complete: healthy rows committed, poisonous rows quarantined"
-            );
-            Ok(outcome)
-        }
-        Err(salvage_error) => {
-            let _ = tx.rollback();
-            stats.errors.fetch_add(1, Ordering::Relaxed);
-            ::metrics::counter!("storage_errors_total").increment(1);
-            tracing::error!(
-                signal,
-                %salvage_error,
-                cause = %cause,
-                "salvage pass failed; treating as fatal"
-            );
-            Err(salvage_error)
-        }
-    }
+    stats.mark_progress();
+    Ok(())
 }
 
 /// Executes one maintenance command, returning `false` when it was
@@ -425,9 +319,10 @@ fn finish_salvage(
 fn run_maintenance(
     conn: &mut Connection,
     operation: MaintenanceOperation,
+    search: &mut SearchIndex,
     queue_backlog: usize,
 ) -> Result<bool, StorageError> {
-    // Heavy operations (full-file VACUUM, full FTS rebuild, large prunes)
+    // Heavy operations (full-file VACUUM, index rebuild, large prunes)
     // stall the single writer for seconds on GB databases. When ingestion is
     // waiting, defer them to the next scheduler interval instead of stalling
     // it: the scheduler re-enqueues on its own cadence.
@@ -449,7 +344,14 @@ fn run_maintenance(
     match operation {
         MaintenanceOperation::Analyze => maintenance::analyze(conn)?,
         MaintenanceOperation::Vacuum => maintenance::vacuum(conn)?,
-        MaintenanceOperation::RebuildFts => maintenance::rebuild_fts(conn).map(|_| ())?,
+        MaintenanceOperation::RebuildFts => {
+            // The command restarts a resumable background rebuild; it never
+            // runs the whole scan synchronously and never re-enables a
+            // disabled index.
+            if !search.restart(conn)? {
+                return Ok(false);
+            }
+        }
         MaintenanceOperation::Prune(window) => {
             if window.is_none() {
                 return Ok(false);
@@ -515,6 +417,7 @@ fn enforce_quota(
 /// Backlog depth above which heavy maintenance defers to the next scheduler
 /// interval instead of stalling ingestion behind a seconds-long exclusive op.
 const MAINTENANCE_PRESSURE_SKIP_DEPTH: usize = 1_000;
+
 /// Label of an operation heavy enough to defer under ingestion pressure, or
 /// `None` when it is cheap and should always run (`Analyze`, disabled prunes).
 fn heavy_maintenance_label(operation: &MaintenanceOperation) -> Option<&'static str> {

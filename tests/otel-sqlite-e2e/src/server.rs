@@ -105,6 +105,7 @@ pub mod benchmark_profile {
             synchronous: sync_mode(),
             startup_timeout: otel_sqlite_storage::DEFAULT_STARTUP_TIMEOUT,
             shutdown_timeout: otel_sqlite_storage::DEFAULT_SHUTDOWN_TIMEOUT,
+            ..StorageConfig::default()
         }
     }
 }

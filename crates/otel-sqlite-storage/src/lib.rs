@@ -11,8 +11,10 @@ mod maintenance;
 mod migration;
 mod origin_buffers;
 pub(crate) mod permissions;
+mod search;
 mod sqlite;
 mod stats;
+mod transaction_group;
 mod writer;
 
 use std::sync::Arc;
@@ -25,8 +27,8 @@ use otel_sqlite_core::saturating_deadline;
 use otel_sqlite_core::storage::{CommitLedger, IngestMessage, InsertBatcherConfig, WriteCommand};
 
 pub use config::{
-    DEFAULT_COMMAND_QUEUE_CAPACITY, DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_STARTUP_TIMEOUT,
-    StorageConfig,
+    DEFAULT_COMMAND_QUEUE_CAPACITY, DEFAULT_GROUP_COMMIT_RECORDS, DEFAULT_SHUTDOWN_TIMEOUT,
+    DEFAULT_STARTUP_TIMEOUT, MAX_GROUP_COMMIT_RECORDS, StorageConfig,
 };
 pub use error::StorageError;
 /// Applies only the migrations up to and including `target_version`, stamping
@@ -37,6 +39,7 @@ pub use error::StorageError;
 pub use migration::migrate_up_to;
 pub use migration::{SchemaStatus, inspect_schema, latest_schema_version};
 pub use permissions::{restrict_permissions, warn_if_world_readable};
+pub use search::{FtsMode, SearchIndexStatus, SearchStatus, inspect_search_index};
 pub use stats::{BatcherStats, StorageHealth, StorageStatsSnapshot};
 // The health sample returned by `StorageHealth::sample` is core vocabulary so
 // the runtime watchdog can consume it without depending on this crate.
@@ -122,6 +125,13 @@ impl Storage {
         if config.insert_batcher.max_batch_records == 0 {
             return Err(StorageError::StartupFailed {
                 message: "insert_batcher.max_batch_records must be at least 1".to_owned(),
+            });
+        }
+        if config.group_commit_max_records > MAX_GROUP_COMMIT_RECORDS {
+            return Err(StorageError::StartupFailed {
+                message: format!(
+                    "group_commit_max_records must be at most {MAX_GROUP_COMMIT_RECORDS}"
+                ),
             });
         }
 

@@ -4,6 +4,7 @@ mod durability;
 mod duration;
 mod file;
 mod maintenance;
+mod search;
 mod tls;
 mod validate;
 mod watchdog;
@@ -28,7 +29,7 @@ use otel_sqlite_ingress::{
     MAX_MAPPING_CONCURRENCY, MAX_SCOPE_METADATA_EXPANSION_BYTES, TlsConfig, expand_bind_address,
 };
 use otel_sqlite_runtime::{MaintenanceConfig, WatchdogConfig};
-use otel_sqlite_storage::StorageConfig;
+use otel_sqlite_storage::{DEFAULT_GROUP_COMMIT_RECORDS, FtsMode, StorageConfig};
 
 /// Environment variable holding the path of an optional TOML config file.
 ///
@@ -68,6 +69,13 @@ pub struct Config {
     /// Maximum age of the oldest buffered record before a partial batch is
     /// flushed (`max_batch_age`).
     pub batcher_max_batch_age: Duration,
+    /// Maximum records the SQLite writer may commit in one insert transaction.
+    /// Consecutive insert commands already in the queue are coalesced; `0`
+    /// restores one transaction per command.
+    pub group_commit_max_records: usize,
+    /// Installed log search-index mode (`off`, `body` or `full`). The index is
+    /// derived data and is reconciled at startup.
+    pub search_mode: FtsMode,
     pub grpc_max_recv_msg_size: usize,
     pub grpc_max_concurrent_streams: u32,
     /// Maximum proto→model mapping jobs (running or queued) on the blocking
@@ -134,6 +142,8 @@ impl Default for Config {
             command_queue_capacity: otel_sqlite_storage::DEFAULT_COMMAND_QUEUE_CAPACITY,
             batcher_max_batch_records: otel_sqlite_core::storage::DEFAULT_MAX_INSERT_BATCH_RECORDS,
             batcher_max_batch_age: otel_sqlite_core::storage::DEFAULT_MAX_INSERT_BATCH_AGE,
+            group_commit_max_records: DEFAULT_GROUP_COMMIT_RECORDS,
+            search_mode: FtsMode::Body,
             grpc_max_recv_msg_size: DEFAULT_MAX_RECV_MSG_SIZE,
             grpc_max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
             mapping_concurrency: DEFAULT_MAPPING_CONCURRENCY,
@@ -218,6 +228,8 @@ impl Config {
             "command_queue_capacity": self.command_queue_capacity,
             "batcher_max_batch_records": self.batcher_max_batch_records,
             "batcher_max_batch_age_ms": self.batcher_max_batch_age.as_millis(),
+            "group_commit_max_records": self.group_commit_max_records,
+            "search_mode": self.search_mode.as_str(),
             "grpc_max_recv_msg_size": self.grpc_max_recv_msg_size,
             "grpc_max_concurrent_streams": self.grpc_max_concurrent_streams,
             "mapping_concurrency": self.mapping_concurrency,
@@ -269,6 +281,8 @@ impl Config {
                 self.batcher_max_batch_age,
             ),
             command_queue_capacity: self.command_queue_capacity,
+            group_commit_max_records: self.group_commit_max_records,
+            fts_mode: self.search_mode,
             max_db_bytes: self.max_db_bytes,
             synchronous: self.sqlite_synchronous,
             startup_timeout: otel_sqlite_storage::DEFAULT_STARTUP_TIMEOUT,

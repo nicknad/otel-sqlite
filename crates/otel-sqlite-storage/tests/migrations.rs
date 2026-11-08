@@ -71,6 +71,15 @@ fn upgrade_via_storage_open(path: &std::path::Path) {
         },
     )
     .expect("storage opens over the historic database");
+    // The upgrade marks the reduced index rebuilding; keep the writer alive
+    // until the bounded background rebuild completes so the assertions below
+    // see a fully searchable database.
+    assert!(
+        otel_sqlite_test_support::wait_until(Duration::from_secs(5), || {
+            otel_sqlite_test_support::search_index_ready(path)
+        }),
+        "background search-index rebuild did not finish"
+    );
     drop(sender);
     storage.join().expect("storage joins cleanly");
 }
@@ -92,7 +101,7 @@ fn assert_upgraded(path: &std::path::Path) {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "005", "upgrade must land on the current schema");
+    assert_eq!(version, "006", "upgrade must land on the current schema");
 
     let applied: Vec<String> = conn
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -307,7 +316,10 @@ fn fresh_database_has_no_metric_objects() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(applied, vec!["000", "001", "002", "003", "004", "005"]);
+    assert_eq!(
+        applied,
+        vec!["000", "001", "002", "003", "004", "005", "006"]
+    );
     let descriptions: Vec<String> = conn
         .prepare("SELECT DISTINCT description FROM schema_migrations")
         .unwrap()
@@ -321,7 +333,7 @@ fn fresh_database_has_no_metric_objects() {
     );
 }
 
-/// Reopening a current-schema database is a no-op: the stamp stays 005 and the
+/// Reopening a current-schema database is a no-op: the stamp stays 006 and the
 /// data is untouched — upgrades are idempotent for already-current databases.
 #[test]
 fn current_schema_reopen_is_idempotent() {
@@ -365,7 +377,7 @@ fn newer_recorded_schema_version_is_rejected() {
                 "message must name the offending version: {message}"
             );
             assert!(
-                message.contains("005"),
+                message.contains("006"),
                 "message must name the newest supported version: {message}"
             );
         }

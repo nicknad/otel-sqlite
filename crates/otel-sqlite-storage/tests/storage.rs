@@ -9,7 +9,7 @@ use otel_sqlite_core::model::{Attribute, AttributeValue, LogRecord, LogScope, Re
 use otel_sqlite_core::storage::{
     BatchOrigin, IngestMessage, LogChunk, MaintenanceOperation, WriteCommand,
 };
-use otel_sqlite_storage::{Storage, StorageConfig, StorageError};
+use otel_sqlite_storage::{FtsMode, Storage, StorageConfig, StorageError};
 use rusqlite::Connection;
 
 fn logs_message(records: Vec<LogRecord>) -> IngestMessage {
@@ -136,7 +136,7 @@ fn writes_logs_deduplicates_resources() -> Result<(), Box<dyn std::error::Error>
         [],
         |r| r.get(0),
     )?;
-    assert_eq!(migration, "005");
+    assert_eq!(migration, "006");
 
     Ok(())
 }
@@ -281,6 +281,15 @@ fn rebuild_fts_heals_a_crashed_rebuild() -> Result<(), Box<dyn std::error::Error
             .send(WriteCommand::Maintenance(MaintenanceOperation::RebuildFts))?;
         sender.send(sample_message())?;
         sender.send(IngestMessage::Flush)?;
+
+        // The rebuild runs in bounded background batches; keep ingestion
+        // connected until it completes so shutdown cannot cut it short.
+        assert!(
+            otel_sqlite_test_support::wait_until(Duration::from_secs(5), || {
+                otel_sqlite_test_support::search_index_ready(&db_path)
+            }),
+            "background search-index rebuild did not finish"
+        );
         drop(sender);
         storage.join()?;
 
@@ -797,5 +806,88 @@ fn size_quota_evicts_oldest_first_and_keeps_newest() -> Result<(), Box<dyn std::
     );
     assert_eq!(fresh, 1, "the newest rows must survive quota enforcement");
 
+    Ok(())
+}
+
+/// The configured search mode is installed at startup and controls both the
+/// physical column set and whether inserts pay for trigger maintenance.
+#[test]
+fn search_modes_install_the_expected_index_shape() -> Result<(), Box<dyn std::error::Error>> {
+    for (mode, columns, triggers, body_hits, service_hits) in [
+        (FtsMode::Off, vec!["body"], 0, 0, None),
+        (FtsMode::Body, vec!["body"], 2, 1, None),
+        (
+            FtsMode::Full,
+            vec![
+                "body",
+                "service_name",
+                "host_name",
+                "severity_text",
+                "event_name",
+                "scope_name",
+            ],
+            2,
+            1,
+            Some(2),
+        ),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("mode.db");
+        let (sender, receiver) = unbounded();
+        let mut storage = Storage::open(
+            receiver,
+            StorageConfig {
+                sqlite_path: db_path.clone(),
+                insert_batcher: otel_sqlite_core::storage::InsertBatcherConfig::new(
+                    1_000,
+                    Duration::from_millis(20),
+                ),
+                fts_mode: mode,
+                ..StorageConfig::default()
+            },
+        )?;
+        sender.send(sample_message())?;
+        sender.send(IngestMessage::Flush)?;
+        drop(sender);
+        storage.join()?;
+
+        let conn = Connection::open(&db_path)?;
+        let mut statement = conn.prepare("PRAGMA table_info(logs_fts)")?;
+        let actual_columns: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(actual_columns, columns, "mode {mode:?} column set");
+
+        let trigger_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'trigger' AND name LIKE 'logs_fts%'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(trigger_count, triggers, "mode {mode:?} trigger count");
+
+        let body: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM logs_fts WHERE logs_fts MATCH 'payment'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(body, body_hits, "mode {mode:?} body hits");
+
+        if let Some(expected) = service_hits {
+            let service: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM logs_fts WHERE logs_fts MATCH 'service_name:checkout'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(service, expected, "full mode indexes service_name");
+        }
+
+        let installed: String = conn.query_row(
+            "SELECT mode FROM search_index_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(installed, mode.as_str(), "state row records the mode");
+    }
     Ok(())
 }

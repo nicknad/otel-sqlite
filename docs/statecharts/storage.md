@@ -224,6 +224,12 @@ selected tests passed. No temporary replay test was needed.
   only run from `writing`. The single-writer rule is therefore by construction;
   it is not a separate invariant. The command queue is the only producer of
   insert commands in the model.
+- **Grouped commits.** The model keeps one batch per transaction. The writer
+  may coalesce consecutive insert commands up to `group_commit_max_records`;
+  every grouped ticket settles only after the shared commit, and `Flush`,
+  checkpoint and maintenance remain hard boundaries. Group formation is
+  untimed and outside the model, but it does not weaken the modeled per-batch
+  settlement rules.
 
 ## Reproduce
 

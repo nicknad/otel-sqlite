@@ -59,7 +59,7 @@ alert on `Result != success`.
 sudo systemctl stop otel-sqlite.service
 sudo -u otel-sqlite otel-sqlite restore --backup /backups/otel-logs.db.<UTC>.otsb \
   --dir /data/restored --key-file /etc/otel-sqlite/backup.key  # omit key if .bak
-otel-sqlite verify --db /data/restored/otel-logs.db  # integrity=ok, FK=0, schema=005, rows match backup
+otel-sqlite verify --db /data/restored/otel-logs.db  # integrity=ok, FK=0, schema=006, rows match backup
 sudo -u otel-sqlite mv /data/otel-logs.db /data/otel-logs.db.pre-restore
 sudo -u otel-sqlite mv /data/restored/otel-logs.db /data/otel-logs.db
 sudo systemctl start otel-sqlite.service

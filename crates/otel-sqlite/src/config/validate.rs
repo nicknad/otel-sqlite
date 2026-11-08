@@ -11,6 +11,7 @@ use super::{
     MAX_MAPPING_CONCURRENCY, MAX_RECORDS_PER_REQUEST, MAX_RETENTION,
     MAX_SCOPE_METADATA_EXPANSION_BYTES, MAX_TIMEOUT, MIN_DB_QUOTA_BYTES, is_loopback_listen,
 };
+use otel_sqlite_storage::{FtsMode, MAX_GROUP_COMMIT_RECORDS};
 
 /// Validates the complete effective configuration before any listener or
 /// worker is started. One function per section so limits, durations and
@@ -76,6 +77,21 @@ fn validate_queues_and_grpc(config: &Config) -> Result<()> {
         1,
         super::MAX_BATCH_RECORDS,
     )?;
+    validate_range(
+        "group_commit_max_records",
+        config.group_commit_max_records,
+        0,
+        MAX_GROUP_COMMIT_RECORDS,
+    )?;
+    if config.group_commit_max_records > 0
+        && config.group_commit_max_records < config.batcher_max_batch_records
+    {
+        tracing::warn!(
+            group_commit_max_records = config.group_commit_max_records,
+            batcher_max_batch_records = config.batcher_max_batch_records,
+            "group_commit_max_records is below batcher_max_batch_records; full batches will not coalesce"
+        );
+    }
     validate_range(
         "grpc_max_recv_msg_size",
         config.grpc_max_recv_msg_size,
@@ -185,6 +201,9 @@ fn validate_maintenance(config: &Config) -> Result<()> {
         config.maintenance.rebuild_fts_interval,
         MAX_RETENTION,
     )?;
+    if config.search_mode == FtsMode::Off && config.maintenance.rebuild_fts_interval.is_some() {
+        tracing::warn!("search.mode = \"off\" makes maintenance.rebuild_fts_interval a no-op");
+    }
     Ok(())
 }
 

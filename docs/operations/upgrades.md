@@ -13,14 +13,15 @@ schema or checkpoint problems fail startup, not first traffic or shutdown.
 There are two paths, both ending at the same schema:
 
 - **Fresh database:** applies the squashed logs-only baseline
-  (`migrations/000_baseline.sql`) once. It never creates the metric signal
+  (`migrations/baseline_006.sql`) once. It never creates the metric signal
   that the old `000`-`004` chain used to build and `005` used to drop. The
-  baseline is then stamped as satisfying every migration through `005`, with
+  baseline is then stamped as satisfying every migration through `006`, with
   description `Satisfied by squashed logs-only baseline` — those historical
   DDL statements did not run.
 - **Existing database:** replays the missing files in
-  `migrations/upgrades/` (the frozen `000`-`005` chain), then any newer
-  migrations. Databases stamped `005` take no upgrade action.
+  `migrations/upgrades/` (the frozen `000`-`006` chain), then any newer
+  migrations. Databases stamped `005` apply `006`, which reduces the search
+  index and starts the bounded background rebuild.
 
 Once stamped, never re-run. **Never edit an applied migration or the
 baseline** — SQLite can't tell an edited `001` from the original; evolution
@@ -31,7 +32,7 @@ current one.
 ## Supported versions
 
 Binary is compatible when its `MIGRATIONS` contains every stamped version
-(i.e. binary **at or above** the DB's schema). Current: **005**.
+(i.e. binary **at or above** the DB's schema). Current: **006**.
 
 | Version | Contents |
 |---|---|
@@ -40,16 +41,25 @@ Binary is compatible when its `MIGRATIONS` contains every stamped version
 | `003` | New log/scope columns (`scope_attributes_json`, `scope_schema_url`, …) with defaults; views gain columns (old `SELECT`s keep working) |
 | `005` | **Drops OTLP metrics signal** (views `metrics`/`metric_buckets`, tables `scope`/`metric`/`metric_series`/`metric_data_point). **Destructive, irreversible.** Logs, `logs` view, FTS untouched. |
 
-Fresh databases do not execute `000`-`005`; they apply the logs-only baseline
-(`migrations/000_baseline.sql`) and stamp the versions it satisfies. That file
-already contains the `001` FTS triggers and the `003` scope columns.
-(`002`/`004` were metrics-only and are gone with `005`. Full upgrade history
-lives in `migrations/upgrades/` + git.)
+Fresh databases do not execute `000`-`006`; they apply the logs-only baseline
+(`migrations/baseline_006.sql`) and stamp the versions it satisfies. The prior
+frozen baseline is `migrations/baseline_005.sql`; it is kept for reference, not
+executed. (`002`/`004` were metrics-only and are gone with `005`. Full upgrade
+history lives in `migrations/upgrades/` + git.)
 
 Incompatible changes:
 
 - `005` deletes stored metric rows; metrics exports return `UNIMPLEMENTED`.
   Back up first if that data matters.
+- `006` drops the existing search index. On a large database the one-time
+  `DROP TABLE` can take a while; run `otel-sqlite check` first and keep the
+  backup. After startup the index is `rebuilding`; `logs_fts` row counts are
+  lower than `log_event` counts until the background rebuild finishes. Search
+  covers new rows immediately; historical rows become searchable as the
+  rebuild advances.
+- Body-only search (the default) no longer matches metadata column filters
+  such as `MATCH 'service_name:checkout'`. Set `[search] mode = "full"` before
+  the first start to keep the six-column index.
 - Downgrading the **binary** below the DB schema is unsupported — old binary
   fails at startup. Only rollback is **restore from pre-upgrade backup**.
 - Never open a newer-schema DB with an older binary.
@@ -83,7 +93,7 @@ newer binary is a hard failure.
    starting; then start — `Storage::open` applies pending migrations in order,
    one txn each, then folds the startup WAL and hardens the files. Readiness
    is published only after all of those succeed.
-5. Verify: `otel-sqlite verify --db /data/otel-logs.db` shows `schema: 005`,
+5. Verify: `otel-sqlite verify --db /data/otel-logs.db` shows `schema: 006`,
    `integrity: ok`, 0 FK violations, row counts matching pre-upgrade (+
    restart-window traffic).
 6. Keep the pre-upgrade backup until the *next* verified backup succeeds.

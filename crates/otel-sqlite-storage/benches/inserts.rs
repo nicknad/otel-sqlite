@@ -43,6 +43,10 @@ struct Pipeline {
 }
 
 fn open_pipeline() -> Pipeline {
+    open_pipeline_with(0)
+}
+
+fn open_pipeline_with(group_commit_max_records: usize) -> Pipeline {
     let dir = TempDir::new().expect("temp dir");
     let (ingest, receiver) = crossbeam_channel::unbounded();
     let config = StorageConfig {
@@ -53,6 +57,9 @@ fn open_pipeline() -> Pipeline {
         synchronous: SyncMode::Normal,
         startup_timeout: otel_sqlite_storage::DEFAULT_STARTUP_TIMEOUT,
         shutdown_timeout: otel_sqlite_storage::DEFAULT_SHUTDOWN_TIMEOUT,
+        // The write-batch family measures one command per transaction.
+        group_commit_max_records,
+        ..StorageConfig::default()
     };
     let storage = Storage::open(receiver, config).expect("storage opens");
     let producer = storage.producer();
@@ -401,11 +408,46 @@ fn bench_analyze_vacuum(c: &mut Criterion) {
     group.finish();
 }
 
+/// Coalescing many one-record insert commands into one transaction. The `cap_0`
+/// variant is the pre-grouping behavior; the `cap_1000` variant amortises the
+/// fixed commit cost when the queue holds a backlog.
+fn bench_group_commit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("group_commit");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(10));
+
+    for commands in [10usize, 100, 1_000] {
+        group.throughput(Throughput::Elements(commands as u64));
+        for cap in [0usize, 1_000] {
+            group.bench_function(format!("commands_{commands}_cap_{cap}"), |b| {
+                b.iter_batched(
+                    || open_pipeline_with(cap),
+                    |pipeline| {
+                        let target = pipeline.storage.stats().records_written + commands as u64;
+                        for _ in 0..commands {
+                            pipeline
+                                .producer
+                                .send(logs_write_command(1))
+                                .expect("writer alive");
+                        }
+                        wait_written(&pipeline.storage, target);
+                        pipeline
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_pipeline_overhead,
     bench_write_batch,
     bench_ingest_path,
+    bench_group_commit,
     bench_prune,
     bench_checkpoint,
     bench_analyze_vacuum

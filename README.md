@@ -81,9 +81,17 @@ retention = "7d"            # or [maintenance.retention] logs = "7d"
 ```
 
 Purge deletes expired events plus orphaned resources, so nothing grows
-unbounded. FTS index is trigger-maintained, so pruned events leave no
-stale hits. `rebuild_fts_interval` (off by default) re-reads every row —
-recovery for a corrupted index only.
+unbounded. The search index is trigger-maintained, so pruned events leave no
+stale hits. It is body-only by default (`[search] mode = "body"`); `full`
+keeps the legacy six-column index and `off` removes trigger maintenance
+entirely. `rebuild_fts_interval` (off by default) restarts the bounded
+background rebuild — recovery for a corrupted index only.
+
+The writer coalesces consecutive insert commands into one SQLite transaction
+up to `group_commit_max_records` (default 1000, `0` disables). This targets
+high resource cardinality, where the per-origin batcher emits many tiny
+batches at its age deadline. Collection never waits: only commands already
+queued are grouped.
 
 ### Durability & acknowledgement
 
@@ -146,6 +154,10 @@ allow_insecure_remote = true         # isolated/trusted net only; prefer [tls]
 max_records_per_request = 100000
 # mapping_concurrency = 128       # max mapping jobs; bounds abandoned-work memory
 # allow_remote_metrics = true        # explicit opt-in; prefer protected proxy
+# group_commit_max_records = 1000    # 0 = one transaction per insert command
+
+[search]
+mode = "body"                       # "off" | "body" | "full"
 ```
 
 Config validates before listeners/workers start; effective config prints as

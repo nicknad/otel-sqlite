@@ -8,7 +8,7 @@ cover individual boundaries for regression/design (see §10).
 ```text
 OTLP client (otel-sqlite-e2e) ─gRPC──▶ ingress ──▶ bounded ingest queue (50k)
   ──▶ insert batcher (500 rec / 10 ms) ──▶ bounded command queue (50k)
-  ──▶ single SQLite writer (1 txn/batch) ──▶ SQLite (WAL, synchronous=NORMAL)
+  ──▶ single SQLite writer (1 txn per coalesced group) ──▶ SQLite (WAL, synchronous=NORMAL)
 ```
 
 Embedded mode boots the exact production wiring in-process (only shutdown
@@ -194,5 +194,22 @@ Already done (regression suites only):
 - Batcher timer alloc → `recv_timeout` in `batcher.rs`.
 - Scope JSON rendered once per `ScopeLogs` group as shared `Arc<LogScope>`
   (`core/src/model/attribute.rs`).
+
+- The writer coalesces consecutive insert commands up to
+  `group_commit_max_records` (default 1000, `0` disables). It only helps when
+  a command backlog exists; when the writer keeps up, a group has one command.
+  Measure it with high resource cardinality (`--resources`), not the default
+  four resources.
+- `[search] mode = "body"` (default) indexes only `log_event.body` and removes
+  the per-row `log_resource` join from the insert trigger. `full` restores the
+  six-column cost; `off` removes trigger maintenance. Every insert benchmark
+  therefore depends on the configured search mode.
+
+Grouping microbench on this host (`cargo bench -p otel-sqlite-storage --
+bench inserts -- group_commit`): 100 one-record commands took 5.83 ms with
+grouping disabled and 2.35 ms with the 1000-record cap; 1000 commands took
+48.4 ms and 23.7 ms (~2.0-2.5x). That isolates the fixed commit cost, not
+end-to-end throughput; confirm with a high-cardinality e2e run before
+publishing a production number.
 
 Next: re-profile before the prepared-rows stage; do it only on evidence.

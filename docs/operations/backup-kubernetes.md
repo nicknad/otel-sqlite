@@ -62,7 +62,7 @@ kubectl -n otel-sqlite scale statefulset otel-sqlite --replicas=0
 # one-shot restore Job (mounts backups + data PVCs, + key Secret if .otsb):
 # args: restore --backup /backups/otel-logs.db.<UTC>.otsb --dir /data/restored [--key-file /keys/backup.key]
 kubectl -n otel-sqlite wait --for=condition=complete job/otel-sqlite-restore
-# verify Job: verify --db /data/restored/otel-logs.db (integrity=ok, FK=0, schema=005)
+# verify Job: verify --db /data/restored/otel-logs.db (integrity=ok, FK=0, schema=006)
 # swap Job (server still scaled to 0):
 #   mv otel-logs.db otel-logs.db.pre-restore; mv restored/otel-logs.db otel-logs.db
 kubectl -n otel-sqlite delete job otel-sqlite-restore otel-sqlite-verify otel-sqlite-swap

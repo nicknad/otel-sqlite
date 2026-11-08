@@ -30,3 +30,19 @@ pub fn open_readonly(db_path: &Path) -> Connection {
     Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .expect("database readable")
 }
+
+/// Whether the log search index finished its background rebuild.
+pub fn search_index_ready(db_path: &Path) -> bool {
+    Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM search_index_state
+                  WHERE id = 1 AND status = 'ready'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+        })
+        .is_some_and(|ready| ready == 1)
+}

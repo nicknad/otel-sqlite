@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use otel_sqlite_ingress::{TokenFileVault, validate_tls_material};
-use otel_sqlite_storage::{backup, latest_schema_version};
+use otel_sqlite_storage::{
+    FtsMode, SearchStatus, backup, inspect_search_index, latest_schema_version,
+};
 use serde::Serialize;
 
 use crate::backup_cli::{set_once, value};
@@ -247,7 +249,12 @@ fn evaluate(config: &Config, source: &'static str, path: Option<PathBuf>) -> Che
         },
     };
 
-    let database = check_database(&config.sqlite_path, &mut warnings, &mut errors);
+    let database = check_database(
+        &config.sqlite_path,
+        config.search_mode,
+        &mut warnings,
+        &mut errors,
+    );
 
     CheckReport {
         ok: errors.is_empty(),
@@ -265,6 +272,7 @@ fn evaluate(config: &Config, source: &'static str, path: Option<PathBuf>) -> Che
 /// Inspects the configured database path without opening it read-write.
 fn check_database(
     path: &Path,
+    configured_search: FtsMode,
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
 ) -> DatabaseCheck {
@@ -356,6 +364,31 @@ fn check_database(
             state: "not_otel",
             ..base
         };
+    }
+
+    match inspect_search_index(&conn) {
+        Ok(Some(search)) => {
+            if search.status == SearchStatus::Rebuilding {
+                warnings.push(format!(
+                    "log search index is rebuilding (mode {}, indexed through row {}); \
+                     search results are partial until it completes",
+                    search.mode.as_str(),
+                    search.indexed_through
+                ));
+            }
+            if search.mode != configured_search {
+                warnings.push(format!(
+                    "configured search mode `{}` differs from the installed `{}`; \
+                     startup will rebuild the log search index",
+                    configured_search.as_str(),
+                    search.mode.as_str()
+                ));
+            }
+        }
+        Ok(None) => {}
+        Err(error) => warnings.push(format!(
+            "cannot inspect the log search index state: {error}"
+        )),
     }
 
     if status.newer_than_binary {

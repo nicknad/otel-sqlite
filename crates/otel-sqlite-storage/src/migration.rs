@@ -45,6 +45,12 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/upgrades/005_drop_metrics_signal.sql"),
         disable_foreign_keys: false,
     },
+    Migration {
+        version: "006",
+        description: "Search index becomes an optional, reconciled derived index with a reduced default column set",
+        sql: include_str!("../migrations/upgrades/006_search_index_modes.sql"),
+        disable_foreign_keys: false,
+    },
 ];
 
 /// Newest schema version this baseline is equivalent to.
@@ -52,13 +58,14 @@ const MIGRATIONS: &[Migration] = &[
 /// A fresh database executes [`BASELINE_SQL`] once and is stamped as satisfying
 /// every migration up to and including this version. Keep this equal to the
 /// last legacy migration that the baseline folds in; a unit test enforces it.
-const BASELINE_VERSION: &str = "005";
+const BASELINE_VERSION: &str = "006";
 
 /// Complete logs-only schema for a brand-new database.
 ///
 /// It is the frozen result of the historical ladder at [`BASELINE_VERSION`],
-/// with the metric signal removed rather than created and then dropped.
-const BASELINE_SQL: &str = include_str!("../migrations/000_baseline.sql");
+/// with the metric signal removed rather than created and then dropped, plus
+/// the reduced, trigger-maintained search index.
+const BASELINE_SQL: &str = include_str!("../migrations/baseline_006.sql");
 
 /// Stamp text for versions satisfied by [`BASELINE_SQL`]. Their historical
 /// DDL never ran, so this deliberately does not reuse the per-version
@@ -135,7 +142,7 @@ pub fn latest_schema_version() -> &'static str {
 
 /// Whether `name` is a table in the opened database. Uses `sqlite_master`
 /// directly so a missing table is data, not an error.
-fn table_exists(conn: &Connection, name: &str) -> Result<bool, StorageError> {
+pub(crate) fn table_exists(conn: &Connection, name: &str) -> Result<bool, StorageError> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
         [name],
@@ -310,9 +317,61 @@ mod tests {
             "baseline must install both FTS maintenance triggers"
         );
         assert!(
+            BASELINE_SQL.contains("search_index_state"),
+            "baseline must install the search-index state row"
+        );
+        assert!(
             BASELINE_SQL.contains("scope_attributes_json")
                 && BASELINE_SQL.contains("scope_schema_url"),
             "baseline must fold in the log scope columns"
         );
+    }
+
+    #[test]
+    fn upgrade_006_defers_the_backfill_and_marks_the_index_rebuilding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("upgrade.db");
+        let mut conn = Connection::open(&path).expect("open database");
+        migrate_up_to(&mut conn, "005").expect("build a 005 database");
+
+        conn.execute(
+            "INSERT INTO log_resource (id, service_name) VALUES ('r', 'checkout')",
+            [],
+        )
+        .expect("seed resource");
+        conn.execute(
+            "INSERT INTO log_event
+                 (resource_id, timestamp_ns, observed_timestamp_ns, severity_number, body)
+             VALUES ('r', 1, 1, 9, 'payment failed')",
+            [],
+        )
+        .expect("seed log");
+
+        let indexed: i64 = conn
+            .query_row("SELECT COUNT(*) FROM logs_fts", [], |row| row.get(0))
+            .expect("count legacy index");
+        assert_eq!(indexed, 1, "the 005 index tracks the seeded row");
+
+        migrate(&mut conn).expect("apply 006");
+
+        let indexed: i64 = conn
+            .query_row("SELECT COUNT(*) FROM logs_fts", [], |row| row.get(0))
+            .expect("count reduced index");
+        assert_eq!(indexed, 0, "006 must not backfill inside the migration");
+
+        let (mode, status): (String, String) = conn
+            .query_row(
+                "SELECT mode, status FROM search_index_state WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read state");
+        assert_eq!(mode, "body");
+        assert_eq!(status, "rebuilding");
+
+        let canonical: i64 = conn
+            .query_row("SELECT COUNT(*) FROM log_event", [], |row| row.get(0))
+            .expect("count logs");
+        assert_eq!(canonical, 1, "canonical rows survive the upgrade");
     }
 }

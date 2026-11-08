@@ -34,7 +34,8 @@ pub(crate) struct WriterStats {
     pub records_written: AtomicU64,
     pub transactions_committed: AtomicU64,
     /// Insert commands received from the command queue. One insert command is
-    /// exactly one write batch and becomes exactly one transaction.
+    /// exactly one write batch; the writer may commit several consecutive
+    /// commands in one transaction when grouping is enabled.
     pub batches_received: AtomicU64,
     pub maintenance_runs: AtomicU64,
     pub errors: AtomicU64,
@@ -78,6 +79,12 @@ impl WriterStats {
     pub(crate) fn mark_progress(&self) {
         self.last_progress_ms
             .store(monotonic_millis(), Ordering::Relaxed);
+    }
+
+    /// Publishes the current command-queue backlog.
+    pub(crate) fn observe_queue_depth(&self, depth: usize) {
+        self.queue_depth.store(depth, Ordering::Relaxed);
+        ::metrics::gauge!("storage_queue_depth").set(depth as f64);
     }
 
     /// Marks the thread as running until the returned guard is dropped (or

@@ -38,6 +38,10 @@ fn storage_config(db_path: std::path::PathBuf) -> StorageConfig {
         synchronous: SyncMode::Normal,
         startup_timeout: otel_sqlite_storage::DEFAULT_STARTUP_TIMEOUT,
         shutdown_timeout: otel_sqlite_storage::DEFAULT_SHUTDOWN_TIMEOUT,
+        // Keep one command per transaction so backlog observations stay
+        // deterministic.
+        group_commit_max_records: 0,
+        ..StorageConfig::default()
     }
 }
 

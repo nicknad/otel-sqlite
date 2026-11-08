@@ -9,6 +9,7 @@ use super::auth::AuthSection;
 use super::durability::DurabilitySection;
 use super::duration::{RawDuration, apply_required_duration};
 use super::maintenance::MaintenanceSection;
+use super::search::SearchSection;
 use super::tls::TlsSection;
 use super::watchdog::WatchdogSection;
 
@@ -23,6 +24,7 @@ pub(crate) struct FileConfig {
     command_queue_capacity: Option<usize>,
     batcher_max_batch_records: Option<usize>,
     batcher_max_batch_age: Option<RawDuration>,
+    group_commit_max_records: Option<usize>,
     grpc_max_recv_msg_size: Option<usize>,
     grpc_max_concurrent_streams: Option<u32>,
     mapping_concurrency: Option<usize>,
@@ -35,6 +37,7 @@ pub(crate) struct FileConfig {
     max_db_bytes: Option<u64>,
     shutdown_timeout: Option<RawDuration>,
     maintenance: Option<MaintenanceSection>,
+    search: Option<SearchSection>,
     watchdog: Option<WatchdogSection>,
     durability: Option<DurabilitySection>,
     metrics_address: Option<String>,
@@ -66,6 +69,9 @@ impl FileConfig {
             self.batcher_max_batch_age,
             "batcher_max_batch_age",
         )?;
+        if let Some(value) = self.group_commit_max_records {
+            config.group_commit_max_records = value;
+        }
         if let Some(value) = self.grpc_max_recv_msg_size {
             config.grpc_max_recv_msg_size = value;
         }
@@ -104,6 +110,9 @@ impl FileConfig {
 
         if let Some(section) = self.maintenance {
             section.apply_to(&mut config.maintenance)?;
+        }
+        if let Some(section) = self.search {
+            section.apply_to(config)?;
         }
         if let Some(section) = self.watchdog {
             section.apply_to(&mut config.watchdog)?;

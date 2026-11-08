@@ -70,7 +70,7 @@ fn historic_schema_reports_the_next_migration_as_pending() {
     let status = read_only_inspect(&path);
 
     assert_eq!(status.applied.last().map(String::as_str), Some("004"));
-    assert_eq!(status.pending, vec!["005"]);
+    assert_eq!(status.pending, vec!["005", "006"]);
     assert!(!status.newer_than_binary);
     assert!(status.is_otel_schema);
 }

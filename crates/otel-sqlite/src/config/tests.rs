@@ -45,6 +45,11 @@ fn empty_overlay_keeps_defaults() {
     );
     assert_eq!(config.batcher_max_batch_age, Duration::from_millis(10));
     assert_eq!(
+        config.group_commit_max_records,
+        otel_sqlite_storage::DEFAULT_GROUP_COMMIT_RECORDS
+    );
+    assert_eq!(config.search_mode, otel_sqlite_storage::FtsMode::Body);
+    assert_eq!(
         config.grpc_max_concurrent_streams,
         DEFAULT_MAX_CONCURRENT_STREAMS
     );
@@ -72,6 +77,7 @@ fn top_level_keys_override_defaults() {
         command_queue_capacity = 20
         batcher_max_batch_records = 42
         batcher_max_batch_age = "250ms"
+        group_commit_max_records = 17
          grpc_max_recv_msg_size = 1024
          grpc_max_concurrent_streams = 8
          mapping_concurrency = 64
@@ -82,6 +88,9 @@ fn top_level_keys_override_defaults() {
          max_body_bytes = 444
          max_scope_metadata_expansion_bytes = 8192
          shutdown_timeout = 90
+
+        [search]
+        mode = "full"
         "#,
     )
     .apply_to(&mut config)
@@ -92,6 +101,8 @@ fn top_level_keys_override_defaults() {
     assert_eq!(config.command_queue_capacity, 20);
     assert_eq!(config.batcher_max_batch_records, 42);
     assert_eq!(config.batcher_max_batch_age, Duration::from_millis(250));
+    assert_eq!(config.group_commit_max_records, 17);
+    assert_eq!(config.search_mode, otel_sqlite_storage::FtsMode::Full);
     assert_eq!(config.grpc_max_recv_msg_size, 1024);
     assert_eq!(config.grpc_max_concurrent_streams, 8);
     assert_eq!(config.mapping_concurrency, 64);
@@ -123,6 +134,44 @@ fn size_quota_parses_validates_and_reaches_storage() {
         ..Config::default()
     };
     assert!(tiny.validate().is_err(), "sub-MiB quotas must be rejected");
+}
+
+#[test]
+fn search_mode_parsing_and_group_commit_range_are_validated() {
+    let mut config = Config::default();
+    file_config("[search]\n mode = \"enabled\"\n")
+        .apply_to(&mut config)
+        .expect_err("unknown search mode must be rejected");
+
+    let too_large = Config {
+        group_commit_max_records: otel_sqlite_storage::MAX_GROUP_COMMIT_RECORDS + 1,
+        ..Config::default()
+    };
+    assert!(
+        too_large.validate().is_err(),
+        "over-limit group commit must be rejected"
+    );
+
+    let disabled = Config {
+        group_commit_max_records: 0,
+        search_mode: otel_sqlite_storage::FtsMode::Off,
+        ..Config::default()
+    };
+    disabled
+        .validate()
+        .expect("0 disables grouping; off is valid");
+    let dump = disabled.dump_json().expect("dumps");
+    assert!(dump.contains("group_commit_max_records"));
+    assert!(dump.contains("search_mode"));
+    assert_eq!(
+        disabled.storage_config().group_commit_max_records,
+        0,
+        "the knob must reach the writer"
+    );
+    assert_eq!(
+        disabled.storage_config().fts_mode,
+        otel_sqlite_storage::FtsMode::Off
+    );
 }
 
 #[test]

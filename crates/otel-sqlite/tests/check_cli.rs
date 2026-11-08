@@ -178,3 +178,43 @@ fn check_help_prints_usage_and_exits_zero() {
     assert!(stdout.contains("otel-sqlite check"), "stdout: {stdout}");
     assert!(stdout.contains("--config"), "stdout: {stdout}");
 }
+
+#[test]
+fn check_warns_when_the_search_index_is_rebuilding_or_mode_mismatched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("logs.db");
+    {
+        let mut conn = Connection::open(&db).expect("open database");
+        migrate_up_to(&mut conn, latest_schema_version()).expect("build current schema");
+        conn.execute(
+            "UPDATE search_index_state
+                SET mode = 'body', status = 'rebuilding', last_rowid = 0, rebuild_until = 1
+              WHERE id = 1",
+            [],
+        )
+        .expect("mark rebuilding");
+    }
+    let config = write_config(dir.path(), &db, "[search]\n mode = \"full\"\n");
+
+    let output = run_check(Some(&config), &["--json"]);
+    assert!(
+        output.status.success(),
+        "a derived index state must not fail check; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = json(&output);
+    let warnings = report["warnings"].as_array().expect("warnings array");
+    let text = warnings
+        .iter()
+        .filter_map(|warning| warning.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("rebuilding"),
+        "missing rebuild warning: {text}"
+    );
+    assert!(
+        text.contains("differs from the installed"),
+        "missing mode-mismatch warning: {text}"
+    );
+}

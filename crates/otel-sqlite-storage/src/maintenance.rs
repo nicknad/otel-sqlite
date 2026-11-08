@@ -5,45 +5,6 @@ use rusqlite::Connection;
 
 use crate::error::StorageError;
 
-/// Schema of the log search index, including the sync triggers that keep it
-/// consistent with `log_event`.
-///
-/// This mirrors the FTS section of `migrations/000_baseline.sql` on purpose:
-/// `rebuild_fts` drops and recreates the table, so it must recreate the
-/// identical trigger shape the baseline installs. Change both together.
-const FTS_SCHEMA: &str = "
-CREATE VIRTUAL TABLE logs_fts USING fts5(
-    body,
-    service_name,
-    host_name,
-    severity_text,
-    event_name,
-    scope_name,
-
-    tokenize = 'unicode61 remove_diacritics 2',
-
-    content = '',
-    contentless_delete = 1
-);
-
-CREATE TRIGGER logs_fts_ai AFTER INSERT ON log_event BEGIN
-    INSERT INTO logs_fts (rowid, body, service_name, host_name, severity_text, event_name, scope_name)
-    SELECT
-        new.id,
-        COALESCE(new.body, ''),
-        COALESCE(lr.service_name, ''),
-        COALESCE(lr.host_name, ''),
-        COALESCE(new.severity_text, ''),
-        COALESCE(new.event_name, ''),
-        COALESCE(new.scope_name, '')
-    FROM log_resource AS lr
-    WHERE lr.id = new.resource_id;
-END;
-
-CREATE TRIGGER logs_fts_ad AFTER DELETE ON log_event BEGIN
-    DELETE FROM logs_fts WHERE rowid = old.id;
-END;";
-
 pub(crate) fn checkpoint(conn: &Connection, mode: CheckpointMode) -> Result<(), StorageError> {
     let sql = match mode {
         CheckpointMode::Passive => "PRAGMA wal_checkpoint(PASSIVE);",
@@ -193,45 +154,6 @@ fn collect_orphan_dimensions(
         [],
     )?;
     Ok(())
-}
-
-/// Drops, recreates and repopulates the search index. Inserts and deletes
-/// maintain the index incrementally via triggers; this full rebuild exists
-/// for recovery from a corrupted or manually emptied index (and for schema
-/// changes to the indexed columns).
-///
-/// The whole rebuild is one transaction: SQLite DDL is transactional, so a
-/// crash mid-rebuild rolls back completely and leaves either the old or the
-/// new index in place — never a database whose migration stamp claims an
-/// index that does not exist.
-pub(crate) fn rebuild_fts(conn: &mut Connection) -> Result<usize, StorageError> {
-    let tx = conn.transaction()?;
-    // The sync triggers hang off `log_event`, not the FTS table, so dropping
-    // the table alone would leave them behind and block recreation.
-    tx.execute_batch(
-        "DROP TRIGGER IF EXISTS logs_fts_ai;
-         DROP TRIGGER IF EXISTS logs_fts_ad;
-         DROP TABLE IF EXISTS logs_fts;",
-    )?;
-    tx.execute_batch(FTS_SCHEMA)?;
-
-    let indexed = tx.execute(
-        "INSERT INTO logs_fts (rowid, body, service_name, host_name, severity_text, event_name, scope_name)
-         SELECT
-             id,
-             COALESCE(body, ''),
-             COALESCE(service_name, ''),
-             COALESCE(host_name, ''),
-             COALESCE(severity_text, ''),
-             COALESCE(event_name, ''),
-             COALESCE(scope_name, '')
-         FROM logs",
-        [],
-    )?;
-    tx.commit()?;
-
-    tracing::info!(indexed, "rebuilt log search index");
-    Ok(indexed)
 }
 
 /// What one size-quota enforcement pass evicted.
@@ -445,7 +367,7 @@ mod tests {
             0,
             "legacy default has no auto-vacuum"
         );
-        let quota = size.saturating_sub(16 * 1024);
+        let quota = size / 2;
 
         let report = enforce_size_quota(&mut conn, &path, quota).expect("enforce quota");
 

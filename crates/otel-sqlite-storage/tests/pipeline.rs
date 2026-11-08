@@ -52,6 +52,10 @@ fn config(
         synchronous: SyncMode::Normal,
         startup_timeout: otel_sqlite_storage::DEFAULT_STARTUP_TIMEOUT,
         shutdown_timeout: otel_sqlite_storage::DEFAULT_SHUTDOWN_TIMEOUT,
+        // These tests assert exact per-command transaction counts; grouping
+        // has its own coverage below.
+        group_commit_max_records: 0,
+        ..StorageConfig::default()
     }
 }
 
