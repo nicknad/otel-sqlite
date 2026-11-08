@@ -84,9 +84,8 @@ pub(crate) fn collect_group(
     mut pull: impl FnMut() -> Pull,
 ) -> (InsertGroup, Option<WriteCommand>) {
     let mut group = InsertGroup::new(budget);
-    group
-        .try_push(first)
-        .expect("an empty insert group accepts any batch");
+    group.records = first.records.len();
+    group.batches.push(first);
     let mut boundary = None;
     while !group.at_budget() {
         match pull() {

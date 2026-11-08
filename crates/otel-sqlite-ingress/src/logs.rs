@@ -178,27 +178,23 @@ impl LogsIngress {
     ///
     /// A partially accepted request is reported with OTLP `partial_success`:
     /// records that committed are not retried, so a retrying exporter cannot
-    /// duplicate them. A retryable `UNAVAILABLE` is reserved for requests with
-    /// no durable records at all.
+    /// duplicate them. `UNAVAILABLE` means the pipeline shut down before any
+    /// record settled; quarantined records are reported as `partial_success`
+    /// because retrying cannot help.
     async fn finish(&self, outcome: EnqueueOutcome) -> Result<ExportLogsServiceResponse, Status> {
         if outcome.accepted == 0 {
             if outcome.disconnected {
                 return Err(Status::unavailable("ingress queue is closed"));
             }
             if outcome.rejected > 0 {
-                tracing::warn!(
-                    accepted = outcome.accepted,
-                    rejected = outcome.rejected,
-                    "ingress queue backpressure"
-                );
+                warn_backpressure(&outcome);
                 return Err(Status::unavailable("ingress queue is full"));
             }
-            // Empty request: nothing was accepted and nothing was rejected.
             return Ok(ExportLogsServiceResponse::default());
         }
 
         if self.config.durability_mode == DurabilityMode::Commit {
-            if let Some(ticket) = outcome.last_ticket {
+            if let Some(ticket) = outcome.last_ticket() {
                 // Wait for the contiguous watermark, not just this ticket's
                 // own outcome: a later ticket can fail while an earlier
                 // split chunk is still buffered, and reporting early would
@@ -247,11 +243,7 @@ impl LogsIngress {
         // queued is reported as rejected without asking the sender to resend
         // the chunks that were queued.
         if outcome.rejected > 0 {
-            tracing::warn!(
-                accepted = outcome.accepted,
-                rejected = outcome.rejected,
-                "ingress queue backpressure"
-            );
+            warn_backpressure(&outcome);
             ::metrics::counter!(
                 "otlp_records_rejected_total",
                 "signal" => "logs",
@@ -268,10 +260,19 @@ impl LogsIngress {
     }
 }
 
+fn warn_backpressure(outcome: &EnqueueOutcome) {
+    tracing::warn!(
+        accepted = outcome.accepted,
+        rejected = outcome.rejected,
+        "ingress queue backpressure"
+    );
+}
+
 fn partial_success(rejected: u64, message: &str) -> ExportLogsServiceResponse {
     ExportLogsServiceResponse {
         partial_success: Some(ExportLogsPartialSuccess {
-            rejected_log_records: i64::try_from(rejected).unwrap_or(i64::MAX),
+            rejected_log_records: i64::try_from(rejected)
+                .expect("record count is bounded by max_records_per_request"),
             error_message: message.to_owned(),
         }),
     }
@@ -547,7 +548,6 @@ mod tests {
             accepted,
             rejected,
             total_records: accepted + rejected,
-            last_ticket: tickets.last().map(|(ticket, _)| *ticket),
             tickets: tickets.to_vec(),
             ..EnqueueOutcome::default()
         }

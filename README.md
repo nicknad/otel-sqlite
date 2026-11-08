@@ -9,6 +9,7 @@ insert batcher → bounded command queue → single SQLite writer (WAL)`.
 - Benchmarks: [docs/performance.md](docs/performance.md)
   (`cargo run --release -p otel-sqlite-e2e -- --scenario baseline`)
 - Architecture & invariants: [docs/architecture.md](docs/architecture.md)
+- Statecharts: [docs/statecharts/](docs/statecharts/)
 - Local CI (run `.github/workflows/ci.yml` with `act`):
   [tools/local-ci/](tools/local-ci/)
 
@@ -135,8 +136,9 @@ a retryable error.
 - **gRPC health** (`grpc.health.v1`) on the OTLP port. Overall + logs
   service report `NOT_SERVING` unless writer *and* batcher are running;
   shutdown flips to `NOT_SERVING` before draining.
-- **Startup readiness**: `Storage::open` blocks until DB open + migrated; a
-  broken backend fails startup, not first traffic.
+- **Startup readiness**: `Storage::open` blocks until the database is opened,
+  migrations are applied, the startup WAL checkpoint completes, and file
+  permissions are hardened; a broken backend fails startup, not first traffic.
 - **Failure policy**: per batch — transient (`BUSY`/`LOCKED`) retries 4×
   with backoff; poisonous rows (constraints, binding failures) salvage:
   healthy rows commit, offenders drop-and-count (`quarantined_records`,

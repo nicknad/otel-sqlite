@@ -142,22 +142,6 @@ impl FtsMode {
     pub const fn enabled(self) -> bool {
         !matches!(self, Self::Off)
     }
-
-    /// Columns in DDL order. `Off` keeps the body table shape so a query that
-    /// names `body` still parses; it simply has no triggers and no rows.
-    pub const fn columns(self) -> &'static [&'static str] {
-        match self {
-            Self::Off | Self::Body => &["body"],
-            Self::Full => &[
-                "body",
-                "service_name",
-                "host_name",
-                "severity_text",
-                "event_name",
-                "scope_name",
-            ],
-        }
-    }
 }
 
 /// Read-only view of the installed search index.
@@ -605,16 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_columns_match_the_ddl() {
-        for mode in [FtsMode::Off, FtsMode::Body, FtsMode::Full] {
-            let mut ddl = table_ddl(mode).to_owned();
-            for &(_, sql) in trigger_ddl(mode) {
-                ddl.push_str(sql);
-            }
-            for column in mode.columns() {
-                assert!(ddl.contains(column), "{mode:?} DDL must contain `{column}`");
-            }
-        }
+    fn off_mode_installs_no_triggers() {
         assert_eq!(trigger_ddl(FtsMode::Off).len(), 0);
     }
 

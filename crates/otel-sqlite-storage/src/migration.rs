@@ -140,6 +140,14 @@ pub fn latest_schema_version() -> &'static str {
         .unwrap_or_default()
 }
 
+/// Message for a database stamped by a binary newer than this one.
+pub fn version_too_new_message(applied: &str, latest_known: &str) -> String {
+    format!(
+        "database schema version {applied} is newer than the newest supported \
+         version {latest_known}; upgrade this binary before opening it"
+    )
+}
+
 /// Whether `name` is a table in the opened database. Uses `sqlite_master`
 /// directly so a missing table is data, not an error.
 pub(crate) fn table_exists(conn: &Connection, name: &str) -> Result<bool, StorageError> {
@@ -188,10 +196,7 @@ fn migrate_inner(conn: &mut Connection, target_version: Option<&str>) -> Result<
         && newest_applied.as_str() > newest_known
     {
         return Err(StorageError::StartupFailed {
-            message: format!(
-                "database schema version {newest_applied} is newer than the newest supported \
-                 version {newest_known}; upgrade this binary before opening it"
-            ),
+            message: version_too_new_message(newest_applied, newest_known),
         });
     }
 
@@ -286,11 +291,10 @@ mod tests {
 
     #[test]
     fn baseline_version_is_part_of_the_migration_ladder() {
-        assert!(
-            MIGRATIONS
-                .iter()
-                .any(|migration| migration.version == BASELINE_VERSION),
-            "baseline version {BASELINE_VERSION} must name a real migration"
+        assert_eq!(
+            MIGRATIONS.last().map(|migration| migration.version),
+            Some(BASELINE_VERSION),
+            "baseline version {BASELINE_VERSION} must name the newest migration"
         );
     }
 

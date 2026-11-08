@@ -43,8 +43,8 @@ impl MappingBudget {
         }
     }
 
-    /// A budget that admits every job, preserving the historical behavior of
-    /// wiring (tests, fuzz harness) that does not supply a production limit.
+    /// A budget that admits every job, for callers that wire the ingestor
+    /// without a process-wide limit (tests, fuzz harness).
     pub(crate) fn unlimited(timeout: Duration) -> Self {
         Self::new(Semaphore::MAX_PERMITS, timeout)
     }

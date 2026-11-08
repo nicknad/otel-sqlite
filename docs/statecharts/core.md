@@ -110,8 +110,6 @@ make obvious.
 | `TypeOK` | Every reachable state has well-formed ticket, progress, watermark, and request fields. | Holds |
 | `NoDeadlock` | Every reachable state has a step; a closed idle state stutters via `Done`. | Holds |
 
-No rule breaks; all 17 checks pass.
-
 The request arrow is the ingress `wait_watermark` path, not `wait(ticket)`. A
 direct `wait(2)` would return `Failed` or `Committed` as soon as ticket 2
 settles ahead of ticket 1; `TicketWaitMatchesState` records that mapping. The
@@ -138,12 +136,10 @@ though the request reports Closed.
 
 ## Bug paths
 
-None. The final report has no `## ... breaks` sections and every rule is under
-"Rules that hold". No replay against a bug path was needed. The commit-ledger
-unit tests pass: `cargo test -p otel-sqlite-core storage::commit` runs 19 tests,
-including partial progress, quarantined tickets, close preserving progress,
-`wait_watermark` across a failed later ticket, and failed tickets staying
-failed after later commits.
+None. All 17 rules hold, and the commit-ledger unit tests cover partial
+progress, quarantined tickets, close preserving progress, `wait_watermark`
+across a failed later ticket, and failed tickets staying failed after later
+commits.
 
 ## What the model intentionally leaves out
 
@@ -177,21 +173,3 @@ failed after later commits.
 - **The rest of the durability vocabulary.** `DurabilityMode::Enqueue`,
   `SyncMode`, all-or-nothing admission, and per-origin ticket folding are not
   part of the ticket lifecycle chart.
-
-## Reproduce
-
-The spec, config, view, and checked run are in
-`/tmp/opencode/statechart-core` (`CommitLedger.tla`, `CommitLedger.cfg`,
-`view.ts`, `run-v2-h/`). Use a new `--out` folder:
-
-```sh
-cd /tmp/opencode/statechart-core
-TLA2TOOLS=/tmp/opencode/tla2tools.jar JAVA=/usr/bin/java \
-  node /home/nnadolski/projects/otel-sqlite/.agents/skills/statechart/scripts/statechart.ts \
-  CommitLedger.tla --config CommitLedger.cfg --view view.ts \
-  --out run-v2-reproduce
-```
-
-`run-v2-reproduce` must not exist or must be empty. The checked run is
-`run-v2-h/`; the command reproduces the same 176-state, 541-step result when
-given a fresh folder.

@@ -82,15 +82,12 @@ make obvious.
 | `WatchdogNeverRestarts` | The watchdog never restarts a component; its only output is the halt. | Holds |
 | `NoDeadlock` | The model has no reachable dead end; the stopped watchdog has a stuttering `Done` step. | Holds |
 
-No rule breaks. The final report has no `## ... breaks` sections and no bug
-paths, so no replay against a bug path was needed. The runtime crate's
-`cargo test -p otel-sqlite-runtime --lib` passes all 40 tests, including the
-watchdog tests that exercise these cases.
+No rule breaks. The runtime crate's `cargo test -p otel-sqlite-runtime --lib`
+passes all 40 tests, including the watchdog tests that exercise these cases.
 
 ### Two precedence refinements
 
-Two of the short rules need the code's documented precedence to be stated
-exactly; this is not a weakening of the rules.
+Two of the short rules depend on the code's documented precedence:
 
 - **Outside maintenance, idle is checked after the durability leak check.**
   The code checks
@@ -148,21 +145,3 @@ None. The report lists every rule under "Rules that hold":
 - **Clean shutdown.** The chart ends at the one-shot halt. The normal
   operator-driven stop of the watchdog after ingress returns, the thread
   spawn/stop/join lifecycle, and the final health-gauge reset are not drawn.
-
-## Reproduce
-
-The spec, config, view, and final run are in
-`/tmp/opencode/statechart-runtime` (`RuntimeWatchdog.tla`,
-`RuntimeWatchdog.cfg`, `view.ts`, `out-final2/`). Use a new `--out` folder:
-
-```sh
-cd /tmp/opencode/statechart-runtime
-TLA2TOOLS=/tmp/opencode/tla2tools.jar JAVA=/usr/bin/java \
-  node /home/nnadolski/projects/otel-sqlite/.agents/skills/statechart/scripts/statechart.ts \
-  RuntimeWatchdog.tla --config RuntimeWatchdog.cfg --view view.ts \
-  --out out-reproduce
-```
-
-`out-reproduce` must not exist or must be empty. The checked run used
-`out-final2`; the command reproduces the same 434-state, 96,560-step run when
-given a fresh folder.

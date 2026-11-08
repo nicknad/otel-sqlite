@@ -221,7 +221,13 @@ impl Config {
 
     /// Machine-readable effective configuration for startup diagnostics.
     pub fn dump_json(&self) -> Result<String> {
-        serde_json::to_string_pretty(&serde_json::json!({
+        serde_json::to_string_pretty(&self.dump_value())
+            .context("failed to serialize effective configuration")
+    }
+
+    /// Effective configuration as a JSON value.
+    pub fn dump_value(&self) -> serde_json::Value {
+        serde_json::json!({
             "listen_address": self.listen_address,
             "sqlite_path": self.sqlite_path,
             "ingest_queue_capacity": self.ingest_queue_capacity,
@@ -250,8 +256,7 @@ impl Config {
             "auth_configured": self.auth.is_some(),
             "maintenance": dump::maintenance_dump(&self.maintenance),
             "watchdog": dump::watchdog_dump(&self.watchdog),
-        }))
-        .context("failed to serialize effective configuration")
+        })
     }
 
     pub fn ingress_config(&self) -> IngressConfig {

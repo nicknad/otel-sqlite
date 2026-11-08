@@ -3,12 +3,13 @@
 -- Squashed logs-only baseline
 --
 -- This file is the canonical schema for a brand-new database. It folds the
--- historical 000-005 upgrade chain into the schema those migrations actually
--- produced, without ever creating the metrics signal that 005 used to drop.
+-- historical 000-005 upgrade chain plus the 006 search-index shape into the
+-- schema those migrations actually produced, without ever creating the metrics
+-- signal that 005 used to drop.
 --
 -- The frozen upgrade history lives in `migrations/upgrades/`. Existing
 -- databases replay it; fresh databases only execute this file and are then
--- stamped as already satisfying every version through `005`.
+-- stamped as already satisfying every version through `006`.
 --
 -- Design principles:
 --   * SQLite WAL + single writer

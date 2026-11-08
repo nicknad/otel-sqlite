@@ -36,9 +36,6 @@ pub(crate) struct EnqueueOutcome {
     pub accepted: u64,
     pub rejected: u64,
     pub disconnected: bool,
-    /// Highest durability ticket among *accepted* chunks; `None` when nothing
-    /// was accepted.
-    pub last_ticket: Option<u64>,
     /// Total records in the request, including chunks never accepted.
     pub total_records: u64,
     /// Accepted tickets with the number of records each covers, in send
@@ -47,12 +44,20 @@ pub(crate) struct EnqueueOutcome {
     pub tickets: Vec<(u64, u64)>,
 }
 
+impl EnqueueOutcome {
+    /// Highest durability ticket among *accepted* chunks; `None` when nothing
+    /// was accepted.
+    pub fn last_ticket(&self) -> Option<u64> {
+        self.tickets.last().map(|(ticket, _)| *ticket)
+    }
+}
+
 /// Hands mapped ingest chunks to the storage insert batcher through the
 /// bounded input channel.
 ///
 /// All-or-nothing: if every chunk cannot be admitted, the whole request is
-/// rejected (`accepted = 0`, `rejected = total`, `last_ticket = None`) without
-/// issuing any durability tickets. On success the chunks are enqueued in order
+/// rejected (`accepted = 0`, `rejected = total`, no ticket) without issuing
+/// any durability tickets. On success the chunks are enqueued in order
 /// under one admission reservation, so no other producer can interleave.
 ///
 /// Returns [`IngressError::Mapping`] when the request maps to more chunks than
@@ -113,7 +118,6 @@ pub(crate) fn enqueue(
         match guard.try_send(message) {
             Ok(()) => {
                 outcome.accepted += records;
-                outcome.last_ticket = Some(ticket);
                 outcome.tickets.push((ticket, records));
             }
             Err(SendFailure::Full) => {
@@ -191,7 +195,7 @@ mod tests {
         assert_eq!(outcome.accepted, 0);
         assert_eq!(outcome.rejected, 5);
         assert_eq!(outcome.total_records, 5);
-        assert_eq!(outcome.last_ticket, None);
+        assert_eq!(outcome.last_ticket(), None);
         assert!(outcome.tickets.is_empty());
         assert!(!outcome.disconnected);
         assert_eq!(
@@ -236,7 +240,7 @@ mod tests {
         assert_eq!(outcome.rejected, 0);
         assert_eq!(outcome.total_records, 5);
         assert_eq!(outcome.tickets, vec![(1, 2), (2, 3)]);
-        assert_eq!(outcome.last_ticket, Some(2));
+        assert_eq!(outcome.last_ticket(), Some(2));
 
         let first = receiver.recv().expect("first chunk in flight");
         let second = receiver.recv().expect("second chunk in flight");
@@ -259,7 +263,7 @@ mod tests {
         assert_eq!(outcome.rejected, 2);
         assert_eq!(outcome.total_records, 2);
         assert_eq!(outcome.accepted, 0);
-        assert_eq!(outcome.last_ticket, None);
+        assert_eq!(outcome.last_ticket(), None);
         assert!(outcome.tickets.is_empty());
         assert!(
             !ledger.watermark().closed,

@@ -7,7 +7,7 @@ writer transaction, and the resulting commit, retry, quarantine, or fatal
 outcome. It also models the commit-ticket state, because the ingress can only
 distinguish a clean acknowledgement from a partial success by asking the
 ledger. The model follows
-`crates/otel-sqlite-storage/src/{batcher,origin_buffers,writer,error}.rs`,
+`crates/otel-sqlite-storage/src/{batcher,origin_buffers,writer,transaction_group,error}.rs`,
 `crates/otel-sqlite-core/src/storage/{batcher,commit,command}.rs`, and the
 ingress `finish` path in `crates/otel-sqlite-ingress/src/logs.rs`. One chunk of
 three records with batch capacity two becomes two storage batches: batch 1
@@ -124,7 +124,7 @@ obvious.
   turns those records into `RecordSegment { commit_seq, records, complete }`;
   `complete` is true only when the segment carries the ticket's last buffered
   record. `LogWriteBatch` carries the partition to the writer.
-- **First batch, strict.** `writer::settle_log_batch` walks the segments,
+- **First batch, strict.** `transaction_group::settle_log_batch` walks the segments,
   calls `ledger.note_committed(1, 2)`, and does not call `complete` because the
   segment is incomplete. The ticket is `Unsettled { committed: 2, dropped: 0 }`,
   which is the chart's blue `First batch committed, ticket open` state.
@@ -156,8 +156,7 @@ obvious.
 
 ## Bug paths
 
-None. TLC reports no broken rules, and the chart has no `breaks` or `mayBreak`
-marks. The segment-completion and quarantine-failure regression tests pass:
+None. The segment-completion and quarantine-failure regression tests pass:
 
 ```sh
 cargo test -p otel-sqlite-storage --test pipeline ticket -- --nocapture
@@ -165,7 +164,7 @@ cargo test -p otel-sqlite-storage --test pipeline ticket -- --nocapture
 
 The run includes `split_chunk_ticket_waits_for_the_last_record` and
 `quarantined_record_fails_the_ticket_after_the_remainder_flushes`; all four
-selected tests passed. No temporary replay test was needed.
+selected tests passed.
 
 ## What the model intentionally leaves out
 
@@ -230,21 +229,3 @@ selected tests passed. No temporary replay test was needed.
   checkpoint and maintenance remain hard boundaries. Group formation is
   untimed and outside the model, but it does not weaken the modeled per-batch
   settlement rules.
-
-## Reproduce
-
-The spec, config, view, and checked run are in
-`/tmp/opencode/statechart-storage` (`Storage.tla`, `SPEC.cfg`, `view.ts`,
-`OUT-new4/`). Use a new `--out` folder:
-
-```sh
-cd /tmp/opencode/statechart-storage
-TLA2TOOLS=/tmp/opencode/tla2tools.jar JAVA=/usr/bin/java \
-  node /home/nnadolski/projects/otel-sqlite/.agents/skills/statechart/scripts/statechart.ts \
-  Storage.tla --config SPEC.cfg --view view.ts --out OUT-reproduce-final
-```
-
-`OUT-reproduce-final` must not exist or must be empty. The command exits 0
-because every rule holds. The checked run is `OUT-new4/`, which has 29 states,
-55 steps, 10 chart states, and 13 chart arrows; the `OUT-reproduce-final/` run
-was executed and matches it.

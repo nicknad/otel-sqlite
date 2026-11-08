@@ -40,6 +40,7 @@ Binary is compatible when its `MIGRATIONS` contains every stamped version
 | `001` | FTS rebuild as contentless FTS5 (`contentless_delete=1`) + triggers + backfill (**breaking** FTS shape) |
 | `003` | New log/scope columns (`scope_attributes_json`, `scope_schema_url`, …) with defaults; views gain columns (old `SELECT`s keep working) |
 | `005` | **Drops OTLP metrics signal** (views `metrics`/`metric_buckets`, tables `scope`/`metric`/`metric_series`/`metric_data_point). **Destructive, irreversible.** Logs, `logs` view, FTS untouched. |
+| `006` | Search index becomes optional and reconciled; the default drops to body-only columns, with a background rebuild after a mode change |
 
 Fresh databases do not execute `000`-`006`; they apply the logs-only baseline
 (`migrations/baseline_006.sql`) and stamp the versions it satisfies. The prior

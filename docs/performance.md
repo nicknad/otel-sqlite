@@ -194,7 +194,6 @@ Already done (regression suites only):
 - Batcher timer alloc → `recv_timeout` in `batcher.rs`.
 - Scope JSON rendered once per `ScopeLogs` group as shared `Arc<LogScope>`
   (`core/src/model/attribute.rs`).
-
 - The writer coalesces consecutive insert commands up to
   `group_commit_max_records` (default 1000, `0` disables). It only helps when
   a command backlog exists; when the writer keeps up, a group has one command.

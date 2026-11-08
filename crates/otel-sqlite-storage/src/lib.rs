@@ -37,7 +37,7 @@ pub use error::StorageError;
 /// version and then let [`Storage::open`] migrate them to the current schema.
 #[doc(hidden)]
 pub use migration::migrate_up_to;
-pub use migration::{SchemaStatus, inspect_schema, latest_schema_version};
+pub use migration::{SchemaStatus, inspect_schema, latest_schema_version, version_too_new_message};
 pub use permissions::{restrict_permissions, warn_if_world_readable};
 pub use search::{FtsMode, SearchIndexStatus, SearchStatus, inspect_search_index};
 pub use stats::{BatcherStats, StorageHealth, StorageStatsSnapshot};

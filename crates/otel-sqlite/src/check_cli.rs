@@ -66,10 +66,16 @@ pub fn parse_args(args: &[String]) -> Result<CheckArgs> {
 /// Runs the preflight and prints the report. Returns `Ok(true)` when no
 /// blocking problem was found.
 pub fn run(args: &CheckArgs) -> Result<bool> {
-    let source = config_source(args);
     let path = args.config.clone().or_else(Config::env_config_path);
+    let source = if args.config.is_some() {
+        "file"
+    } else if path.is_some() {
+        "env"
+    } else {
+        "defaults"
+    };
 
-    let report = match load_config(args) {
+    let report = match load_config(path.as_deref()) {
         Ok(config) => evaluate(&config, source, path),
         Err(error) => CheckReport::config_failure(source, path, format!("{error:#}")),
     };
@@ -105,20 +111,10 @@ Exit status: 0 = no blocking problem, 1 = failed check, 2 = usage error.",
     );
 }
 
-fn config_source(args: &CheckArgs) -> &'static str {
-    if args.config.is_some() {
-        "file"
-    } else if Config::env_config_path().is_some() {
-        "env"
-    } else {
-        "defaults"
-    }
-}
-
-/// Loads validation-identical config. Explicit `--config` replaces (rather
+/// Loads validation-identical config. An explicit `--config` replaces (rather
 /// than layers on top of) the environment-selected file.
-fn load_config(args: &CheckArgs) -> Result<Config> {
-    match &args.config {
+fn load_config(path: Option<&Path>) -> Result<Config> {
+    match path {
         Some(path) => Config::from_file(path)
             .with_context(|| format!("failed to load config file {}", path.display())),
         None => Config::from_env().context("failed to load configuration"),
@@ -179,6 +175,21 @@ struct DatabaseCheck {
     search: Option<SearchIndexStatus>,
 }
 
+impl DatabaseCheck {
+    /// Report entry for a path that was not inspected.
+    fn empty(path: String, state: &'static str, binary_version: &'static str) -> Self {
+        Self {
+            path,
+            state,
+            applied_version: None,
+            binary_version,
+            applied: Vec::new(),
+            pending: Vec::new(),
+            search: None,
+        }
+    }
+}
+
 /// Stable report emitted by [`run`].
 #[derive(Debug, Serialize)]
 struct CheckReport {
@@ -218,39 +229,26 @@ fn evaluate(config: &Config, source: &'static str, path: Option<PathBuf>) -> Che
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
-    let effective_config = match config.dump_json() {
-        Ok(dump) => serde_json::from_str(&dump).ok(),
-        Err(error) => {
-            errors.push(format!(
-                "cannot serialize effective configuration: {error:#}"
-            ));
-            None
-        }
-    };
+    let effective_config = Some(config.dump_value());
 
-    let tls = match &config.tls {
-        None => MaterialCheck::not_configured(),
-        Some(tls) => match validate_tls_material(tls) {
-            Ok(()) => MaterialCheck::valid(),
-            Err(error) => {
-                let message = format!("TLS material is invalid: {error}");
-                errors.push(message.clone());
-                MaterialCheck::invalid(message)
-            }
-        },
-    };
+    let tls = material_check(
+        "TLS material",
+        config
+            .tls
+            .as_ref()
+            .map(|tls| validate_tls_material(tls).map_err(|error| error.to_string())),
+        &mut errors,
+    );
 
-    let auth = match &config.auth {
-        None => MaterialCheck::not_configured(),
-        Some(auth) => match TokenFileVault::open(&auth.token_file) {
-            Ok(_) => MaterialCheck::valid(),
-            Err(error) => {
-                let message = format!("bearer-token file is invalid: {error}");
-                errors.push(message.clone());
-                MaterialCheck::invalid(message)
-            }
-        },
-    };
+    let auth = material_check(
+        "bearer-token file",
+        config.auth.as_ref().map(|auth| {
+            TokenFileVault::open(&auth.token_file)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }),
+        &mut errors,
+    );
 
     let database = check_database(
         &config.sqlite_path,
@@ -272,6 +270,23 @@ fn evaluate(config: &Config, source: &'static str, path: Option<PathBuf>) -> Che
     }
 }
 
+/// Turns an optional material check into a report entry and records failures.
+fn material_check(
+    label: &str,
+    result: Option<Result<(), String>>,
+    errors: &mut Vec<String>,
+) -> MaterialCheck {
+    match result {
+        None => MaterialCheck::not_configured(),
+        Some(Ok(())) => MaterialCheck::valid(),
+        Some(Err(error)) => {
+            let message = format!("{label} is invalid: {error}");
+            errors.push(message.clone());
+            MaterialCheck::invalid(message)
+        }
+    }
+}
+
 /// Inspects the configured database path without opening it read-write.
 fn check_database(
     path: &Path,
@@ -283,15 +298,7 @@ fn check_database(
     let display = path.display().to_string();
 
     if is_memory_path(path) {
-        return DatabaseCheck {
-            path: display,
-            state: "in_memory",
-            applied_version: None,
-            binary_version,
-            applied: Vec::new(),
-            pending: Vec::new(),
-            search: None,
-        };
+        return DatabaseCheck::empty(display, "in_memory", binary_version);
     }
 
     check_parent_directory(path, warnings);
@@ -300,15 +307,7 @@ fn check_database(
         warnings.push(format!(
             "database {display} does not exist yet; the server will create it"
         ));
-        return DatabaseCheck {
-            path: display,
-            state: "missing",
-            applied_version: None,
-            binary_version,
-            applied: Vec::new(),
-            pending: Vec::new(),
-            search: None,
-        };
+        return DatabaseCheck::empty(display, "missing", binary_version);
     }
 
     let conn = match backup::open_immutable(path) {
@@ -320,15 +319,7 @@ fn check_database(
                 "error"
             };
             errors.push(format!("cannot open database {display}: {error}"));
-            return DatabaseCheck {
-                path: display,
-                state,
-                applied_version: None,
-                binary_version,
-                applied: Vec::new(),
-                pending: Vec::new(),
-                search: None,
-            };
+            return DatabaseCheck::empty(display, state, binary_version);
         }
     };
 
@@ -341,15 +332,7 @@ fn check_database(
                 "error"
             };
             errors.push(format!("cannot inspect database {display}: {error}"));
-            return DatabaseCheck {
-                path: display,
-                state,
-                applied_version: None,
-                binary_version,
-                applied: Vec::new(),
-                pending: Vec::new(),
-                search: None,
-            };
+            return DatabaseCheck::empty(display, state, binary_version);
         }
     };
 
@@ -403,11 +386,9 @@ fn check_database(
     }
 
     if status.newer_than_binary {
-        errors.push(format!(
-            "database schema version {} is newer than the newest supported version {}; \
-             upgrade this binary before opening it",
+        errors.push(otel_sqlite_storage::version_too_new_message(
             base.applied_version.as_deref().unwrap_or("(unknown)"),
-            status.latest_known
+            status.latest_known,
         ));
         return DatabaseCheck {
             state: "newer",

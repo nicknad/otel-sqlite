@@ -1354,7 +1354,7 @@ fn tls_material_preflight_accepts_a_valid_identity() {
 }
 
 #[test]
-fn tls_material_preflight_rejects_garbage_pem_without_binding() {
+fn tls_material_preflight_rejects_garbage_pem() {
     let pki = Pki::generate();
     pki.write("garbage.pem", "this is not a certificate");
 

@@ -97,9 +97,10 @@ impl std::error::Error for CommitLedgerClosed {}
 
 #[derive(Debug)]
 struct Inner {
-    /// Completed-or-voided tickets above `committed_through`, awaiting their
-    /// predecessors so the contiguous watermark can advance. Small in
-    /// practice: entries leave as soon as the missing predecessor arrives.
+    /// Completed, voided, or failed tickets above `committed_through`,
+    /// awaiting their predecessors so the contiguous watermark can advance.
+    /// Small in practice: entries leave as soon as the missing predecessor
+    /// arrives.
     settled_above: BTreeSet<u64>,
     committed_through: u64,
     /// Records already durable (or quarantined) for tickets that are not

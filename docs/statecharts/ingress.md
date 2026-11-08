@@ -168,19 +168,3 @@ The notable paths all end in an honest response:
 - Enqueue-mode commits after the acknowledgement are not modeled; the
   response has already been sent. Commits during sending are modeled so the
   durable-ack rules can be checked.
-
-## Reproduce
-
-The spec, config, view, and checked run are in
-`/tmp/opencode/statechart-ingress` (`Ingress.tla`, `Ingress.cfg`, `view.ts`,
-`OUT-new2/`). Use a new `--out` folder:
-
-```sh
-cd /tmp/opencode/statechart-ingress
-TLA2TOOLS=/tmp/opencode/tla2tools.jar JAVA=/usr/bin/java \
-  node /home/nnadolski/projects/otel-sqlite/.agents/skills/statechart/scripts/statechart.ts \
-  Ingress.tla --config Ingress.cfg --view view.ts --out out-reproduce
-```
-
-`out-reproduce` must not exist or must be empty. The command exits 0 because
-every rule holds.
