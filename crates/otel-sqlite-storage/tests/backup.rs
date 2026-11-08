@@ -13,7 +13,7 @@ use crossbeam_channel::unbounded;
 use otel_sqlite_core::model::{Attribute, LogRecord, LogScope, Resource, Severity};
 use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, LogChunk};
 use otel_sqlite_storage::backup::{self, BackupError};
-use otel_sqlite_storage::{Storage, StorageConfig};
+use otel_sqlite_storage::{FtsMode, SearchStatus, Storage, StorageConfig};
 
 fn sample_message() -> IngestMessage {
     IngestMessage::Logs(LogChunk {
@@ -92,6 +92,9 @@ fn backup_matches_source_and_restores_into_a_clean_directory() {
     let source = backup::verify(&db).unwrap();
     assert_eq!(source.integrity, "ok");
     assert_eq!(source.row_counts.log_events, 4);
+    let search = source.search.expect("current database has search state");
+    assert_eq!(search.mode, FtsMode::Body);
+    assert_eq!(search.status, SearchStatus::Ready);
 
     // Online backup while nothing else holds a write lock — the read-only
     // source is the same code path the CLI uses against a live server.

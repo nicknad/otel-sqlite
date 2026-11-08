@@ -203,6 +203,9 @@ fn check_warns_when_the_search_index_is_rebuilding_or_mode_mismatched() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report = json(&output);
+    assert_eq!(report["database"]["search"]["mode"], "body");
+    assert_eq!(report["database"]["search"]["status"], "rebuilding");
+    assert_eq!(report["database"]["search"]["indexed_through"], 0);
     let warnings = report["warnings"].as_array().expect("warnings array");
     let text = warnings
         .iter()

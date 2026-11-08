@@ -49,15 +49,21 @@ CREATE VIRTUAL TABLE logs_fts USING fts5(
     contentless_delete = 1
 );";
 
-const BODY_TRIGGERS: &str = "
-CREATE TRIGGER logs_fts_ai AFTER INSERT ON log_event BEGIN
+const BODY_TRIGGERS: &[(&str, &str)] = &[
+    (
+        "logs_fts_ai",
+        "CREATE TRIGGER logs_fts_ai AFTER INSERT ON log_event BEGIN
     INSERT INTO logs_fts (rowid, body)
     VALUES (new.id, COALESCE(new.body, ''));
-END;
-
-CREATE TRIGGER logs_fts_ad AFTER DELETE ON log_event BEGIN
+END;",
+    ),
+    (
+        "logs_fts_ad",
+        "CREATE TRIGGER logs_fts_ad AFTER DELETE ON log_event BEGIN
     DELETE FROM logs_fts WHERE rowid = old.id;
-END;";
+END;",
+    ),
+];
 
 const FULL_TABLE: &str = "
 CREATE VIRTUAL TABLE logs_fts USING fts5(
@@ -74,8 +80,10 @@ CREATE VIRTUAL TABLE logs_fts USING fts5(
     contentless_delete = 1
 );";
 
-const FULL_TRIGGERS: &str = "
-CREATE TRIGGER logs_fts_ai AFTER INSERT ON log_event BEGIN
+const FULL_TRIGGERS: &[(&str, &str)] = &[
+    (
+        "logs_fts_ai",
+        "CREATE TRIGGER logs_fts_ai AFTER INSERT ON log_event BEGIN
     INSERT INTO logs_fts (rowid, body, service_name, host_name, severity_text, event_name, scope_name)
     SELECT
         new.id,
@@ -87,11 +95,15 @@ CREATE TRIGGER logs_fts_ai AFTER INSERT ON log_event BEGIN
         COALESCE(new.scope_name, '')
     FROM log_resource AS lr
     WHERE lr.id = new.resource_id;
-END;
-
-CREATE TRIGGER logs_fts_ad AFTER DELETE ON log_event BEGIN
+END;",
+    ),
+    (
+        "logs_fts_ad",
+        "CREATE TRIGGER logs_fts_ad AFTER DELETE ON log_event BEGIN
     DELETE FROM logs_fts WHERE rowid = old.id;
-END;";
+END;",
+    ),
+];
 
 const DROP_INDEX: &str = "
 DROP TRIGGER IF EXISTS logs_fts_ai;
@@ -171,7 +183,7 @@ pub enum SearchStatus {
 }
 
 impl SearchStatus {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ready => "ready",
             Self::Rebuilding => "rebuilding",
@@ -240,13 +252,17 @@ fn table_ddl(mode: FtsMode) -> &'static str {
     }
 }
 
-fn trigger_ddl(mode: FtsMode) -> &'static str {
+fn trigger_ddl(mode: FtsMode) -> &'static [(&'static str, &'static str)] {
     match mode {
-        FtsMode::Off => "",
+        FtsMode::Off => &[],
         FtsMode::Body => BODY_TRIGGERS,
         FtsMode::Full => FULL_TRIGGERS,
     }
 }
+
+/// Names of the triggers this module owns. Foreign triggers with a similar
+/// name are ignored so a hand-added trigger cannot force a rebuild every boot.
+const OWNED_TRIGGERS: [&str; 2] = ["logs_fts_ai", "logs_fts_ad"];
 
 /// Reads the installed state without mutating the database.
 pub fn inspect_search_index(conn: &Connection) -> Result<Option<SearchIndexStatus>, StorageError> {
@@ -284,29 +300,55 @@ fn read_state(conn: &Connection) -> Result<Option<InstalledIndex>, StorageError>
 }
 
 /// Whether the physical index objects match `mode`.
+///
+/// Compares the stored table and trigger SQL rather than counting names, so a
+/// hand-added `logs_fts_*` trigger cannot force a drop/recreate on every boot,
+/// and option drift (tokenizer, `contentless_delete`) is detected.
 fn objects_match(conn: &Connection, mode: FtsMode) -> Result<bool, StorageError> {
-    if !crate::migration::table_exists(conn, "logs_fts")? {
+    let Some(table_sql) = object_sql(conn, "logs_fts")? else {
+        return Ok(false);
+    };
+    if normalize_ddl(&table_sql) != normalize_ddl(table_ddl(mode)) {
         return Ok(false);
     }
-    let mut statement = conn.prepare("PRAGMA table_info(logs_fts)")?;
-    let columns: Vec<String> = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<_, _>>()?;
-    if !columns
-        .iter()
-        .map(String::as_str)
-        .eq(mode.columns().iter().copied())
-    {
-        return Ok(false);
+    for &(name, expected) in trigger_ddl(mode) {
+        let Some(actual) = object_sql(conn, name)? else {
+            return Ok(false);
+        };
+        if normalize_ddl(&actual) != normalize_ddl(expected) {
+            return Ok(false);
+        }
     }
-    let triggers: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master
-          WHERE type = 'trigger' AND name LIKE 'logs_fts%'",
-        [],
-        |row| row.get(0),
-    )?;
-    let expected = if mode.enabled() { 2 } else { 0 };
-    Ok(triggers == expected)
+    if !mode.enabled() {
+        for name in OWNED_TRIGGERS {
+            if object_sql(conn, name)?.is_some() {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Stored `sqlite_master.sql` for one table or trigger.
+fn object_sql(conn: &Connection, name: &str) -> Result<Option<String>, StorageError> {
+    Ok(conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+              WHERE name = ?1 AND type IN ('table', 'trigger')",
+            [name],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Normalizes DDL for comparison: SQLite strips `IF NOT EXISTS` and the
+/// trailing semicolon, and formatting is irrelevant to the installed shape.
+fn normalize_ddl(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<String>()
+        .trim_end_matches(';')
+        .to_ascii_lowercase()
 }
 
 /// Installs `mode` in one transaction. DDL only; never scans `log_event`
@@ -315,8 +357,8 @@ fn install(conn: &mut Connection, mode: FtsMode) -> Result<InstalledIndex, Stora
     let tx = conn.transaction()?;
     tx.execute_batch(DROP_INDEX)?;
     tx.execute_batch(table_ddl(mode))?;
-    if mode.enabled() {
-        tx.execute_batch(trigger_ddl(mode))?;
+    for &(_, sql) in trigger_ddl(mode) {
+        tx.execute_batch(sql)?;
     }
     tx.execute_batch(STATE_TABLE)?;
 
@@ -513,14 +555,125 @@ mod tests {
         assert!(!FtsMode::Off.enabled());
     }
 
+    fn migrated_connection(dir: &std::path::Path, name: &str) -> Connection {
+        use otel_sqlite_core::storage::SyncMode;
+        let mut conn = crate::sqlite::open(&dir.join(name), SyncMode::default()).expect("open");
+        crate::migration::migrate(&mut conn).expect("migrate");
+        conn
+    }
+
+    #[test]
+    fn foreign_trigger_does_not_force_a_reinstall() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut conn = migrated_connection(dir.path(), "foreign.db");
+        install(&mut conn, FtsMode::Body).expect("install body");
+        conn.execute_batch(
+            "CREATE TRIGGER logs_fts_extra AFTER INSERT ON log_event BEGIN SELECT 1; END;",
+        )
+        .expect("create foreign trigger");
+
+        assert!(
+            objects_match(&conn, FtsMode::Body).expect("match shape"),
+            "an unrelated logs_fts_* trigger must not force a rebuild on every boot"
+        );
+    }
+
+    #[test]
+    fn owned_trigger_and_table_drift_is_detected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut conn = migrated_connection(dir.path(), "drift.db");
+        install(&mut conn, FtsMode::Body).expect("install body");
+
+        conn.execute_batch("DROP TRIGGER logs_fts_ad")
+            .expect("drop delete trigger");
+        assert!(
+            !objects_match(&conn, FtsMode::Body).expect("match shape"),
+            "a missing owned trigger must be repaired"
+        );
+
+        install(&mut conn, FtsMode::Body).expect("reinstall body");
+        conn.execute_batch(
+            "DROP TRIGGER logs_fts_ai;
+             DROP TRIGGER logs_fts_ad;
+             DROP TABLE logs_fts;
+             CREATE VIRTUAL TABLE logs_fts USING fts5(
+                 body,
+                 tokenize = 'porter',
+                 content = '',
+                 contentless_delete = 1
+             );",
+        )
+        .expect("drift table options");
+        assert!(
+            !objects_match(&conn, FtsMode::Body).expect("match shape"),
+            "tokenizer drift must be detected even when the columns match"
+        );
+    }
+
     #[test]
     fn mode_columns_match_the_ddl() {
         for mode in [FtsMode::Off, FtsMode::Body, FtsMode::Full] {
-            let ddl = format!("{}{}", table_ddl(mode), trigger_ddl(mode));
+            let mut ddl = table_ddl(mode).to_owned();
+            for &(_, sql) in trigger_ddl(mode) {
+                ddl.push_str(sql);
+            }
             for column in mode.columns() {
                 assert!(ddl.contains(column), "{mode:?} DDL must contain `{column}`");
             }
         }
-        assert_eq!(trigger_ddl(FtsMode::Off), "");
+        assert_eq!(trigger_ddl(FtsMode::Off).len(), 0);
+    }
+
+    fn search_shape(conn: &Connection) -> Vec<(String, String)> {
+        ["logs_fts", "logs_fts_ai", "logs_fts_ad"]
+            .into_iter()
+            .map(|name| {
+                let sql = object_sql(conn, name)
+                    .expect("read schema")
+                    .unwrap_or_default();
+                (name.to_owned(), normalize_ddl(&sql))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn migration_and_runtime_search_ddl_do_not_drift() {
+        use otel_sqlite_core::storage::SyncMode;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let fresh_path = dir.path().join("fresh.db");
+        let mut fresh = crate::sqlite::open(&fresh_path, SyncMode::default()).expect("open");
+        crate::migration::migrate(&mut fresh).expect("migrate fresh");
+        assert!(
+            objects_match(&fresh, FtsMode::Body).expect("match fresh shape"),
+            "the fresh baseline must already match the installed body shape"
+        );
+        let fresh_shape = search_shape(&fresh);
+
+        let upgraded_path = dir.path().join("upgraded.db");
+        let mut upgraded = crate::sqlite::open(&upgraded_path, SyncMode::default()).expect("open");
+        crate::migration::migrate_up_to(&mut upgraded, "005").expect("build 005");
+        crate::migration::migrate(&mut upgraded).expect("apply 006");
+        assert!(
+            objects_match(&upgraded, FtsMode::Body).expect("match upgraded shape"),
+            "the 006 upgrade must not force a reconcile rewrite on the next boot"
+        );
+        assert_eq!(
+            search_shape(&upgraded),
+            fresh_shape,
+            "the 006 upgrade must install the same search DDL as the fresh baseline"
+        );
+
+        let recreated_path = dir.path().join("recreated.db");
+        let mut recreated =
+            crate::sqlite::open(&recreated_path, SyncMode::default()).expect("open");
+        crate::migration::migrate(&mut recreated).expect("migrate");
+        install(&mut recreated, FtsMode::Body).expect("install body");
+        assert_eq!(
+            search_shape(&recreated),
+            fresh_shape,
+            "search.rs must install the same search DDL as the migration baseline"
+        );
     }
 }

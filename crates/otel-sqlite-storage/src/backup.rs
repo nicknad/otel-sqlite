@@ -43,6 +43,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::search::{SearchIndexStatus, inspect_search_index};
+
 /// Magic bytes identifying an otel-sqlite encrypted backup file.
 pub const BACKUP_FILE_MAGIC: &[u8; 8] = b"OTSQBAK1";
 /// Legacy whole-file format version (kept for `decrypt_to` compatibility).
@@ -124,6 +126,10 @@ pub struct VerifyReport {
     /// Canonical-table row counts; all zero when [`VerifyReport::is_otel_schema`]
     /// is false.
     pub row_counts: RowCounts,
+    /// Installed log search index state, when the database has one. `None`
+    /// means the derived index is absent (pre-006 schema or non-otel file);
+    /// `fts_rows` alone cannot distinguish disabled, empty and rebuilding.
+    pub search: Option<SearchIndexStatus>,
     /// SHA-256 of the file bytes as they sit on disk.
     pub sha256: String,
 }
@@ -296,6 +302,9 @@ pub fn verify(db_path: &Path) -> Result<VerifyReport, BackupError> {
 
     let counts = row_counts(&conn)?;
     let is_otel_schema = counts.is_some();
+    let search = inspect_search_index(&conn).map_err(|error| {
+        BackupError::CorruptBackup(format!("unreadable search index state: {error}"))
+    })?;
     drop(conn);
 
     Ok(VerifyReport {
@@ -306,6 +315,7 @@ pub fn verify(db_path: &Path) -> Result<VerifyReport, BackupError> {
         schema_version,
         is_otel_schema,
         row_counts: counts.unwrap_or_default(),
+        search,
         sha256: sha256_hex(db_path)?,
     })
 }

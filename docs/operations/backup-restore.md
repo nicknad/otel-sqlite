@@ -62,9 +62,9 @@ Platform guides: [systemd](backup-systemd.md),
 ## 5. Integrity, encryption, access
 
 `verify` checks `integrity_check`, `foreign_key_check`, row counts
-(`log_event`, `log_resource`, `logs_fts`), schema stamp, SHA-256. For
-encrypted backups the hash covers the `.otsb` as stored; row/integrity
-fields describe decrypted contents.
+(`log_event`, `log_resource`, `logs_fts`), the installed search-index
+mode/status, schema stamp, SHA-256. For encrypted backups the hash covers the
+`.otsb` as stored; row/integrity fields describe decrypted contents.
 
 Encryption: optional AES-256-GCM. `openssl rand -out /keys/backup.key 32`
 (`0600`, outside data dir); pass `--key-file` to `backup` + `restore`.

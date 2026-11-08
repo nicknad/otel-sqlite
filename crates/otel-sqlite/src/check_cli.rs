@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use otel_sqlite_ingress::{TokenFileVault, validate_tls_material};
 use otel_sqlite_storage::{
-    FtsMode, SearchStatus, backup, inspect_search_index, latest_schema_version,
+    FtsMode, SearchIndexStatus, SearchStatus, backup, inspect_search_index, latest_schema_version,
 };
 use serde::Serialize;
 
@@ -174,6 +174,9 @@ struct DatabaseCheck {
     binary_version: &'static str,
     applied: Vec<String>,
     pending: Vec<&'static str>,
+    /// Installed log search index state, when the database has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search: Option<SearchIndexStatus>,
 }
 
 /// Stable report emitted by [`run`].
@@ -287,6 +290,7 @@ fn check_database(
             binary_version,
             applied: Vec::new(),
             pending: Vec::new(),
+            search: None,
         };
     }
 
@@ -303,6 +307,7 @@ fn check_database(
             binary_version,
             applied: Vec::new(),
             pending: Vec::new(),
+            search: None,
         };
     }
 
@@ -322,6 +327,7 @@ fn check_database(
                 binary_version,
                 applied: Vec::new(),
                 pending: Vec::new(),
+                search: None,
             };
         }
     };
@@ -342,17 +348,19 @@ fn check_database(
                 binary_version,
                 applied: Vec::new(),
                 pending: Vec::new(),
+                search: None,
             };
         }
     };
 
-    let base = DatabaseCheck {
+    let mut base = DatabaseCheck {
         path: display,
         state: "current",
         applied_version: status.applied.last().cloned(),
         binary_version,
         applied: status.applied,
         pending: status.pending,
+        search: None,
     };
 
     if !status.is_otel_schema {
@@ -366,29 +374,32 @@ fn check_database(
         };
     }
 
-    match inspect_search_index(&conn) {
-        Ok(Some(search)) => {
-            if search.status == SearchStatus::Rebuilding {
-                warnings.push(format!(
-                    "log search index is rebuilding (mode {}, indexed through row {}); \
-                     search results are partial until it completes",
-                    search.mode.as_str(),
-                    search.indexed_through
-                ));
-            }
-            if search.mode != configured_search {
-                warnings.push(format!(
-                    "configured search mode `{}` differs from the installed `{}`; \
-                     startup will rebuild the log search index",
-                    configured_search.as_str(),
-                    search.mode.as_str()
-                ));
-            }
+    base.search = match inspect_search_index(&conn) {
+        Ok(search) => search,
+        Err(error) => {
+            warnings.push(format!(
+                "cannot inspect the log search index state: {error}"
+            ));
+            None
         }
-        Ok(None) => {}
-        Err(error) => warnings.push(format!(
-            "cannot inspect the log search index state: {error}"
-        )),
+    };
+    if let Some(search) = &base.search {
+        if search.status == SearchStatus::Rebuilding {
+            warnings.push(format!(
+                "log search index is rebuilding (mode {}, indexed through row {}); \
+                 search results are partial until it completes",
+                search.mode.as_str(),
+                search.indexed_through
+            ));
+        }
+        if search.mode != configured_search {
+            warnings.push(format!(
+                "configured search mode `{}` differs from the installed `{}`; \
+                 startup will drop and recreate the index, then rebuild it in the background",
+                configured_search.as_str(),
+                search.mode.as_str()
+            ));
+        }
     }
 
     if status.newer_than_binary {

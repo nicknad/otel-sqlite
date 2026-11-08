@@ -266,6 +266,14 @@ fn print_backup_summary(report: &BackupReport) {
         report.verify.row_counts.log_resources,
         report.verify.row_counts.fts_rows,
     );
+    if let Some(search) = &report.verify.search {
+        println!(
+            "  search:      mode={} status={} indexed_through={}",
+            search.mode.as_str(),
+            search.status.as_str(),
+            search.indexed_through
+        );
+    }
 }
 
 /// Runs `restore`: install a (possibly encrypted) backup into a clean
@@ -370,6 +378,14 @@ fn print_verify_summary(report: &VerifyReport) {
         "  rows:        log_events={} log_resources={} fts={}",
         report.row_counts.log_events, report.row_counts.log_resources, report.row_counts.fts_rows,
     );
+    if let Some(search) = &report.search {
+        println!(
+            "  search:      mode={} status={} indexed_through={}",
+            search.mode.as_str(),
+            search.status.as_str(),
+            search.indexed_through
+        );
+    }
     println!("  sha256:      {}", report.sha256);
 }
 
