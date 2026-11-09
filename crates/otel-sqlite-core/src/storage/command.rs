@@ -264,9 +264,9 @@ impl MaintenanceOperation {
             Self::Vacuum
                 | Self::RebuildFts
                 | Self::Prune(_)
-                | Self::Checkpoint(CheckpointMode::Full)
-                | Self::Checkpoint(CheckpointMode::Restart)
-                | Self::Checkpoint(CheckpointMode::Truncate)
+                | Self::Checkpoint(
+                    CheckpointMode::Full | CheckpointMode::Restart | CheckpointMode::Truncate
+                )
         )
     }
 }
