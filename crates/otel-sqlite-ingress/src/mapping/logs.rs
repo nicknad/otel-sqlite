@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use otel_sqlite_core::model::{AttributeValue, LogRecord, LogScope, Severity};
-use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, LogChunk};
+use otel_sqlite_core::storage::{BatchOrigin, LogChunk};
 
 use crate::error::IngressError;
 
@@ -18,7 +18,9 @@ use crate::config::IngressConfig;
 /// ingest chunk.
 ///
 /// `commit_seq` is left at zero: the enqueue path stamps the durability ticket
-/// when the chunk is admitted to the queue.
+/// when the chunk is admitted to the queue. This combined-group form is kept
+/// for direct callers and benchmarks; the export path emits one chunk per
+/// non-empty `ScopeLogs` group through [`map_chunks`].
 ///
 /// Mapping only fails for shape/byte/depth bounds that would otherwise
 /// exhaust memory or CPU. Present-but-invalid trace/span ids carry no trace
@@ -46,48 +48,12 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogChunk, IngressError> 
         });
     }
 
-    let mut records = Vec::with_capacity(capacity);
-
     let resource = resource
         .map(|resource| convert_resource(resource, schema_url.clone()))
         .transpose()?;
-
+    let mut records = Vec::with_capacity(capacity);
     for scope in scope_logs {
-        let ScopeLogs {
-            scope,
-            log_records,
-            schema_url: scope_schema_url,
-        } = scope;
-        // Record-less groups are dropped by `map_chunks`, so their scope
-        // metadata can never reach storage. Check that before extracting the
-        // scope fields: materializing the metadata and rendering its canonical
-        // JSON would be work with no possible consumer.
-        if log_records.is_empty() {
-            continue;
-        }
-        let (scope_name, scope_version, scope_attributes) = scope
-            .map(
-                |InstrumentationScope {
-                     name,
-                     version,
-                     attributes,
-                     ..
-                 }| (name, version, attributes),
-            )
-            .unwrap_or_default();
-        let scope_attributes = attributes(scope_attributes)?;
-        // One shared scope per `ScopeLogs` group: every record references the
-        // same allocation and reuses the canonical attributes JSON rendered
-        // here instead of cloning/serializing per record.
-        let scope = Arc::new(LogScope::new(
-            scope_name,
-            scope_version,
-            scope_attributes,
-            scope_schema_url,
-        ));
-        for record in log_records {
-            records.push(convert_record(record, &scope)?);
-        }
+        records.extend(convert_scope_records(scope)?);
     }
 
     Ok(LogChunk {
@@ -100,8 +66,8 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogChunk, IngressError> 
     })
 }
 
-/// Maps an OTLP export request into mapped log chunks, one per
-/// `ResourceLogs` group.
+/// Maps an OTLP export request into mapped log chunks, one per non-empty
+/// `ScopeLogs` group.
 ///
 /// This is deliberately *not* a batching step: the OTLP batch boundaries are a
 /// transport concern. Each chunk is handed to the storage-owned insert
@@ -109,20 +75,76 @@ pub fn try_convert_batch(value: ResourceLogs) -> Result<LogChunk, IngressError> 
 /// chunks by ownership transfer without cloning. Mapping is fallible only for
 /// shape/byte/depth bounds; invalid trace/span ids are zeroed and counted, not
 /// a request failure.
-pub(crate) fn map_chunks(
-    resource_logs: Vec<ResourceLogs>,
-) -> Result<Vec<IngestMessage>, IngressError> {
-    // Groups may be empty and are dropped below, so allocate on the first
-    // emitted chunk instead of reserving for groups that cannot produce one.
+pub(crate) fn map_chunks(resource_logs: Vec<ResourceLogs>) -> Result<Vec<LogChunk>, IngressError> {
     let mut chunks = Vec::new();
     for item in resource_logs {
-        let chunk = try_convert_batch(item)?;
-        if chunk.records.is_empty() {
+        let ResourceLogs {
+            resource,
+            scope_logs,
+            schema_url,
+        } = item;
+        // A group with no records at all is discarded without converting its
+        // resource metadata.
+        if !scope_logs.iter().any(|scope| !scope.log_records.is_empty()) {
             continue;
         }
-        chunks.push(IngestMessage::Logs(chunk));
+        let resource = resource
+            .map(|resource| convert_resource(resource, schema_url.clone()))
+            .transpose()?;
+        for scope in scope_logs {
+            if scope.log_records.is_empty() {
+                continue;
+            }
+            chunks.push(LogChunk {
+                origin: BatchOrigin {
+                    resource: resource.clone(),
+                    schema_url: schema_url.clone(),
+                },
+                records: convert_scope_records(scope)?,
+                commit_seq: 0,
+            });
+        }
     }
     Ok(chunks)
+}
+
+/// Converts one non-empty `ScopeLogs` group's records, sharing one rendered
+/// `LogScope` across them.
+fn convert_scope_records(scope: ScopeLogs) -> Result<Vec<LogRecord>, IngressError> {
+    let ScopeLogs {
+        scope,
+        log_records,
+        schema_url: scope_schema_url,
+    } = scope;
+    // Record-less groups are dropped by map_chunks, so their scope metadata
+    // can never reach storage. Skip conversion before rendering its JSON.
+    if log_records.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (scope_name, scope_version, scope_attributes) = scope
+        .map(
+            |InstrumentationScope {
+                 name,
+                 version,
+                 attributes,
+                 ..
+             }| (name, version, attributes),
+        )
+        .unwrap_or_default();
+    let scope_attributes = attributes(scope_attributes)?;
+    // One shared scope per `ScopeLogs` group: every record references the
+    // same allocation and reuses the canonical attributes JSON rendered here.
+    let scope = Arc::new(LogScope::new(
+        scope_name,
+        scope_version,
+        scope_attributes,
+        scope_schema_url,
+    ));
+    let mut records = Vec::with_capacity(log_records.len());
+    for record in log_records {
+        records.push(convert_record(record, &scope)?);
+    }
+    Ok(records)
 }
 
 fn convert_record(value: ProtoLogRecord, scope: &Arc<LogScope>) -> Result<LogRecord, IngressError> {
@@ -255,6 +277,14 @@ fn body_value(value: super::AnyValue) -> Result<(String, Option<String>), Ingres
     }
 }
 
+/// The request's total record count and the number of chunks mapping will
+/// emit (one per non-empty `ScopeLogs` group).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RequestShape {
+    pub records: usize,
+    pub chunks: usize,
+}
+
 /// Pre-mapping size guard (H2): walks the borrowed request without allocating
 /// model values and rejects hostile shapes with `INVALID_ARGUMENT` *before*
 /// the blocking mapping task runs.
@@ -265,16 +295,17 @@ fn body_value(value: super::AnyValue) -> Result<(String, Option<String>), Ingres
 /// cannot overflow the worker stack). Trace/span id *validity* stays in
 /// `try_convert_batch`; this only bounds allocation/CPU.
 ///
-/// Also returns the request's total record count, so the caller does not need
-/// a separate pass just to know how much work it represents. The record cap is
-/// checked as each scope is reached, before its records are validated: a
-/// request that cannot be admitted stops early instead of paying for
-/// validation it will throw away.
+/// Also returns the request shape, so the caller can reject a request that
+/// maps to more chunks than the queue can ever hold before paying to map it.
+/// The record cap is checked as each scope is reached, before its records are
+/// validated: a request that cannot be admitted stops early instead of paying
+/// for validation it will throw away.
 pub(crate) fn validate_request(
     resource_logs: &[ResourceLogs],
     limits: &IngressConfig,
-) -> Result<usize, IngressError> {
+) -> Result<RequestShape, IngressError> {
     let mut total = 0usize;
+    let mut chunks = 0usize;
     for group in resource_logs {
         check_plain_string(&group.schema_url, limits, "resource.schema_url")?;
         check_attributes(
@@ -304,6 +335,7 @@ pub(crate) fn validate_request(
             // amplified. Skip the metadata walk entirely instead of computing
             // a size that can never exceed the expansion budget.
             if !scope.log_records.is_empty() {
+                chunks = chunks.saturating_add(1);
                 check_scope_expansion(
                     scope_metadata_bytes(scope_view, &scope.schema_url),
                     scope.log_records.len(),
@@ -321,7 +353,10 @@ pub(crate) fn validate_request(
             }
         }
     }
-    Ok(total)
+    Ok(RequestShape {
+        records: total,
+        chunks,
+    })
 }
 
 fn check_body(body: Option<&AnyValue>, limits: &IngressConfig) -> Result<(), IngressError> {
@@ -562,9 +597,7 @@ mod tests {
                 ..Default::default()
             };
             let chunks = map_chunks(vec![proto]).expect("an invalid id must not fail the request");
-            let IngestMessage::Logs(chunk) = &chunks[0] else {
-                panic!("expected logs chunk");
-            };
+            let chunk = &chunks[0];
             (chunk.records[0].trace_id, chunk.records[0].span_id)
         };
 
@@ -612,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_one_chunk_per_resource_logs_group_without_batching_policy() {
+    fn maps_one_chunk_per_non_empty_scope_without_batching_policy() {
         let shared = || ResourceLogs {
             resource: sample_resource(),
             schema_url: "https://example.test/schemas/logs".to_owned(),
@@ -633,35 +666,39 @@ mod tests {
 
         let chunks = map_chunks(vec![shared(), shared(), other]).expect("valid request");
 
-        // One chunk per OTLP group, in order; grouping/splitting is the
+        // One chunk per OTLP scope group, in order; grouping/splitting is the
         // storage insert batcher's job, not ingress's.
         assert_eq!(chunks.len(), 3);
-        for command in &chunks {
-            match command {
-                IngestMessage::Logs(chunk) => assert_eq!(chunk.records.len(), 1),
-                IngestMessage::Flush => panic!("expected insert logs chunk"),
-            }
+        for chunk in &chunks {
+            assert_eq!(chunk.records.len(), 1);
         }
-        let IngestMessage::Logs(first) = &chunks[0] else {
-            panic!("expected logs chunk");
-        };
+        let first = &chunks[0];
         assert!(first.origin.resource.is_some());
         assert_eq!(first.origin.schema_url, "https://example.test/schemas/logs");
 
-        let oversized = ResourceLogs {
-            scope_logs: vec![ScopeLogs {
-                log_records: (0..5).map(|_| sample_record()).collect(),
-                ..Default::default()
-            }],
+        let multi_scope = ResourceLogs {
+            scope_logs: vec![
+                ScopeLogs {
+                    log_records: vec![sample_record()],
+                    ..Default::default()
+                },
+                ScopeLogs::default(),
+                ScopeLogs {
+                    log_records: (0..4).map(|_| sample_record()).collect(),
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         };
 
-        let chunks = map_chunks(vec![oversized]).expect("valid request");
-        assert_eq!(chunks.len(), 1);
-        match &chunks[0] {
-            IngestMessage::Logs(chunk) => assert_eq!(chunk.records.len(), 5),
-            IngestMessage::Flush => panic!("expected insert logs chunk"),
-        }
+        let chunks = map_chunks(vec![multi_scope]).expect("valid request");
+        assert_eq!(
+            chunks.len(),
+            2,
+            "empty scope groups produce no chunk, non-empty ones each produce one"
+        );
+        assert_eq!(chunks[0].records.len(), 1);
+        assert_eq!(chunks[1].records.len(), 4);
     }
 
     #[test]
@@ -751,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_returns_the_total_and_enforces_the_record_cap_in_one_pass() {
+    fn validate_returns_the_shape_and_enforces_the_record_cap_in_one_pass() {
         let proto = ResourceLogs {
             scope_logs: vec![
                 ScopeLogs {
@@ -769,7 +806,10 @@ mod tests {
         assert_eq!(
             validate_request(std::slice::from_ref(&proto), &IngressConfig::default())
                 .expect("bounded request"),
-            3
+            RequestShape {
+                records: 3,
+                chunks: 2,
+            }
         );
 
         let limits = IngressConfig {
@@ -778,6 +818,32 @@ mod tests {
         };
         let error = validate_request(&[proto], &limits).expect_err("3 records exceed the cap");
         assert!(error.to_string().contains("3 log records"), "{error}");
+    }
+
+    #[test]
+    fn validate_counts_only_non_empty_scope_chunks() {
+        let proto = ResourceLogs {
+            scope_logs: vec![
+                ScopeLogs {
+                    log_records: vec![sample_record()],
+                    ..Default::default()
+                },
+                ScopeLogs::default(),
+                ScopeLogs {
+                    log_records: vec![sample_record(), sample_record()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            validate_request(&[proto], &IngressConfig::default()).expect("bounded request"),
+            RequestShape {
+                records: 3,
+                chunks: 2,
+            }
+        );
     }
 
     #[test]

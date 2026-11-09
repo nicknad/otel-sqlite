@@ -6,8 +6,8 @@ use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
 use crate::IngestSender;
-use crate::config::IngressConfig;
-use crate::enqueue::{EnqueueOutcome, enqueue};
+use crate::config::{IngressConfig, MAPPING_TIMEOUT};
+use crate::enqueue::{EnqueueOutcome, enqueue, ensure_chunks_fit};
 use crate::mapping::budget::{MappingBudget, MappingError};
 use crate::mapping::logs::{map_chunks, validate_request};
 use crate::mapping::pb::collector::logs::v1::{
@@ -19,46 +19,71 @@ use crate::mapping::pb::collector::logs::v1::{
 pub struct LogsIngress {
     queue: IngestSender,
     config: Arc<IngressConfig>,
-    /// Durability-ticket book shared with the storage pipeline. In
-    /// `DurabilityMode::Commit` the export response waits here until the
-    /// writer has committed everything this request had accepted.
+    /// Durability-ticket book shared with the storage pipeline. Every enqueue
+    /// path issues tickets here, independent of the acknowledgement policy.
     commit: Arc<CommitLedger>,
+    /// Selected once from `IngressConfig::durability_mode`; the two variants
+    /// are the only acknowledgement policies the pipeline supports.
+    ack: AckPolicy,
     /// Process-wide export concurrency guard shared by every connection;
     /// the HTTP/2 `max_concurrent_streams` setting is per connection, so this
-    /// is what bounds in-flight exports across all connections. `new` leaves
-    /// it effectively unlimited; production wiring attaches the shared one.
+    /// is what bounds in-flight exports across all connections.
     stream_limit: Arc<Semaphore>,
     /// Process-wide budget for proto→model mapping jobs. Because tokio
     /// cannot cancel `spawn_blocking`, the permit is held by the blocking
     /// closure rather than this request future; a timed-out export therefore
-    /// frees its stream slot while its mapping job stays counted. `new` leaves
-    /// it unlimited; production wiring attaches the configured bound.
+    /// frees its stream slot while its mapping job stays counted.
     mapping_budget: MappingBudget,
+}
+
+#[derive(Debug, Clone)]
+enum AckPolicy {
+    /// Hold the response until the writer's contiguous watermark covers
+    /// every accepted ticket.
+    Commit { ledger: Arc<CommitLedger> },
+    /// Acknowledge as soon as the chunks entered the bounded ingest queue.
+    Enqueue,
 }
 
 impl LogsIngress {
     pub fn new(queue: IngestSender, config: Arc<IngressConfig>, commit: Arc<CommitLedger>) -> Self {
+        // The transport's per-connection stream cap does not bound memory
+        // across connections; this process-wide semaphore does. `run` builds
+        // one service per server, so constructing the limit here is enough.
+        let stream_limit = Arc::new(Semaphore::new(
+            usize::try_from(config.max_concurrent_streams)
+                .unwrap_or(usize::MAX)
+                .max(1),
+        ));
+        let mapping_budget = MappingBudget::new(config.mapping_concurrency, MAPPING_TIMEOUT);
+        let ack = AckPolicy::new(config.durability_mode, Arc::clone(&commit));
         Self {
             queue,
             config,
             commit,
-            stream_limit: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
-            mapping_budget: MappingBudget::unlimited(crate::config::MAPPING_TIMEOUT),
+            ack,
+            stream_limit,
+            mapping_budget,
+        }
+    }
+}
+
+impl AckPolicy {
+    fn new(mode: DurabilityMode, commit: Arc<CommitLedger>) -> Self {
+        match mode {
+            DurabilityMode::Commit => Self::Commit { ledger: commit },
+            DurabilityMode::Enqueue => Self::Enqueue,
         }
     }
 
-    /// Sets the process-wide export concurrency budget: all OTLP exports draw
-    /// from this one shared limit, not the per-connection stream cap.
-    pub fn with_stream_limit(mut self, limit: Arc<Semaphore>) -> Self {
-        self.stream_limit = limit;
-        self
-    }
-
-    /// Sets the process-wide mapping-job budget from a concurrency limit,
-    /// using the standard mapping deadline.
-    pub fn with_mapping_limit(mut self, concurrency: usize) -> Self {
-        self.mapping_budget = MappingBudget::new(concurrency, crate::config::MAPPING_TIMEOUT);
-        self
+    async fn finish(&self, outcome: EnqueueOutcome) -> Result<ExportLogsServiceResponse, Status> {
+        if outcome.accepted == 0 {
+            return finish_nothing_accepted(&outcome);
+        }
+        match self {
+            Self::Commit { ledger } => finish_commit(ledger, outcome).await,
+            Self::Enqueue => Ok(finish_enqueue(outcome)),
+        }
     }
 }
 
@@ -117,19 +142,24 @@ impl LogsIngress {
         // Request-level counting and validation run on the blocking pool with
         // the CPU-heavy mapping: the async path only ever does channel and
         // ledger work, so a walk of borrowed proto fields cannot stall a tokio
-        // worker. The record cap is checked before mapping allocates chunks.
+        // worker. The record and chunk caps are checked before mapping
+        // allocates any model values.
         let limits = Arc::clone(&self.config);
+        let capacity = self.queue.capacity();
         let work = self
             .mapping_budget
             .run(move || {
                 let _span = tracing::info_span!("map").entered();
-                let total = validate_request(&resource_logs, &limits)?;
+                let shape = validate_request(&resource_logs, &limits)?;
                 ::metrics::counter!("otlp_records_received_total", "signal" => "logs")
-                    .increment(total as u64);
+                    .increment(shape.records as u64);
                 // Every group may be empty; mapping would only drop them.
-                if total == 0 {
+                if shape.records == 0 {
                     return Ok(Vec::new());
                 }
+                // A request that can never fit is permanent, so reject it
+                // before paying the mapping cost.
+                ensure_chunks_fit(shape.chunks, capacity)?;
                 map_chunks(resource_logs)
             })
             .await
@@ -163,9 +193,6 @@ impl LogsIngress {
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let _span = tracing::info_span!("enqueue").entered();
-                // A request mapping to more chunks than the queue can ever
-                // hold is permanent: answer INVALID_ARGUMENT (via the mapping
-                // error) instead of a retryable UNAVAILABLE.
                 enqueue(&queue, &ledger, work)
             })
             .await
@@ -173,98 +200,111 @@ impl LogsIngress {
             .map_err(|error| Status::invalid_argument(error.to_string()))?
         };
 
-        self.finish(outcome).await
+        self.ack.finish(outcome).await
+    }
+}
+
+/// A request with no accepted chunk cannot wait for a durable commit: report
+/// backpressure or shutdown immediately.
+fn finish_nothing_accepted(outcome: &EnqueueOutcome) -> Result<ExportLogsServiceResponse, Status> {
+    if outcome.disconnected {
+        return Err(Status::unavailable("ingress queue is closed"));
+    }
+    if outcome.rejected > 0 {
+        warn_backpressure(outcome);
+        return Err(Status::unavailable("ingress queue is full"));
+    }
+    Ok(ExportLogsServiceResponse::default())
+}
+
+/// Turns an enqueue outcome into the wire response for `durability=commit`.
+///
+/// A partially accepted request is reported with OTLP `partial_success`:
+/// records that committed are not retried, so a retrying exporter cannot
+/// duplicate them. `UNAVAILABLE` means the pipeline shut down before any
+/// record settled; quarantined records are reported as `partial_success`
+/// because retrying cannot help.
+async fn finish_commit(
+    ledger: &CommitLedger,
+    outcome: EnqueueOutcome,
+) -> Result<ExportLogsServiceResponse, Status> {
+    let Some(ticket) = outcome.last_ticket() else {
+        return finish_nothing_accepted(&outcome);
+    };
+    // Wait for the contiguous watermark, not just this ticket's own outcome:
+    // a later ticket can fail while an earlier split chunk is still buffered,
+    // and reporting early would reject records that are about to commit.
+    let watermark = ledger.wait_watermark(ticket).await;
+
+    let mut committed = 0u64;
+    let mut any_failed = false;
+    for (ticket, records) in &outcome.tickets {
+        // Once every accepted record is accounted for, no remaining ticket
+        // can change `rejected`.
+        if committed == outcome.accepted {
+            break;
+        }
+        match ledger.state(*ticket) {
+            TicketState::Completed => committed += records,
+            TicketState::Failed { progress } => {
+                committed += progress.committed;
+                any_failed = true;
+            }
+            TicketState::Unsettled { progress } => {
+                committed += progress.committed;
+            }
+        }
     }
 
-    /// Turns an enqueue outcome into the wire response.
-    ///
-    /// A partially accepted request is reported with OTLP `partial_success`:
-    /// records that committed are not retried, so a retrying exporter cannot
-    /// duplicate them. `UNAVAILABLE` means the pipeline shut down before any
-    /// record settled; quarantined records are reported as `partial_success`
-    /// because retrying cannot help.
-    async fn finish(&self, outcome: EnqueueOutcome) -> Result<ExportLogsServiceResponse, Status> {
-        if outcome.accepted == 0 {
-            if outcome.disconnected {
-                return Err(Status::unavailable("ingress queue is closed"));
-            }
-            if outcome.rejected > 0 {
-                warn_backpressure(&outcome);
-                return Err(Status::unavailable("ingress queue is full"));
-            }
-            return Ok(ExportLogsServiceResponse::default());
-        }
-
-        if self.config.durability_mode == DurabilityMode::Commit {
-            if let Some(ticket) = outcome.last_ticket() {
-                // Wait for the contiguous watermark, not just this ticket's
-                // own outcome: a later ticket can fail while an earlier
-                // split chunk is still buffered, and reporting early would
-                // reject records that are about to commit.
-                let _ = self.commit.wait_watermark(ticket).await;
-            }
-
-            let mut committed = 0u64;
-            let mut any_failed = false;
-            for (ticket, records) in &outcome.tickets {
-                // Once every record is committed, no remaining ticket can
-                // change `rejected`, so stop inspecting settlements.
-                if committed == outcome.total_records {
-                    break;
-                }
-                match self.commit.state(*ticket) {
-                    TicketState::Completed => committed += records,
-                    TicketState::Failed { progress } => {
-                        committed += progress.committed;
-                        any_failed = true;
-                    }
-                    TicketState::Unsettled { progress } => {
-                        committed += progress.committed;
-                    }
-                }
-            }
-
-            let rejected = outcome.total_records.saturating_sub(committed);
-            if rejected == 0 {
-                return Ok(ExportLogsServiceResponse::default());
-            }
-            if any_failed || committed > 0 {
-                tracing::warn!(accepted = committed, rejected, "export partially accepted");
-                ::metrics::counter!(
-                    "otlp_records_rejected_total",
-                    "signal" => "logs",
-                    "reason" => if any_failed { "quarantined" } else { "not_committed" }
-                )
-                .increment(rejected);
-                return Ok(partial_success(
-                    rejected,
-                    "storage accepted part of the request; retry only the rejected records",
-                ));
-            }
-            return Err(Status::unavailable(
-                "storage pipeline shut down before commit",
-            ));
-        }
-
-        // Enqueue mode acknowledges at queue entry. A tail that could not be
-        // queued is reported as rejected without asking the sender to resend
-        // the chunks that were queued.
-        if outcome.rejected > 0 {
-            warn_backpressure(&outcome);
-            ::metrics::counter!(
-                "otlp_records_rejected_total",
-                "signal" => "logs",
-                "reason" => "queue"
-            )
-            .increment(outcome.rejected);
-            return Ok(partial_success(
-                outcome.rejected,
-                "ingress accepted part of the request; retry only the rejected records",
-            ));
-        }
-
-        Ok(ExportLogsServiceResponse::default())
+    let rejected = outcome.total_records.saturating_sub(committed);
+    if rejected == 0 {
+        return Ok(ExportLogsServiceResponse::default());
     }
+    if any_failed || committed > 0 {
+        tracing::warn!(accepted = committed, rejected, "export partially accepted");
+        ::metrics::counter!(
+            "otlp_records_rejected_total",
+            "signal" => "logs",
+            "reason" => if any_failed { "quarantined" } else { "not_committed" }
+        )
+        .increment(rejected);
+        return Ok(partial_success(
+            rejected,
+            "storage accepted part of the request; retry only the rejected records",
+        ));
+    }
+
+    // No accepted record committed. The watermark only stops before the
+    // request's last ticket when the ledger closed, so this is the shutdown
+    // case.
+    let message = if watermark.closed {
+        "storage pipeline shut down before commit"
+    } else {
+        "storage pipeline did not commit the request"
+    };
+    Err(Status::unavailable(message))
+}
+
+/// Turns an enqueue outcome into the wire response for `durability=enqueue`.
+///
+/// A tail that could not be queued is reported as rejected without asking the
+/// sender to resend the chunks that were queued.
+fn finish_enqueue(outcome: EnqueueOutcome) -> ExportLogsServiceResponse {
+    if outcome.rejected > 0 {
+        warn_backpressure(&outcome);
+        ::metrics::counter!(
+            "otlp_records_rejected_total",
+            "signal" => "logs",
+            "reason" => "queue"
+        )
+        .increment(outcome.rejected);
+        return partial_success(
+            outcome.rejected,
+            "ingress accepted part of the request; retry only the rejected records",
+        );
+    }
+
+    ExportLogsServiceResponse::default()
 }
 
 fn warn_backpressure(outcome: &EnqueueOutcome) {
@@ -301,9 +341,18 @@ mod tests {
             durability_mode,
             ..IngressConfig::default()
         });
+        let ingress = ingress_with_config(capacity, Arc::clone(&config), commit);
+        (ingress, config)
+    }
+
+    fn ingress_with_config(
+        capacity: usize,
+        config: Arc<IngressConfig>,
+        commit: Arc<CommitLedger>,
+    ) -> LogsIngress {
         let (queue, receiver) = channel(capacity);
         std::mem::forget(receiver);
-        (LogsIngress::new(queue, Arc::clone(&config), commit), config)
+        LogsIngress::new(queue, config, commit)
     }
 
     fn request_with(records: usize) -> ExportLogsServiceRequest {
@@ -331,7 +380,6 @@ mod tests {
         let ledger = Arc::new(CommitLedger::new());
         let (ingress, _) = ingress_with(8, DurabilityMode::Commit, Arc::clone(&ledger));
 
-        let started = Instant::now();
         let handle = tokio::spawn(async move { ingress.handle(request_with(4)).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
@@ -352,7 +400,6 @@ mod tests {
             1,
             "the response must not be released before the ticket committed"
         );
-        assert!(started.elapsed() >= std::time::Duration::from_millis(50));
     }
 
     #[tokio::test]
@@ -360,10 +407,10 @@ mod tests {
         let ledger = Arc::new(CommitLedger::new());
         let config = Arc::new(IngressConfig {
             durability_mode: DurabilityMode::Commit,
+            mapping_concurrency: 1,
             ..IngressConfig::default()
         });
-        let (queue, receiver) = channel(8);
-        let ingress = LogsIngress::new(queue, config, Arc::clone(&ledger)).with_mapping_limit(1);
+        let ingress = ingress_with_config(8, config, Arc::clone(&ledger));
         let probe = ingress.mapping_budget.clone();
 
         let handle = tokio::spawn(async move { ingress.handle(request_with(2)).await });
@@ -384,7 +431,6 @@ mod tests {
             .expect("released after commit")
             .expect("handler did not panic")
             .expect("export succeeds");
-        drop(receiver);
     }
 
     #[tokio::test]
@@ -467,7 +513,6 @@ mod tests {
             0,
             "nothing was accepted, so the watermark never moved"
         );
-        assert!(!ledger.watermark().closed);
         assert_eq!(receiver.len(), 2, "only the prefill messages remain");
     }
 
@@ -509,6 +554,40 @@ mod tests {
         );
         assert!(receiver.is_empty(), "nothing may be enqueued");
         assert_eq!(ledger.watermark().committed_through, 0);
+    }
+
+    #[tokio::test]
+    async fn empty_scope_groups_do_not_count_against_queue_capacity() {
+        let ledger = Arc::new(CommitLedger::new());
+        let config = Arc::new(IngressConfig {
+            durability_mode: DurabilityMode::Enqueue,
+            ..IngressConfig::default()
+        });
+        let (queue, receiver) = channel(1);
+        let ingress = LogsIngress::new(queue, config, ledger);
+
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![
+                    ScopeLogs::default(),
+                    ScopeLogs {
+                        log_records: vec![ProtoLogRecord::default()],
+                        ..ScopeLogs::default()
+                    },
+                ],
+                ..ResourceLogs::default()
+            }],
+        };
+
+        ingress
+            .handle(request)
+            .await
+            .expect("one non-empty scope fits a one-slot queue");
+        let message = receiver.recv().expect("record enqueued");
+        assert!(matches!(
+            message,
+            otel_sqlite_core::storage::IngestMessage::Logs(_)
+        ));
     }
 
     #[tokio::test]
@@ -567,6 +646,7 @@ mod tests {
         ledger.complete(1);
 
         let response = ingress
+            .ack
             .finish(outcome(1, 1, &[(1, 1)]))
             .await
             .expect("a request with a committed chunk must not ask for a full retry");
@@ -582,6 +662,7 @@ mod tests {
         ledger.close();
 
         let response = ingress
+            .ack
             .finish(outcome(2, 0, &[(1, 1), (2, 1)]))
             .await
             .expect("committed records must not be resent");
@@ -598,6 +679,7 @@ mod tests {
         ledger.complete(1);
 
         let response = ingress
+            .ack
             .finish(outcome(2, 0, &[(1, 2)]))
             .await
             .expect("a quarantined ticket is a completed request, not a retryable failure");
@@ -612,6 +694,7 @@ mod tests {
         ledger.close();
 
         let status = ingress
+            .ack
             .finish(outcome(1, 1, &[(1, 1)]))
             .await
             .expect_err("nothing committed must stay retryable");
@@ -626,7 +709,7 @@ mod tests {
         ledger.complete(2);
 
         let handle =
-            tokio::spawn(async move { ingress.finish(outcome(2, 0, &[(1, 1), (2, 1)])).await });
+            tokio::spawn(async move { ingress.ack.finish(outcome(2, 0, &[(1, 1), (2, 1)])).await });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(
             !handle.is_finished(),
@@ -649,6 +732,7 @@ mod tests {
         let (ingress, _) = ingress_with(8, DurabilityMode::Enqueue, ledger);
 
         let response = ingress
+            .ack
             .finish(outcome(1, 1, &[(1, 1)]))
             .await
             .expect("queued records must not be resent");

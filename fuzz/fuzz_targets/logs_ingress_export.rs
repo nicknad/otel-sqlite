@@ -14,7 +14,7 @@ use std::sync::{Arc, LazyLock};
 
 use libfuzzer_sys::fuzz_target;
 use otel_sqlite_core::storage::{CommitLedger, DurabilityMode, IngestMessage};
-use otel_sqlite_ingress::pb::collector::logs::v1::{
+use otel_sqlite_ingress::mapping::pb::collector::logs::v1::{
     ExportLogsServiceRequest, logs_service_server::LogsService,
 };
 use otel_sqlite_ingress::{IngressConfig, LogsIngress};
