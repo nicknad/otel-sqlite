@@ -438,12 +438,13 @@ pub async fn run_scenario(
             storage_deltas,
         };
 
-        if !report.correctness.passed {
+        if !report.correctness.passed || report.record_id_mismatches > 0 {
             print_step_summary(&report);
             bail!(
-                "correctness validation failed for step '{}': {:?}",
+                "correctness validation failed for step '{}': {:?} (record-id mismatches: {})",
                 params.label,
-                report.correctness.failure_reasons
+                report.correctness.failure_reasons,
+                report.record_id_mismatches
             );
         }
 

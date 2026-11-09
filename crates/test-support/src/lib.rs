@@ -24,19 +24,17 @@ pub fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> boo
 
 /// Polls a TCP endpoint until a connection succeeds or `timeout` elapses.
 ///
-/// `host_port` is a `host:port` pair (no URL scheme). Name resolution is done
-/// once; returns `false` on an invalid address or when nothing accepts within
-/// the budget.
+/// `host_port` is a `host:port` pair (no URL scheme). Resolution is retried on
+/// every attempt and every resolved address is tried, so a dual-stack or
+/// multi-A service name succeeds when any address accepts.
 pub fn wait_for_tcp(host_port: &str, timeout: Duration) -> bool {
-    let Some(addr) = host_port
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut addresses| addresses.next())
-    else {
-        return false;
-    };
     wait_until(timeout, || {
-        TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
+        let Ok(addresses) = host_port.to_socket_addrs() else {
+            return false;
+        };
+        addresses
+            .into_iter()
+            .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok())
     })
 }
 

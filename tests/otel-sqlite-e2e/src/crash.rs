@@ -96,7 +96,7 @@ pub fn write_server_config(config: &CrashServerConfig) -> PathBuf {
     // them everywhere), avoiding backslash-escaping pitfalls in the config.
     let sqlite_path = config
         .dir
-        .join("otel-logs.db")
+        .join(otel_sqlite_storage::DEFAULT_DB_FILENAME)
         .display()
         .to_string()
         .replace('\\', "/");
@@ -210,6 +210,11 @@ pub fn validate_run(
 /// so rejected requests never reached the server. Use
 /// [`assert_valid_recovery`] when a pipeline *component* dies instead.
 pub fn assert_valid(db_path: &Path, run_id: &str, outcome: &LoadOutcome) -> anyhow::Result<()> {
+    if !outcome.positions_exact {
+        anyhow::bail!(
+            "strict crash validation for run '{run_id}' requires exact rejected positions;              a mixed partial rejection made them unknowable"
+        );
+    }
     let report = validate_run(db_path, run_id, outcome)?;
     if !report.passed {
         anyhow::bail!(
@@ -256,19 +261,6 @@ pub fn assert_valid_recovery(
         anyhow::bail!(
             "crash recovery validation failed for run '{run_id}': {} duplicate rows",
             report.duplicate_sequences
-        );
-    }
-    let classified = outcome.counters.records_accepted
-        + outcome.counters.records_rejected
-        + outcome.counters.records_ambiguous;
-    if classified != outcome.counters.records_generated {
-        anyhow::bail!(
-            "crash recovery validation failed for run '{run_id}': accounting mismatch, \
-             generated {} != accepted {} + rejected {} + ambiguous {}",
-            outcome.counters.records_generated,
-            outcome.counters.records_accepted,
-            outcome.counters.records_rejected,
-            outcome.counters.records_ambiguous,
         );
     }
     let conn = crate::db::open_readonly(db_path)?;

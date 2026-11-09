@@ -125,10 +125,14 @@ impl LogWriteBatch {
         segments: Vec<RecordSegment>,
     ) -> Self {
         let covered: usize = segments.iter().map(|segment| segment.records).sum();
-        debug_assert_eq!(
+        assert_eq!(
             covered,
             records.len(),
             "record segments must cover every record exactly once"
+        );
+        assert!(
+            segments.iter().all(|segment| segment.records > 0),
+            "record segments must not be empty"
         );
         Self {
             origin,
@@ -199,6 +203,7 @@ impl CheckpointMode {
     /// `truncate`, case-insensitive). Lives beside the type so every config
     /// loader uses one vocabulary.
     pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
         if value.eq_ignore_ascii_case("passive") {
             Some(Self::Passive)
         } else if value.eq_ignore_ascii_case("full") {
@@ -298,10 +303,8 @@ mod tests {
 
         assert_eq!(WriteCommand::Flush.kind(), "flush");
         assert_eq!(
-            WriteCommand::Maintenance(MaintenanceOperation::Checkpoint(
-                CheckpointMode::Truncate
-            ))
-            .kind(),
+            WriteCommand::Maintenance(MaintenanceOperation::Checkpoint(CheckpointMode::Truncate))
+                .kind(),
             "checkpoint"
         );
         assert_eq!(
@@ -322,10 +325,8 @@ mod tests {
     fn record_counts_only_apply_to_inserts() {
         assert_eq!(WriteCommand::Flush.record_count(), 0);
         assert_eq!(
-            WriteCommand::Maintenance(MaintenanceOperation::Checkpoint(
-                CheckpointMode::Passive
-            ))
-            .record_count(),
+            WriteCommand::Maintenance(MaintenanceOperation::Checkpoint(CheckpointMode::Passive))
+                .record_count(),
             0
         );
         assert_eq!(
@@ -369,7 +370,10 @@ mod tests {
             CheckpointMode::Restart,
             CheckpointMode::Truncate,
         ] {
-            assert_eq!(CheckpointMode::parse(&mode.as_str().to_lowercase()), Some(mode));
+            assert_eq!(
+                CheckpointMode::parse(&mode.as_str().to_lowercase()),
+                Some(mode)
+            );
         }
         assert_eq!(CheckpointMode::parse("FULL"), Some(CheckpointMode::Full));
         assert_eq!(CheckpointMode::parse("unknown"), None);
@@ -383,6 +387,16 @@ mod tests {
         assert!(MaintenanceOperation::Vacuum.is_heavy());
         assert!(MaintenanceOperation::RebuildFts.is_heavy());
         assert!(MaintenanceOperation::Prune(Duration::from_secs(1)).is_heavy());
+    }
+
+    #[test]
+    #[should_panic(expected = "cover every record")]
+    fn batch_constructor_rejects_a_segment_record_mismatch() {
+        let _ = LogWriteBatch::new(
+            BatchOrigin::default(),
+            WriteBatch::from_vec(vec![LogRecord::default()]),
+            Vec::new(),
+        );
     }
 
     #[test]

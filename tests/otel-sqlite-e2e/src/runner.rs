@@ -244,7 +244,7 @@ pub(crate) async fn run_load(request: LoadRequest) -> anyhow::Result<LoadRun> {
         .unwrap_or_default();
 
     if let Some(error) = first_worker_error {
-        return Err(error.context(format!("load against '{}' lost a producer", endpoint)));
+        return Err(error.context(format!("load against '{endpoint}' lost a producer")));
     }
 
     let snapshot = counters.snapshot();

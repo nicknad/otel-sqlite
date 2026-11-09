@@ -29,6 +29,13 @@ use crate::config::MaintenanceConfig;
 /// zero, but this is a public library type.
 const MIN_RETRY_DELAY: Duration = Duration::from_millis(10);
 
+/// Queue depth above which heavy maintenance (VACUUM, index rebuild, a large
+/// prune) is deferred. Running it while ingestion waits stalls the single
+/// writer for seconds; the scheduler re-arms it at `retry_delay`. This is the
+/// only admission policy for maintenance — the writer never silently skips a
+/// command it already accepted.
+const HEAVY_MAINTENANCE_BACKLOG_LIMIT: usize = 1_000;
+
 /// Outcome of one scheduler tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TickOutcome {
@@ -150,6 +157,31 @@ impl Scheduler {
             let operation = task.operation;
             let command = WriteCommand::Maintenance(operation);
 
+            if should_defer_heavy(operation, sink.len()) {
+                let first_deferral = !task.deferred;
+                task.defer(now, self.retry_delay);
+                ::metrics::counter!(
+                    "maintenance_enqueue_failures_total",
+                    "operation" => operation.as_str(),
+                    "reason" => "backlog"
+                )
+                .increment(1);
+                if first_deferral {
+                    tracing::warn!(
+                        operation = operation.as_str(),
+                        queue_depth = sink.len(),
+                        retry_in_ms = self.retry_delay.as_millis() as u64,
+                        "maintenance deferred; ingestion backlog present"
+                    );
+                } else {
+                    tracing::debug!(
+                        operation = operation.as_str(),
+                        "maintenance still deferred; ingestion backlog present"
+                    );
+                }
+                continue;
+            }
+
             match sink.try_send(command) {
                 Ok(()) => {
                     if task.deferred {
@@ -230,6 +262,11 @@ impl Scheduler {
     }
 }
 
+/// Whether this operation should wait for the ingestion backlog to drain.
+const fn should_defer_heavy(operation: MaintenanceOperation, queue_depth: usize) -> bool {
+    operation.is_heavy() && queue_depth > HEAVY_MAINTENANCE_BACKLOG_LIMIT
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -239,6 +276,26 @@ mod tests {
 
     use super::*;
     use crate::config::PurgeSchedule;
+
+    #[test]
+    fn heavy_operations_wait_for_backlog_but_cheap_ones_do_not() {
+        assert!(!should_defer_heavy(
+            MaintenanceOperation::Analyze,
+            usize::MAX
+        ));
+        assert!(!should_defer_heavy(
+            MaintenanceOperation::Vacuum,
+            HEAVY_MAINTENANCE_BACKLOG_LIMIT
+        ));
+        assert!(should_defer_heavy(
+            MaintenanceOperation::Vacuum,
+            HEAVY_MAINTENANCE_BACKLOG_LIMIT + 1
+        ));
+        assert!(should_defer_heavy(
+            MaintenanceOperation::Prune(Duration::from_secs(3_600)),
+            HEAVY_MAINTENANCE_BACKLOG_LIMIT + 1
+        ));
+    }
 
     fn drain(receiver: &Receiver<WriteCommand>) -> Vec<WriteCommand> {
         receiver.try_iter().collect()

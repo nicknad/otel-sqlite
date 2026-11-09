@@ -144,7 +144,9 @@ impl EmbeddedServer {
     /// Start the full pipeline. Mirrors `crates/otel-sqlite/src/main.rs`.
     pub async fn start(listen_addr: &str, data_dir: &Path) -> anyhow::Result<Self> {
         let config = benchmark_profile::ingress_config(listen_addr.to_owned());
-        let storage_config = benchmark_profile::storage_config(data_dir.join("otel-logs.db"));
+        let storage_config = benchmark_profile::storage_config(
+            data_dir.join(otel_sqlite_storage::DEFAULT_DB_FILENAME),
+        );
 
         let addr: SocketAddr = config.socket_addr()?;
 
@@ -179,7 +181,7 @@ impl EmbeddedServer {
 
         Ok(Self {
             endpoint,
-            db_path: data_dir.join("otel-logs.db"),
+            db_path: data_dir.join(otel_sqlite_storage::DEFAULT_DB_FILENAME),
             ingest_tx: Some(ingest_tx),
             storage: Some(storage),
             shutdown_tx,

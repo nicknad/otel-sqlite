@@ -25,7 +25,7 @@ pub(crate) fn vacuum(conn: &Connection) -> Result<(), StorageError> {
     // effective when `auto_vacuum = INCREMENTAL` (set for new databases in
     // `sqlite::open`); legacy databases convert once via a full VACUUM and
     // are incremental thereafter.
-    if auto_vacuum_mode(conn) == INCREMENTAL_AUTO_VACUUM {
+    if auto_vacuum_mode(conn)? == INCREMENTAL_AUTO_VACUUM {
         incremental_vacuum(conn)
     } else {
         convert_to_incremental_vacuum(conn)
@@ -35,9 +35,8 @@ pub(crate) fn vacuum(conn: &Connection) -> Result<(), StorageError> {
 /// `PRAGMA auto_vacuum` value for `INCREMENTAL`.
 const INCREMENTAL_AUTO_VACUUM: i64 = 2;
 
-fn auto_vacuum_mode(conn: &Connection) -> i64 {
-    conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
-        .unwrap_or(0)
+fn auto_vacuum_mode(conn: &Connection) -> Result<i64, StorageError> {
+    Ok(conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?)
 }
 
 /// One-time conversion for databases created before incremental auto-vacuum
@@ -190,7 +189,7 @@ pub(crate) fn enforce_size_quota(
     // Legacy databases were created without auto-vacuum and need a one-time
     // converting VACUUM before deletions can shrink the file; without it the
     // loop below would evict batch after batch without ever fitting.
-    if auto_vacuum_mode(conn) != INCREMENTAL_AUTO_VACUUM {
+    if auto_vacuum_mode(conn)? != INCREMENTAL_AUTO_VACUUM {
         convert_to_incremental_vacuum(conn)?;
     }
     for _ in 0..MAX_QUOTA_ROUNDS {
@@ -349,7 +348,7 @@ mod tests {
         seed_logs(&mut conn, "r", 6_000);
         let size = file_size(&path);
         assert_eq!(
-            auto_vacuum_mode(&conn),
+            auto_vacuum_mode(&conn).expect("read auto_vacuum"),
             0,
             "legacy default has no auto-vacuum"
         );
@@ -358,7 +357,7 @@ mod tests {
         let report = enforce_size_quota(&mut conn, &path, quota).expect("enforce quota");
 
         assert_eq!(
-            auto_vacuum_mode(&conn),
+            auto_vacuum_mode(&conn).expect("read auto_vacuum"),
             INCREMENTAL_AUTO_VACUUM,
             "quota enforcement must convert the database once"
         );

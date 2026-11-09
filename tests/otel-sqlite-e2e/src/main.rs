@@ -356,7 +356,7 @@ async fn main() -> Result<()> {
             // The embedded server migrates/creates the database during startup,
             // so probe the state BEFORE booting it; afterwards every path
             // would misleadingly report "pre-populated".
-            let db_path = guard.path().join("otel-logs.db");
+            let db_path = guard.path().join(otel_sqlite_storage::DEFAULT_DB_FILENAME);
             let (state, rows) = probe_database_state(&db_path).await?;
             let started = server::EmbeddedServer::start(&args.listen, guard.path()).await?;
             let endpoint = started.endpoint().to_owned();
@@ -425,8 +425,8 @@ async fn main() -> Result<()> {
     };
 
     // ----- scenario dispatch -------------------------------------------------
-    let ramp_stop = !args.keep_going;
     let plan = args.scenario.plan(&overrides, args.keep_going);
+    let stop_on_saturation_ramp = plan.iter().any(|entry| entry.stop_on_saturation);
 
     let mut scenario_reports = Vec::new();
     for entry in plan {
@@ -484,7 +484,7 @@ async fn main() -> Result<()> {
             search_mode: server::benchmark_profile::search_mode().as_str().to_owned(),
             drain_timeout_secs: args.drain_timeout_secs,
             overrides_applied: overrides,
-            stop_on_saturation_ramp: ramp_stop,
+            stop_on_saturation_ramp,
         },
         pre_existing_log_rows: pre_existing_rows,
         scenarios: scenario_reports,

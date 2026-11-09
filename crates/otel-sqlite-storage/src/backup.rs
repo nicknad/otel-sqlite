@@ -444,7 +444,7 @@ pub fn restore_into(
 
     // Decrypt on demand into a temporary sibling, cleaned up on every path.
     let (plain, _guard) = if let Some(key_path) = key_path {
-        let temp = dest_dir.join("otel-logs.db.decrypting");
+        let temp = dest_dir.join(format!("{}.decrypting", crate::config::DEFAULT_DB_FILENAME));
         let guard = TempGuard(Some(temp.clone()));
         decrypt_to(backup_path, key_path, &temp)?;
         (temp, guard)
@@ -543,10 +543,6 @@ fn modified(metadata: Option<&fs::Metadata>) -> Option<std::time::SystemTime> {
     metadata.and_then(|metadata| metadata.modified().ok())
 }
 
-/// Prefix of every backup artifact written by `otel-sqlite backup`. Includes
-/// the trailing dot so the live database file (`otel-logs.db`) never matches.
-const OTEL_DB_PREFIX: &str = "otel-logs.db.";
-
 /// Suffixes of transient artifacts (a crashed restore's decryption temp, a
 /// partial download, ...) that must never be counted or pruned as backups.
 const TEMP_ARTIFACT_SUFFIXES: &[&str] = &[".decrypting", ".tmp", ".part", ".partial"];
@@ -554,7 +550,10 @@ const TEMP_ARTIFACT_SUFFIXES: &[&str] = &[".decrypting", ".tmp", ".part", ".part
 /// Whether a directory entry name identifies a completed backup artifact:
 /// it carries the retention prefix but is not a hidden or transient file.
 fn is_backup_artifact(name: &str) -> bool {
-    let Some(suffix) = name.strip_prefix(OTEL_DB_PREFIX) else {
+    let Some(suffix) = name.strip_prefix(crate::config::DEFAULT_DB_FILENAME) else {
+        return false;
+    };
+    let Some(suffix) = suffix.strip_prefix('.') else {
         return false;
     };
     !suffix.is_empty()
@@ -570,7 +569,11 @@ fn is_backup_artifact(name: &str) -> bool {
 /// touches files this tool wrote.
 pub fn backup_filename(epoch_secs: u64, encrypted: bool) -> String {
     let extension = if encrypted { "otsb" } else { "bak" };
-    format!("{OTEL_DB_PREFIX}{}.{extension}", utc_timestamp(epoch_secs))
+    format!(
+        "{}.{}.{extension}",
+        crate::config::DEFAULT_DB_FILENAME,
+        utc_timestamp(epoch_secs)
+    )
 }
 
 /// Artifact path for a backup taken at `epoch_secs` that does not collide with

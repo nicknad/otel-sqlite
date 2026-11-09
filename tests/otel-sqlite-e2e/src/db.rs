@@ -146,7 +146,7 @@ mod tests {
                 .unwrap_or_default()
         ));
         std::fs::create_dir_all(&dir)?;
-        let db_path = dir.join("otel-logs.db");
+        let db_path = dir.join(otel_sqlite_storage::DEFAULT_DB_FILENAME);
         let mut conn = Connection::open(&db_path)?;
         otel_sqlite_storage::migrate_up_to(
             &mut conn,

@@ -13,7 +13,7 @@ pub(crate) fn maintenance_dump(config: &MaintenanceConfig) -> serde_json::Value 
         "retention_ms": ms(&retention),
         "purge_interval_ms": ms(&purge_interval),
         "checkpoint_interval_ms": ms(&config.checkpoint_interval),
-        "checkpoint_mode": format!("{:?}", config.checkpoint_mode),
+        "checkpoint_mode": config.checkpoint_mode.as_str().to_ascii_lowercase(),
         "optimize_interval_ms": ms(&config.optimize_interval),
         "vacuum_interval_ms": ms(&config.vacuum_interval),
         "rebuild_fts_interval_ms": ms(&config.rebuild_fts_interval),

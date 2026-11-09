@@ -557,7 +557,7 @@ mod tests {
         assert!(report.ok, "a fresh database path is expected: {report:?}");
         let database = report.database.expect("database section");
         assert_eq!(database.state, "missing");
-        assert!(!report.warnings.is_empty());
+        assert_ne!(report.warnings.len(), 0);
     }
 
     #[test]
@@ -598,7 +598,7 @@ mod tests {
         assert!(report.ok, "current schema passes: {report:?}");
         let database = report.database.expect("database section");
         assert_eq!(database.state, "current");
-        assert!(database.pending.is_empty());
+        assert_eq!(database.pending.len(), 0);
     }
 
     #[test]

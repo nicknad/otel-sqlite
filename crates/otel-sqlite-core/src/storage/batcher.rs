@@ -207,7 +207,7 @@ mod tests {
 
         assert_eq!(sizes(output), vec![1000]);
         assert_eq!(batcher.buffered(), 0);
-        assert!(batcher.is_empty());
+        assert_eq!(batcher.buffered(), 0);
         assert_eq!(batcher.flush(), None);
     }
 
@@ -217,13 +217,13 @@ mod tests {
 
         let output = batcher.push(records(700));
 
-        assert!(output.is_empty());
+        assert_eq!(output.len(), 0);
         assert_eq!(output.len(), 0);
         assert_eq!(batcher.buffered(), 700);
         // Nothing may be force-emitted while under capacity...
         let forced = batcher.flush().expect("partial batch available");
         assert_eq!(forced.len(), 700);
-        assert!(batcher.is_empty());
+        assert_eq!(batcher.buffered(), 0);
     }
 
     #[test]
@@ -231,7 +231,7 @@ mod tests {
         let mut batcher = InsertBatcher::new(config(1000, 10));
 
         let first = batcher.push(records(700));
-        assert!(first.is_empty());
+        assert_eq!(first.len(), 0);
 
         let second = batcher.push(records(600));
         assert_eq!(sizes(second), vec![1000]);
@@ -280,7 +280,7 @@ mod tests {
 
         let output = batcher.push(Vec::new());
 
-        assert!(output.is_empty());
+        assert_eq!(output.len(), 0);
         assert_eq!(batcher.buffered(), 0);
         assert_eq!(batcher.flush(), None);
     }
@@ -366,7 +366,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40));
         let partial = batcher.flush_if_expired(Instant::now()).expect("expired");
         assert_eq!(partial.len(), 2);
-        assert!(batcher.is_empty());
+        assert_eq!(batcher.buffered(), 0);
     }
 
     #[test]

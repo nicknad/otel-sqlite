@@ -120,8 +120,8 @@ enum Reason {
     Idle,
     Stalled {
         pending: usize,
-        writer_idle_ms: u64,
-        batcher_idle_ms: u64,
+        age_ms: u64,
+        stage: &'static str,
     },
     Draining {
         pending: usize,
@@ -192,18 +192,13 @@ impl fmt::Display for Reason {
             Self::Idle => f.write_str("pipeline idle"),
             Self::Stalled {
                 pending,
-                writer_idle_ms,
-                batcher_idle_ms,
-            } => {
-                let age = Duration::from_millis((*writer_idle_ms).max(*batcher_idle_ms));
-                write!(
-                    f,
-                    "{pending} work item(s) pending but no pipeline progress for {age:.1?} \
-                     (writer {:.1?}, batcher {:.1?})",
-                    Duration::from_millis(*writer_idle_ms),
-                    Duration::from_millis(*batcher_idle_ms)
-                )
-            }
+                age_ms,
+                stage,
+            } => write!(
+                f,
+                "{pending} work item(s) pending but the {stage} made no progress for {:.1?}",
+                Duration::from_millis(*age_ms)
+            ),
             Self::Draining { pending, age_ms } => write!(
                 f,
                 "{pending} work item(s) pending, draining slowly ({:.1?} since last progress)",
@@ -330,33 +325,41 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     // healthy, and buffered records with an idle writer are equally expected;
     // judging both ages whenever *any* work exists turned those healthy
     // post-burst states into false stalls.
-    let writer_age = (sample.queue_depth > 0)
-        .then_some(Duration::from_millis(sample.writer_idle_ms))
-        .filter(|age| *age >= config.degraded_after);
-    let batcher_age = (sample.pending_records > 0)
-        .then_some(Duration::from_millis(sample.batcher_idle_ms))
-        .filter(|age| *age >= config.degraded_after);
-    let stale_age = match (writer_age, batcher_age) {
-        (None, None) => None,
-        (Some(age), None) | (None, Some(age)) => Some(age),
-        (Some(writer), Some(batcher)) => Some(writer.max(batcher)),
+    let writer_has_work = sample.queue_depth > 0;
+    let batcher_has_work = sample.pending_records > 0;
+    let writer_age = if writer_has_work {
+        Duration::from_millis(sample.writer_idle_ms)
+    } else {
+        Duration::ZERO
     };
-    if stale_age.is_some_and(|age| age >= config.unhealthy_after) {
+    let batcher_age = if batcher_has_work {
+        Duration::from_millis(sample.batcher_idle_ms)
+    } else {
+        Duration::ZERO
+    };
+    let judged_age = writer_age.max(batcher_age);
+    let judged_age_ms = u64::try_from(judged_age.as_millis()).unwrap_or(u64::MAX);
+    if judged_age >= config.unhealthy_after {
+        let stage = match (writer_has_work, batcher_has_work) {
+            (true, true) => "writer and batcher",
+            (false, true) => "insert batcher",
+            (_, false) => "sqlite writer",
+        };
         return Evaluation {
             state: HealthState::Unhealthy,
             reason: Reason::Stalled {
                 pending,
-                writer_idle_ms: sample.writer_idle_ms,
-                batcher_idle_ms: sample.batcher_idle_ms,
+                age_ms: judged_age_ms,
+                stage,
             },
         };
     }
-    if let Some(age) = stale_age {
+    if judged_age >= config.degraded_after {
         return Evaluation {
             state: HealthState::Degraded,
             reason: Reason::Draining {
                 pending,
-                age_ms: age.as_millis() as u64,
+                age_ms: judged_age_ms,
             },
         };
     }
@@ -835,6 +838,21 @@ mod tests {
         sample.writer_idle_ms = 150;
         sample.batcher_idle_ms = 150;
         assert_eq!(evaluate(&sample, &config()).state, HealthState::Unhealthy);
+    }
+
+    #[test]
+    fn idle_stage_age_does_not_inflate_the_stall_reason() {
+        let mut sample = running_sample();
+        sample.queue_depth = 4;
+        sample.pending_records = 0;
+        sample.writer_idle_ms = 150;
+        sample.batcher_idle_ms = 10_000;
+
+        let evaluation = evaluate(&sample, &config());
+        assert_eq!(evaluation.state, HealthState::Unhealthy);
+        let reason = evaluation.reason.to_string();
+        assert!(reason.contains("150.0ms"), "{reason}");
+        assert!(!reason.contains("10.0s"), "{reason}");
     }
 
     /// Canned-sample source for driving the spawned watchdog in tests.

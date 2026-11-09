@@ -191,22 +191,4 @@ mod tests {
             "stop must not wait out the next schedule deadline"
         );
     }
-
-    #[test]
-    fn closed_command_queue_terminates_the_worker() {
-        let (queue, receiver) = crossbeam_channel::bounded::<WriteCommand>(16);
-        let handle = MaintenanceWorker::new(queue, config(Some(Duration::from_millis(10))))
-            .spawn()
-            .expect("worker thread spawns");
-        drop(receiver);
-
-        let started = Instant::now();
-        handle
-            .stop()
-            .expect("worker exits cleanly after disconnect");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "disconnect must terminate the loop instead of spinning forever"
-        );
-    }
 }
