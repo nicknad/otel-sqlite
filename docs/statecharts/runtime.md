@@ -56,7 +56,7 @@ stateDiagram-v2
 
 TLC reached **434 states and 103,921 steps**. The chart draws **6 states and
 10 arrows**. The remaining 28,780 steps stay in one chart state and are not
-drawn. The exact chart text is also stored as `docs/statecharts/runtime.mmd`.
+drawn.
 
 ## Rules checked
 

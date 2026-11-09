@@ -104,8 +104,7 @@ stateDiagram-v2
 TLC reached **113 states and 177 steps**. The chart draws **18 states and 19
 arrows**. The view hides 95 steps that do not change the chart state: pipeline
 death, most ticket commits and quarantines while sending, settlements that
-leave a label unchanged, and the final stutter. The exact chart text is also
-stored as `docs/statecharts/ingress.mmd`.
+leave a label unchanged, and the final stutter.
 
 The separate waiting state is the out-of-order case: a later chunk is
 quarantined while an earlier chunk is still open. The response cannot leave

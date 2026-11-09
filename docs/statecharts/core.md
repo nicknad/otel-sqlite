@@ -81,8 +81,7 @@ arrows**. The view hides 381 steps that stay in one chart state: additional
 ticket issuance, a close before any ticket is issued, duplicate settlement,
 quarantine progress before the final segment, settlements of the other tickets
 that do not change the focused request, ledger or close changes after the
-request has already reported, and the idle `Done` stutter. The exact chart
-text is also stored as `docs/statecharts/core.mmd`.
+request has already reported, and the idle `Done` stutter.
 
 ## Rules checked
 

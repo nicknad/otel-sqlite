@@ -77,8 +77,7 @@ stateDiagram-v2
 
 TLC reached **29 states and 55 steps**. The chart draws **10 states and 13
 arrows**. The remaining 7 steps stay in one chart state and are not drawn; the
-view hides 10 more steps, all `Done` stutters in an end state. The exact chart
-text is also stored as `docs/statecharts/storage.mmd`.
+view hides 10 more steps, all `Done` stutters in an end state.
 
 The colors are phases, not verdicts: orange batching, purple writing, blue
 first-segment progress, yellow partial/quarantined work, teal a clean
