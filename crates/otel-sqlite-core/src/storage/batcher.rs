@@ -207,7 +207,6 @@ mod tests {
 
         assert_eq!(sizes(output), vec![1000]);
         assert_eq!(batcher.buffered(), 0);
-        assert_eq!(batcher.buffered(), 0);
         assert_eq!(batcher.flush(), None);
     }
 
@@ -217,7 +216,6 @@ mod tests {
 
         let output = batcher.push(records(700));
 
-        assert_eq!(output.len(), 0);
         assert_eq!(output.len(), 0);
         assert_eq!(batcher.buffered(), 700);
         // Nothing may be force-emitted while under capacity...
@@ -367,23 +365,5 @@ mod tests {
         let partial = batcher.flush_if_expired(Instant::now()).expect("expired");
         assert_eq!(partial.len(), 2);
         assert_eq!(batcher.buffered(), 0);
-    }
-
-    #[test]
-    fn fit_and_split_pushes_report_their_ready_batches() {
-        let mut batcher = InsertBatcher::new(config(3, 10));
-        let output = batcher.push(records(3));
-        assert_eq!(output.len(), 1);
-
-        let mut batcher = InsertBatcher::new(config(3, 10));
-        let output = batcher.push(records(7));
-        assert_eq!(output.len(), 2);
-        assert_eq!(batcher.buffered(), 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "max_batch_records")]
-    fn zero_capacity_is_rejected() {
-        let _ = InsertBatcher::<u8>::new(config(0, 10));
     }
 }

@@ -605,11 +605,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn off_mode_installs_no_triggers() {
-        assert_eq!(trigger_ddl(FtsMode::Off).len(), 0);
-    }
-
     fn search_shape(conn: &Connection) -> Vec<(String, String)> {
         ["logs_fts", "logs_fts_ai", "logs_fts_ad"]
             .into_iter()

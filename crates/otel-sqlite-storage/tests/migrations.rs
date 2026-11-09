@@ -121,7 +121,6 @@ fn assert_upgraded(path: &std::path::Path) {
         "migration stamps must be applied in order: {applied:?}"
     );
 
-    // Log data preserved.
     assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM log_event"), 2);
     assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM log_resource"), 1);
     let body: String = conn
@@ -155,7 +154,6 @@ fn assert_upgraded(path: &std::path::Path) {
         .unwrap();
     assert_eq!(matches, 1);
 
-    // Integrity and foreign keys.
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .unwrap();

@@ -160,7 +160,11 @@ mod tests {
             ServingStatus::NotServing
         );
 
-        // Shutdown flips everything off and ends the monitor.
+        // Recovery flips back to SERVING, then shutdown flips it off again and
+        // ends the monitor: the halt must be what causes the final transition.
+        flag.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(check(&mut client, "").await, ServingStatus::Serving);
         let _ = halt_tx.send(true);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(check(&mut client, "").await, ServingStatus::NotServing);

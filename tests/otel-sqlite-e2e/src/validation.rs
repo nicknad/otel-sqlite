@@ -42,6 +42,8 @@ pub struct CorrectnessReport {
     pub duplicate_sequences: u64,
     /// Rejected sequences that nevertheless appear (policy violation).
     pub unexpected_rejected_present: u64,
+    /// Persisted sequences outside the generated `[1, generated]` window.
+    pub unexpected_sequences: u64,
     /// Ambiguous sequences observed present (informational).
     pub ambiguous_present: u64,
     /// True when every expected sequence was found and none besides.
@@ -106,9 +108,12 @@ pub fn validate(
     let duplicate_sequences = rows_found.saturating_sub(distinct_sequences);
 
     let mut unexpected_rejected_present = 0u64;
+    let mut unexpected_sequences = 0u64;
     let mut ambiguous_present = 0u64;
     for seq in found.iter().map(|seq| *seq as u64) {
-        if rejected.contains(seq) {
+        if seq == 0 || seq > generated_total {
+            unexpected_sequences += 1;
+        } else if rejected.contains(seq) {
             unexpected_rejected_present += 1;
         } else if ambiguous.contains(seq) {
             ambiguous_present += 1;
@@ -127,6 +132,11 @@ pub fn validate(
             "{unexpected_rejected_present} rejected sequences were persisted anyway"
         ));
     }
+    if unexpected_sequences > 0 {
+        failure_reasons.push(format!(
+            "{unexpected_sequences} persisted sequences were outside the generated run"
+        ));
+    }
 
     Ok(CorrectnessReport {
         run_id: run_id.to_owned(),
@@ -139,6 +149,7 @@ pub fn validate(
         missing_sequences: missing,
         duplicate_sequences,
         unexpected_rejected_present,
+        unexpected_sequences,
         ambiguous_present,
         passed: failure_reasons.is_empty(),
         failure_reasons,

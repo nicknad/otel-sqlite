@@ -116,7 +116,6 @@ fn backup_matches_source_and_restores_into_a_clean_directory() {
     assert!(!dir.path().join("snapshot.bak-wal").exists());
     assert!(!dir.path().join("snapshot.bak-shm").exists());
 
-    // Restore into a clean directory.
     let clean = dir.path().join("restored");
     let restored = backup::restore_into(&snapshot, &clean, None).unwrap();
     assert_eq!(restored.target, clean.join("otel-logs.db"));

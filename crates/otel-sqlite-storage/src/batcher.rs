@@ -98,6 +98,7 @@ pub(crate) fn run(
             break;
         }
         stats.observe_buffered(logs.buffered());
+        stats.observe_ingest_queue(input.len());
 
         let event = match logs.deadline() {
             Some(deadline) => {
@@ -609,16 +610,21 @@ mod tests {
                 break;
             }
         }
-        let started = Instant::now();
         drop(input);
-        handle
-            .join()
-            .expect("batcher exits when the command queue closes");
-
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let joiner = std::thread::spawn(move || {
+            let result = handle.join();
+            let _ = done_tx.send(());
+            result
+        });
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "batcher must stop promptly once submissions fail"
         );
+        joiner
+            .join()
+            .expect("joiner")
+            .expect("batcher exits when the command queue closes");
         assert!(
             stats.dropped_records.load(Ordering::Relaxed) > 0,
             "records held when the queue closed are accounted as dropped"
@@ -721,7 +727,6 @@ mod tests {
 
         let commands = drain(commands_rx);
         assert_eq!(log_sizes(&commands), vec![78]);
-        assert_eq!(log_sizes(&commands).iter().sum::<usize>(), 78);
     }
 
     #[test]

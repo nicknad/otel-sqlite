@@ -184,11 +184,16 @@ mod tests {
             .expect("worker thread spawns");
         std::thread::sleep(Duration::from_millis(50));
 
-        let started = Instant::now();
-        handle.stop().expect("clean stop");
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let joiner = std::thread::spawn(move || {
+            let result = handle.stop();
+            let _ = done_tx.send(());
+            result
+        });
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "stop must not wait out the next schedule deadline"
         );
+        joiner.join().expect("joiner").expect("clean stop");
     }
 }

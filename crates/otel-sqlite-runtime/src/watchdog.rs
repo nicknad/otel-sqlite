@@ -299,8 +299,14 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     // legitimate in-flight records, and a slow drain must degrade gracefully
     // rather than halt.
     let pending = sample.pending_work();
+    // Both stages must also have been idle for the full window: after a long
+    // idle period the watermark age is already large, and a request that just
+    // entered the pipeline must not be mistaken for a leaked ticket.
+    let both_stages_idle = Duration::from_millis(sample.writer_idle_ms) >= config.ack_stall_after
+        && Duration::from_millis(sample.batcher_idle_ms) >= config.ack_stall_after;
     if sample.outstanding_tickets > 0
         && pending == 0
+        && both_stages_idle
         && Duration::from_millis(sample.watermark_idle_ms) >= config.ack_stall_after
     {
         return Evaluation {
@@ -614,7 +620,7 @@ fn log_transition(from: HealthState, to: HealthState, reason: &Reason) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use otel_sqlite_test_support::wait_until;
 
@@ -642,6 +648,7 @@ mod tests {
             queue_depth: 2,
             queue_capacity: 100,
             pending_records: 5,
+            ingest_queue_depth: 0,
             outstanding_tickets: 0,
             watermark_idle_ms: 10,
             maintenance_in_progress: false,
@@ -819,7 +826,24 @@ mod tests {
         );
 
         sample.watermark_idle_ms = 60_000;
+        sample.writer_idle_ms = 60_000;
+        sample.batcher_idle_ms = 60_000;
         assert_eq!(evaluate(&sample, &config()).state, HealthState::Unhealthy);
+    }
+
+    /// After a long idle period the watermark age is already large. A request
+    /// that just entered the pipeline must not be mistaken for a leaked ticket.
+    #[test]
+    fn a_new_request_after_idle_is_not_a_ticket_leak() {
+        let mut sample = running_sample();
+        sample.queue_depth = 0;
+        sample.pending_records = 0;
+        sample.ingest_queue_depth = 0;
+        sample.outstanding_tickets = 1;
+        sample.watermark_idle_ms = 60_000;
+        sample.writer_idle_ms = 1;
+        sample.batcher_idle_ms = 1;
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Healthy);
     }
 
     /// Outstanding tickets while work is still visibly in flight are left to
@@ -926,12 +950,17 @@ mod tests {
             .expect("watchdog thread spawns");
         std::thread::sleep(Duration::from_millis(50));
 
-        let started = Instant::now();
-        handle.stop().expect("clean stop");
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let joiner = std::thread::spawn(move || {
+            let result = handle.stop();
+            let _ = done_tx.send(());
+            result
+        });
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "stop must not wait out the next tick deadline"
         );
+        joiner.join().expect("joiner").expect("clean stop");
     }
 
     #[test]
