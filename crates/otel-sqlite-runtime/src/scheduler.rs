@@ -29,59 +29,18 @@ use crate::config::MaintenanceConfig;
 /// zero, but this is a public library type.
 const MIN_RETRY_DELAY: Duration = Duration::from_millis(10);
 
-/// Periodic maintenance operations supported by the worker.
-///
-/// Each maps onto an existing writer command variant; none of them carry SQL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Operation {
-    Purge,
-    Checkpoint,
-    Optimize,
-    Vacuum,
-    RebuildFts,
-}
-
-impl Operation {
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Purge => "purge",
-            Self::Checkpoint => "checkpoint",
-            Self::Optimize => "optimize",
-            Self::Vacuum => "vacuum",
-            Self::RebuildFts => "rebuild_fts",
-        }
-    }
-
-    /// Builds the writer command for this operation.
-    ///
-    /// All parameters (retention windows, checkpoint mode) come from
-    /// configuration; the command itself is interpreted exclusively by the
-    /// SQLite writer.
-    fn build(self, config: &MaintenanceConfig) -> WriteCommand {
-        match self {
-            Self::Purge => WriteCommand::Maintenance(MaintenanceOperation::Prune(config.retention)),
-            Self::Checkpoint => WriteCommand::Checkpoint(config.checkpoint_mode),
-            Self::Optimize => WriteCommand::Maintenance(MaintenanceOperation::Analyze),
-            Self::Vacuum => WriteCommand::Maintenance(MaintenanceOperation::Vacuum),
-            Self::RebuildFts => WriteCommand::Maintenance(MaintenanceOperation::RebuildFts),
-        }
-    }
-}
-
 /// Outcome of one scheduler tick.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct TickReport {
-    /// Commands successfully enqueued during this tick.
-    pub scheduled: usize,
-    /// Operations that were due but deferred because the queue was full.
-    pub deferred: usize,
-    /// True when the queue was disconnected (writer gone): terminal.
-    pub disconnected: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TickOutcome {
+    /// The queue is still open; schedule the next tick normally.
+    Continue,
+    /// The writer is gone: there is nowhere to schedule into anymore.
+    Disconnected,
 }
 
 /// One periodic maintenance operation and its schedule state.
 struct Task {
-    operation: Operation,
+    operation: MaintenanceOperation,
     /// `None` disables the operation entirely.
     interval: Option<Duration>,
     next_due: Option<Instant>,
@@ -91,7 +50,7 @@ struct Task {
 }
 
 impl Task {
-    fn new(operation: Operation, interval: Option<Duration>, now: Instant) -> Self {
+    fn new(operation: MaintenanceOperation, interval: Option<Duration>, now: Instant) -> Self {
         // A zero interval would keep the task permanently due and spin the
         // worker. The binary rejects zero, but library callers may not.
         let interval = interval.filter(|interval| !interval.is_zero());
@@ -129,7 +88,7 @@ impl Task {
 
 pub(crate) struct Scheduler {
     tasks: Vec<Task>,
-    config: MaintenanceConfig,
+    retry_delay: Duration,
 }
 
 impl Scheduler {
@@ -137,14 +96,39 @@ impl Scheduler {
         // See `MIN_RETRY_DELAY`: a zero delay would spin `tick` against a full
         // queue. Clamp here so both the worker and the tests share one rule.
         config.retry_delay = config.retry_delay.max(MIN_RETRY_DELAY);
-        let tasks = vec![
-            Task::new(Operation::Purge, purge_interval(&config), now),
-            Task::new(Operation::Checkpoint, config.checkpoint_interval, now),
-            Task::new(Operation::Optimize, config.optimize_interval, now),
-            Task::new(Operation::Vacuum, config.vacuum_interval, now),
-            Task::new(Operation::RebuildFts, config.rebuild_fts_interval, now),
-        ];
-        Self { tasks, config }
+
+        let mut tasks = Vec::with_capacity(5);
+        if let Some(purge) = config.purge {
+            tasks.push(Task::new(
+                MaintenanceOperation::Prune(purge.retention),
+                Some(purge.interval),
+                now,
+            ));
+        }
+        tasks.push(Task::new(
+            MaintenanceOperation::Checkpoint(config.checkpoint_mode),
+            config.checkpoint_interval,
+            now,
+        ));
+        tasks.push(Task::new(
+            MaintenanceOperation::Analyze,
+            config.optimize_interval,
+            now,
+        ));
+        tasks.push(Task::new(
+            MaintenanceOperation::Vacuum,
+            config.vacuum_interval,
+            now,
+        ));
+        tasks.push(Task::new(
+            MaintenanceOperation::RebuildFts,
+            config.rebuild_fts_interval,
+            now,
+        ));
+        Self {
+            tasks,
+            retry_delay: config.retry_delay,
+        }
     }
 
     /// How many periodic operations are enabled. The worker logs this at
@@ -157,44 +141,40 @@ impl Scheduler {
             .count()
     }
 
-    /// Enqueues every operation that is due, then reports what happened.
-    pub(crate) fn tick(&mut self, now: Instant, sink: &Sender<WriteCommand>) -> TickReport {
-        let mut report = TickReport::default();
-
+    /// Enqueues every operation that is due.
+    pub(crate) fn tick(&mut self, now: Instant, sink: &Sender<WriteCommand>) -> TickOutcome {
         for task in &mut self.tasks {
             if !task.due(now) {
                 continue;
             }
             let operation = task.operation;
-            let command = operation.build(&self.config);
+            let command = WriteCommand::Maintenance(operation);
 
             match sink.try_send(command) {
                 Ok(()) => {
                     if task.deferred {
                         tracing::info!(
-                            operation = operation.label(),
+                            operation = operation.as_str(),
                             "maintenance enqueue recovered after queue pressure"
                         );
                     }
                     task.reschedule(now);
-                    report.scheduled += 1;
                     ::metrics::counter!(
                         "maintenance_commands_total",
-                        "operation" => operation.label()
+                        "operation" => operation.as_str()
                     )
                     .increment(1);
                     tracing::info!(
-                        operation = operation.label(),
+                        operation = operation.as_str(),
                         "maintenance command scheduled"
                     );
                 }
                 Err(TrySendError::Full(command)) => {
                     let first_deferral = !task.deferred;
-                    task.defer(now, self.config.retry_delay);
-                    report.deferred += 1;
+                    task.defer(now, self.retry_delay);
                     ::metrics::counter!(
                         "maintenance_enqueue_failures_total",
-                        "operation" => operation.label(),
+                        "operation" => operation.as_str(),
                         "reason" => "queue_full"
                     )
                     .increment(1);
@@ -202,38 +182,37 @@ impl Scheduler {
                     // otherwise emit a warning every `retry_delay`.
                     if first_deferral {
                         tracing::warn!(
-                            operation = operation.label(),
-                            retry_in_ms = self.config.retry_delay.as_millis() as u64,
+                            operation = operation.as_str(),
+                            retry_in_ms = self.retry_delay.as_millis() as u64,
                             "maintenance enqueue deferred; command queue full ({})",
                             command.kind()
                         );
                     } else {
                         tracing::debug!(
-                            operation = operation.label(),
+                            operation = operation.as_str(),
                             "maintenance enqueue still deferred; command queue full ({})",
                             command.kind()
                         );
                     }
                 }
                 Err(TrySendError::Disconnected(command)) => {
-                    report.disconnected = true;
                     ::metrics::counter!(
                         "maintenance_enqueue_failures_total",
-                        "operation" => operation.label(),
+                        "operation" => operation.as_str(),
                         "reason" => "queue_closed"
                     )
                     .increment(1);
                     tracing::error!(
-                        operation = operation.label(),
+                        operation = operation.as_str(),
                         "command queue closed while enqueueing {}",
                         command.kind()
                     );
-                    return report;
+                    return TickOutcome::Disconnected;
                 }
             }
         }
 
-        report
+        TickOutcome::Continue
     }
 
     /// Earliest instant at which some enabled operation becomes due again.
@@ -244,18 +223,11 @@ impl Scheduler {
     }
 
     #[cfg(test)]
-    fn is_due(&self, operation: Operation, now: Instant) -> bool {
+    fn is_due(&self, operation: MaintenanceOperation, now: Instant) -> bool {
         self.tasks
             .iter()
             .any(|task| task.operation == operation && task.due(now))
     }
-}
-
-/// Purge cadence: enabled when a retention window is set. The enqueued prune
-/// command carries that window; `None` never schedules.
-fn purge_interval(config: &MaintenanceConfig) -> Option<Duration> {
-    config.retention?;
-    config.purge_interval
 }
 
 #[cfg(test)]
@@ -266,10 +238,14 @@ mod tests {
     use otel_sqlite_core::storage::{CheckpointMode, MaintenanceOperation, WriteCommand};
 
     use super::*;
+    use crate::config::PurgeSchedule;
 
-    /// Drains every command the scheduler enqueued so far.
     fn drain(receiver: &Receiver<WriteCommand>) -> Vec<WriteCommand> {
         receiver.try_iter().collect()
+    }
+
+    fn assert_drained(receiver: &Receiver<WriteCommand>) {
+        assert_eq!(drain(receiver), Vec::new(), "queue must stay empty");
     }
 
     fn kinds(commands: &[WriteCommand]) -> Vec<&'static str> {
@@ -278,8 +254,10 @@ mod tests {
 
     fn config(purge: Option<Duration>) -> MaintenanceConfig {
         MaintenanceConfig {
-            retention: Some(Duration::from_secs(3_600)),
-            purge_interval: purge,
+            purge: purge.map(|interval| PurgeSchedule {
+                retention: Duration::from_secs(3_600),
+                interval,
+            }),
             ..MaintenanceConfig::default()
         }
     }
@@ -289,21 +267,19 @@ mod tests {
         let base = Instant::now();
         let mut scheduler = Scheduler::new(config(Some(Duration::from_secs(1))), base);
         let (sink, enqueued) = bounded::<WriteCommand>(16);
+        let prune = MaintenanceOperation::Prune(Duration::from_secs(3_600));
 
-        assert!(!scheduler.is_due(Operation::Purge, base));
-        assert!(!scheduler.is_due(Operation::Purge, base + Duration::from_millis(999)));
-        assert!(scheduler.is_due(Operation::Purge, base + Duration::from_secs(1)));
+        assert!(!scheduler.is_due(prune, base));
+        assert!(!scheduler.is_due(prune, base + Duration::from_millis(999)));
+        assert!(scheduler.is_due(prune, base + Duration::from_secs(1)));
 
-        let report = scheduler.tick(base + Duration::from_secs(1), &sink);
-        assert_eq!(report.scheduled, 1);
-        let commands = drain(&enqueued);
-        assert_eq!(kinds(&commands), vec!["maintenance"]);
-        let WriteCommand::Maintenance(MaintenanceOperation::Prune(window)) = &commands[0] else {
-            panic!("expected a prune command");
-        };
         assert_eq!(
-            window,
-            &Some(Duration::from_secs(3_600)),
+            scheduler.tick(base + Duration::from_secs(1), &sink),
+            TickOutcome::Continue
+        );
+        assert_eq!(
+            drain(&enqueued),
+            vec![WriteCommand::Maintenance(prune)],
             "the configured retention window must ride on the prune command"
         );
     }
@@ -314,16 +290,17 @@ mod tests {
         let mut scheduler = Scheduler::new(config(Some(Duration::from_secs(60))), base);
         let (sink, enqueued) = bounded::<WriteCommand>(16);
 
-        let report = scheduler.tick(base, &sink);
-        assert_eq!(report, TickReport::default());
-        assert!(drain(&enqueued).is_empty());
+        scheduler.tick(base, &sink);
+        assert_drained(&enqueued);
     }
 
     #[test]
     fn operations_follow_independent_schedules() {
         let cfg = MaintenanceConfig {
-            retention: Some(Duration::from_secs(60)),
-            purge_interval: Some(Duration::from_secs(1)),
+            purge: Some(PurgeSchedule {
+                retention: Duration::from_secs(60),
+                interval: Duration::from_secs(1),
+            }),
             checkpoint_interval: Some(Duration::from_secs(3)),
             optimize_interval: None,
             vacuum_interval: Some(Duration::from_secs(5)),
@@ -333,32 +310,23 @@ mod tests {
         let mut scheduler = Scheduler::new(cfg, base);
         let (sink, enqueued) = bounded::<WriteCommand>(16);
 
-        let report = scheduler.tick(base + Duration::from_secs(1), &sink);
-        assert_eq!(report.scheduled, 1);
+        scheduler.tick(base + Duration::from_secs(1), &sink);
+        assert_eq!(enqueued.len(), 1);
 
-        let report = scheduler.tick(base + Duration::from_secs(3), &sink);
-        assert_eq!(report.scheduled, 2, "purge (due again) plus checkpoint");
+        scheduler.tick(base + Duration::from_secs(3), &sink);
+        assert_eq!(enqueued.len(), 3, "purge again plus checkpoint");
 
-        let report = scheduler.tick(base + Duration::from_secs(5), &sink);
-        assert_eq!(report.scheduled, 2, "purge (due again) plus vacuum");
-
+        scheduler.tick(base + Duration::from_secs(5), &sink);
         let commands = drain(&enqueued);
         assert_eq!(
             kinds(&commands),
             vec![
-                "maintenance", // purge @1s
-                "maintenance", // purge @3s
-                "checkpoint",  // @3s
-                "maintenance", // purge @5s
-                "maintenance", // vacuum @5s
+                "purge",      // @1s
+                "purge",      // @3s
+                "checkpoint", // @3s
+                "purge",      // @5s
+                "vacuum",     // @5s
             ]
-        );
-        assert_eq!(
-            kinds(&commands)
-                .iter()
-                .filter(|k| **k == "checkpoint")
-                .count(),
-            1
         );
     }
 
@@ -370,12 +338,11 @@ mod tests {
 
         scheduler.tick(base + Duration::from_secs(2), &sink);
         for ms in [2_100u64, 2_500, 2_900, 3_500, 3_900] {
-            let report = scheduler.tick(base + Duration::from_millis(ms), &sink);
-            assert_eq!(report.scheduled, 0, "no duplicate before interval elapses");
+            scheduler.tick(base + Duration::from_millis(ms), &sink);
+            assert_eq!(enqueued.len(), 1, "no duplicate before interval elapses");
         }
 
-        let report = scheduler.tick(base + Duration::from_secs(4), &sink);
-        assert_eq!(report.scheduled, 1);
+        scheduler.tick(base + Duration::from_secs(4), &sink);
         assert_eq!(drain(&enqueued).len(), 2);
     }
 
@@ -394,29 +361,24 @@ mod tests {
         // bounded queue; the idle receiver just never accepts anything.
         let (saturated, idle) = bounded::<WriteCommand>(0);
 
-        let report = scheduler.tick(base + Duration::from_secs(10), &saturated);
-        assert_eq!(report.deferred, 1);
-        assert_eq!(report.scheduled, 0);
-        assert!(drain(&idle).is_empty());
+        scheduler.tick(base + Duration::from_secs(10), &saturated);
+        assert_drained(&idle);
 
         // Still within the retry window: nothing is re-attempted yet, and no
         // duplicate appears.
-        let report = scheduler.tick(base + Duration::new(10, 400_000_000), &saturated);
-        assert_eq!(report.scheduled, 0);
-        assert!(drain(&idle).is_empty());
+        scheduler.tick(base + Duration::new(10, 400_000_000), &saturated);
+        assert_drained(&idle);
 
         // Pressure gone: the pending operation goes through exactly once.
         let (sink, enqueued) = bounded::<WriteCommand>(16);
-        let report = scheduler.tick(base + Duration::from_millis(10_500), &sink);
-        assert_eq!(report.scheduled, 1);
+        scheduler.tick(base + Duration::from_millis(10_500), &sink);
         let mut commands = drain(&enqueued);
         assert_eq!(commands.len(), 1);
 
         // Normal cadence resumes from the successful enqueue.
-        let report = scheduler.tick(base + Duration::from_secs(19), &sink);
-        assert_eq!(report.scheduled, 0);
-        let report = scheduler.tick(base + Duration::from_millis(20_500), &sink);
-        assert_eq!(report.scheduled, 1);
+        scheduler.tick(base + Duration::from_secs(19), &sink);
+        assert_drained(&enqueued);
+        scheduler.tick(base + Duration::from_millis(20_500), &sink);
         commands.extend(drain(&enqueued));
         assert_eq!(commands.len(), 2);
     }
@@ -426,38 +388,41 @@ mod tests {
         let base = Instant::now();
         let mut scheduler = Scheduler::new(config(Some(Duration::from_secs(1))), base);
         let (sink, receiver) = bounded::<WriteCommand>(16);
-        drop(receiver); // the writer is gone
+        drop(receiver);
 
-        let report = scheduler.tick(base + Duration::from_secs(1), &sink);
-        assert!(report.disconnected);
-        assert_eq!(report.scheduled, 0);
+        assert_eq!(
+            scheduler.tick(base + Duration::from_secs(1), &sink),
+            TickOutcome::Disconnected
+        );
     }
 
     #[test]
     fn disabled_operations_never_schedule() {
         let cfg = MaintenanceConfig {
-            retention: None,
-            purge_interval: Some(Duration::from_secs(1)), // ignored without retention
+            purge: None,
             checkpoint_interval: None,
             optimize_interval: None,
             vacuum_interval: None,
+            rebuild_fts_interval: None,
             ..MaintenanceConfig::default()
         };
         let base = Instant::now();
         let mut scheduler = Scheduler::new(cfg, base);
         let (sink, enqueued) = bounded::<WriteCommand>(16);
 
-        let report = scheduler.tick(base + Duration::from_secs(1_000), &sink);
-        assert_eq!(report, TickReport::default());
+        scheduler.tick(base + Duration::from_secs(1_000), &sink);
         assert_eq!(scheduler.next_deadline(), None);
-        assert!(drain(&enqueued).is_empty());
+        assert_eq!(scheduler.enabled_task_count(), 0);
+        assert_drained(&enqueued);
     }
 
     #[test]
     fn next_deadline_is_the_nearest_enabled_schedule() {
         let cfg = MaintenanceConfig {
-            retention: Some(Duration::from_secs(60)),
-            purge_interval: Some(Duration::from_secs(10)),
+            purge: Some(PurgeSchedule {
+                retention: Duration::from_secs(60),
+                interval: Duration::from_secs(10),
+            }),
             checkpoint_interval: Some(Duration::from_secs(300)),
             optimize_interval: None,
             vacuum_interval: Some(Duration::from_secs(86_400)),
@@ -475,8 +440,10 @@ mod tests {
     #[test]
     fn built_commands_carry_configured_parameters() {
         let cfg = MaintenanceConfig {
-            retention: Some(Duration::from_secs(90)),
-            purge_interval: Some(Duration::from_secs(1)),
+            purge: Some(PurgeSchedule {
+                retention: Duration::from_secs(90),
+                interval: Duration::from_secs(1),
+            }),
             checkpoint_mode: CheckpointMode::Restart,
             checkpoint_interval: Some(Duration::from_secs(1)),
             optimize_interval: Some(Duration::from_secs(1)),
@@ -491,22 +458,24 @@ mod tests {
         scheduler.tick(base + Duration::from_secs(1), &sink);
         let commands = drain(&enqueued);
 
-        assert!(
-            commands.contains(&WriteCommand::Maintenance(MaintenanceOperation::Prune(
-                Some(Duration::from_secs(90))
-            )))
-        );
-        assert!(commands.contains(&WriteCommand::Checkpoint(CheckpointMode::Restart)));
-        assert!(commands.contains(&WriteCommand::Maintenance(MaintenanceOperation::Analyze)));
-        assert!(commands.contains(&WriteCommand::Maintenance(MaintenanceOperation::Vacuum)));
-        assert!(commands.contains(&WriteCommand::Maintenance(MaintenanceOperation::RebuildFts)));
+        for operation in [
+            MaintenanceOperation::Prune(Duration::from_secs(90)),
+            MaintenanceOperation::Checkpoint(CheckpointMode::Restart),
+            MaintenanceOperation::Analyze,
+            MaintenanceOperation::Vacuum,
+            MaintenanceOperation::RebuildFts,
+        ] {
+            assert!(
+                commands.contains(&WriteCommand::Maintenance(operation)),
+                "missing {operation:?} in {commands:?}"
+            );
+        }
     }
 
     #[test]
     fn rebuild_fts_follows_its_own_schedule() {
         let cfg = MaintenanceConfig {
-            retention: None,
-            purge_interval: None,
+            purge: None,
             checkpoint_interval: None,
             optimize_interval: None,
             vacuum_interval: None,
@@ -517,11 +486,10 @@ mod tests {
         let mut scheduler = Scheduler::new(cfg, base);
         let (sink, enqueued) = bounded::<WriteCommand>(16);
 
-        let report = scheduler.tick(base, &sink);
-        assert_eq!(report.scheduled, 0);
+        scheduler.tick(base, &sink);
+        assert_drained(&enqueued);
 
-        let report = scheduler.tick(base + Duration::from_secs(30), &sink);
-        assert_eq!(report.scheduled, 1);
+        scheduler.tick(base + Duration::from_secs(30), &sink);
         assert_eq!(
             drain(&enqueued),
             vec![WriteCommand::Maintenance(MaintenanceOperation::RebuildFts)]
@@ -534,14 +502,16 @@ mod tests {
     #[test]
     fn zero_intervals_are_disabled_instead_of_spinning() {
         let cfg = MaintenanceConfig {
-            retention: Some(Duration::from_secs(60)),
-            purge_interval: Some(Duration::ZERO),
+            purge: Some(PurgeSchedule {
+                retention: Duration::from_secs(60),
+                interval: Duration::ZERO,
+            }),
             checkpoint_interval: Some(Duration::ZERO),
             optimize_interval: Some(Duration::ZERO),
             vacuum_interval: Some(Duration::ZERO),
             rebuild_fts_interval: Some(Duration::ZERO),
-            checkpoint_mode: CheckpointMode::Passive,
             retry_delay: Duration::ZERO,
+            ..MaintenanceConfig::default()
         };
         let base = Instant::now();
         let mut scheduler = Scheduler::new(cfg, base);
@@ -549,65 +519,64 @@ mod tests {
 
         assert_eq!(scheduler.enabled_task_count(), 0);
         assert_eq!(scheduler.next_deadline(), None);
-        assert_eq!(scheduler.tick(base, &sink), TickReport::default());
-        assert!(drain(&enqueued).is_empty());
+        scheduler.tick(base, &sink);
+        assert_drained(&enqueued);
     }
 
-    /// A zero retry delay would spin `tick` against a full queue; the
-    /// scheduler lifts it to `MIN_RETRY_DELAY`.
     #[test]
     fn zero_retry_delay_is_lifted_to_a_floor() {
         let base = Instant::now();
         let mut scheduler = Scheduler::new(
             MaintenanceConfig {
-                retention: Some(Duration::from_secs(60)),
-                purge_interval: Some(Duration::from_secs(1)),
+                purge: Some(PurgeSchedule {
+                    retention: Duration::from_secs(60),
+                    interval: Duration::from_secs(1),
+                }),
                 checkpoint_interval: None,
                 optimize_interval: None,
                 vacuum_interval: None,
                 rebuild_fts_interval: None,
-                checkpoint_mode: CheckpointMode::Passive,
                 retry_delay: Duration::ZERO,
+                ..MaintenanceConfig::default()
             },
             base,
         );
-        let (saturated, _idle) = bounded::<WriteCommand>(0);
+        let (saturated, idle) = bounded::<WriteCommand>(0);
 
-        let report = scheduler.tick(base + Duration::from_secs(1), &saturated);
-        assert_eq!(report.deferred, 1);
+        scheduler.tick(base + Duration::from_secs(1), &saturated);
+        assert_drained(&idle);
         assert_eq!(
             scheduler.next_deadline(),
             Some(base + Duration::from_secs(1) + MIN_RETRY_DELAY)
         );
     }
 
-    /// A long saturation must warn once per episode, not once per retry; the
-    /// recovery is reported when the queue drains.
     #[test]
-    fn repeated_deferrals_do_not_repeat_the_warning() {
+    fn repeated_deferrals_keep_the_operation_due_until_the_queue_drains() {
         let base = Instant::now();
         let mut scheduler = Scheduler::new(
             MaintenanceConfig {
-                retention: Some(Duration::from_secs(60)),
-                purge_interval: Some(Duration::from_secs(1)),
+                purge: Some(PurgeSchedule {
+                    retention: Duration::from_secs(60),
+                    interval: Duration::from_secs(1),
+                }),
                 checkpoint_interval: None,
                 optimize_interval: None,
                 vacuum_interval: None,
                 rebuild_fts_interval: None,
-                checkpoint_mode: CheckpointMode::Passive,
                 retry_delay: Duration::from_millis(100),
+                ..MaintenanceConfig::default()
             },
             base,
         );
-        let (saturated, _idle) = bounded::<WriteCommand>(0);
+        let (saturated, idle) = bounded::<WriteCommand>(0);
         for tick in 1..=5u64 {
-            let report = scheduler.tick(base + Duration::from_secs(tick), &saturated);
-            assert_eq!(report.deferred, 1, "tick {tick}");
+            scheduler.tick(base + Duration::from_secs(tick), &saturated);
+            assert_drained(&idle);
         }
 
         let (sink, enqueued) = bounded::<WriteCommand>(16);
-        let report = scheduler.tick(base + Duration::from_secs(6), &sink);
-        assert_eq!(report.scheduled, 1);
+        scheduler.tick(base + Duration::from_secs(6), &sink);
         assert_eq!(drain(&enqueued).len(), 1);
     }
 }

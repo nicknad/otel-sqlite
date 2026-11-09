@@ -102,7 +102,8 @@ fn idle_pipeline_after_a_burst_is_not_halted() {
     };
     let watchdog = Watchdog::new(StorageSource(storage.health()), config, halt_tx)
         .expect("valid watchdog config")
-        .spawn();
+        .spawn()
+        .expect("watchdog thread spawns");
 
     // Several ticks of idleness: the stale-depth bug halted within ~150 ms.
     std::thread::sleep(Duration::from_millis(600));

@@ -58,7 +58,7 @@
 //! # Lifecycle
 //!
 //! ```text
-//! MaintenanceWorker::new(sink, config).spawn()  ─▶ started thread
+//! MaintenanceWorker::new(sink, config).spawn()? ─▶ started thread
 //!                                                ─▶ periodic enqueue loop
 //! handle.stop()                                 ─▶ clean exit + join()
 //! ```
@@ -85,17 +85,20 @@
 //! # Lifecycle
 //!
 //! ```text
-//! Watchdog::new(source, config, halt)?.spawn() ─▶ started thread
-//!                                               ─▶ periodic sample/verdict loop
-//! unhealthy verdict                             ─▶ one-shot halt, loop ends
-//! handle.stop()                                 ─▶ clean exit + join()
+//! Watchdog::new(source, config, halt)?.spawn()? ─▶ started thread
+//!                                                ─▶ periodic sample/verdict loop
+//! unhealthy verdict                              ─▶ one-shot halt, loop ends
+//! handle.stop()                                  ─▶ clean exit + join()
 //! ```
 
 pub mod config;
 mod scheduler;
+mod thread;
 mod watchdog;
 mod worker;
 
-pub use config::{MaintenanceConfig, WatchdogConfig, WatchdogConfigError};
+pub use config::{
+    MaintenanceConfig, MaintenanceConfigError, PurgeSchedule, WatchdogConfig, WatchdogConfigError,
+};
 pub use watchdog::{HealthSampleSource, HealthState, Watchdog, WatchdogError, WatchdogHandle};
 pub use worker::{MaintenanceHandle, MaintenanceWorker, MaintenanceWorkerError};
