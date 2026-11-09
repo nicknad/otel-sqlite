@@ -7,7 +7,8 @@
 use std::path::Path;
 
 use anyhow::Context;
-use rusqlite::{Connection, OpenFlags};
+use otel_sqlite_test_support::{file_len, try_open_readonly, wal_path};
+use rusqlite::Connection;
 
 use crate::generator::RUN_ID_KEY;
 
@@ -25,25 +26,8 @@ pub struct StorageInfo {
     pub wal_bytes: u64,
 }
 
-fn file_len(path: &Path) -> u64 {
-    std::fs::metadata(path).map_or(0, |meta| meta.len())
-}
-
-/// SQLite write-ahead-log sidecar path (`<db>-wal`). Appending the suffix
-/// matches SQLite's naming for any database path, including extensionless
-/// ones, unlike `Path::with_extension`.
-pub(crate) fn wal_path(db_path: &Path) -> std::path::PathBuf {
-    let mut os = db_path.as_os_str().to_owned();
-    os.push("-wal");
-    std::path::PathBuf::from(os)
-}
-
 pub fn open_readonly(db_path: &Path) -> anyhow::Result<Connection> {
-    Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("failed to open {}", db_path.display()))
+    try_open_readonly(db_path).with_context(|| format!("failed to open {}", db_path.display()))
 }
 
 /// Capture the exact SQLite configuration and physical sizes of the database
@@ -68,7 +52,6 @@ pub fn inspect(db_path: &Path) -> anyhow::Result<StorageInfo> {
     })
 }
 
-/// Total log rows currently persisted (any run).
 pub fn count_all_log_events(db_path: &Path) -> anyhow::Result<u64> {
     let conn = open_readonly(db_path)?;
     let count: u64 = conn.query_row("SELECT COUNT(*) FROM log_event", [], |row| {
@@ -110,7 +93,7 @@ pub fn wait_until_drained(
             }
         } else if last_change.elapsed() >= std::time::Duration::from_millis(1_500) && last_count > 0
         {
-            // Stable for longer than the writer's 1s flush interval.
+            // No new rows for 1.5s, comfortably beyond any batch-age flush.
             return Ok(last_count);
         }
         if started.elapsed() > timeout {
@@ -151,8 +134,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    /// Minimal stand-in for the migrated schema: `wait_until_drained` only
-    /// reads `log_event.attributes_json` through `count_for_run`.
+    /// Builds a real migrated database so the drain query runs against the
+    /// production schema rather than a hand-written stand-in.
     fn fixture_db(rows: &[(&str, u64)]) -> anyhow::Result<PathBuf> {
         let dir = std::env::temp_dir().join(format!(
             "otel-sqlite-e2e-dbtest-{}-{}",
@@ -164,11 +147,20 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir)?;
         let db_path = dir.join("otel-logs.db");
-        let conn = Connection::open(&db_path)?;
-        conn.execute_batch("CREATE TABLE log_event (attributes_json TEXT NOT NULL);")?;
+        let mut conn = Connection::open(&db_path)?;
+        otel_sqlite_storage::migrate_up_to(
+            &mut conn,
+            otel_sqlite_storage::latest_schema_version(),
+        )?;
+        conn.execute(
+            "INSERT INTO log_resource (id, service_name) VALUES ('fixture-resource', 'fixture')",
+            [],
+        )?;
         let insert = |run_id: &str| -> anyhow::Result<()> {
             conn.execute(
-                "INSERT INTO log_event (attributes_json) VALUES (json_object(?1, ?2))",
+                "INSERT INTO log_event \
+                 (resource_id, timestamp_ns, observed_timestamp_ns, severity_number, attributes_json) \
+                 VALUES ('fixture-resource', 0, 0, 0, json_object(?1, ?2))",
                 rusqlite::params![RUN_ID_KEY, run_id],
             )?;
             Ok(())

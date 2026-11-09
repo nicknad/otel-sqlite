@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
+use otel_sqlite_e2e::accounting::RunAccounting;
 use otel_sqlite_e2e::client::ClientCountersSnapshot;
 use otel_sqlite_e2e::crash::{LoadOutcome, LoadParams, assert_valid, run_load};
 use otel_sqlite_e2e::generator::WorkloadSpec;
@@ -81,6 +82,7 @@ struct Manifest {
     ambiguous: u64,
     rejected_ranges: Vec<(u64, u64)>,
     ambiguous_ranges: Vec<(u64, u64)>,
+    positions_exact: bool,
 }
 
 impl Manifest {
@@ -94,6 +96,7 @@ impl Manifest {
             ambiguous: counters.records_ambiguous,
             rejected_ranges: outcome.rejected.ranges().to_vec(),
             ambiguous_ranges: outcome.ambiguous.ranges().to_vec(),
+            positions_exact: outcome.positions_exact,
         }
     }
 }
@@ -190,8 +193,8 @@ fn run_validate_phase(db_path: &std::path::Path, manifest_path: &PathBuf) -> Res
         .with_context(|| format!("parse manifest {}", manifest_path.display()))?;
 
     // Round-trip the accounting exactly as `crash::run_load` produced it.
-    let outcome = LoadOutcome {
-        counters: ClientCountersSnapshot {
+    let outcome: LoadOutcome = RunAccounting::new(
+        ClientCountersSnapshot {
             requests: 0,
             records_generated: manifest.generated,
             records_accepted: manifest.accepted,
@@ -200,9 +203,11 @@ fn run_validate_phase(db_path: &std::path::Path, manifest_path: &PathBuf) -> Res
             requests_failed: 0,
             requests_timed_out: 0,
         },
-        rejected: IntervalSet::from_ranges(manifest.rejected_ranges),
-        ambiguous: IntervalSet::from_ranges(manifest.ambiguous_ranges),
-    };
+        IntervalSet::from_ranges(manifest.rejected_ranges),
+        IntervalSet::from_ranges(manifest.ambiguous_ranges),
+        manifest.positions_exact,
+    )
+    .context("manifest accounting is inconsistent")?;
 
     println!(
         "validate '{}': db {} (generated={} accepted={} rejected={} ambiguous={})",

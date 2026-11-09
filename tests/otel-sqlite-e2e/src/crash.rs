@@ -9,20 +9,14 @@
 //! accounting (`generated = accepted + rejected + ambiguous`).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use otel_sqlite_core::storage::SyncMode;
 use serde::Serialize;
-use tokio::time::Instant as TokioInstant;
 
-use crate::client::{
-    ClientCounters, ClientCountersSnapshot, LatencyHistogram, LoadClient, SequenceAllocator,
-};
+use crate::accounting::RunAccounting;
 use crate::generator::WorkloadSpec;
-use crate::interval_set::IntervalSet;
-use crate::ledger::Ledger;
-use crate::pacer::Pacer;
+use crate::runner::{LoadRequest, TransportFailurePolicy};
 use crate::validation;
 
 // ---------------------------------------------------------------------------
@@ -141,15 +135,7 @@ pub fn write_server_config(config: &CrashServerConfig) -> PathBuf {
 // Load execution and outcome accounting
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
-pub struct LoadOutcome {
-    pub counters: ClientCountersSnapshot,
-    /// Sequences definitively rejected by the server (`InvalidArgument` or
-    /// server-generated `UNAVAILABLE`); transport failures become ambiguous.
-    pub rejected: IntervalSet,
-    /// Sequences whose fate is unknown client-side (timeout/transport break).
-    pub ambiguous: IntervalSet,
-}
+pub type LoadOutcome = RunAccounting;
 
 #[derive(Debug, Clone)]
 pub struct LoadParams {
@@ -177,107 +163,28 @@ impl LoadParams {
     }
 }
 
-/// Executes a bounded load and returns the outcome accounting. Unlike the
-/// benchmark runner there is deliberately NO consecutive-failure abort: a
-/// crash test EXPECTS the endpoint to die mid-run, and every request after
-/// the kill must still be classified (rejected or ambiguous), never silently
-/// dropped from the accounting.
-///
-/// Every worker is awaited, including any request still in flight past the
-/// deadline (bounded by `request_timeout`), so
-/// `generated = accepted + rejected + ambiguous` holds exactly and
-/// validation never sees unclassified sequences.
+/// Executes a bounded load through the shared driver, tolerating transport
+/// failures: a crash test EXPECTS the endpoint to die mid-run, and every
+/// request after the kill must still be classified (rejected or ambiguous),
+/// never silently dropped from the accounting.
 pub async fn run_load(
     endpoint: &str,
     spec: WorkloadSpec,
     params: &LoadParams,
 ) -> anyhow::Result<LoadOutcome> {
-    let spec = Arc::new(spec);
-    let allocator = Arc::new(SequenceAllocator::new(0));
-    let ledger = Arc::new(Ledger::new());
-    let latencies = Arc::new(LatencyHistogram::new());
-    let counters = Arc::new(ClientCounters::default());
-
-    let offered_request_rate = params
-        .offered_records_per_second
-        .map(|records_per_sec| records_per_sec as f64 / params.records_per_request as f64);
-    let pacer = Arc::new(Pacer::new(offered_request_rate));
-
-    let deadline = TokioInstant::now() + params.duration;
-    let records_per_request = params.records_per_request;
-    let request_timeout = params.request_timeout;
-
-    let mut workers = Vec::with_capacity(params.clients);
-    for _ in 0..params.clients {
-        let client_endpoint = endpoint.to_owned();
-        let spec = Arc::clone(&spec);
-        let allocator = Arc::clone(&allocator);
-        let pacer = Arc::clone(&pacer);
-        let ledger = Arc::clone(&ledger);
-        let latencies = Arc::clone(&latencies);
-        let counters = Arc::clone(&counters);
-        workers.push(tokio::spawn(async move {
-            load_worker(
-                &client_endpoint,
-                spec,
-                allocator,
-                records_per_request,
-                request_timeout,
-                pacer,
-                ledger,
-                latencies,
-                counters,
-                deadline,
-            )
-            .await
-        }));
-    }
-
-    for worker in workers {
-        worker.await??;
-    }
-
-    let (rejected, ambiguous, _positions_exact) = ledger.freeze();
-    Ok(LoadOutcome {
-        counters: counters.snapshot(),
-        rejected,
-        ambiguous,
+    let run = crate::runner::run_load(LoadRequest {
+        endpoint: endpoint.to_owned(),
+        spec: std::sync::Arc::new(spec),
+        clients: params.clients,
+        records_per_request: params.records_per_request,
+        offered_records_per_second: params.offered_records_per_second,
+        duration: params.duration,
+        request_timeout: params.request_timeout,
+        transport_failures: TransportFailurePolicy::Tolerate,
+        sampling: None,
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn load_worker(
-    endpoint: &str,
-    spec: Arc<WorkloadSpec>,
-    allocator: Arc<SequenceAllocator>,
-    records_per_request: usize,
-    request_timeout: Duration,
-    pacer: Arc<Pacer>,
-    ledger: Arc<Ledger>,
-    latencies: Arc<LatencyHistogram>,
-    counters: Arc<ClientCounters>,
-    deadline: TokioInstant,
-) -> anyhow::Result<()> {
-    let mut client = LoadClient::connect(
-        endpoint,
-        spec,
-        allocator,
-        records_per_request,
-        request_timeout,
-        latencies,
-        counters,
-    )
     .await?;
-
-    while TokioInstant::now() < deadline {
-        pacer.acquire().await;
-        if TokioInstant::now() >= deadline {
-            break;
-        }
-        let result = client.send_one().await;
-        ledger.record(&result);
-    }
-    Ok(())
+    Ok(run.accounting)
 }
 
 // ---------------------------------------------------------------------------
@@ -291,13 +198,7 @@ pub fn validate_run(
     run_id: &str,
     outcome: &LoadOutcome,
 ) -> anyhow::Result<validation::CorrectnessReport> {
-    validation::validate(
-        db_path,
-        run_id,
-        outcome.counters.records_generated,
-        &outcome.rejected,
-        &outcome.ambiguous,
-    )
+    validation::validate(db_path, run_id, outcome)
 }
 
 /// Full crash-recovery assertion: correctness passes (no acknowledged loss,
@@ -309,6 +210,12 @@ pub fn validate_run(
 /// so rejected requests never reached the server. Use
 /// [`assert_valid_recovery`] when a pipeline *component* dies instead.
 pub fn assert_valid(db_path: &Path, run_id: &str, outcome: &LoadOutcome) -> anyhow::Result<()> {
+    if !outcome.positions_exact {
+        anyhow::bail!(
+            "crash recovery validation failed for run '{run_id}': ledger marked rejected \
+             positions inexact, so absent-rejected assertions cannot be trusted"
+        );
+    }
     let report = validate_run(db_path, run_id, outcome)?;
     if !report.passed {
         anyhow::bail!(
@@ -344,6 +251,12 @@ pub fn assert_valid_recovery(
     run_id: &str,
     outcome: &LoadOutcome,
 ) -> anyhow::Result<()> {
+    if !outcome.positions_exact {
+        anyhow::bail!(
+            "crash recovery validation failed for run '{run_id}': ledger marked rejected \
+             positions inexact; expected rows cannot be derived reliably"
+        );
+    }
     let report = validate_run(db_path, run_id, outcome)?;
     if report.missing_sequences > 0 {
         anyhow::bail!(

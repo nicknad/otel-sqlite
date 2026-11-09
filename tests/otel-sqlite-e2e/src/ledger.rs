@@ -74,3 +74,71 @@ impl Ledger {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(start_seq: u64, records: usize, kind: OutcomeKind) -> RequestResult {
+        RequestResult {
+            start_seq,
+            records,
+            kind,
+        }
+    }
+
+    #[test]
+    fn accepted_requests_leave_the_interval_sets_empty() {
+        let ledger = Ledger::new();
+        ledger.record(&result(1, 10, OutcomeKind::AllAccepted));
+        let (rejected, ambiguous, positions_exact) = ledger.freeze();
+        assert_eq!(rejected.total(), 0);
+        assert_eq!(ambiguous.total(), 0);
+        assert!(positions_exact);
+    }
+
+    #[test]
+    fn rejected_and_ambiguous_ranges_are_tracked_separately() {
+        let ledger = Ledger::new();
+        ledger.record(&result(1, 10, OutcomeKind::Rejected));
+        ledger.record(&result(11, 5, OutcomeKind::Ambiguous));
+        let (rejected, ambiguous, positions_exact) = ledger.freeze();
+        assert_eq!(rejected.ranges(), &[(1, 10)]);
+        assert_eq!(ambiguous.ranges(), &[(11, 15)]);
+        assert!(positions_exact);
+    }
+
+    #[test]
+    fn a_fully_rejected_partial_success_is_an_exact_rejection() {
+        let ledger = Ledger::new();
+        ledger.record(&result(
+            1,
+            4,
+            OutcomeKind::PartiallyRejected {
+                accepted: 0,
+                rejected: 4,
+            },
+        ));
+        let (rejected, ambiguous, positions_exact) = ledger.freeze();
+        assert_eq!(rejected.ranges(), &[(1, 4)]);
+        assert_eq!(ambiguous.total(), 0);
+        assert!(positions_exact);
+    }
+
+    #[test]
+    fn a_mixed_partial_success_degrades_positions_to_ambiguous() {
+        let ledger = Ledger::new();
+        ledger.record(&result(
+            1,
+            10,
+            OutcomeKind::PartiallyRejected {
+                accepted: 6,
+                rejected: 4,
+            },
+        ));
+        let (rejected, ambiguous, positions_exact) = ledger.freeze();
+        assert_eq!(rejected.total(), 0);
+        assert_eq!(ambiguous.ranges(), &[(1, 10)]);
+        assert!(!positions_exact);
+    }
+}

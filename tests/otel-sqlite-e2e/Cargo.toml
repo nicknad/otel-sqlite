@@ -37,6 +37,7 @@ metrics = { workspace = true }
 otel-sqlite-core = { workspace = true }
 otel-sqlite-ingress = { workspace = true }
 otel-sqlite-storage = { workspace = true }
+otel-sqlite-test-support = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }

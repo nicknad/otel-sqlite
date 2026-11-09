@@ -19,9 +19,9 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
+use crate::accounting::RunAccounting;
 use crate::db::open_readonly;
 use crate::generator::{RECORD_ID_KEY, RUN_ID_KEY, SEQ_KEY};
-use crate::interval_set::IntervalSet;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CorrectnessReport {
@@ -51,21 +51,22 @@ pub struct CorrectnessReport {
 
 /// Full correctness validation for one benchmark run against its SQLite data.
 ///
-/// `generated_range` covers `[1, generated]`; `rejected`/`ambiguous` hold the
-/// corresponding sequence sets collected by the scenario runner.
+/// The accounting value is checked first: a ledger that disagrees with the
+/// client counters is a hard error, never a silently smaller expected set.
 pub fn validate(
     db_path: &Path,
     run_id: &str,
-    generated_total: u64,
-    rejected: &IntervalSet,
-    ambiguous: &IntervalSet,
+    accounting: &RunAccounting,
 ) -> anyhow::Result<CorrectnessReport> {
     // Cap enumeration so pathological runs cannot spin here forever; a run
     // exceeding the cap is reported with at least `MISSING_CAP` misses.
     const MISSING_CAP: u64 = 1_000_000;
 
-    let all = IntervalSet::from_ranges(vec![(1, generated_total)]);
-    let expected = all.subtract(rejected).subtract(ambiguous);
+    accounting.check()?;
+    let generated_total = accounting.counters.records_generated;
+    let rejected = &accounting.rejected;
+    let ambiguous = &accounting.ambiguous;
+    let expected = accounting.expected_persisted();
 
     let conn = open_readonly(db_path)?;
     let seq_expr = format!("json_extract(attributes_json, '$.\"{SEQ_KEY}\"')");

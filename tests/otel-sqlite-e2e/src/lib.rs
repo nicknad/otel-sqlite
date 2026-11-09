@@ -4,6 +4,7 @@
 // Test harness: assertions and quick probes use unwrap() throughout.
 #![allow(clippy::unwrap_used)]
 
+pub mod accounting;
 pub mod client;
 pub mod crash;
 pub mod db;
