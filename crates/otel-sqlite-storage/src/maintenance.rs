@@ -6,13 +6,7 @@ use rusqlite::Connection;
 use crate::error::StorageError;
 
 pub(crate) fn checkpoint(conn: &Connection, mode: CheckpointMode) -> Result<(), StorageError> {
-    let sql = match mode {
-        CheckpointMode::Passive => "PRAGMA wal_checkpoint(PASSIVE);",
-        CheckpointMode::Full => "PRAGMA wal_checkpoint(FULL);",
-        CheckpointMode::Restart => "PRAGMA wal_checkpoint(RESTART);",
-        CheckpointMode::Truncate => "PRAGMA wal_checkpoint(TRUNCATE);",
-    };
-    conn.execute_batch(sql)?;
+    conn.execute_batch(&format!("PRAGMA wal_checkpoint({});", mode.as_str()))?;
     Ok(())
 }
 
@@ -31,7 +25,7 @@ pub(crate) fn vacuum(conn: &Connection) -> Result<(), StorageError> {
     // effective when `auto_vacuum = INCREMENTAL` (set for new databases in
     // `sqlite::open`); legacy databases convert once via a full VACUUM and
     // are incremental thereafter.
-    if auto_vacuum_mode(conn) == INCREMENTAL_AUTO_VACUUM {
+    if auto_vacuum_mode(conn)? == INCREMENTAL_AUTO_VACUUM {
         incremental_vacuum(conn)
     } else {
         convert_to_incremental_vacuum(conn)
@@ -41,9 +35,8 @@ pub(crate) fn vacuum(conn: &Connection) -> Result<(), StorageError> {
 /// `PRAGMA auto_vacuum` value for `INCREMENTAL`.
 const INCREMENTAL_AUTO_VACUUM: i64 = 2;
 
-fn auto_vacuum_mode(conn: &Connection) -> i64 {
-    conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
-        .unwrap_or(0)
+fn auto_vacuum_mode(conn: &Connection) -> Result<i64, StorageError> {
+    Ok(conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?)
 }
 
 /// One-time conversion for databases created before incremental auto-vacuum
@@ -102,27 +95,25 @@ impl PruneReport {
 /// `now_unix_nano` is injected so callers control the cutoff clock.
 pub(crate) fn prune(
     conn: &mut Connection,
-    window: Option<std::time::Duration>,
+    window: std::time::Duration,
     now_unix_nano: i64,
 ) -> Result<PruneReport, StorageError> {
     let mut report = PruneReport::default();
 
-    if let Some(window) = window {
-        let cutoff = retention_cutoff(now_unix_nano, window);
-        let batch = PRUNE_BATCH_ROWS as i64;
-        loop {
-            let tx = conn.transaction()?;
-            let deleted = tx.execute(
-                "DELETE FROM log_event WHERE id IN (
-                    SELECT id FROM log_event WHERE timestamp_ns < ?1 LIMIT ?2
-                 )",
-                rusqlite::params![cutoff, batch],
-            )?;
-            tx.commit()?;
-            report.log_events += deleted;
-            if deleted < PRUNE_BATCH_ROWS {
-                break;
-            }
+    let cutoff = retention_cutoff(now_unix_nano, window);
+    let batch = PRUNE_BATCH_ROWS as i64;
+    loop {
+        let tx = conn.transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM log_event WHERE id IN (
+                SELECT id FROM log_event WHERE timestamp_ns < ?1 LIMIT ?2
+             )",
+            rusqlite::params![cutoff, batch],
+        )?;
+        tx.commit()?;
+        report.log_events += deleted;
+        if deleted < PRUNE_BATCH_ROWS {
+            break;
         }
     }
 
@@ -198,7 +189,7 @@ pub(crate) fn enforce_size_quota(
     // Legacy databases were created without auto-vacuum and need a one-time
     // converting VACUUM before deletions can shrink the file; without it the
     // loop below would evict batch after batch without ever fitting.
-    if auto_vacuum_mode(conn) != INCREMENTAL_AUTO_VACUUM {
+    if auto_vacuum_mode(conn)? != INCREMENTAL_AUTO_VACUUM {
         convert_to_incremental_vacuum(conn)?;
     }
     for _ in 0..MAX_QUOTA_ROUNDS {
@@ -258,19 +249,13 @@ pub(crate) fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
-/// SQLite sidecar path (`<db>-wal`), matching SQLite's suffix convention
-/// rather than `Path::with_extension`.
-fn wal_path(db_path: &Path) -> std::path::PathBuf {
-    let mut os = db_path.as_os_str().to_owned();
-    os.push("-wal");
-    std::path::PathBuf::from(os)
-}
-
 /// On-disk bytes used by the database: main file plus WAL. The quota is a
 /// disk budget, so the WAL must count; it is bounded by
 /// `journal_size_limit` but can still hold megabytes between checkpoints.
 pub(crate) fn database_bytes(db_path: &Path) -> u64 {
-    file_size(db_path).saturating_add(file_size(&wal_path(db_path)))
+    file_size(db_path).saturating_add(file_size(&crate::permissions::sidecar_path(
+        db_path, "-wal",
+    )))
 }
 
 /// Deletes one bounded batch of the oldest log events (oldest-first by event
@@ -363,7 +348,7 @@ mod tests {
         seed_logs(&mut conn, "r", 6_000);
         let size = file_size(&path);
         assert_eq!(
-            auto_vacuum_mode(&conn),
+            auto_vacuum_mode(&conn).expect("read auto_vacuum"),
             0,
             "legacy default has no auto-vacuum"
         );
@@ -372,7 +357,7 @@ mod tests {
         let report = enforce_size_quota(&mut conn, &path, quota).expect("enforce quota");
 
         assert_eq!(
-            auto_vacuum_mode(&conn),
+            auto_vacuum_mode(&conn).expect("read auto_vacuum"),
             INCREMENTAL_AUTO_VACUUM,
             "quota enforcement must convert the database once"
         );

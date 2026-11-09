@@ -44,10 +44,10 @@ pub struct StepParams {
     pub duration_secs: u64,
     /// Override for distinct OTLP resources in the workload.
     ///
-    /// Closed-loop overload runs pin this to 1: together with
-    /// `records_per_request <= 512` every request then maps to exactly one
-    /// storage batch, so rejections are atomic whole requests and sequence
-    /// positions stay exact for validation.
+    /// Closed-loop overload runs pin this to 1 so each request maps to a
+    /// single ingest chunk. A mid-request storage disconnect then cannot
+    /// produce a partial accept, keeping rejected sequence positions exact
+    /// for validation. This is independent of storage insert batching.
     pub resource_count: Option<usize>,
 }
 

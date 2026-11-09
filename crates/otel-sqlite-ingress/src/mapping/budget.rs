@@ -29,7 +29,9 @@ pub(crate) enum MappingError {
     Timeout,
     /// The mapping job panicked or was cancelled by the runtime.
     Join(JoinError),
-    /// The budget is closed. Production never closes it.
+    /// The budget's semaphore was closed. `MappingBudget` exposes no close
+    /// path, so this is unreachable in production; it is kept defensive
+    /// because `Semaphore::acquire_owned` can report it.
     Closed,
 }
 
@@ -41,12 +43,6 @@ impl MappingBudget {
             permits: Arc::new(Semaphore::new(concurrency.max(1))),
             timeout,
         }
-    }
-
-    /// A budget that admits every job, for callers that wire the ingestor
-    /// without a process-wide limit (tests, fuzz harness).
-    pub(crate) fn unlimited(timeout: Duration) -> Self {
-        Self::new(Semaphore::MAX_PERMITS, timeout)
     }
 
     /// Runs `job` on the blocking pool under one permit and one deadline.

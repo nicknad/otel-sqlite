@@ -585,6 +585,11 @@ pub struct BearerInterceptor {
 }
 
 impl BearerInterceptor {
+    /// An interceptor with no vault: every request passes through.
+    pub const fn disabled() -> Self {
+        Self { vault: None }
+    }
+
     /// Loads the token file eagerly; a `Some` path that cannot be read is a
     /// startup error. `None` disables authentication.
     pub fn new(token_file: Option<&Path>) -> Result<Self, AuthError> {

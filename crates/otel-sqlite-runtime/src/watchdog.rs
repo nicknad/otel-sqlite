@@ -41,17 +41,18 @@
 //! and requests.
 
 use std::fmt;
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, after, select};
+use crossbeam_channel::{Receiver, after, select};
 use otel_sqlite_core::PipelineSample;
 use thiserror::Error;
 use tokio::sync::watch;
 
 use crate::config::WatchdogConfig;
+use crate::thread::{ActiveGauge, WorkerHandle, shutdown_signalled, spawn_named};
 
 /// Derived health of the observed pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,8 +120,8 @@ enum Reason {
     Idle,
     Stalled {
         pending: usize,
-        writer_idle_ms: u64,
-        batcher_idle_ms: u64,
+        age_ms: u64,
+        stage: &'static str,
     },
     Draining {
         pending: usize,
@@ -191,18 +192,13 @@ impl fmt::Display for Reason {
             Self::Idle => f.write_str("pipeline idle"),
             Self::Stalled {
                 pending,
-                writer_idle_ms,
-                batcher_idle_ms,
-            } => {
-                let age = Duration::from_millis((*writer_idle_ms).max(*batcher_idle_ms));
-                write!(
-                    f,
-                    "{pending} work item(s) pending but no pipeline progress for {age:.1?} \
-                     (writer {:.1?}, batcher {:.1?})",
-                    Duration::from_millis(*writer_idle_ms),
-                    Duration::from_millis(*batcher_idle_ms)
-                )
-            }
+                age_ms,
+                stage,
+            } => write!(
+                f,
+                "{pending} work item(s) pending but the {stage} made no progress for {:.1?}",
+                Duration::from_millis(*age_ms)
+            ),
             Self::Draining { pending, age_ms } => write!(
                 f,
                 "{pending} work item(s) pending, draining slowly ({:.1?} since last progress)",
@@ -303,8 +299,14 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
     // legitimate in-flight records, and a slow drain must degrade gracefully
     // rather than halt.
     let pending = sample.pending_work();
+    // Both stages must also have been idle for the full window: after a long
+    // idle period the watermark age is already large, and a request that just
+    // entered the pipeline must not be mistaken for a leaked ticket.
+    let both_stages_idle = Duration::from_millis(sample.writer_idle_ms) >= config.ack_stall_after
+        && Duration::from_millis(sample.batcher_idle_ms) >= config.ack_stall_after;
     if sample.outstanding_tickets > 0
         && pending == 0
+        && both_stages_idle
         && Duration::from_millis(sample.watermark_idle_ms) >= config.ack_stall_after
     {
         return Evaluation {
@@ -324,27 +326,46 @@ fn evaluate(sample: &PipelineSample, config: &WatchdogConfig) -> Evaluation {
         };
     }
 
-    // WORK BUT NO PROGRESS: judge each stage independently. Taking the
-    // fresher of the two would let a still-accepting batcher mask a wedged
-    // writer until its queue fills.
-    let writer_age = Duration::from_millis(sample.writer_idle_ms);
-    let batcher_age = Duration::from_millis(sample.batcher_idle_ms);
-    if writer_age >= config.unhealthy_after || batcher_age >= config.unhealthy_after {
+    // WORK BUT NO PROGRESS: a stage's age only matters while that stage has
+    // work to do. A draining queue with an idle (blocked in `recv`) batcher is
+    // healthy, and buffered records with an idle writer are equally expected;
+    // judging both ages whenever *any* work exists turned those healthy
+    // post-burst states into false stalls.
+    let writer_has_work = sample.queue_depth > 0;
+    let batcher_has_work = sample.pending_records > 0;
+    let writer_age = if writer_has_work {
+        Duration::from_millis(sample.writer_idle_ms)
+    } else {
+        Duration::ZERO
+    };
+    let batcher_age = if batcher_has_work {
+        Duration::from_millis(sample.batcher_idle_ms)
+    } else {
+        Duration::ZERO
+    };
+    let judged_age = writer_age.max(batcher_age);
+    let judged_age_ms = u64::try_from(judged_age.as_millis()).unwrap_or(u64::MAX);
+    if judged_age >= config.unhealthy_after {
+        let stage = match (writer_has_work, batcher_has_work) {
+            (true, true) => "writer and batcher",
+            (false, true) => "insert batcher",
+            (_, false) => "sqlite writer",
+        };
         return Evaluation {
             state: HealthState::Unhealthy,
             reason: Reason::Stalled {
                 pending,
-                writer_idle_ms: sample.writer_idle_ms,
-                batcher_idle_ms: sample.batcher_idle_ms,
+                age_ms: judged_age_ms,
+                stage,
             },
         };
     }
-    if writer_age >= config.degraded_after || batcher_age >= config.degraded_after {
+    if judged_age >= config.degraded_after {
         return Evaluation {
             state: HealthState::Degraded,
             reason: Reason::Draining {
                 pending,
-                age_ms: sample.writer_idle_ms.max(sample.batcher_idle_ms),
+                age_ms: judged_age_ms,
             },
         };
     }
@@ -395,6 +416,8 @@ fn normalized_tick_interval(interval: Duration) -> Duration {
 
 #[derive(Debug, Error)]
 pub enum WatchdogError {
+    #[error("failed to spawn watchdog thread: {0}")]
+    Spawn(#[source] io::Error),
     #[error("watchdog thread panicked")]
     Panicked,
     #[error(transparent)]
@@ -435,36 +458,32 @@ impl Watchdog {
 
     /// Starts the watchdog on its own thread and returns a handle controlling
     /// its lifecycle.
-    pub fn spawn(self) -> WatchdogHandle {
+    pub fn spawn(self) -> Result<WatchdogHandle, WatchdogError> {
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let halted = Arc::new(AtomicBool::new(false));
         let thread_halted = Arc::clone(&halted);
-        let join_handle = std::thread::Builder::new()
-            .name("otel-sqlite-watchdog".to_owned())
-            .spawn(move || {
-                run(
-                    self.source,
-                    self.config,
-                    self.halt,
-                    thread_halted,
-                    shutdown_rx,
-                );
-            })
-            .expect("failed to spawn watchdog thread");
+        let join_handle = spawn_named("otel-sqlite-watchdog", move || {
+            run(
+                self.source,
+                self.config,
+                self.halt,
+                thread_halted,
+                shutdown_rx,
+            );
+        })
+        .map_err(WatchdogError::Spawn)?;
 
-        WatchdogHandle {
-            shutdown: Some(shutdown_tx),
-            join: Some(join_handle),
+        Ok(WatchdogHandle {
+            worker: WorkerHandle::new(shutdown_tx, join_handle),
             halted,
-        }
+        })
     }
 }
 
 /// Control handle for a spawned [`Watchdog`].
 #[derive(Debug)]
 pub struct WatchdogHandle {
-    shutdown: Option<Sender<()>>,
-    join: Option<JoinHandle<()>>,
+    worker: WorkerHandle,
     halted: Arc<AtomicBool>,
 }
 
@@ -477,51 +496,19 @@ impl WatchdogHandle {
     /// Signals the watchdog to stop without waiting for it. Idempotent: a
     /// second call (or one after the thread has exited) is a no-op.
     pub fn shutdown(&self) {
-        if let Some(sender) = &self.shutdown {
-            let _ = sender.try_send(());
-        }
+        self.worker.shutdown();
     }
 
     /// Signals shutdown and joins the thread. Returns an error if the
     /// watchdog panicked; observation already stopped either way.
     pub fn stop(self) -> Result<(), WatchdogError> {
-        self.shutdown();
-        self.join()
+        self.worker.stop().map_err(|_| WatchdogError::Panicked)
     }
 
     /// Joins the watchdog thread. Dropping every shutdown sender (including
     /// this handle's) also releases a watchdog waiting for its next tick.
-    pub fn join(mut self) -> Result<(), WatchdogError> {
-        self.shutdown = None;
-        if let Some(handle) = self.join.take() {
-            handle.join().map_err(|_| WatchdogError::Panicked)?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for WatchdogHandle {
-    fn drop(&mut self) {
-        // Best-effort: releasing the sender wakes a block-waiting watchdog
-        // even when nobody called `stop()`.
-        self.shutdown = None;
-    }
-}
-
-/// Publishes the watchdog's liveness for as long as the thread runs, including
-/// unwind paths (a panic must not leave the gauge stuck at 1).
-struct ActiveGauge;
-
-impl ActiveGauge {
-    fn new() -> Self {
-        ::metrics::gauge!("sidecar_watchdog_active").set(1.0);
-        Self
-    }
-}
-
-impl Drop for ActiveGauge {
-    fn drop(&mut self) {
-        ::metrics::gauge!("sidecar_watchdog_active").set(0.0);
+    pub fn join(self) -> Result<(), WatchdogError> {
+        self.worker.join().map_err(|_| WatchdogError::Panicked)
     }
 }
 
@@ -533,7 +520,7 @@ fn run(
     shutdown: Receiver<()>,
 ) {
     tracing::info!(tick = ?config.tick_interval, "watchdog started");
-    let _active = ActiveGauge::new();
+    let _active = ActiveGauge::new("sidecar_watchdog_active");
 
     let mut previous = HealthState::Healthy;
     loop {
@@ -631,13 +618,9 @@ fn log_transition(from: HealthState, to: HealthState, reason: &Reason) {
     }
 }
 
-fn shutdown_signalled(shutdown: &Receiver<()>) -> bool {
-    !matches!(shutdown.try_recv(), Err(TryRecvError::Empty))
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use otel_sqlite_test_support::wait_until;
 
@@ -665,6 +648,7 @@ mod tests {
             queue_depth: 2,
             queue_capacity: 100,
             pending_records: 5,
+            ingest_queue_depth: 0,
             outstanding_tickets: 0,
             watermark_idle_ms: 10,
             maintenance_in_progress: false,
@@ -707,6 +691,48 @@ mod tests {
         sample.writer_idle_ms = 60;
         sample.batcher_idle_ms = 60;
         assert_eq!(evaluate(&sample, &config()).state, HealthState::Degraded);
+    }
+
+    /// Post-burst drain: the queue still holds commands, but the batcher is
+    /// blocked in `recv` with nothing buffered. Its stale age must not count.
+    #[test]
+    fn draining_queue_with_a_stale_batcher_is_healthy() {
+        let mut sample = running_sample();
+        sample.pending_records = 0;
+        sample.queue_depth = 5;
+        sample.writer_idle_ms = 5;
+        sample.batcher_idle_ms = 10_000;
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Healthy);
+
+        // Only the stage with work is judged: a stale writer still stalls.
+        sample.writer_idle_ms = 150;
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Unhealthy);
+    }
+
+    /// Buffered records wait for the batcher to submit them; a writer idle
+    /// because nothing has been submitted yet is not a stall.
+    #[test]
+    fn buffered_records_with_a_stale_writer_are_healthy() {
+        let mut sample = running_sample();
+        sample.queue_depth = 0;
+        sample.pending_records = 5;
+        sample.writer_idle_ms = 10_000;
+        sample.batcher_idle_ms = 5;
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Healthy);
+
+        // Only the stage with work is judged: a stale batcher still stalls.
+        sample.batcher_idle_ms = 150;
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Unhealthy);
+    }
+
+    #[test]
+    fn both_stages_stalled_with_work_are_unhealthy() {
+        let mut sample = running_sample();
+        sample.queue_depth = 3;
+        sample.pending_records = 3;
+        sample.writer_idle_ms = 150;
+        sample.batcher_idle_ms = 150;
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Unhealthy);
     }
 
     /// A long VACUUM/rebuild under live traffic must not be mistaken for a
@@ -800,7 +826,24 @@ mod tests {
         );
 
         sample.watermark_idle_ms = 60_000;
+        sample.writer_idle_ms = 60_000;
+        sample.batcher_idle_ms = 60_000;
         assert_eq!(evaluate(&sample, &config()).state, HealthState::Unhealthy);
+    }
+
+    /// After a long idle period the watermark age is already large. A request
+    /// that just entered the pipeline must not be mistaken for a leaked ticket.
+    #[test]
+    fn a_new_request_after_idle_is_not_a_ticket_leak() {
+        let mut sample = running_sample();
+        sample.queue_depth = 0;
+        sample.pending_records = 0;
+        sample.ingest_queue_depth = 0;
+        sample.outstanding_tickets = 1;
+        sample.watermark_idle_ms = 60_000;
+        sample.writer_idle_ms = 1;
+        sample.batcher_idle_ms = 1;
+        assert_eq!(evaluate(&sample, &config()).state, HealthState::Healthy);
     }
 
     /// Outstanding tickets while work is still visibly in flight are left to
@@ -819,6 +862,21 @@ mod tests {
         sample.writer_idle_ms = 150;
         sample.batcher_idle_ms = 150;
         assert_eq!(evaluate(&sample, &config()).state, HealthState::Unhealthy);
+    }
+
+    #[test]
+    fn idle_stage_age_does_not_inflate_the_stall_reason() {
+        let mut sample = running_sample();
+        sample.queue_depth = 4;
+        sample.pending_records = 0;
+        sample.writer_idle_ms = 150;
+        sample.batcher_idle_ms = 10_000;
+
+        let evaluation = evaluate(&sample, &config());
+        assert_eq!(evaluation.state, HealthState::Unhealthy);
+        let reason = evaluation.reason.to_string();
+        assert!(reason.contains("150.0ms"), "{reason}");
+        assert!(!reason.contains("10.0s"), "{reason}");
     }
 
     /// Canned-sample source for driving the spawned watchdog in tests.
@@ -842,7 +900,8 @@ mod tests {
         let (halt_tx, mut halt_rx) = watch::channel(false);
         let handle = Watchdog::new(FixedSource(stalled_sample()), config(), halt_tx)
             .expect("valid config")
-            .spawn();
+            .spawn()
+            .expect("watchdog thread spawns");
 
         assert!(
             wait_until(Duration::from_secs(5), || *halt_rx.borrow_and_update()),
@@ -862,7 +921,8 @@ mod tests {
             cfg.halt_on_unhealthy = halt_on_unhealthy;
             let handle = Watchdog::new(FixedSource(source), cfg, halt_tx)
                 .expect("valid config")
-                .spawn();
+                .spawn()
+                .expect("watchdog thread spawns");
 
             std::thread::sleep(Duration::from_millis(120));
             assert!(!handle.requested_halt());
@@ -886,15 +946,21 @@ mod tests {
         cfg.halt_on_unhealthy = false; // keep the loop running for the test
         let handle = Watchdog::new(FixedSource(stalled_sample()), cfg, halt_tx)
             .expect("valid config")
-            .spawn();
+            .spawn()
+            .expect("watchdog thread spawns");
         std::thread::sleep(Duration::from_millis(50));
 
-        let started = Instant::now();
-        handle.stop().expect("clean stop");
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let joiner = std::thread::spawn(move || {
+            let result = handle.stop();
+            let _ = done_tx.send(());
+            result
+        });
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "stop must not wait out the next tick deadline"
         );
+        joiner.join().expect("joiner").expect("clean stop");
     }
 
     #[test]
@@ -914,7 +980,8 @@ mod tests {
         drop(halt_rx);
         let handle = Watchdog::new(FixedSource(stalled_sample()), config(), halt_tx)
             .expect("valid config")
-            .spawn();
+            .spawn()
+            .expect("watchdog thread spawns");
 
         // The loop samples immediately; give it time to attempt the send.
         std::thread::sleep(Duration::from_millis(100));

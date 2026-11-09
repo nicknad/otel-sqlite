@@ -136,7 +136,7 @@ fn writes_logs_deduplicates_resources() -> Result<(), Box<dyn std::error::Error>
         [],
         |r| r.get(0),
     )?;
-    assert_eq!(migration, "006");
+    assert_eq!(migration, otel_sqlite_storage::latest_schema_version());
 
     Ok(())
 }
@@ -205,7 +205,7 @@ fn log_search_index_tracks_inserts_and_prunes_without_rebuild()
         storage
             .producer()
             .send(WriteCommand::Maintenance(MaintenanceOperation::Prune(
-                Some(Duration::from_secs(1)),
+                Duration::from_secs(1),
             )))?;
         drop(sender);
         storage.join()?;
@@ -537,7 +537,7 @@ fn retention_prunes_logs_collects_orphans_and_leaves_no_fts_ghosts()
     storage
         .producer()
         .send(WriteCommand::Maintenance(MaintenanceOperation::Prune(
-            Some(Duration::from_secs(1)),
+            Duration::from_secs(1),
         )))?;
     drop(sender);
     storage.join()?;

@@ -20,28 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as AnyhowContext, Result, bail};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use serde::Serialize;
-
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum, Debug)]
-enum ScenarioChoice {
-    /// A - small controlled workload.
-    Baseline,
-    /// B - progressively higher offered load.
-    Throughput,
-    /// C - records-per-request comparison.
-    Batch,
-    /// D - client-count comparison at constant offered load.
-    Concurrency,
-    /// E - long-running sustained load (default 10 minutes).
-    Sustained,
-    /// F - intentional overload / backpressure verification.
-    Backpressure,
-    /// G - storage insert-batcher behaviour across OTLP batch shapes.
-    InsertBatching,
-    /// Everything except `sustained`.
-    All,
-}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -51,8 +31,8 @@ enum ScenarioChoice {
 )]
 struct Args {
     /// Scenario to execute.
-    #[arg(long, value_enum, default_value_t = ScenarioChoice::Baseline)]
-    scenario: ScenarioChoice,
+    #[arg(long, value_enum, default_value_t = scenarios::Scenario::Baseline)]
+    scenario: scenarios::Scenario,
 
     /// Load an already-running server instead of booting one in-process
     /// (e.g. <http://127.0.0.1:4317> or a Docker service name).
@@ -66,7 +46,10 @@ struct Args {
     db_path: Option<PathBuf>,
 
     /// Listen address used by the embedded pipeline.
-    #[arg(long, default_value = "127.0.0.1:4317")]
+    #[arg(
+        long,
+        default_value_t = otel_sqlite_ingress::DEFAULT_LISTEN_ADDRESS.to_owned()
+    )]
     listen: String,
 
     /// Data directory for the embedded-mode database. Defaults to a fresh
@@ -274,19 +257,15 @@ async fn wait_for_endpoint(endpoint: &str, timeout: Duration) -> Result<()> {
         .trim_start_matches("http://")
         .trim_start_matches("https://")
         .to_owned();
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if tokio::net::TcpStream::connect(host_port.as_str())
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            bail!("endpoint {endpoint} not reachable within {timeout:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+    let reachable = tokio::task::spawn_blocking(move || {
+        otel_sqlite_test_support::wait_for_tcp(&host_port, timeout)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("endpoint readiness task panicked: {error}"))?;
+    if !reachable {
+        bail!("endpoint {endpoint} not reachable within {timeout:?}");
     }
+    Ok(())
 }
 
 /// Pre-run database state: `"fresh"` when the file does not exist yet,
@@ -377,7 +356,7 @@ async fn main() -> Result<()> {
             // The embedded server migrates/creates the database during startup,
             // so probe the state BEFORE booting it; afterwards every path
             // would misleadingly report "pre-populated".
-            let db_path = guard.path().join("otel-logs.db");
+            let db_path = guard.path().join(otel_sqlite_storage::DEFAULT_DB_FILENAME);
             let (state, rows) = probe_database_state(&db_path).await?;
             let started = server::EmbeddedServer::start(&args.listen, guard.path()).await?;
             let endpoint = started.endpoint().to_owned();
@@ -421,7 +400,7 @@ async fn main() -> Result<()> {
         execution_mode,
         endpoint,
         db_path.display(),
-        format!("{:?}", args.scenario).to_lowercase()
+        args.scenario.name()
     );
 
     let overrides = params::Overrides {
@@ -446,46 +425,15 @@ async fn main() -> Result<()> {
     };
 
     // ----- scenario dispatch -------------------------------------------------
-    let ramp_stop = !args.keep_going;
-    let plan: Vec<(&'static str, Vec<params::StepParams>, bool)> = match args.scenario {
-        ScenarioChoice::Baseline => vec![("baseline", scenarios::baseline(&overrides), false)],
-        ScenarioChoice::Throughput => vec![(
-            "throughput-ramp",
-            scenarios::throughput_ramp(&overrides),
-            ramp_stop,
-        )],
-        ScenarioChoice::Batch => vec![("batch-sizes", scenarios::batch_sizes(&overrides), false)],
-        ScenarioChoice::Concurrency => {
-            vec![("concurrency", scenarios::concurrency(&overrides), false)]
-        }
-        ScenarioChoice::Sustained => vec![("sustained", scenarios::sustained(&overrides), false)],
-        ScenarioChoice::Backpressure => {
-            vec![("backpressure", scenarios::backpressure(&overrides), false)]
-        }
-        ScenarioChoice::InsertBatching => {
-            vec![(
-                "insert-batching",
-                scenarios::insert_batching(&overrides),
-                false,
-            )]
-        }
-        ScenarioChoice::All => vec![
-            ("baseline", scenarios::baseline(&overrides), false),
-            (
-                "throughput-ramp",
-                scenarios::throughput_ramp(&overrides),
-                ramp_stop,
-            ),
-            ("batch-sizes", scenarios::batch_sizes(&overrides), false),
-            ("concurrency", scenarios::concurrency(&overrides), false),
-            ("backpressure", scenarios::backpressure(&overrides), false),
-        ],
-    };
+    let plan = args.scenario.plan(&overrides, args.keep_going);
+    let stop_on_saturation_ramp = plan.iter().any(|entry| entry.stop_on_saturation);
 
     let mut scenario_reports = Vec::new();
-    for (name, steps, stop_on_saturation) in plan {
-        scenario_reports
-            .push(scenarios::run_scenario(&context, name, steps, stop_on_saturation).await?);
+    for entry in plan {
+        scenario_reports.push(
+            scenarios::run_scenario(&context, entry.name, entry.steps, entry.stop_on_saturation)
+                .await?,
+        );
     }
 
     // ----- graceful shutdown -------------------------------------------------
@@ -517,7 +465,7 @@ async fn main() -> Result<()> {
         schema_version: 1,
         environment,
         configuration: ConfigurationSummary {
-            scenario: format!("{:?}", args.scenario).to_lowercase(),
+            scenario: args.scenario.name().to_owned(),
             endpoint,
             database_path: db_path.display().to_string(),
             seed: args.seed,
@@ -536,7 +484,7 @@ async fn main() -> Result<()> {
             search_mode: server::benchmark_profile::search_mode().as_str().to_owned(),
             drain_timeout_secs: args.drain_timeout_secs,
             overrides_applied: overrides,
-            stop_on_saturation_ramp: ramp_stop,
+            stop_on_saturation_ramp,
         },
         pre_existing_log_rows: pre_existing_rows,
         scenarios: scenario_reports,

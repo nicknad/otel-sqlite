@@ -153,6 +153,8 @@ pub struct BatcherStats {
     pub batches_emitted: AtomicU64,
     pub timer_flushes: AtomicU64,
     pub buffered_records: AtomicUsize,
+    /// Chunks still waiting in the ingress→batcher channel.
+    pub ingest_queue_depth: AtomicUsize,
     pub dropped_records: AtomicU64,
     /// Monotonic ms of the last chunk received or batch submitted.
     pub last_progress_ms: AtomicU64,
@@ -183,6 +185,11 @@ impl BatcherStats {
     pub(crate) fn observe_buffered(&self, buffered: usize) {
         self.buffered_records.store(buffered, Ordering::Relaxed);
         ::metrics::gauge!("insert_batcher_buffered_records").set(buffered as f64);
+    }
+
+    /// Publishes the ingress-channel backlog sampled by the batcher loop.
+    pub(crate) fn observe_ingest_queue(&self, depth: usize) {
+        self.ingest_queue_depth.store(depth, Ordering::Relaxed);
     }
 }
 
@@ -241,6 +248,7 @@ impl StorageHealth {
                 .saturating_add(self.writer.in_flight.load(Ordering::Relaxed)),
             queue_capacity: self.queue_capacity,
             pending_records: self.batcher.buffered_records.load(Ordering::Relaxed),
+            ingest_queue_depth: self.batcher.ingest_queue_depth.load(Ordering::Relaxed),
             outstanding_tickets: self.ledger.outstanding_tickets(),
             watermark_idle_ms: now.saturating_sub(self.ledger.last_advance_ms()),
             maintenance_in_progress: self.writer.maintenance_in_progress.load(Ordering::Relaxed),

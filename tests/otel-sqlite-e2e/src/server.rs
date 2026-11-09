@@ -1,29 +1,29 @@
-//! Embedded server: boots the real pipeline exactly as the production
-//! `otel-sqlite` binary does (see `crates/otel-sqlite/src/main.rs`):
+//! Embedded server: boots the real pipeline with the production OTLP service
+//! assembly (see `crates/otel-sqlite/src/main.rs`):
 //!
 //! ```text
-//! tonic gRPC (real TCP) -> real LogsIngress handler
-//!     -> bounded ingest channel -> storage insert batcher thread
+//! tonic gRPC (real TCP) -> IngressLogsService from `logs_service` (gzip,
+//!     decode-size/auth/stream limits) -> storage insert batcher thread
 //!     -> bounded WriteCommand queue -> single Storage writer thread -> SQLite WAL
 //! ```
 //!
-//! Only two things differ from the production process:
+//! The service wiring is the shared `otel_sqlite_ingress::logs_service`, so
+//! request handling, mapping, gzip, decoding limits, insert batching, queue
+//! backpressure and SQLite persistence are the production implementations.
+//! Only the transport lifecycle and benchmark profile differ:
 //!
 //! 1. The gRPC server is driven by a programmatic shutdown channel instead of
 //!    waiting for Ctrl+C/SIGTERM (`ingress::serve` blocks on OS signals).
-//! 2. The listen address defaults to loopback instead of all interfaces.
-//!
-//! All request handling, mapping, insert batching, queue backpressure and
-//! SQLite persistence code paths are byte-for-byte the production implementations.
+//! 2. [`benchmark_profile`] tightens per-record caps and raises stream
+//!    concurrency for short benchmark runs; those values are not production
+//!    defaults.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use otel_sqlite_core::storage::{IngestMessage, InsertBatcherConfig};
-use otel_sqlite_ingress::mapping::pb::collector::logs::v1::logs_service_server::LogsServiceServer;
-use otel_sqlite_ingress::{IngressConfig, LogsIngress};
+use otel_sqlite_ingress::{BearerInterceptor, IngressConfig, logs_service};
 use otel_sqlite_storage::{Storage, StorageConfig};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -50,7 +50,7 @@ pub mod benchmark_profile {
     use otel_sqlite_storage::FtsMode;
 
     pub const INGEST_QUEUE_CAPACITY: usize = 50_000;
-    pub const COMMAND_QUEUE_CAPACITY: usize = 50_000;
+    pub const COMMAND_QUEUE_CAPACITY: usize = otel_sqlite_storage::DEFAULT_COMMAND_QUEUE_CAPACITY;
     pub const MAX_BATCH_RECORDS: usize =
         otel_sqlite_core::storage::DEFAULT_MAX_INSERT_BATCH_RECORDS;
     pub const MAX_BATCH_AGE: Duration = otel_sqlite_core::storage::DEFAULT_MAX_INSERT_BATCH_AGE;
@@ -144,10 +144,11 @@ impl EmbeddedServer {
     /// Start the full pipeline. Mirrors `crates/otel-sqlite/src/main.rs`.
     pub async fn start(listen_addr: &str, data_dir: &Path) -> anyhow::Result<Self> {
         let config = benchmark_profile::ingress_config(listen_addr.to_owned());
-        let storage_config = benchmark_profile::storage_config(data_dir.join("otel-logs.db"));
+        let storage_config = benchmark_profile::storage_config(
+            data_dir.join(otel_sqlite_storage::DEFAULT_DB_FILENAME),
+        );
 
         let addr: SocketAddr = config.socket_addr()?;
-        let config = Arc::new(config);
 
         let (ingest_tx, receiver) =
             otel_sqlite_ingress::channel(benchmark_profile::INGEST_QUEUE_CAPACITY);
@@ -155,11 +156,12 @@ impl EmbeddedServer {
             .map_err(|error| anyhow::anyhow!("failed to start sqlite storage: {error}"))?;
         let commit_ledger = storage.commit_ledger();
 
-        let logs_service = LogsServiceServer::new(
-            LogsIngress::new(ingest_tx.clone(), Arc::clone(&config), commit_ledger)
-                .with_mapping_limit(config.mapping_concurrency),
-        )
-        .max_decoding_message_size(config.max_recv_msg_size);
+        let logs_service = logs_service(
+            &config,
+            ingest_tx.clone(),
+            commit_ledger,
+            BearerInterceptor::disabled(),
+        );
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let max_concurrent_streams = config.max_concurrent_streams;
@@ -175,14 +177,11 @@ impl EmbeddedServer {
         });
 
         wait_until_listening(addr).await?;
-        // `Storage::open` blocks until the writer finished bootstrapping
-        // (database open, schema migrated), so no extra readiness wait is
-        // needed here.
         let endpoint = format!("http://{addr}");
 
         Ok(Self {
             endpoint,
-            db_path: data_dir.join("otel-logs.db"),
+            db_path: data_dir.join(otel_sqlite_storage::DEFAULT_DB_FILENAME),
             ingest_tx: Some(ingest_tx),
             storage: Some(storage),
             shutdown_tx,
@@ -315,18 +314,17 @@ impl EmbeddedServer {
 }
 
 async fn wait_until_listening(addr: SocketAddr) -> anyhow::Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("embedded server did not start listening within 15s");
-        }
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+    let started = tokio::task::spawn_blocking(move || {
+        otel_sqlite_test_support::wait_for_tcp(&addr.to_string(), Duration::from_secs(15))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("listener readiness task panicked: {error}"))?;
+    if !started {
+        anyhow::bail!("embedded server did not start listening within 15s");
     }
+    Ok(())
 }
 
-// NOTE: no schema-readiness polling is needed here. `Storage::open` blocks
-// until the writer finished bootstrapping (database open, schema migrated),
-// so the embedded server is storage-ready the moment `start()` returns.
+// `Storage::open` blocks until the writer finished bootstrapping (database
+// open, schema migrated), so the embedded server is storage-ready the moment
+// `start()` returns; no extra schema-readiness poll is needed.

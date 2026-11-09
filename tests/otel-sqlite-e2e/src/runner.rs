@@ -1,9 +1,10 @@
 //! Load execution mechanics: pacing, worker loops, sampling and drain.
 //!
 //! One scenario step runs `clients` concurrent [`worker_loop`]s against the
-//! shared [`Pacer`], while a one-second [`sampler_task`] records gauge and
-//! file-size samples. After producers stop, [`drain_storage`] flushes the
-//! pipeline (embedded mode) and polls SQLite until row counts stabilize.
+//! shared [`Pacer`], while an optional one-second [`sampler_task`] records
+//! gauge and file-size samples. After producers stop, [`drain_storage`]
+//! flushes the pipeline (embedded mode) and polls SQLite until row counts
+//! stabilize.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -12,13 +13,10 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tokio::time::Instant as TokioInstant;
 
-use crate::client::{
-    ClientCounters, ClientCountersSnapshot, LatencyHistogram, LoadClient, OutcomeKind,
-    SequenceAllocator,
-};
+use crate::accounting::RunAccounting;
+use crate::client::{ClientCounters, LatencyHistogram, LoadClient, OutcomeKind, SequenceAllocator};
 use crate::db;
 use crate::generator::WorkloadSpec;
-use crate::interval_set::IntervalSet;
 use crate::ledger::Ledger;
 use crate::metrics::TelemetryHandle;
 use crate::pacer::Pacer;
@@ -30,6 +28,23 @@ use crate::params::{RunContext, StepParams};
 /// admission gate) and `InvalidArgument` — never count: the server answered,
 /// so it is demonstrably alive.
 const WORKER_FAILURE_ABORT: u32 = 25;
+
+/// Whether a worker aborts after repeated transport failures.
+///
+/// Benchmark steps treat a lost endpoint as fatal. Crash tests deliberately
+/// kill the endpoint mid-run, so every request must still be classified
+/// rather than aborting the driver.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TransportFailurePolicy {
+    Abort,
+    Tolerate,
+}
+
+#[derive(Clone)]
+pub(crate) struct SamplingConfig {
+    pub telemetry: TelemetryHandle,
+    pub db_path: PathBuf,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SamplePoint {
@@ -56,30 +71,39 @@ async fn sampler_task(
         sink.lock().expect("sample sink lock").push(SamplePoint {
             elapsed_secs: started.elapsed().as_secs_f64(),
             gauges: telemetry.sample_gauges(),
-            database_bytes: file_len(&db_path),
-            wal_bytes: file_len(&db::wal_path(&db_path)),
+            database_bytes: otel_sqlite_test_support::file_len(&db_path),
+            wal_bytes: otel_sqlite_test_support::file_len(&otel_sqlite_test_support::wal_path(
+                &db_path,
+            )),
         });
     }
 }
 
-fn file_len(path: &std::path::Path) -> u64 {
-    std::fs::metadata(path).map_or(0, |meta| meta.len())
+/// Everything one load driver run needs. The two callers (benchmark steps and
+/// crash recovery) differ only in `transport_failures` and `sampling`.
+pub(crate) struct LoadRequest {
+    pub endpoint: String,
+    pub spec: Arc<WorkloadSpec>,
+    pub clients: usize,
+    pub records_per_request: usize,
+    pub offered_records_per_second: Option<u64>,
+    pub duration: Duration,
+    pub request_timeout: Duration,
+    pub transport_failures: TransportFailurePolicy,
+    pub sampling: Option<SamplingConfig>,
 }
 
 #[derive(Debug)]
-pub(crate) struct StepRaw {
-    pub counters: ClientCountersSnapshot,
-    pub rejected: IntervalSet,
-    pub ambiguous: IntervalSet,
-    pub positions_exact: bool,
+pub(crate) struct LoadRun {
+    pub accounting: RunAccounting,
     pub latency_us: hdrhistogram::Histogram<u64>,
-    pub samples: Arc<Mutex<Vec<SamplePoint>>>,
+    pub samples: Vec<SamplePoint>,
     pub measured_seconds: f64,
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn worker_loop(
-    context: RunContext,
+    endpoint: String,
     spec: Arc<WorkloadSpec>,
     allocator: Arc<SequenceAllocator>,
     records_per_request: usize,
@@ -87,14 +111,16 @@ async fn worker_loop(
     ledger: Arc<Ledger>,
     latencies: Arc<LatencyHistogram>,
     counters: Arc<ClientCounters>,
+    request_timeout: Duration,
+    transport_failures: TransportFailurePolicy,
     deadline: TokioInstant,
 ) -> anyhow::Result<()> {
     let mut client = LoadClient::connect(
-        &context.endpoint,
+        &endpoint,
         spec,
         allocator,
         records_per_request,
-        context.request_timeout,
+        request_timeout,
         latencies,
         counters,
     )
@@ -113,12 +139,14 @@ async fn worker_loop(
             // any answer from the server (accepted, partially rejected or
             // definitively rejected) resets the counter.
             OutcomeKind::Ambiguous => {
-                consecutive_failures += 1;
-                if consecutive_failures >= WORKER_FAILURE_ABORT {
-                    anyhow::bail!(
-                        "worker aborted after {consecutive_failures} consecutive \
-                         transport-failed/ambiguous requests"
-                    );
+                if matches!(transport_failures, TransportFailurePolicy::Abort) {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= WORKER_FAILURE_ABORT {
+                        anyhow::bail!(
+                            "worker aborted after {consecutive_failures} consecutive \
+                             transport-failed/ambiguous requests"
+                        );
+                    }
                 }
             }
             OutcomeKind::AllAccepted
@@ -132,50 +160,58 @@ async fn worker_loop(
     Ok(())
 }
 
-pub(crate) async fn execute_load(
-    context: &RunContext,
-    params: &StepParams,
-    run_id: &str,
-) -> anyhow::Result<StepRaw> {
-    let spec = Arc::new(WorkloadSpec {
-        run_id: run_id.to_owned(),
-        seed: context.seed,
-        body_size: context.body_size,
-        attributes_per_record: context.attributes_per_record,
-        resource_count: params.resource_count.unwrap_or(context.resource_count),
-    });
+/// Single load driver for benchmark steps and crash recovery.
+///
+/// Every spawned worker is joined before this returns, so no task can mutate
+/// the counters or ledger after the accounting value is frozen. The sampler
+/// is stopped and joined the same way before its samples are read.
+pub(crate) async fn run_load(request: LoadRequest) -> anyhow::Result<LoadRun> {
+    let LoadRequest {
+        endpoint,
+        spec,
+        clients,
+        records_per_request,
+        offered_records_per_second,
+        duration,
+        request_timeout,
+        transport_failures,
+        sampling,
+    } = request;
+
     let allocator = Arc::new(SequenceAllocator::new(0));
     let ledger = Arc::new(Ledger::new());
     let latencies = Arc::new(LatencyHistogram::new());
     let counters = Arc::new(ClientCounters::default());
 
-    let offered_request_rate = params
-        .offered_records_per_second
-        .map(|records_per_sec| records_per_sec as f64 / params.records_per_request as f64);
+    let offered_request_rate = offered_records_per_second
+        .map(|records_per_sec| records_per_sec as f64 / records_per_request as f64);
     let pacer = Arc::new(Pacer::new(offered_request_rate));
 
-    let duration = Duration::from_secs(params.duration_secs);
     let deadline = TokioInstant::now() + duration;
     let samples = Arc::new(Mutex::new(Vec::new()));
-    let sampler_handle = tokio::spawn(sampler_task(
-        context.telemetry.clone(),
-        context.db_path.clone(),
-        deadline,
-        Arc::clone(&samples),
-    ));
+    let sampler_handle = sampling.map(|sampling| {
+        tokio::spawn(sampler_task(
+            sampling.telemetry,
+            sampling.db_path,
+            deadline,
+            Arc::clone(&samples),
+        ))
+    });
 
     let started = Instant::now();
-    let mut workers = Vec::with_capacity(params.clients);
-    for _ in 0..params.clients {
+    let mut workers = Vec::with_capacity(clients);
+    for _ in 0..clients {
         workers.push(tokio::spawn(worker_loop(
-            context.clone(),
+            endpoint.clone(),
             Arc::clone(&spec),
             Arc::clone(&allocator),
-            params.records_per_request,
+            records_per_request,
             Arc::clone(&pacer),
             Arc::clone(&ledger),
             Arc::clone(&latencies),
             Arc::clone(&counters),
+            request_timeout,
+            transport_failures,
             deadline,
         )));
     }
@@ -198,22 +234,59 @@ pub(crate) async fn execute_load(
         }
     }
     let measured_seconds = started.elapsed().as_secs_f64().max(f64::EPSILON);
-    sampler_handle.abort();
+
+    if let Some(handle) = sampler_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+    let samples = Arc::into_inner(samples)
+        .map(|sink| sink.into_inner().expect("sample sink lock"))
+        .unwrap_or_default();
 
     if let Some(error) = first_worker_error {
-        return Err(error.context(format!("step '{run_id}' lost a producer")));
+        return Err(error.context(format!("load against '{endpoint}' lost a producer")));
     }
 
+    let snapshot = counters.snapshot();
     let (rejected, ambiguous, positions_exact) = ledger.freeze();
-    Ok(StepRaw {
-        counters: counters.snapshot(),
-        rejected,
-        ambiguous,
-        positions_exact,
+    let accounting = RunAccounting::new(snapshot, rejected, ambiguous, positions_exact)?;
+
+    Ok(LoadRun {
+        accounting,
         latency_us: latencies.snapshot().await,
         samples,
         measured_seconds,
     })
+}
+
+pub(crate) async fn execute_load(
+    context: &RunContext,
+    params: &StepParams,
+    run_id: &str,
+) -> anyhow::Result<LoadRun> {
+    let spec = Arc::new(WorkloadSpec {
+        run_id: run_id.to_owned(),
+        seed: context.seed,
+        body_size: context.body_size,
+        attributes_per_record: context.attributes_per_record,
+        resource_count: params.resource_count.unwrap_or(context.resource_count),
+    });
+
+    run_load(LoadRequest {
+        endpoint: context.endpoint.clone(),
+        spec,
+        clients: params.clients,
+        records_per_request: params.records_per_request,
+        offered_records_per_second: params.offered_records_per_second,
+        duration: Duration::from_secs(params.duration_secs),
+        request_timeout: context.request_timeout,
+        transport_failures: TransportFailurePolicy::Abort,
+        sampling: Some(SamplingConfig {
+            telemetry: context.telemetry.clone(),
+            db_path: context.db_path.clone(),
+        }),
+    })
+    .await
 }
 
 /// Order barrier plus stability poll: everything accepted must be persisted

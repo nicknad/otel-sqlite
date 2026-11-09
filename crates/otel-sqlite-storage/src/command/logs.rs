@@ -48,11 +48,9 @@ pub(crate) fn insert_logs(
     batch: &LogWriteBatch,
     scratch: &mut InsertScratch,
 ) -> Result<u64, StorageError> {
-    // Empty batches have no rows, resource, or statement work to do.
     if batch.records.is_empty() {
         return Ok(0);
     }
-    debug_assert_segments(batch);
     resolve_batch_resource(conn, batch, scratch)?;
 
     let mut statement = conn.prepare_cached(SQL_INSERT_LOG_EVENT)?;
@@ -78,7 +76,6 @@ pub(crate) fn insert_logs_tolerant(
     if batch.records.is_empty() {
         return Ok(SalvageOutcome::default());
     }
-    debug_assert_segments(batch);
     resolve_batch_resource(conn, batch, scratch)?;
 
     let mut statement = conn.prepare_cached(SQL_INSERT_LOG_EVENT)?;
@@ -86,10 +83,9 @@ pub(crate) fn insert_logs_tolerant(
     let mut dropped = 0u64;
     let mut by_ticket: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
     let tickets = batch
-        .segments
+        .segments()
         .iter()
-        .flat_map(|segment| std::iter::repeat_n(segment.commit_seq, segment.records))
-        .chain(std::iter::repeat_n(0, batch.records.len()));
+        .flat_map(|segment| std::iter::repeat_n(segment.commit_seq, segment.records));
     for (record, ticket) in batch.records.records().iter().zip(tickets) {
         match execute_record(&mut statement, scratch, record) {
             Ok(_) => {
@@ -120,19 +116,6 @@ pub(crate) fn insert_logs_tolerant(
         dropped,
         by_ticket,
     })
-}
-
-fn debug_assert_segments(batch: &LogWriteBatch) {
-    debug_assert!(
-        batch.segments.is_empty()
-            || batch
-                .segments
-                .iter()
-                .map(|segment| segment.records)
-                .sum::<usize>()
-                == batch.records.len(),
-        "record segments must partition the batch"
-    );
 }
 
 fn resolve_batch_resource(

@@ -235,7 +235,7 @@ fn execute_next(
                 .increment(consumed);
             stats
                 .batches_received
-                .fetch_add(group.non_empty() as u64, Ordering::Relaxed);
+                .fetch_add(group.len() as u64, Ordering::Relaxed);
             stats.observe_queue_depth(receiver.len() + usize::from(pending.is_some()));
 
             // Quota probes, transactions and statement work all belong only to
@@ -250,7 +250,7 @@ fn execute_next(
         }
         other => {
             ::metrics::counter!("storage_commands_total", "kind" => other.kind()).increment(1);
-            execute_non_insert(conn, other, search, stats, receiver.len())?;
+            execute_non_insert(conn, other, search, stats)?;
             Ok(1)
         }
     }
@@ -263,23 +263,13 @@ fn execute_non_insert(
     command: WriteCommand,
     search: &mut SearchIndex,
     stats: &WriterStats,
-    queue_backlog: usize,
 ) -> Result<(), StorageError> {
     match command {
         WriteCommand::InsertLogs(_) => unreachable!("insert commands are handled by execute_next"),
         WriteCommand::Flush => {}
-        WriteCommand::Checkpoint(mode) => {
-            let _maintenance = stats.maintenance_guard();
-            maintenance::checkpoint(conn, mode)?;
-            stats.maintenance_runs.fetch_add(1, Ordering::Relaxed);
-            stats.mark_progress();
-        }
         WriteCommand::Maintenance(operation) => {
             let _maintenance = stats.maintenance_guard();
-            if run_maintenance(conn, operation, search, queue_backlog)? {
-                stats.maintenance_runs.fetch_add(1, Ordering::Relaxed);
-                stats.mark_progress();
-            }
+            run_maintenance(conn, operation, search, stats)?;
         }
     }
     Ok(())
@@ -317,49 +307,28 @@ fn run_rebuild_step(
     Ok(())
 }
 
-/// Executes one maintenance command, returning `false` when it was
-/// deliberately deferred (backlog pressure) or disabled. Callers only count
-/// and timestamp a run that actually happened.
+/// Executes one maintenance command. Operations disabled by configuration
+/// (e.g. a rebuild while the search index is off) return without counting a
+/// run; everything else is real maintenance work.
 fn run_maintenance(
     conn: &mut Connection,
     operation: MaintenanceOperation,
     search: &mut SearchIndex,
-    queue_backlog: usize,
-) -> Result<bool, StorageError> {
-    // Heavy operations (full-file VACUUM, index rebuild, large prunes)
-    // stall the single writer for seconds on GB databases. When ingestion is
-    // waiting, defer them to the next scheduler interval instead of stalling
-    // it: the scheduler re-enqueues on its own cadence.
-    if queue_backlog > MAINTENANCE_PRESSURE_SKIP_DEPTH
-        && let Some(label) = heavy_maintenance_label(&operation)
-    {
-        ::metrics::counter!(
-            "storage_maintenance_deferred_total",
-            "operation" => label
-        )
-        .increment(1);
-        tracing::warn!(
-            operation = label,
-            queue_backlog,
-            "deferring heavy maintenance; ingestion backlog present"
-        );
-        return Ok(false);
-    }
+    stats: &WriterStats,
+) -> Result<(), StorageError> {
     match operation {
         MaintenanceOperation::Analyze => maintenance::analyze(conn)?,
+        MaintenanceOperation::Checkpoint(mode) => maintenance::checkpoint(conn, mode)?,
         MaintenanceOperation::Vacuum => maintenance::vacuum(conn)?,
         MaintenanceOperation::RebuildFts => {
             // The command restarts a resumable background rebuild; it never
             // runs the whole scan synchronously and never re-enables a
             // disabled index.
             if !search.restart(conn)? {
-                return Ok(false);
+                return Ok(());
             }
         }
         MaintenanceOperation::Prune(window) => {
-            if window.is_none() {
-                return Ok(false);
-            }
             let report = maintenance::prune(conn, window, unix_nano_now())?;
             if report.total() > 0 {
                 ::metrics::counter!("storage_records_pruned_total", "table" => "log_event")
@@ -374,7 +343,9 @@ fn run_maintenance(
             }
         }
     }
-    Ok(true)
+    stats.maintenance_runs.fetch_add(1, Ordering::Relaxed);
+    stats.mark_progress();
+    Ok(())
 }
 
 /// Best-effort size-quota enforcement ahead of an insert batch.
@@ -415,21 +386,6 @@ fn enforce_quota(
                 "size-quota enforcement failed; proceeding with insert"
             );
         }
-    }
-}
-
-/// Backlog depth above which heavy maintenance defers to the next scheduler
-/// interval instead of stalling ingestion behind a seconds-long exclusive op.
-const MAINTENANCE_PRESSURE_SKIP_DEPTH: usize = 1_000;
-
-/// Label of an operation heavy enough to defer under ingestion pressure, or
-/// `None` when it is cheap and should always run (`Analyze`, disabled prunes).
-fn heavy_maintenance_label(operation: &MaintenanceOperation) -> Option<&'static str> {
-    match operation {
-        MaintenanceOperation::Vacuum => Some("vacuum"),
-        MaintenanceOperation::RebuildFts => Some("rebuild_fts"),
-        MaintenanceOperation::Prune(Some(_)) => Some("prune"),
-        MaintenanceOperation::Prune(None) | MaintenanceOperation::Analyze => None,
     }
 }
 

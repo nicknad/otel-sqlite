@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Restricts `path` to owner-only access.
 ///
@@ -67,7 +67,15 @@ fn restrict_windows(path: &Path) -> std::io::Result<()> {
 
 /// SQLite sidecar suffixes that carry the same telemetry bytes as the main
 /// database file: WAL frames, the shared-memory index, and rollback journals.
-const SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
+pub(crate) const SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
+
+/// SQLite's sidecar path convention appends the suffix to the whole filename
+/// (`db-wal`), unlike `Path::with_extension`.
+pub(crate) fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut os = db_path.as_os_str().to_owned();
+    os.push(suffix);
+    PathBuf::from(os)
+}
 
 /// Restricts the database file *and* its SQLite sidecars to owner-only
 /// access.
@@ -87,15 +95,14 @@ pub(crate) fn harden_database_files(db_path: &Path) {
         );
     }
     for suffix in SIDECAR_SUFFIXES {
-        let mut sidecar = db_path.as_os_str().to_owned();
-        sidecar.push(suffix);
-        match restrict_permissions(Path::new(&sidecar)) {
+        let sidecar = sidecar_path(db_path, suffix);
+        match restrict_permissions(&sidecar) {
             Ok(()) => {}
             // Sidecars appear lazily; absence is the normal case, not trouble.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 tracing::warn!(
-                    path = %Path::new(&sidecar).display(),
+                    path = %sidecar.display(),
                     %error,
                     "could not restrict database sidecar permissions"
                 );

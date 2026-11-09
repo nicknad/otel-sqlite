@@ -13,7 +13,9 @@
 use std::time::Duration;
 
 use crossbeam_channel::unbounded;
-use otel_sqlite_storage::{Storage, StorageConfig, StorageError, migrate_up_to};
+use otel_sqlite_storage::{
+    Storage, StorageConfig, StorageError, latest_schema_version, migrate_up_to,
+};
 use rusqlite::Connection;
 
 /// A database built and stamped at an old schema version, seeded with data
@@ -101,7 +103,11 @@ fn assert_upgraded(path: &std::path::Path) {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "006", "upgrade must land on the current schema");
+    assert_eq!(
+        version,
+        latest_schema_version(),
+        "upgrade must land on the current schema"
+    );
 
     let applied: Vec<String> = conn
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -115,7 +121,6 @@ fn assert_upgraded(path: &std::path::Path) {
         "migration stamps must be applied in order: {applied:?}"
     );
 
-    // Log data preserved.
     assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM log_event"), 2);
     assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM log_resource"), 1);
     let body: String = conn
@@ -149,7 +154,6 @@ fn assert_upgraded(path: &std::path::Path) {
         .unwrap();
     assert_eq!(matches, 1);
 
-    // Integrity and foreign keys.
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .unwrap();
@@ -333,7 +337,7 @@ fn fresh_database_has_no_metric_objects() {
     );
 }
 
-/// Reopening a current-schema database is a no-op: the stamp stays 006 and the
+/// Reopening a current-schema database is a no-op: the stamp stays current and the
 /// data is untouched — upgrades are idempotent for already-current databases.
 #[test]
 fn current_schema_reopen_is_idempotent() {
@@ -377,7 +381,7 @@ fn newer_recorded_schema_version_is_rejected() {
                 "message must name the offending version: {message}"
             );
             assert!(
-                message.contains("006"),
+                message.contains(latest_schema_version()),
                 "message must name the newest supported version: {message}"
             );
         }

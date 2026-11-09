@@ -19,8 +19,8 @@ fn empty_database_reports_every_migration_pending_and_is_not_otel() {
     let status = read_only_inspect(&path);
 
     assert_eq!(status.latest_known, latest_schema_version());
-    assert!(status.applied.is_empty());
-    assert!(!status.pending.is_empty());
+    assert_eq!(status.applied.len(), 0);
+    assert_ne!(status.pending.len(), 0);
     assert_eq!(
         status.pending.last().copied(),
         Some(latest_schema_version())
@@ -85,7 +85,7 @@ fn current_schema_has_nothing_pending() {
 
     let status = read_only_inspect(&path);
 
-    assert!(status.pending.is_empty());
+    assert_eq!(status.pending.len(), 0);
     assert!(!status.newer_than_binary);
     assert!(status.is_otel_schema);
     assert_eq!(
@@ -111,7 +111,7 @@ fn newer_schema_is_flagged_as_newer_than_the_binary() {
 
     assert!(status.newer_than_binary);
     assert_eq!(status.applied.last().map(String::as_str), Some("999"));
-    assert!(status.pending.is_empty());
+    assert_eq!(status.pending.len(), 0);
     assert!(status.is_otel_schema);
 }
 
@@ -135,7 +135,7 @@ fn immutable_open_leaves_no_wal_or_shm_sidecars() {
     drop(conn);
     let after = std::fs::read(&path).expect("read after");
 
-    assert!(status.pending.is_empty());
+    assert_eq!(status.pending.len(), 0);
     assert_eq!(before, after, "inspection must not modify the file");
     assert!(
         !dir.path().join("wal.db-wal").exists(),

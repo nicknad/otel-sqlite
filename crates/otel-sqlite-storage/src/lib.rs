@@ -27,8 +27,8 @@ use otel_sqlite_core::saturating_deadline;
 use otel_sqlite_core::storage::{CommitLedger, IngestMessage, InsertBatcherConfig, WriteCommand};
 
 pub use config::{
-    DEFAULT_COMMAND_QUEUE_CAPACITY, DEFAULT_GROUP_COMMIT_RECORDS, DEFAULT_SHUTDOWN_TIMEOUT,
-    DEFAULT_STARTUP_TIMEOUT, MAX_GROUP_COMMIT_RECORDS, StorageConfig,
+    DEFAULT_COMMAND_QUEUE_CAPACITY, DEFAULT_DB_FILENAME, DEFAULT_GROUP_COMMIT_RECORDS,
+    DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_STARTUP_TIMEOUT, MAX_GROUP_COMMIT_RECORDS, StorageConfig,
 };
 pub use error::StorageError;
 /// Applies only the migrations up to and including `target_version`, stamping

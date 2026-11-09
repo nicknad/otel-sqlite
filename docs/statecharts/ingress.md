@@ -4,10 +4,11 @@ This statechart models one OTLP log export through the ingress in both
 `durability = "commit"` and `durability = "enqueue"` modes: credentials are
 checked, the request is mapped, room for the whole request is reserved on the
 bounded ingest queue, each chunk is sent, and the handler turns the enqueue
-outcome into the wire response. It follows `LogsIngress::finish`, the enqueue
-outcome in `crates/otel-sqlite-ingress/src/{logs,enqueue}.rs`, the commit
-ledger in `crates/otel-sqlite-core/src/storage/commit.rs`, and the writer's
-quarantine settlement in `crates/otel-sqlite-storage/src/writer.rs`.
+outcome into the wire response. It follows the commit/enqueue `AckPolicy`
+selected by `LogsIngress`, the typed enqueue path in
+`crates/otel-sqlite-ingress/src/{logs,enqueue}.rs`, the commit ledger in
+`crates/otel-sqlite-core/src/storage/commit.rs`, and the writer's quarantine
+settlement in `crates/otel-sqlite-storage/src/writer.rs`.
 
 In commit mode the handler waits for the contiguous watermark covering the
 highest accepted ticket, then inspects every accepted ticket. Records behind
@@ -103,8 +104,7 @@ stateDiagram-v2
 TLC reached **113 states and 177 steps**. The chart draws **18 states and 19
 arrows**. The view hides 95 steps that do not change the chart state: pipeline
 death, most ticket commits and quarantines while sending, settlements that
-leave a label unchanged, and the final stutter. The exact chart text is also
-stored as `docs/statecharts/ingress.mmd`.
+leave a label unchanged, and the final stutter.
 
 The separate waiting state is the out-of-order case: a later chunk is
 quarantined while an earlier chunk is still open. The response cannot leave

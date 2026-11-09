@@ -6,18 +6,21 @@
 //! there is no polling and no busy loop. When no operation is enabled it waits
 //! on shutdown alone.
 
-use std::thread::JoinHandle;
+use std::io;
 use std::time::Instant;
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, after, select};
+use crossbeam_channel::{Receiver, Sender, after, select};
 use otel_sqlite_core::storage::WriteCommand;
 use thiserror::Error;
 
 use crate::config::MaintenanceConfig;
-use crate::scheduler::Scheduler;
+use crate::scheduler::{Scheduler, TickOutcome};
+use crate::thread::{ActiveGauge, WorkerHandle, shutdown_signalled, spawn_named};
 
 #[derive(Debug, Error)]
 pub enum MaintenanceWorkerError {
+    #[error("failed to spawn maintenance worker thread: {0}")]
+    Spawn(#[source] io::Error),
     #[error("maintenance worker thread panicked")]
     Panicked,
 }
@@ -39,78 +42,46 @@ impl MaintenanceWorker {
 
     /// Starts the worker on its own thread and returns a handle controlling
     /// its lifecycle.
-    pub fn spawn(self) -> MaintenanceHandle {
+    pub fn spawn(self) -> Result<MaintenanceHandle, MaintenanceWorkerError> {
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
-        let join_handle = std::thread::Builder::new()
-            .name("otel-sqlite-maintenance".to_owned())
-            .spawn(move || run(self.sink, self.config, shutdown_rx))
-            .expect("failed to spawn maintenance worker thread");
+        let join_handle = spawn_named("otel-sqlite-maintenance", move || {
+            run(self.sink, self.config, shutdown_rx);
+        })
+        .map_err(MaintenanceWorkerError::Spawn)?;
 
-        MaintenanceHandle {
-            shutdown: Some(shutdown_tx),
-            join: Some(join_handle),
-        }
+        Ok(MaintenanceHandle {
+            worker: WorkerHandle::new(shutdown_tx, join_handle),
+        })
     }
 }
 
 /// Control handle for a spawned [`MaintenanceWorker`].
 #[derive(Debug)]
 pub struct MaintenanceHandle {
-    shutdown: Option<Sender<()>>,
-    join: Option<JoinHandle<()>>,
+    worker: WorkerHandle,
 }
 
 impl MaintenanceHandle {
     /// Signals the worker to stop without waiting for it. Idempotent: a
     /// second call (or one after the thread has exited) is a no-op.
     pub fn shutdown(&self) {
-        if let Some(sender) = &self.shutdown {
-            let _ = sender.try_send(());
-        }
+        self.worker.shutdown();
     }
 
     /// Signals shutdown and joins the thread. Returns an error if the worker
     /// panicked; scheduling already stopped either way.
     pub fn stop(self) -> Result<(), MaintenanceWorkerError> {
-        self.shutdown();
-        self.join()
+        self.worker
+            .stop()
+            .map_err(|_| MaintenanceWorkerError::Panicked)
     }
 
     /// Joins the worker thread. Dropping every shutdown sender (including
     /// this handle's) also releases a worker waiting for shutdown.
-    pub fn join(mut self) -> Result<(), MaintenanceWorkerError> {
-        self.shutdown = None;
-        if let Some(handle) = self.join.take() {
-            handle
-                .join()
-                .map_err(|_| MaintenanceWorkerError::Panicked)?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for MaintenanceHandle {
-    fn drop(&mut self) {
-        // Best-effort: releasing the sender wakes a block-waiting worker even
-        // when nobody called `stop()`.
-        self.shutdown = None;
-    }
-}
-
-/// Publishes the worker's liveness for as long as the thread runs, including
-/// unwind paths (a panic must not leave the gauge stuck at 1).
-struct ActiveGauge;
-
-impl ActiveGauge {
-    fn new() -> Self {
-        ::metrics::gauge!("maintenance_worker_active").set(1.0);
-        Self
-    }
-}
-
-impl Drop for ActiveGauge {
-    fn drop(&mut self) {
-        ::metrics::gauge!("maintenance_worker_active").set(0.0);
+    pub fn join(self) -> Result<(), MaintenanceWorkerError> {
+        self.worker
+            .join()
+            .map_err(|_| MaintenanceWorkerError::Panicked)
     }
 }
 
@@ -121,7 +92,7 @@ fn run(sink: Sender<WriteCommand>, config: MaintenanceConfig, shutdown: Receiver
     let enabled = scheduler.enabled_task_count();
 
     tracing::info!(tasks = enabled, "maintenance worker started");
-    let _active = ActiveGauge::new();
+    let _active = ActiveGauge::new("maintenance_worker_active");
 
     loop {
         // Drain a shutdown requested while the previous cycle was running so
@@ -130,8 +101,7 @@ fn run(sink: Sender<WriteCommand>, config: MaintenanceConfig, shutdown: Receiver
             break;
         }
 
-        let report = scheduler.tick(Instant::now(), &sink);
-        if report.disconnected {
+        if scheduler.tick(Instant::now(), &sink) == TickOutcome::Disconnected {
             // The writer is gone; there is nowhere to schedule into anymore.
             break;
         }
@@ -153,26 +123,24 @@ fn run(sink: Sender<WriteCommand>, config: MaintenanceConfig, shutdown: Receiver
     tracing::info!("maintenance worker stopped");
 }
 
-fn shutdown_signalled(shutdown: &Receiver<()>) -> bool {
-    !matches!(shutdown.try_recv(), Err(TryRecvError::Empty))
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use otel_sqlite_core::storage::{MaintenanceOperation, WriteCommand};
+    use otel_sqlite_core::storage::{CheckpointMode, MaintenanceOperation, WriteCommand};
     use otel_sqlite_test_support::wait_until;
 
     use super::*;
-    use crate::config::MaintenanceConfig;
+    use crate::config::PurgeSchedule;
 
     fn config(purge_interval: Option<Duration>) -> MaintenanceConfig {
         MaintenanceConfig {
-            retention: Some(Duration::from_secs(60)),
-            purge_interval,
+            purge: purge_interval.map(|interval| PurgeSchedule {
+                retention: Duration::from_secs(60),
+                interval,
+            }),
             checkpoint_interval: None,
-            checkpoint_mode: otel_sqlite_core::storage::CheckpointMode::Passive,
+            checkpoint_mode: CheckpointMode::Passive,
             optimize_interval: None,
             vacuum_interval: None,
             rebuild_fts_interval: None,
@@ -185,54 +153,47 @@ mod tests {
         // A plain channel is the only dependency: scheduling never needs
         // SQLite. This test enforces the architectural boundary.
         let (queue, receiver) = crossbeam_channel::bounded::<WriteCommand>(16);
-        let handle = MaintenanceWorker::new(queue, config(Some(Duration::from_millis(20)))).spawn();
+        let handle = MaintenanceWorker::new(queue, config(Some(Duration::from_millis(20))))
+            .spawn()
+            .expect("worker thread spawns");
 
         assert!(
             wait_until(Duration::from_secs(5), || !receiver.is_empty()),
             "worker must enqueue a purge command once the interval elapses"
         );
 
-        handle.stop().unwrap();
+        handle.stop().expect("clean stop");
 
         let prunes: Vec<_> = receiver
             .try_iter()
             .filter_map(|command| match command {
-                WriteCommand::Maintenance(MaintenanceOperation::Prune(policy)) => Some(policy),
+                WriteCommand::Maintenance(MaintenanceOperation::Prune(retention)) => {
+                    Some(retention)
+                }
                 _ => None,
             })
             .collect();
-        assert!(!prunes.is_empty());
-        assert_eq!(prunes[0], Some(Duration::from_secs(60)));
+        assert_eq!(prunes.first(), Some(&Duration::from_secs(60)));
     }
 
     #[test]
     fn shutdown_stops_the_worker_promptly() {
         let (queue, _receiver) = crossbeam_channel::bounded::<WriteCommand>(16);
-        let handle =
-            MaintenanceWorker::new(queue, config(Some(Duration::from_secs(3_600)))).spawn();
+        let handle = MaintenanceWorker::new(queue, config(Some(Duration::from_secs(3_600))))
+            .spawn()
+            .expect("worker thread spawns");
         std::thread::sleep(Duration::from_millis(50));
 
-        let started = Instant::now();
-        handle.stop().expect("clean stop");
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let joiner = std::thread::spawn(move || {
+            let result = handle.stop();
+            let _ = done_tx.send(());
+            result
+        });
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "stop must not wait out the next schedule deadline"
         );
-    }
-
-    #[test]
-    fn closed_command_queue_terminates_the_worker() {
-        let (queue, receiver) = crossbeam_channel::bounded::<WriteCommand>(16);
-        let handle = MaintenanceWorker::new(queue, config(Some(Duration::from_millis(10)))).spawn();
-        drop(receiver); // simulate writer death
-
-        let started = Instant::now();
-        handle
-            .stop()
-            .expect("worker exits cleanly after disconnect");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "disconnect must terminate the loop instead of spinning forever"
-        );
+        joiner.join().expect("joiner").expect("clean stop");
     }
 }

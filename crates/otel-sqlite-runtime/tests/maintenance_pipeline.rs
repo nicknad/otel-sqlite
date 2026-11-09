@@ -21,7 +21,7 @@ use otel_sqlite_core::storage::{
     BatchOrigin, IngestMessage, InsertBatcherConfig, LogChunk, SyncMode,
 };
 use otel_sqlite_core::unix_nano_now;
-use otel_sqlite_runtime::{MaintenanceConfig, MaintenanceWorker};
+use otel_sqlite_runtime::{MaintenanceConfig, MaintenanceWorker, PurgeSchedule};
 use otel_sqlite_storage::{Storage, StorageConfig};
 use otel_sqlite_test_support::{open_readonly, wait_until};
 use rusqlite::Connection;
@@ -42,8 +42,10 @@ fn storage_config(db_path: std::path::PathBuf) -> StorageConfig {
 /// Test-only maintenance configuration: purge every 50 ms, nothing else.
 fn maintenance_config() -> MaintenanceConfig {
     MaintenanceConfig {
-        retention: Some(Duration::from_secs(3_600)), // 1 hour
-        purge_interval: Some(Duration::from_millis(50)),
+        purge: Some(PurgeSchedule {
+            retention: Duration::from_secs(3_600), // 1 hour
+            interval: Duration::from_millis(50),
+        }),
         checkpoint_interval: None,
         checkpoint_mode: otel_sqlite_core::storage::CheckpointMode::Passive,
         optimize_interval: None,
@@ -112,7 +114,9 @@ fn maintenance_worker_purges_expired_records_through_the_real_pipeline() {
     );
     assert_eq!(bodies(&open_readonly(&db_path)).len(), 3);
 
-    let worker = MaintenanceWorker::new(producer.clone(), maintenance_config()).spawn();
+    let worker = MaintenanceWorker::new(producer.clone(), maintenance_config())
+        .spawn()
+        .expect("maintenance worker spawns");
 
     // The scheduler enqueues a prune; the writer executes it and deletes only
     // the records outside the retention window.
@@ -149,7 +153,9 @@ fn maintenance_worker_survives_writer_shutdown_ordering() {
     let (ingest_tx, receiver) = crossbeam_channel::unbounded();
     let mut storage = Storage::open(receiver, storage_config(db_path.clone())).unwrap();
     let producer = storage.producer();
-    let worker = MaintenanceWorker::new(producer.clone(), MaintenanceConfig::default()).spawn();
+    let worker = MaintenanceWorker::new(producer.clone(), MaintenanceConfig::default())
+        .spawn()
+        .expect("maintenance worker spawns");
 
     ingest_tx
         .send(IngestMessage::Logs(LogChunk {

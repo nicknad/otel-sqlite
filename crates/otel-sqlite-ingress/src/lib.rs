@@ -4,7 +4,7 @@
 
 pub mod auth;
 pub mod config;
-pub mod enqueue;
+mod enqueue;
 pub mod error;
 mod grpc;
 mod health;
@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
+use otel_sqlite_core::saturating_deadline;
 use otel_sqlite_core::storage::IngestMessage;
 
 pub use auth::{AuthError, BearerInterceptor, TokenFileVault};
@@ -29,9 +30,10 @@ pub use config::{
     MAX_MAPPING_CONCURRENCY, MAX_SCOPE_METADATA_EXPANSION_BYTES, TlsConfig, expand_bind_address,
 };
 pub use error::IngressError;
-pub use grpc::{serve, serve_with_shutdown, validate_tls_material};
+pub use grpc::{
+    IngressLogsService, logs_service, serve, serve_with_shutdown, validate_tls_material,
+};
 pub use logs::LogsIngress;
-pub use mapping::pb;
 
 /// Sender half of the bounded channel feeding the storage insert batcher.
 ///
@@ -214,7 +216,7 @@ impl IngestSender {
         mut message: IngestMessage,
         timeout: Duration,
     ) -> Result<(), SendTimeoutFailure> {
-        let deadline = Instant::now() + timeout;
+        let deadline = saturating_deadline(Instant::now(), timeout);
         loop {
             // Scope the gate to the try_send alone so the retry pause and the
             // deadline check run without holding it (see `send`).

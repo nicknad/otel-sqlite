@@ -77,8 +77,7 @@ stateDiagram-v2
 
 TLC reached **29 states and 55 steps**. The chart draws **10 states and 13
 arrows**. The remaining 7 steps stay in one chart state and are not drawn; the
-view hides 10 more steps, all `Done` stutters in an end state. The exact chart
-text is also stored as `docs/statecharts/storage.mmd`.
+view hides 10 more steps, all `Done` stutters in an end state.
 
 The colors are phases, not verdicts: orange batching, purple writing, blue
 first-segment progress, yellow partial/quarantined work, teal a clean
@@ -179,9 +178,6 @@ selected tests passed.
 - **Voided tickets.** Empty chunks and rejected enqueues void their tickets in
   the code; a void settles a ticket without a batch. The modeled chunk always
   carries records, so it has no void path.
-- **Legacy/benchmark batches.** `settle_log_batch` falls back to completing
-  every referenced ticket when `segments` is empty. Real pipeline batches always
-  carry segments; the model assumes the segment-aware path.
 - **The `Flush` barrier, shutdown flush, and the timing of the age deadline.**
   The age deadline is representative. The chart hides the deadline when it
   fires while writing or after the first batch commits, because it stays in one

@@ -19,6 +19,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use anyhow::bail;
+use clap::ValueEnum;
 
 use crate::db;
 use crate::params::{Overrides, RunContext, StepParams, fresh_run_id};
@@ -28,6 +29,122 @@ use crate::report::{
 };
 use crate::runner::{drain_storage, execute_load};
 use crate::validation;
+
+// ---------------------------------------------------------------------------
+// Scenario registry
+// ---------------------------------------------------------------------------
+
+/// One stop of a scenario plan: the canonical scenario plus the step list its
+/// builder produced.
+#[derive(Debug, Clone)]
+pub struct ScenarioPlan {
+    pub scenario: Scenario,
+    pub name: &'static str,
+    pub steps: Vec<StepParams>,
+    pub stop_on_saturation: bool,
+}
+
+/// The complete registry: every scenario's canonical CLI/report name, step
+/// builder and saturation policy lives in this one enum.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Scenario {
+    /// A - small controlled workload.
+    #[value(name = "baseline")]
+    Baseline,
+    /// B - progressively higher offered load.
+    #[value(name = "throughput-ramp", alias = "throughput")]
+    ThroughputRamp,
+    /// C - records-per-request comparison.
+    #[value(name = "batch-sizes", alias = "batch")]
+    BatchSizes,
+    /// D - client-count comparison at constant offered load.
+    #[value(name = "concurrency")]
+    Concurrency,
+    /// E - long-running sustained load (default 10 minutes).
+    #[value(name = "sustained")]
+    Sustained,
+    /// F - intentional overload / backpressure verification.
+    #[value(name = "backpressure")]
+    Backpressure,
+    /// G - storage insert-batcher behaviour across OTLP batch shapes.
+    #[value(name = "insert-batching", alias = "insertbatching")]
+    InsertBatching,
+    /// Everything except `sustained`.
+    #[value(name = "all")]
+    All,
+}
+
+impl Scenario {
+    /// `all` expands to these in order; `sustained` is intentionally absent.
+    pub const ALL: &'static [Scenario] = &[
+        Scenario::Baseline,
+        Scenario::ThroughputRamp,
+        Scenario::BatchSizes,
+        Scenario::Concurrency,
+        Scenario::Backpressure,
+        Scenario::InsertBatching,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::ThroughputRamp => "throughput-ramp",
+            Self::BatchSizes => "batch-sizes",
+            Self::Concurrency => "concurrency",
+            Self::Sustained => "sustained",
+            Self::Backpressure => "backpressure",
+            Self::InsertBatching => "insert-batching",
+            Self::All => "all",
+        }
+    }
+
+    /// Whether this scenario stops its own steps at saturation. The runtime
+    /// `--keep-going` flag can still override it.
+    pub const fn stop_on_saturation(self) -> bool {
+        matches!(self, Self::ThroughputRamp)
+    }
+
+    pub fn steps(self, overrides: &Overrides) -> Vec<StepParams> {
+        match self {
+            Self::Baseline => baseline(overrides),
+            Self::ThroughputRamp => throughput_ramp(overrides),
+            Self::BatchSizes => batch_sizes(overrides),
+            Self::Concurrency => concurrency(overrides),
+            Self::Sustained => sustained(overrides),
+            Self::Backpressure => backpressure(overrides),
+            Self::InsertBatching => insert_batching(overrides),
+            Self::All => Self::ALL
+                .iter()
+                .flat_map(|scenario| scenario.steps(overrides))
+                .collect(),
+        }
+    }
+
+    /// Expands `all` into the scenarios to run, preserving canonical names.
+    pub fn plan(self, overrides: &Overrides, keep_going: bool) -> Vec<ScenarioPlan> {
+        let scenarios: &[Scenario] = if self == Self::All {
+            Self::ALL
+        } else {
+            std::slice::from_ref(&self)
+        };
+        scenarios
+            .iter()
+            .copied()
+            .map(|scenario| ScenarioPlan {
+                scenario,
+                name: scenario.name(),
+                steps: scenario.steps(overrides),
+                stop_on_saturation: scenario.stop_on_saturation() && !keep_going,
+            })
+            .collect()
+    }
+}
+
+impl std::fmt::Display for Scenario {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Scenario definitions (A-G)
@@ -139,7 +256,8 @@ pub fn backpressure(overrides: &Overrides) -> Vec<StepParams> {
 /// and storage batching (`max_batch_records` / `max_batch_age`):
 ///
 /// * `insert-small`       - OTLP batches far below storage capacity;
-/// * `insert-at-capacity` - OTLP batches exactly at `max_batch_records`;
+/// * `insert-at-capacity` - request record count equal to `max_batch_records`
+///   (the request boundary is independent of the storage batch boundary);
 /// * `insert-oversized`   - OTLP batches several times over capacity (splits);
 /// * `insert-sustained`   - sustained high-volume ingestion (capacity-driven
 ///   emission dominates);
@@ -204,8 +322,9 @@ pub async fn run_scenario(
             warmup_params.duration_secs
         );
         let raw = execute_load(context, &warmup_params, &run_id).await?;
-        drain_storage(context, &run_id, Some(raw.counters.records_accepted)).await?;
-        println!("warm-up drained ({} rows)", raw.counters.records_accepted);
+        let accepted = raw.accounting.counters.records_accepted;
+        drain_storage(context, &run_id, Some(accepted)).await?;
+        println!("warm-up drained ({accepted} rows)");
     }
 
     let mut reports = Vec::with_capacity(steps.len());
@@ -244,17 +363,15 @@ pub async fn run_scenario(
         };
         let window = context.telemetry.end_window();
 
-        let persisted =
-            drain_storage(context, &run_id, Some(raw.counters.records_accepted)).await?;
+        let counters = raw.accounting.counters;
+        let persisted = drain_storage(context, &run_id, Some(counters.records_accepted)).await?;
 
-        let generated_total = raw.counters.records_generated;
         let correctness = {
             let db_path = context.db_path.clone();
-            let rejected = raw.rejected.clone();
-            let ambiguous = raw.ambiguous.clone();
+            let accounting = raw.accounting.clone();
             let run_id = run_id.clone();
             tokio::task::spawn_blocking(move || {
-                validation::validate(&db_path, &run_id, generated_total, &rejected, &ambiguous)
+                validation::validate(&db_path, &run_id, &accounting)
             })
             .await??
         };
@@ -271,7 +388,7 @@ pub async fn run_scenario(
             tokio::task::spawn_blocking(move || db::inspect(&db_path)).await??
         };
 
-        let samples = raw.samples.lock().expect("sample sink lock").clone();
+        let samples = raw.samples;
         let stats_after = context.server.as_ref().and_then(|server| server.stats());
         let storage_deltas = stats_before
             .zip(stats_after)
@@ -286,16 +403,16 @@ pub async fn run_scenario(
 
         let results = ResultsSummary {
             measured_seconds: raw.measured_seconds,
-            requests: raw.counters.requests,
-            records_generated: raw.counters.records_generated,
-            records_accepted: raw.counters.records_accepted,
-            records_rejected: raw.counters.records_rejected,
-            records_ambiguous: raw.counters.records_ambiguous,
-            requests_failed: raw.counters.requests_failed,
-            requests_timed_out: raw.counters.requests_timed_out,
-            achieved_generated_records_per_second: raw.counters.records_generated as f64
+            requests: counters.requests,
+            records_generated: counters.records_generated,
+            records_accepted: counters.records_accepted,
+            records_rejected: counters.records_rejected,
+            records_ambiguous: counters.records_ambiguous,
+            requests_failed: counters.requests_failed,
+            requests_timed_out: counters.requests_timed_out,
+            achieved_generated_records_per_second: counters.records_generated as f64
                 / raw.measured_seconds,
-            achieved_accepted_records_per_second: raw.counters.records_accepted as f64
+            achieved_accepted_records_per_second: counters.records_accepted as f64
                 / raw.measured_seconds,
         };
 
@@ -315,23 +432,24 @@ pub async fn run_scenario(
             drained_rows: persisted,
             correctness,
             record_id_mismatches,
-            rejection_positions_exact: raw.positions_exact,
+            rejection_positions_exact: raw.accounting.positions_exact,
             storage: storage_info,
             size_trajectory: SizeTrajectory::from_samples(&samples),
             storage_deltas,
         };
 
-        if !report.correctness.passed {
+        if !report.correctness.passed || report.record_id_mismatches > 0 {
             print_step_summary(&report);
             bail!(
-                "correctness validation failed for step '{}': {:?}",
+                "correctness validation failed for step '{}': {:?} (record-id mismatches: {})",
                 params.label,
-                report.correctness.failure_reasons
+                report.correctness.failure_reasons,
+                report.record_id_mismatches
             );
         }
 
-        let loss_ratio = (raw.counters.records_rejected + raw.counters.records_ambiguous) as f64
-            / raw.counters.records_generated.max(1) as f64;
+        let loss_ratio = (counters.records_rejected + counters.records_ambiguous) as f64
+            / counters.records_generated.max(1) as f64;
         if stop_on_saturation && loss_ratio > 0.05 {
             saturated = true;
             println!(

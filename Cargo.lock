@@ -1344,6 +1344,7 @@ dependencies = [
  "otel-sqlite-core",
  "otel-sqlite-ingress",
  "otel-sqlite-storage",
+ "otel-sqlite-test-support",
  "rand 0.10.3",
  "rusqlite",
  "serde",
@@ -1425,6 +1426,7 @@ name = "otel-sqlite-test-support"
 version = "0.2.0"
 dependencies = [
  "rusqlite",
+ "tempfile",
 ]
 
 [[package]]

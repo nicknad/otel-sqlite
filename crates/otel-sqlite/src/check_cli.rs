@@ -5,8 +5,8 @@
 //! mutating the database. Each section reports independently so an operator
 //! sees every blocker in one run:
 //!
-//! * the effective config is loaded and validated exactly like the server
-//!   (`Config::from_env` / `Config::from_file`),
+//! * the effective config is loaded and validated through the same
+//!   `Config::from_env` / `Config::from_file` constructors as the server,
 //! * TLS material is parsed (not merely checked for readability),
 //! * the bearer-token file is loaded and validated,
 //! * the SQLite schema is inspected read-only, including the downgrade guard
@@ -96,7 +96,7 @@ pub fn print_usage() {
 Usage:
   otel-sqlite check [--config PATH] [--json]
 
-Loads and validates the effective configuration exactly like the server,
+Loads and validates the configuration through the same loader as the server,
 parses TLS certificates/keys, validates the bearer-token file, and inspects
 the SQLite schema read-only. It never binds a listener or mutates the
 database.
@@ -557,7 +557,7 @@ mod tests {
         assert!(report.ok, "a fresh database path is expected: {report:?}");
         let database = report.database.expect("database section");
         assert_eq!(database.state, "missing");
-        assert!(!report.warnings.is_empty());
+        assert_ne!(report.warnings.len(), 0);
     }
 
     #[test]
@@ -598,7 +598,7 @@ mod tests {
         assert!(report.ok, "current schema passes: {report:?}");
         let database = report.database.expect("database section");
         assert_eq!(database.state, "current");
-        assert!(database.pending.is_empty());
+        assert_eq!(database.pending.len(), 0);
     }
 
     #[test]

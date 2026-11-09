@@ -13,7 +13,7 @@ use crossbeam_channel::unbounded;
 use otel_sqlite_core::model::{Attribute, LogRecord, LogScope, Resource, Severity};
 use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, LogChunk};
 use otel_sqlite_storage::backup::{self, BackupError};
-use otel_sqlite_storage::{FtsMode, SearchStatus, Storage, StorageConfig};
+use otel_sqlite_storage::{FtsMode, SearchStatus, Storage, StorageConfig, latest_schema_version};
 
 fn sample_message() -> IngestMessage {
     IngestMessage::Logs(LogChunk {
@@ -103,7 +103,10 @@ fn backup_matches_source_and_restores_into_a_clean_directory() {
     assert!(!report.encrypted);
     assert_eq!(report.verify.integrity, "ok");
     assert_eq!(report.verify.foreign_key_violations, 0);
-    assert_eq!(report.verify.schema_version.as_deref(), Some("006"));
+    assert_eq!(
+        report.verify.schema_version.as_deref(),
+        Some(latest_schema_version())
+    );
     assert_eq!(
         report.verify.row_counts, source.row_counts,
         "snapshot row counts must match the source exactly"
@@ -113,7 +116,6 @@ fn backup_matches_source_and_restores_into_a_clean_directory() {
     assert!(!dir.path().join("snapshot.bak-wal").exists());
     assert!(!dir.path().join("snapshot.bak-shm").exists());
 
-    // Restore into a clean directory.
     let clean = dir.path().join("restored");
     let restored = backup::restore_into(&snapshot, &clean, None).unwrap();
     assert_eq!(restored.target, clean.join("otel-logs.db"));
@@ -123,7 +125,7 @@ fn backup_matches_source_and_restores_into_a_clean_directory() {
     );
     assert_eq!(
         restored.verified_after.schema_version.as_deref(),
-        Some("006")
+        Some(latest_schema_version())
     );
     assert_eq!(restored.verified_after.integrity, "ok");
     assert_eq!(restored.verified_after.foreign_key_violations, 0);

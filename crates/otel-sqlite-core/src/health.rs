@@ -29,6 +29,10 @@ pub struct PipelineSample {
     pub queue_capacity: usize,
     /// Records buffered inside the insert batcher (pending, unsent).
     pub pending_records: usize,
+    /// Mapped chunks still sitting in the ingress→batcher channel. Work that
+    /// has been accepted and ticketed but not yet observed by the batcher is
+    /// still pending, so a drain must not look idle.
+    pub ingest_queue_depth: usize,
     /// Issued durability tickets that have neither completed nor voided.
     /// In-flight records account for some of these; a ticket that stays
     /// outstanding while nothing is queued or buffered is a leak that will
@@ -48,12 +52,15 @@ pub struct PipelineSample {
 }
 
 impl PipelineSample {
-    /// Work accepted by the pipeline but not yet persisted: queued/executing
-    /// commands plus records still buffered in the insert batcher.
+    /// Work accepted by the pipeline but not yet persisted: the writer
+    /// command queue, records buffered in the insert batcher, and chunks
+    /// still in the ingress channel.
     ///
-    /// Commands and records are different units; the sum is a "is there
+    /// Commands and records are different units; the sum is an "is there
     /// anything left to do" indicator, not an exact record count.
     pub fn pending_work(&self) -> usize {
-        self.queue_depth.saturating_add(self.pending_records)
+        self.queue_depth
+            .saturating_add(self.pending_records)
+            .saturating_add(self.ingest_queue_depth)
     }
 }

@@ -450,7 +450,7 @@ mod tests {
 
         ledger.complete(first);
         assert_eq!(ledger.watermark().committed_through, third);
-        assert_eq!(ledger.inner.lock().unwrap().settled_above.len(), 0);
+        assert_eq!(ledger.outstanding_tickets(), 0);
     }
 
     #[tokio::test]

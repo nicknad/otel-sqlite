@@ -137,7 +137,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_address: DEFAULT_LISTEN_ADDRESS.to_owned(),
-            sqlite_path: PathBuf::from("otel-logs.db"),
+            sqlite_path: PathBuf::from(otel_sqlite_storage::DEFAULT_DB_FILENAME),
             ingest_queue_capacity: DEFAULT_INGEST_QUEUE_CAPACITY,
             command_queue_capacity: otel_sqlite_storage::DEFAULT_COMMAND_QUEUE_CAPACITY,
             batcher_max_batch_records: otel_sqlite_core::storage::DEFAULT_MAX_INSERT_BATCH_RECORDS,
@@ -247,8 +247,8 @@ impl Config {
             "max_scope_metadata_expansion_bytes": self.max_scope_metadata_expansion_bytes,
             "max_db_bytes": self.max_db_bytes,
             "shutdown_timeout_ms": self.shutdown_timeout.as_millis(),
-            "durability_mode": format!("{:?}", self.durability_mode),
-            "sqlite_synchronous": format!("{:?}", self.sqlite_synchronous),
+            "durability_mode": self.durability_mode.as_str(),
+            "sqlite_synchronous": self.sqlite_synchronous.as_str(),
             "metrics_address": self.metrics_address,
             "allow_remote_metrics": self.allow_remote_metrics,
             "allow_insecure_remote": self.allow_insecure_remote,
