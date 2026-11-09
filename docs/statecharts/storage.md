@@ -179,9 +179,6 @@ selected tests passed.
 - **Voided tickets.** Empty chunks and rejected enqueues void their tickets in
   the code; a void settles a ticket without a batch. The modeled chunk always
   carries records, so it has no void path.
-- **Legacy/benchmark batches.** `settle_log_batch` falls back to completing
-  every referenced ticket when `segments` is empty. Real pipeline batches always
-  carry segments; the model assumes the segment-aware path.
 - **The `Flush` barrier, shutdown flush, and the timing of the age deadline.**
   The age deadline is representative. The chart hides the deadline when it
   fires while writing or after the first batch commits, because it stays in one

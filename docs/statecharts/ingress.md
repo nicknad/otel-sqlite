@@ -4,10 +4,11 @@ This statechart models one OTLP log export through the ingress in both
 `durability = "commit"` and `durability = "enqueue"` modes: credentials are
 checked, the request is mapped, room for the whole request is reserved on the
 bounded ingest queue, each chunk is sent, and the handler turns the enqueue
-outcome into the wire response. It follows `LogsIngress::finish`, the enqueue
-outcome in `crates/otel-sqlite-ingress/src/{logs,enqueue}.rs`, the commit
-ledger in `crates/otel-sqlite-core/src/storage/commit.rs`, and the writer's
-quarantine settlement in `crates/otel-sqlite-storage/src/writer.rs`.
+outcome into the wire response. It follows the commit/enqueue `AckPolicy`
+selected by `LogsIngress`, the typed enqueue path in
+`crates/otel-sqlite-ingress/src/{logs,enqueue}.rs`, the commit ledger in
+`crates/otel-sqlite-core/src/storage/commit.rs`, and the writer's quarantine
+settlement in `crates/otel-sqlite-storage/src/writer.rs`.
 
 In commit mode the handler waits for the contiguous watermark covering the
 highest accepted ticket, then inspects every accepted ticket. Records behind
