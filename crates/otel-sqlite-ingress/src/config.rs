@@ -31,7 +31,7 @@ pub const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:4317";
 pub const DEFAULT_MAX_RECV_MSG_SIZE: usize = 16 * 1024 * 1024;
 /// Default cap on concurrent OTLP exports. Applied twice: as the HTTP/2
 /// `max_concurrent_streams` per connection, and as a process-wide semaphore
-/// guarding the logs service (see `grpc::run`), so total in-flight exports
+/// guarding the logs service (see `LogsIngress::new`), so total in-flight exports
 /// never exceed this even across many connections.
 /// Worst-case in-flight request bytes are roughly
 /// `max_concurrent_streams * max_recv_msg_size` (64 * 16 MiB = 1 GiB at the

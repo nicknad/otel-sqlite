@@ -11,7 +11,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use otel_sqlite_core::storage::CommitLedger;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::watch;
+use tonic::codegen::InterceptedService;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 use crate::IngestSender;
@@ -48,6 +49,31 @@ pub async fn serve_with_shutdown(
     run(config, queue, commit, readiness, Some(halt)).await
 }
 
+/// The production-equivalent OTLP logs service, including gzip acceptance,
+/// the configured decode-size cap, bearer authentication, and the
+/// process-wide stream/mapping limits.
+pub type IngressLogsService = InterceptedService<LogsServiceServer<LogsIngress>, BearerInterceptor>;
+
+/// Builds the OTLP logs service without any transport, TLS, or health wiring.
+///
+/// This is the reusable assembly used by [`serve`] and by external benchmarks
+/// and end-to-end harnesses that want the production request contract on top
+/// of their own server/transport.
+pub fn logs_service(
+    config: &IngressConfig,
+    queue: IngestSender,
+    commit: Arc<CommitLedger>,
+    interceptor: BearerInterceptor,
+) -> IngressLogsService {
+    // The OTLP spec expects receivers to accept gzip and the OpenTelemetry
+    // Collector's exporters send it by default; without this the request is
+    // rejected as a permanent `Unimplemented` error and data is lost.
+    let service = LogsServiceServer::new(LogsIngress::new(queue, Arc::new(config.clone()), commit))
+        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+        .max_decoding_message_size(config.max_recv_msg_size);
+    InterceptedService::new(service, interceptor)
+}
+
 async fn run(
     config: IngressConfig,
     queue: IngestSender,
@@ -70,32 +96,7 @@ async fn run(
         BearerInterceptor::new(config.auth.as_ref().map(|auth| auth.token_file.as_path()))
             .map_err(|error| IngressError::Auth(error.to_string()))?;
 
-    // Process-wide export concurrency guard: the transport's
-    // `max_concurrent_streams` is per HTTP/2 connection, so this semaphore
-    // enforces the same budget across every connection. Health stays outside
-    // it.
-    let stream_limit = Arc::new(Semaphore::new(
-        usize::try_from(config.max_concurrent_streams)
-            .unwrap_or(usize::MAX)
-            .max(1),
-    ));
-
-    // Process-wide mapping budget: `spawn_blocking` cannot be cancelled, so
-    // the permit is held by the blocking job (not the request future) and
-    // bounds the mapping work a burst of timed-out requests can retain.
-    let logs_service = tonic::codegen::InterceptedService::new(
-        LogsServiceServer::new(
-            LogsIngress::new(queue, Arc::clone(&config), commit)
-                .with_stream_limit(stream_limit)
-                .with_mapping_limit(config.mapping_concurrency),
-        )
-        // The OTLP spec expects receivers to accept gzip and the OpenTelemetry
-        // Collector's exporters send it by default; without this the request
-        // is rejected as a permanent `Unimplemented` error and data is lost.
-        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-        .max_decoding_message_size(config.max_recv_msg_size),
-        auth_interceptor,
-    );
+    let logs_service = logs_service(&config, queue, commit, auth_interceptor);
 
     // grpc.health.v1: statuses track `readiness` once per second and flip to
     // NOT_SERVING on shutdown before the drain deadline starts.

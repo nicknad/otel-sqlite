@@ -1,12 +1,13 @@
 //! Hand-off of mapped ingest chunks to the storage pipeline.
 //!
-//! [`enqueue`] is the only way OTLP handlers touch the queue. Requests are
-//! admitted **all-or-nothing**: [`IngestSender::reserve`] either reserves room
-//! for every chunk of the request up front or rejects the whole request
-//! without touching the queue or the commit ledger. A request that maps to
-//! more chunks than the queue can ever hold (even when empty) is a permanent
-//! mapping error instead: retrying can never succeed, so handlers answer
-//! `INVALID_ARGUMENT` and tell the client to split the request.
+//! [`enqueue`] is the only way OTLP handlers touch the queue. It accepts only
+//! log chunks, so it cannot emit the control messages that share the queue.
+//! Requests are admitted **all-or-nothing**: [`IngestSender::reserve`] either
+//! reserves room for every chunk of the request up front or rejects the whole
+//! request without touching the queue or the commit ledger. A request that
+//! maps to more chunks than the queue can ever hold (even when empty) is a
+//! permanent mapping error instead: retrying can never succeed, so handlers
+//! answer `INVALID_ARGUMENT` and tell the client to split the request.
 //!
 //! Queue admission is all-or-nothing, which is what makes a queue-full retry
 //! safe: a handler that answers `UNAVAILABLE` has had *none* of the request's
@@ -26,7 +27,7 @@
 
 use std::time::Instant;
 
-use otel_sqlite_core::storage::{CommitLedger, IngestMessage};
+use otel_sqlite_core::storage::{CommitLedger, IngestMessage, LogChunk};
 
 use crate::error::IngressError;
 use crate::{IngestSender, SendFailure};
@@ -52,8 +53,21 @@ impl EnqueueOutcome {
     }
 }
 
-/// Hands mapped ingest chunks to the storage insert batcher through the
-/// bounded input channel.
+/// Rejects a request that maps to more chunks than the queue can ever hold.
+///
+/// An empty queue still has `capacity` slots, so this can never become
+/// admittable: the caller must return a permanent error instead of retrying.
+pub(crate) fn ensure_chunks_fit(chunks: usize, capacity: usize) -> Result<(), IngressError> {
+    if chunks > capacity {
+        return Err(IngressError::Mapping(format!(
+            "request maps to {chunks} chunks, which exceeds the ingest queue capacity of {capacity}; split the request"
+        )));
+    }
+    Ok(())
+}
+
+/// Hands mapped log chunks to the storage insert batcher through the bounded
+/// input channel.
 ///
 /// All-or-nothing: if every chunk cannot be admitted, the whole request is
 /// rejected (`accepted = 0`, `rejected = total`, no ticket) without issuing
@@ -66,31 +80,16 @@ impl EnqueueOutcome {
 pub(crate) fn enqueue(
     queue: &IngestSender,
     ledger: &CommitLedger,
-    work: Vec<IngestMessage>,
+    work: Vec<LogChunk>,
 ) -> Result<EnqueueOutcome, IngressError> {
     // Nothing to admit: skip the admission gate and the per-chunk walk.
     if work.is_empty() {
         return Ok(EnqueueOutcome::default());
     }
 
-    // A request with more chunks than the queue can hold is permanently
-    // unadmittable (an empty queue still has `capacity` slots), so a retry
-    // loop would spin forever. Check this before counting records: a request
-    // that can never fit has no outcome to report, so counting its records
-    // would be wasted work.
-    let capacity = queue.capacity();
-    if work.len() > capacity {
-        return Err(IngressError::Mapping(format!(
-            "request maps to {} chunks, which exceeds the ingest queue capacity of {}; split the request",
-            work.len(),
-            capacity
-        )));
-    }
+    ensure_chunks_fit(work.len(), queue.capacity())?;
 
-    let total_records: u64 = work
-        .iter()
-        .map(|message| message.record_count() as u64)
-        .sum();
+    let total_records: u64 = work.iter().map(|chunk| chunk.records.len() as u64).sum();
     let mut outcome = EnqueueOutcome {
         total_records,
         ..EnqueueOutcome::default()
@@ -113,51 +112,37 @@ pub(crate) fn enqueue(
     // sampling `queue.len()` in the loop and publishing once below.
     let mut samples: Vec<(u64, f64)> = Vec::with_capacity(work.len());
     let mut peak_depth = 0usize;
-    for mut message in work {
-        let records = message.record_count() as u64;
+    for mut chunk in work {
+        let records = chunk.records.len() as u64;
         let started = Instant::now();
         let ticket = ledger.issue();
-        message.set_commit_seq(ticket);
+        chunk.commit_seq = ticket;
         // The admission gate is held, so no other producer can consume a
         // reserved slot; the consumer can only drain. This send therefore
         // succeeds unless the storage side disconnected.
-        let mut stop = false;
-        match guard.try_send(message) {
-            Ok(()) => {
-                outcome.accepted += records;
-                outcome.tickets.push((ticket, records));
-            }
-            Err(SendFailure::Full) => {
-                // Unreachable while holding the gate: `reserve` verified room
-                // for every chunk and no producer can interleave. If it ever
-                // fires the admission invariant is already broken and the
-                // chunks already sent cannot be recalled, so fail loudly in
-                // debug and stop accepting more; the request still leaves as
-                // rejected (`rejected > 0`) rather than half-admitted.
-                debug_assert!(
-                    false,
-                    "admission reserved a slot for every chunk, yet try_send reported Full"
-                );
-                ledger.void(ticket);
-                outcome.rejected = total_records.saturating_sub(outcome.accepted);
-                stop = true;
-            }
-            Err(SendFailure::Disconnected) => {
-                // The storage side is gone mid-request: this ticket was issued
-                // but never sent, so void it, and count every record of this
-                // and every later chunk as rejected so `accepted + rejected`
-                // always equals the request total.
-                ledger.void(ticket);
-                outcome.rejected = total_records.saturating_sub(outcome.accepted);
-                outcome.disconnected = true;
-                stop = true;
-            }
-        }
-        samples.push((records, started.elapsed().as_secs_f64()));
-        peak_depth = peak_depth.max(queue.len());
-        if stop {
+        if let Err(error) = guard.try_send(IngestMessage::Logs(chunk)) {
+            // `Full` is impossible here: `reserve` checked room for every
+            // chunk and no other producer can interleave. Keep the assertion
+            // so a broken admission invariant fails loudly in debug builds.
+            debug_assert!(
+                !matches!(error, SendFailure::Full),
+                "admission reserved a slot for every chunk, yet try_send reported Full"
+            );
+            // The storage side is gone mid-request: this ticket was issued
+            // but never sent, so void it, and count every record of this and
+            // every later chunk as rejected so `accepted + rejected` always
+            // equals the request total.
+            ledger.void(ticket);
+            outcome.rejected = total_records.saturating_sub(outcome.accepted);
+            outcome.disconnected = true;
+            samples.push((records, started.elapsed().as_secs_f64()));
+            peak_depth = peak_depth.max(queue.len());
             break;
         }
+        outcome.accepted += records;
+        outcome.tickets.push((ticket, records));
+        samples.push((records, started.elapsed().as_secs_f64()));
+        peak_depth = peak_depth.max(queue.len());
     }
 
     drop(guard);
@@ -179,12 +164,12 @@ mod tests {
     use otel_sqlite_core::storage::{BatchOrigin, IngestMessage, LogChunk};
     use std::sync::Arc;
 
-    fn log_chunk(records: usize) -> IngestMessage {
-        IngestMessage::Logs(LogChunk {
+    fn log_chunk(records: usize) -> LogChunk {
+        LogChunk {
             origin: BatchOrigin::default(),
             records: (0..records).map(|_| LogRecord::default()).collect(),
             commit_seq: 0,
-        })
+        }
     }
 
     #[test]
@@ -266,8 +251,31 @@ mod tests {
 
         let first = receiver.recv().expect("first chunk in flight");
         let second = receiver.recv().expect("second chunk in flight");
-        assert_eq!(first.commit_seq(), Some(1));
-        assert_eq!(second.commit_seq(), Some(2));
+        let IngestMessage::Logs(first) = first else {
+            panic!("enqueue must only emit log chunks");
+        };
+        let IngestMessage::Logs(second) = second else {
+            panic!("enqueue must only emit log chunks");
+        };
+        assert_eq!(first.commit_seq, 1);
+        assert_eq!(second.commit_seq, 2);
+    }
+
+    #[test]
+    fn typed_enqueue_never_emits_control_messages() {
+        let ledger = Arc::new(CommitLedger::new());
+        let (queue, receiver) = channel(4);
+
+        enqueue(&queue, &ledger, vec![log_chunk(1), log_chunk(1)]).expect("request fits");
+
+        let messages: Vec<IngestMessage> = receiver.try_iter().collect();
+        assert_eq!(messages.len(), 2);
+        for message in messages {
+            assert!(
+                matches!(message, IngestMessage::Logs(_)),
+                "the typed enqueue path cannot produce Flush or other control messages"
+            );
+        }
     }
 
     #[test]
