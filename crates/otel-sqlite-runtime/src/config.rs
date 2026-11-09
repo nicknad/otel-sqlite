@@ -12,16 +12,24 @@ use std::time::Duration;
 use otel_sqlite_core::storage::CheckpointMode;
 use thiserror::Error;
 
+/// Enablement and cadence of age-based purging.
+///
+/// Both values are inseparable: a schedule exists only when there is a
+/// retention window to enforce and an interval at which to enforce it, so
+/// there is no state where one is configured without the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PurgeSchedule {
+    /// Rows older than this window are deleted when the writer executes the
+    /// prune command.
+    pub retention: Duration,
+    /// How often a prune command is enqueued.
+    pub interval: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct MaintenanceConfig {
-    /// Retention window for log events. Older rows are deleted by the writer
-    /// when it executes a prune command; the worker never touches data.
-    ///
-    /// `None` disables purging entirely.
-    pub retention: Option<Duration>,
-    /// How often a retention purge command is enqueued. Ignored while
-    /// `retention` is `None`.
-    pub purge_interval: Option<Duration>,
+    /// Retention purge policy. `None` disables purging entirely.
+    pub purge: Option<PurgeSchedule>,
     /// How often a WAL checkpoint command is enqueued.
     ///
     /// Periodic [`CheckpointMode::Passive`] keeps the WAL from growing
@@ -51,8 +59,7 @@ pub struct MaintenanceConfig {
 impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
-            retention: None,
-            purge_interval: Some(Duration::from_secs(15 * 60)),
+            purge: None,
             checkpoint_interval: Some(Duration::from_secs(5 * 60)),
             checkpoint_mode: CheckpointMode::Passive,
             optimize_interval: Some(Duration::from_secs(12 * 60 * 60)),
@@ -60,6 +67,41 @@ impl Default for MaintenanceConfig {
             rebuild_fts_interval: None,
             retry_delay: Duration::from_secs(2),
         }
+    }
+}
+
+/// A [`MaintenanceConfig`] that cannot produce a sane schedule.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum MaintenanceConfigError {
+    #[error("maintenance.retry_delay must be greater than zero")]
+    ZeroRetryDelay,
+    #[error("maintenance.purge.retention must be greater than zero")]
+    ZeroPurgeRetention,
+    #[error("maintenance.purge.interval must be greater than zero")]
+    ZeroPurgeInterval,
+}
+
+impl MaintenanceConfig {
+    /// Rejects values that would make the scheduler spin or delete everything.
+    ///
+    /// Optional intervals keep their "zero means disabled" semantics; only a
+    /// [`PurgeSchedule`] (which is enabled by its presence) must be non-zero
+    /// in both fields. [`crate::MaintenanceWorker::new`] does not validate so
+    /// that the scheduler can still clamp `retry_delay`; library embedders can
+    /// call this method before constructing a worker.
+    pub fn validate(&self) -> Result<(), MaintenanceConfigError> {
+        if self.retry_delay.is_zero() {
+            return Err(MaintenanceConfigError::ZeroRetryDelay);
+        }
+        if let Some(purge) = self.purge {
+            if purge.retention.is_zero() {
+                return Err(MaintenanceConfigError::ZeroPurgeRetention);
+            }
+            if purge.interval.is_zero() {
+                return Err(MaintenanceConfigError::ZeroPurgeInterval);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -146,6 +188,15 @@ pub enum WatchdogConfigError {
     },
     #[error("watchdog.queue_pressure_ratio must be finite and in (0.0, 1.0]; got {0}")]
     InvalidQueuePressureRatio(f32),
+    #[error(
+        "expected batch age ({batch_age:?}) must be less than \
+         watchdog.degraded_after ({degraded:?}); a normal batching delay would \
+         otherwise be reported as a slow drain"
+    )]
+    BatchAgeNotBelowDegraded {
+        batch_age: Duration,
+        degraded: Duration,
+    },
 }
 
 impl WatchdogConfig {
@@ -181,6 +232,24 @@ impl WatchdogConfig {
         let ratio = self.queue_pressure_ratio;
         if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 {
             return Err(WatchdogConfigError::InvalidQueuePressureRatio(ratio));
+        }
+        Ok(())
+    }
+
+    /// Also requires the expected batching delay to stay below the degraded
+    /// threshold, so ordinary batch formation is never reported as a slow
+    /// drain. Runs [`Self::validate`] first, keeping this type the single
+    /// owner of every watchdog invariant.
+    pub fn validate_batch_age(
+        &self,
+        max_expected_batch_age: Duration,
+    ) -> Result<(), WatchdogConfigError> {
+        self.validate()?;
+        if max_expected_batch_age >= self.degraded_after {
+            return Err(WatchdogConfigError::BatchAgeNotBelowDegraded {
+                batch_age: max_expected_batch_age,
+                degraded: self.degraded_after,
+            });
         }
         Ok(())
     }
@@ -248,6 +317,100 @@ mod tests {
             };
             config.validate().expect("valid ratio");
         }
+    }
+
+    #[test]
+    fn expected_batch_age_must_stay_below_degraded() {
+        let config = WatchdogConfig::default();
+        config
+            .validate_batch_age(Duration::from_secs(1))
+            .expect("a batch age below the degraded threshold is valid");
+        assert_eq!(
+            config.validate_batch_age(config.degraded_after),
+            Err(WatchdogConfigError::BatchAgeNotBelowDegraded {
+                batch_age: config.degraded_after,
+                degraded: config.degraded_after,
+            })
+        );
+        assert!(matches!(
+            config.validate_batch_age(config.degraded_after + Duration::from_secs(1)),
+            Err(WatchdogConfigError::BatchAgeNotBelowDegraded { .. })
+        ));
+    }
+
+    #[test]
+    fn batch_age_validation_still_rejects_invalid_thresholds() {
+        let config = WatchdogConfig {
+            degraded_after: Duration::ZERO,
+            ..WatchdogConfig::default()
+        };
+        assert_eq!(
+            config.validate_batch_age(Duration::ZERO),
+            Err(WatchdogConfigError::ZeroDuration("degraded_after"))
+        );
+    }
+
+    #[test]
+    fn default_maintenance_config_is_valid() {
+        MaintenanceConfig::default()
+            .validate()
+            .expect("defaults must be usable");
+    }
+
+    #[test]
+    fn purge_schedule_must_be_non_zero() {
+        let base = MaintenanceConfig {
+            purge: Some(PurgeSchedule {
+                retention: Duration::from_secs(3_600),
+                interval: Duration::from_secs(60),
+            }),
+            ..MaintenanceConfig::default()
+        };
+        base.validate().expect("valid purge schedule");
+
+        assert_eq!(
+            MaintenanceConfig {
+                purge: Some(PurgeSchedule {
+                    retention: Duration::ZERO,
+                    interval: Duration::from_secs(60),
+                }),
+                ..base.clone()
+            }
+            .validate(),
+            Err(MaintenanceConfigError::ZeroPurgeRetention)
+        );
+        assert_eq!(
+            MaintenanceConfig {
+                purge: Some(PurgeSchedule {
+                    retention: Duration::from_secs(3_600),
+                    interval: Duration::ZERO,
+                }),
+                ..base.clone()
+            }
+            .validate(),
+            Err(MaintenanceConfigError::ZeroPurgeInterval)
+        );
+        assert_eq!(
+            MaintenanceConfig {
+                retry_delay: Duration::ZERO,
+                ..base
+            }
+            .validate(),
+            Err(MaintenanceConfigError::ZeroRetryDelay)
+        );
+    }
+
+    #[test]
+    fn zero_optional_intervals_mean_disabled_not_invalid() {
+        MaintenanceConfig {
+            checkpoint_interval: Some(Duration::ZERO),
+            optimize_interval: Some(Duration::ZERO),
+            vacuum_interval: Some(Duration::ZERO),
+            rebuild_fts_interval: Some(Duration::ZERO),
+            ..MaintenanceConfig::default()
+        }
+        .validate()
+        .expect("zero optional intervals disable the task");
     }
 
     #[test]
