@@ -6,9 +6,12 @@ use otel_sqlite_runtime::{MaintenanceConfig, WatchdogConfig};
 /// milliseconds), used by the JSON startup dump.
 pub(crate) fn maintenance_dump(config: &MaintenanceConfig) -> serde_json::Value {
     let ms = |duration: &Option<Duration>| duration.map(|value| value.as_millis());
+    let purge = config.purge;
+    let retention = purge.map(|schedule| schedule.retention);
+    let purge_interval = purge.map(|schedule| schedule.interval);
     serde_json::json!({
-        "retention_ms": ms(&config.retention),
-        "purge_interval_ms": ms(&config.purge_interval),
+        "retention_ms": ms(&retention),
+        "purge_interval_ms": ms(&purge_interval),
         "checkpoint_interval_ms": ms(&config.checkpoint_interval),
         "checkpoint_mode": format!("{:?}", config.checkpoint_mode),
         "optimize_interval_ms": ms(&config.optimize_interval),
