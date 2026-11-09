@@ -11,6 +11,8 @@
 //! Statement reuse relies on rusqlite's `prepare_cached`; the SQL strings are
 //! module-private constants next to their only callers.
 
+use otel_sqlite_core::model::Resource;
+
 mod identity;
 mod logs;
 
@@ -40,13 +42,12 @@ pub(crate) fn sanitized_preview(value: &str) -> String {
         .collect()
 }
 
-/// Reusable serialization scratch for one persistence call.
+/// Reusable serialization scratch for the writer.
 ///
 /// The insert hot path serializes an attribute set and a SHA-256 fingerprint
-/// per record. These buffers are created once per batch and cleared/reused
-/// per row instead of allocating fresh strings every time. Fields are exposed
-/// to the sibling `command` modules so callers can work with disjoint
-/// borrows.
+/// per record. These buffers are created once and cleared/reused per row
+/// instead of allocating fresh strings every time. Fields are exposed to the
+/// sibling `command` modules so callers can work with disjoint borrows.
 pub(crate) struct InsertScratch {
     /// Batch-level resource id (`resolve_resource`).
     pub(crate) resource_id: String,
@@ -54,17 +55,63 @@ pub(crate) struct InsertScratch {
     pub(crate) json: String,
     /// Key-ordering indices used by the canonical attribute encoder.
     pub(crate) order: Vec<u32>,
+    /// Recently resolved origins. Fingerprints and canonical attributes JSON
+    /// are invariant across batches, so repeated traffic from the same handful
+    /// of resources avoids re-serializing and re-hashing.
+    pub(crate) resources: ResourceCache,
 }
 
 impl InsertScratch {
     pub(crate) fn new() -> Self {
-        // Fingerprints are 64 hex chars; JSON sizes vary and grow on demand.
+        // Everything grows on first use: idle writers allocate no scratch.
         Self {
-            resource_id: String::with_capacity(64),
+            resource_id: String::new(),
             json: String::new(),
             order: Vec::new(),
+            resources: ResourceCache::new(),
         }
     }
+}
+
+impl ResourceCache {
+    /// Bounded because the active origin set is small; the oldest entry is
+    /// evicted once the cap is reached.
+    const MAX_ENTRIES: usize = 8;
+
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Returns the cached fingerprint and canonical attributes JSON for
+    /// `resource`, refreshing its position so the hot origin stays at the
+    /// front.
+    pub(crate) fn lookup(&mut self, resource: &Resource) -> Option<(&str, &str)> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(cached, _, _)| cached == resource)?;
+        if index > 0 {
+            let entry = self.entries.remove(index);
+            self.entries.insert(0, entry);
+        }
+        self.entries
+            .first()
+            .map(|(_, id, json)| (id.as_str(), json.as_str()))
+    }
+
+    pub(crate) fn insert(&mut self, resource: &Resource, id: &str, json: &str) {
+        if self.entries.len() == Self::MAX_ENTRIES {
+            self.entries.pop();
+        }
+        self.entries
+            .insert(0, (resource.clone(), id.to_owned(), json.to_owned()));
+    }
+}
+
+pub(crate) struct ResourceCache {
+    entries: Vec<(Resource, String, String)>,
 }
 
 impl Default for InsertScratch {

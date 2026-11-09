@@ -17,6 +17,7 @@ use rusqlite::Connection;
 use std::sync::atomic::Ordering;
 
 use crate::command;
+use crate::command::InsertScratch;
 use crate::error::{FailureClass, StorageError};
 use crate::stats::WriterStats;
 
@@ -25,6 +26,7 @@ pub(crate) struct InsertGroup {
     budget: usize,
     batches: Vec<LogWriteBatch>,
     records: usize,
+    non_empty: usize,
 }
 
 /// One non-blocking pull while a group is assembled.
@@ -41,6 +43,7 @@ impl InsertGroup {
             budget,
             batches: Vec::new(),
             records: 0,
+            non_empty: 0,
         }
     }
 
@@ -54,6 +57,9 @@ impl InsertGroup {
             return Err(batch);
         }
         self.records = self.records.saturating_add(added);
+        if added > 0 {
+            self.non_empty += 1;
+        }
         self.batches.push(batch);
         Ok(())
     }
@@ -64,6 +70,12 @@ impl InsertGroup {
 
     pub(crate) const fn records(&self) -> usize {
         self.records
+    }
+
+    /// Number of batches that actually carry rows. Tracked while collecting so
+    /// callers never have to walk the group again just to count them.
+    pub(crate) const fn non_empty(&self) -> usize {
+        self.non_empty
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -85,6 +97,7 @@ pub(crate) fn collect_group(
 ) -> (InsertGroup, Option<WriteCommand>) {
     let mut group = InsertGroup::new(budget);
     group.records = first.records.len();
+    group.non_empty = usize::from(!first.records.is_empty());
     group.batches.push(first);
     let mut boundary = None;
     while !group.at_budget() {
@@ -113,6 +126,7 @@ pub(crate) fn persist_group(
     stats: &WriterStats,
     ledger: &CommitLedger,
     group: &InsertGroup,
+    scratch: &mut InsertScratch,
 ) -> Result<(), StorageError> {
     if group.records() == 0 {
         settle_group(ledger, group);
@@ -125,7 +139,7 @@ pub(crate) fn persist_group(
             let mut written = 0u64;
             for batch in group.iter() {
                 if !batch.records.is_empty() {
-                    written += command::insert_logs(tx, batch)?;
+                    written += command::insert_logs(tx, batch, scratch)?;
                 }
             }
             Ok(written)
@@ -143,7 +157,7 @@ pub(crate) fn persist_group(
                 );
                 ::metrics::counter!("storage_group_poison_fallbacks_total").increment(1);
                 for batch in group.iter() {
-                    persist_one(conn, stats, ledger, batch)?;
+                    persist_one(conn, stats, ledger, batch, scratch)?;
                 }
                 return Ok(());
             }
@@ -173,6 +187,7 @@ pub(crate) fn persist_one(
     stats: &WriterStats,
     ledger: &CommitLedger,
     batch: &LogWriteBatch,
+    scratch: &mut InsertScratch,
 ) -> Result<(), StorageError> {
     if batch.records.is_empty() {
         for commit_seq in &batch.commit_seqs {
@@ -180,12 +195,21 @@ pub(crate) fn persist_one(
         }
         return Ok(());
     }
+    // Salvage is exceptional, so it gets its own scratch, created only if the
+    // strict pass actually needs a second chance.
+    let mut salvage_scratch = None;
     let salvage = persist_with_policy(
         conn,
         stats,
         "logs",
-        |tx| command::insert_logs(tx, batch),
-        |tx| command::insert_logs_tolerant(tx, batch),
+        |tx| command::insert_logs(tx, batch, scratch),
+        |tx| {
+            command::insert_logs_tolerant(
+                tx,
+                batch,
+                salvage_scratch.get_or_insert_with(InsertScratch::new),
+            )
+        },
     )?;
     settle_log_batch(ledger, batch, salvage);
     Ok(())
@@ -234,12 +258,12 @@ fn persist_with_policy(
     conn: &mut Connection,
     stats: &WriterStats,
     signal: &'static str,
-    strict: impl Fn(&rusqlite::Transaction<'_>) -> Result<u64, StorageError>,
-    salvage: impl Fn(&rusqlite::Transaction<'_>) -> Result<command::SalvageOutcome, StorageError>,
+    mut strict: impl FnMut(&rusqlite::Transaction<'_>) -> Result<u64, StorageError>,
+    salvage: impl FnMut(&rusqlite::Transaction<'_>) -> Result<command::SalvageOutcome, StorageError>,
 ) -> Result<Option<command::SalvageOutcome>, StorageError> {
     let mut attempt = 0u32;
     loop {
-        let outcome = run_transaction(conn, stats, &strict);
+        let outcome = run_transaction(conn, stats, &mut strict);
         match outcome {
             Ok(()) => return Ok(None),
             Err((error, class)) => match class {
@@ -276,7 +300,7 @@ fn persist_with_policy(
 fn run_transaction(
     conn: &mut Connection,
     stats: &WriterStats,
-    persist: impl Fn(&rusqlite::Transaction<'_>) -> Result<u64, StorageError>,
+    mut persist: impl FnMut(&rusqlite::Transaction<'_>) -> Result<u64, StorageError>,
 ) -> Result<(), (StorageError, FailureClass)> {
     let started = Instant::now();
     let tx = match conn.transaction() {
@@ -326,7 +350,7 @@ fn finish_salvage(
     conn: &mut Connection,
     stats: &WriterStats,
     signal: &'static str,
-    salvage: impl Fn(&rusqlite::Transaction<'_>) -> Result<command::SalvageOutcome, StorageError>,
+    mut salvage: impl FnMut(&rusqlite::Transaction<'_>) -> Result<command::SalvageOutcome, StorageError>,
     cause: StorageError,
 ) -> Result<command::SalvageOutcome, StorageError> {
     let started = Instant::now();
@@ -537,7 +561,14 @@ mod tests {
             group.try_push(batch).expect("fits");
         }
 
-        persist_group(&mut conn, &stats, &ledger, &group).expect("commit group");
+        persist_group(
+            &mut conn,
+            &stats,
+            &ledger,
+            &group,
+            &mut InsertScratch::new(),
+        )
+        .expect("commit group");
 
         assert_eq!(
             stats.transactions_committed.load(Ordering::Relaxed),
@@ -573,7 +604,14 @@ mod tests {
         let path = dir.path().join("group-empty.db");
         let mut conn = crate::sqlite::open(&path, SyncMode::default()).expect("open database");
         crate::migration::migrate(&mut conn).expect("migrate");
-        persist_group(&mut conn, &stats, &ledger, &group).expect("settle empty group");
+        persist_group(
+            &mut conn,
+            &stats,
+            &ledger,
+            &group,
+            &mut InsertScratch::new(),
+        )
+        .expect("settle empty group");
 
         assert_eq!(stats.transactions_committed.load(Ordering::Relaxed), 0);
         assert!(
@@ -608,8 +646,14 @@ mod tests {
             .try_push(ticket_batch(&["healthy two"], 2))
             .expect("second batch fits");
 
-        persist_group(&mut conn, &stats, &ledger, &group)
-            .expect("fallback persists every healthy row");
+        persist_group(
+            &mut conn,
+            &stats,
+            &ledger,
+            &group,
+            &mut InsertScratch::new(),
+        )
+        .expect("fallback persists every healthy row");
 
         assert_eq!(
             stats.records_written.load(Ordering::Relaxed),

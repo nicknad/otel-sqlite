@@ -6,8 +6,6 @@
 //! [`fingerprint_into`] hashes length-prefixed parts to keep boundaries
 //! unambiguous and writes the hex digest into a reused buffer.
 
-use std::fmt::Write as _;
-
 use otel_sqlite_core::model::{Resource, write_attributes_json_into};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -15,6 +13,8 @@ use sha2::{Digest, Sha256};
 use super::InsertScratch;
 use super::non_empty;
 use crate::error::StorageError;
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
 const SQL_INSERT_RESOURCE: &str = "
 INSERT INTO log_resource (id, service_name, host_name, schema_url, attributes_json)
@@ -31,9 +31,10 @@ pub(super) fn fingerprint_into(parts: &[&str], out: &mut String) {
         hasher.update(part.as_bytes());
     }
     out.clear();
-    // Writing hex into a String never fails.
+    out.reserve(64);
     for byte in hasher.finalize() {
-        let _ = write!(out, "{byte:02x}");
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
     }
 }
 
@@ -49,17 +50,30 @@ pub(super) fn resolve_resource(
     let host_name = non_empty(resource.host_name());
     let schema_url = non_empty(resource.schema_url.as_str());
 
-    write_attributes_json_into(&resource.attributes, &mut scratch.order, &mut scratch.json);
-    fingerprint_into(
-        &[
-            service_name,
-            host_name.unwrap_or(""),
-            schema_url.unwrap_or(""),
-            &scratch.json,
-        ],
-        &mut scratch.resource_id,
-    );
+    if let Some((cached_id, cached_json)) = scratch.resources.lookup(resource) {
+        scratch.resource_id.clear();
+        scratch.resource_id.push_str(cached_id);
+        scratch.json.clear();
+        scratch.json.push_str(cached_json);
+    } else {
+        write_attributes_json_into(&resource.attributes, &mut scratch.order, &mut scratch.json);
+        fingerprint_into(
+            &[
+                service_name,
+                host_name.unwrap_or(""),
+                schema_url.unwrap_or(""),
+                &scratch.json,
+            ],
+            &mut scratch.resource_id,
+        );
+        scratch
+            .resources
+            .insert(resource, &scratch.resource_id, &scratch.json);
+    }
 
+    // The upsert stays on every batch: quota and retention eviction can remove
+    // an orphaned resource row between inserts, and cached IDs must never
+    // resurrect a row-less dimension.
     conn.prepare_cached(SQL_INSERT_RESOURCE)?.execute(params![
         &*scratch.resource_id,
         service_name,
