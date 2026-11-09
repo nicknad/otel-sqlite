@@ -102,18 +102,58 @@ pub struct RecordSegment {
 
 /// A storage-ready batch of log records with its origin.
 ///
-/// `commit_seqs` lists every durability ticket referenced by this batch
-/// (sorted ascending). `segments` partitions `records` in order and says which
-/// ticket each run belongs to; only a segment with `complete = true` may
-/// settle its ticket. A ticket whose chunk is split across batches therefore
-/// stays outstanding until its last record is written, so a durable ack can
-/// never be released for records still buffered.
+/// `segments` partitions `records` in order and says which durability ticket
+/// each run belongs to; only a segment with `complete = true` may settle its
+/// ticket. A ticket whose chunk is split across batches therefore stays
+/// outstanding until its last record is written, so a durable ack can never be
+/// released for records still buffered. The segments are the single source of
+/// truth: the ticket set is derived from them, never stored separately.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogWriteBatch {
     pub origin: BatchOrigin,
     pub records: WriteBatch<LogRecord>,
-    pub commit_seqs: Vec<u64>,
-    pub segments: Vec<RecordSegment>,
+    segments: Vec<RecordSegment>,
+}
+
+impl LogWriteBatch {
+    /// Builds a batch and checks that the segments partition its records
+    /// exactly. A mismatch would misattribute durability tickets, so it is a
+    /// programming error rather than a recoverable state.
+    pub fn new(
+        origin: BatchOrigin,
+        records: WriteBatch<LogRecord>,
+        segments: Vec<RecordSegment>,
+    ) -> Self {
+        let covered: usize = segments.iter().map(|segment| segment.records).sum();
+        debug_assert_eq!(
+            covered,
+            records.len(),
+            "record segments must cover every record exactly once"
+        );
+        Self {
+            origin,
+            records,
+            segments,
+        }
+    }
+
+    /// Ordered ticket partition of [`LogWriteBatch::records`].
+    pub fn segments(&self) -> &[RecordSegment] {
+        &self.segments
+    }
+
+    /// Every distinct ticket referenced by this batch, ascending. Derived
+    /// from the segments so the two can never disagree.
+    pub fn commit_seqs(&self) -> Vec<u64> {
+        let mut tickets: Vec<u64> = self
+            .segments
+            .iter()
+            .map(|segment| segment.commit_seq)
+            .collect();
+        tickets.sort_unstable();
+        tickets.dedup();
+        tickets
+    }
 }
 
 /// Commands consumed by the single SQLite writer. Insert variants carry fully
@@ -123,7 +163,6 @@ pub struct LogWriteBatch {
 pub enum WriteCommand {
     InsertLogs(LogWriteBatch),
     Flush,
-    Checkpoint(CheckpointMode),
     Maintenance(MaintenanceOperation),
 }
 
@@ -140,8 +179,7 @@ impl WriteCommand {
         match self {
             Self::InsertLogs(_) => "insert_logs",
             Self::Flush => "flush",
-            Self::Checkpoint(_) => "checkpoint",
-            Self::Maintenance(_) => "maintenance",
+            Self::Maintenance(operation) => operation.as_str(),
         }
     }
 }
@@ -157,6 +195,23 @@ pub enum CheckpointMode {
 }
 
 impl CheckpointMode {
+    /// Parses the operator-facing spelling (`passive`, `full`, `restart`,
+    /// `truncate`, case-insensitive). Lives beside the type so every config
+    /// loader uses one vocabulary.
+    pub fn parse(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("passive") {
+            Some(Self::Passive)
+        } else if value.eq_ignore_ascii_case("full") {
+            Some(Self::Full)
+        } else if value.eq_ignore_ascii_case("restart") {
+            Some(Self::Restart)
+        } else if value.eq_ignore_ascii_case("truncate") {
+            Some(Self::Truncate)
+        } else {
+            None
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Passive => "PASSIVE",
@@ -173,18 +228,47 @@ impl fmt::Display for CheckpointMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaintenanceOperation {
     Analyze,
+    Checkpoint(CheckpointMode),
     Vacuum,
     RebuildFts,
-    /// Age-based prune of log events; `None` disables the prune for this
-    /// command.
+    /// Age-based prune of log events.
     ///
     /// The SQLite writer interprets the window at execution time (cutoff =
     /// now − window), so a long-queued prune never deletes data newer than
-    /// the configured window.
-    Prune(Option<Duration>),
+    /// the configured window. Disabled pruning is represented by not
+    /// scheduling the operation at all.
+    Prune(Duration),
+}
+
+impl MaintenanceOperation {
+    /// Canonical name used by scheduling, writer logs and metrics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Analyze => "optimize",
+            Self::Checkpoint(_) => "checkpoint",
+            Self::Vacuum => "vacuum",
+            Self::RebuildFts => "rebuild_fts",
+            Self::Prune(_) => "purge",
+        }
+    }
+
+    /// Operations that can stall the single writer for an extended time.
+    /// Cheap operations (`ANALYZE`, a passive checkpoint) may run even under
+    /// backlog.
+    pub const fn is_heavy(self) -> bool {
+        matches!(
+            self,
+            Self::Vacuum
+                | Self::RebuildFts
+                | Self::Prune(_)
+                | Self::Checkpoint(CheckpointMode::Full)
+                | Self::Checkpoint(CheckpointMode::Restart)
+                | Self::Checkpoint(CheckpointMode::Truncate)
+        )
+    }
 }
 
 #[cfg(test)]
@@ -193,30 +277,44 @@ mod tests {
     use crate::model::Resource;
 
     fn sample_log_write(records: usize) -> LogWriteBatch {
-        LogWriteBatch {
-            origin: BatchOrigin {
+        LogWriteBatch::new(
+            BatchOrigin {
                 resource: Some(Resource::new(vec![("service.name", "test").into()])),
                 schema_url: "https://example.test".to_owned(),
             },
-            records: WriteBatch::from_vec((0..records).map(|_| LogRecord::default()).collect()),
-            commit_seqs: vec![7],
-            segments: Vec::new(),
-        }
+            WriteBatch::from_vec((0..records).map(|_| LogRecord::default()).collect()),
+            vec![RecordSegment {
+                commit_seq: 7,
+                records,
+                complete: true,
+            }],
+        )
     }
 
     #[test]
-    fn command_kinds() {
+    fn command_kinds_use_the_maintenance_label() {
         let logs = WriteCommand::InsertLogs(sample_log_write(1));
         assert_eq!(logs.kind(), "insert_logs");
 
         assert_eq!(WriteCommand::Flush.kind(), "flush");
         assert_eq!(
-            WriteCommand::Checkpoint(CheckpointMode::Truncate).kind(),
+            WriteCommand::Maintenance(MaintenanceOperation::Checkpoint(
+                CheckpointMode::Truncate
+            ))
+            .kind(),
             "checkpoint"
         );
         assert_eq!(
             WriteCommand::Maintenance(MaintenanceOperation::Vacuum).kind(),
-            "maintenance"
+            "vacuum"
+        );
+        assert_eq!(
+            WriteCommand::Maintenance(MaintenanceOperation::Analyze).kind(),
+            "optimize"
+        );
+        assert_eq!(
+            WriteCommand::Maintenance(MaintenanceOperation::Prune(Duration::from_secs(1))).kind(),
+            "purge"
         );
     }
 
@@ -224,7 +322,10 @@ mod tests {
     fn record_counts_only_apply_to_inserts() {
         assert_eq!(WriteCommand::Flush.record_count(), 0);
         assert_eq!(
-            WriteCommand::Checkpoint(CheckpointMode::Passive).record_count(),
+            WriteCommand::Maintenance(MaintenanceOperation::Checkpoint(
+                CheckpointMode::Passive
+            ))
+            .record_count(),
             0
         );
         assert_eq!(
@@ -234,9 +335,54 @@ mod tests {
     }
 
     #[test]
+    fn batch_tickets_are_derived_from_segments() {
+        let batch = LogWriteBatch::new(
+            BatchOrigin::default(),
+            WriteBatch::from_vec(vec![LogRecord::default(), LogRecord::default()]),
+            vec![
+                RecordSegment {
+                    commit_seq: 5,
+                    records: 1,
+                    complete: true,
+                },
+                RecordSegment {
+                    commit_seq: 3,
+                    records: 1,
+                    complete: true,
+                },
+            ],
+        );
+        assert_eq!(batch.commit_seqs(), vec![3, 5]);
+    }
+
+    #[test]
     fn checkpoint_mode_display_and_default() {
         assert_eq!(CheckpointMode::Full.to_string(), "FULL");
         assert_eq!(CheckpointMode::default(), CheckpointMode::Passive);
+    }
+
+    #[test]
+    fn checkpoint_mode_parses_the_operator_spelling() {
+        for mode in [
+            CheckpointMode::Passive,
+            CheckpointMode::Full,
+            CheckpointMode::Restart,
+            CheckpointMode::Truncate,
+        ] {
+            assert_eq!(CheckpointMode::parse(&mode.as_str().to_lowercase()), Some(mode));
+        }
+        assert_eq!(CheckpointMode::parse("FULL"), Some(CheckpointMode::Full));
+        assert_eq!(CheckpointMode::parse("unknown"), None);
+    }
+
+    #[test]
+    fn only_long_running_operations_are_heavy() {
+        assert!(!MaintenanceOperation::Analyze.is_heavy());
+        assert!(!MaintenanceOperation::Checkpoint(CheckpointMode::Passive).is_heavy());
+        assert!(MaintenanceOperation::Checkpoint(CheckpointMode::Full).is_heavy());
+        assert!(MaintenanceOperation::Vacuum.is_heavy());
+        assert!(MaintenanceOperation::RebuildFts.is_heavy());
+        assert!(MaintenanceOperation::Prune(Duration::from_secs(1)).is_heavy());
     }
 
     #[test]
