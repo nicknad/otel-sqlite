@@ -42,10 +42,13 @@ impl RunAccounting {
         Ok(accounting)
     }
 
-    /// Asserts the counter identity and that the ledger ranges derive the
-    /// accepted row count. A mismatch means the ledger lost or duplicated
-    /// sequence ranges, so validation must fail instead of silently shrinking
-    /// the expected set.
+    /// Asserts the counter identity and that the ledger ranges partition the
+    /// generated sequences. When rejected positions are exact, the ledger
+    /// totals must also reproduce the client counters exactly. When a mixed
+    /// partial rejection made positions unknowable, the whole request is
+    /// conservatively in the ambiguous set, so only the directional bounds
+    /// hold: the expected set can only shrink by accepted records hidden in an
+    /// ambiguous range.
     pub fn check(&self) -> anyhow::Result<()> {
         let counters = &self.counters;
         let classified = counters
@@ -63,32 +66,67 @@ impl RunAccounting {
             );
         }
 
+        let expected = self.expected_persisted();
         let rejected_total = self.rejected.total();
-        if rejected_total != counters.records_rejected {
-            bail!(
-                "ledger rejected ranges total {rejected_total}, but the client rejected counter is {}",
-                counters.records_rejected,
-            );
-        }
         let ambiguous_total = self.ambiguous.total();
-        if ambiguous_total != counters.records_ambiguous {
+        let partition = expected
+            .total()
+            .saturating_add(rejected_total)
+            .saturating_add(ambiguous_total);
+        if partition != counters.records_generated {
             bail!(
-                "ledger ambiguous ranges total {ambiguous_total}, but the client ambiguous counter is {}",
-                counters.records_ambiguous,
+                "ledger ranges partition {partition} of {} generated sequences \
+                 (expected {}, rejected {rejected_total}, ambiguous {ambiguous_total}); \
+                 a range is overlapping or outside the run window",
+                counters.records_generated,
+                expected.total(),
             );
         }
 
-        let expected = self.expected_persisted();
-        if expected.total() != counters.records_accepted {
-            bail!(
-                "ledger-derived expected rows {} disagree with accepted counter {} \
-                 (generated {}, rejected {rejected_total}, ambiguous {ambiguous_total}); \
-                 positions_exact={}",
-                expected.total(),
-                counters.records_accepted,
-                counters.records_generated,
-                self.positions_exact,
-            );
+        if self.positions_exact {
+            if rejected_total != counters.records_rejected {
+                bail!(
+                    "ledger rejected ranges total {rejected_total}, but the client rejected counter is {}",
+                    counters.records_rejected,
+                );
+            }
+            if ambiguous_total != counters.records_ambiguous {
+                bail!(
+                    "ledger ambiguous ranges total {ambiguous_total}, but the client ambiguous counter is {}",
+                    counters.records_ambiguous,
+                );
+            }
+            if expected.total() != counters.records_accepted {
+                bail!(
+                    "ledger-derived expected rows {} disagree with accepted counter {} \
+                     (generated {}, rejected {rejected_total}, ambiguous {ambiguous_total})",
+                    expected.total(),
+                    counters.records_accepted,
+                    counters.records_generated,
+                );
+            }
+        } else {
+            if rejected_total > counters.records_rejected {
+                bail!(
+                    "ledger rejected ranges total {rejected_total} exceeds the client \
+                     rejected counter {}",
+                    counters.records_rejected,
+                );
+            }
+            if ambiguous_total < counters.records_ambiguous {
+                bail!(
+                    "ledger ambiguous ranges total {ambiguous_total} is smaller than the \
+                     client ambiguous counter {}",
+                    counters.records_ambiguous,
+                );
+            }
+            if expected.total() > counters.records_accepted {
+                bail!(
+                    "ledger-derived expected rows {} exceed the accepted counter {}",
+                    expected.total(),
+                    counters.records_accepted,
+                );
+            }
         }
         Ok(())
     }
@@ -191,10 +229,7 @@ mod tests {
             true,
         )
         .expect_err("overlap makes ledger-derived rows disagree with accepted");
-        assert!(
-            error.to_string().contains("ledger-derived expected rows"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("partition"), "{error}");
     }
 
     #[test]
@@ -206,9 +241,32 @@ mod tests {
             true,
         )
         .expect_err("out-of-window rejected positions are a ledger bug");
-        assert!(
-            error.to_string().contains("ledger-derived expected rows"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("partition"), "{error}");
+    }
+
+    #[test]
+    fn inexact_positions_allow_accepted_records_inside_an_ambiguous_range() {
+        // A mixed partial rejection of 20 records (10 accepted, 10 rejected)
+        // is recorded as one ambiguous range because positions are unknown.
+        let accounting = RunAccounting::new(
+            counters(100, 70, 10, 20),
+            ranges(&[]),
+            ranges(&[(61, 80), (81, 100)]),
+            false,
+        )
+        .expect("conservative accounting is consistent");
+        assert_eq!(accounting.expected_rows(), 60);
+    }
+
+    #[test]
+    fn inexact_positions_still_reject_overlapping_ranges() {
+        let error = RunAccounting::new(
+            counters(100, 70, 10, 20),
+            ranges(&[(61, 70)]),
+            ranges(&[(61, 80), (81, 100)]),
+            false,
+        )
+        .expect_err("overlap must shrink the partition");
+        assert!(error.to_string().contains("partition"), "{error}");
     }
 }

@@ -210,12 +210,6 @@ pub fn validate_run(
 /// so rejected requests never reached the server. Use
 /// [`assert_valid_recovery`] when a pipeline *component* dies instead.
 pub fn assert_valid(db_path: &Path, run_id: &str, outcome: &LoadOutcome) -> anyhow::Result<()> {
-    if !outcome.positions_exact {
-        anyhow::bail!(
-            "crash recovery validation failed for run '{run_id}': ledger marked rejected \
-             positions inexact, so absent-rejected assertions cannot be trusted"
-        );
-    }
     let report = validate_run(db_path, run_id, outcome)?;
     if !report.passed {
         anyhow::bail!(
@@ -251,12 +245,6 @@ pub fn assert_valid_recovery(
     run_id: &str,
     outcome: &LoadOutcome,
 ) -> anyhow::Result<()> {
-    if !outcome.positions_exact {
-        anyhow::bail!(
-            "crash recovery validation failed for run '{run_id}': ledger marked rejected \
-             positions inexact; expected rows cannot be derived reliably"
-        );
-    }
     let report = validate_run(db_path, run_id, outcome)?;
     if report.missing_sequences > 0 {
         anyhow::bail!(
