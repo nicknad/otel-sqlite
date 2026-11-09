@@ -15,7 +15,8 @@ use std::time::Duration;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use otel_sqlite_core::model::{AttributeValue, LogRecord, Resource, Severity};
 use otel_sqlite_core::storage::{
-    BatchOrigin, InsertBatcher, InsertBatcherConfig, LogWriteBatch, WriteBatch, WriteCommand,
+    BatchOrigin, InsertBatcher, InsertBatcherConfig, LogWriteBatch, RecordSegment, WriteBatch,
+    WriteCommand,
 };
 
 /// Realistic-ish log record: ~120 byte body, trace context, 4 attributes.
@@ -130,12 +131,15 @@ fn bench_command_construction(c: &mut Criterion) {
             b.iter_batched(
                 || records.clone(),
                 |records| {
-                    let command = WriteCommand::InsertLogs(LogWriteBatch {
-                        origin: origin(),
-                        records: WriteBatch::from_vec(records),
-                        commit_seqs: Vec::new(),
-                        segments: Vec::new(),
-                    });
+                    let command = WriteCommand::InsertLogs(LogWriteBatch::new(
+                        origin(),
+                        WriteBatch::from_vec(records),
+                        vec![RecordSegment {
+                            commit_seq: 1,
+                            records: size,
+                            complete: true,
+                        }],
+                    ));
                     black_box(command.record_count());
                     black_box(command.kind());
                 },
