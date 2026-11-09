@@ -5,6 +5,9 @@ use otel_sqlite_core::storage::{InsertBatcherConfig, SyncMode};
 
 use crate::search::FtsMode;
 
+/// Default database filename used for the live database and backup restores.
+pub const DEFAULT_DB_FILENAME: &str = "otel-logs.db";
+
 /// Capacity of the bounded queue carrying `WriteCommand`s from the insert
 /// batcher to the SQLite writer.
 pub const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 50_000;
@@ -69,7 +72,7 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            sqlite_path: std::path::PathBuf::from("otel-logs.db"),
+            sqlite_path: std::path::PathBuf::from(DEFAULT_DB_FILENAME),
             insert_batcher: InsertBatcherConfig::default(),
             command_queue_capacity: DEFAULT_COMMAND_QUEUE_CAPACITY,
             group_commit_max_records: DEFAULT_GROUP_COMMIT_RECORDS,

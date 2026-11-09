@@ -25,7 +25,7 @@ use crossbeam_channel::Sender;
 use otel_sqlite_core::model::{AttributeValue, LogRecord, LogScope, Severity};
 use otel_sqlite_core::storage::{
     BatchOrigin, CheckpointMode, IngestMessage, InsertBatcherConfig, LogChunk, LogWriteBatch,
-    MaintenanceOperation, SyncMode, WriteBatch, WriteCommand,
+    MaintenanceOperation, RecordSegment, SyncMode, WriteBatch, WriteCommand,
 };
 use otel_sqlite_core::unix_nano_now;
 use otel_sqlite_storage::{Storage, StorageConfig};
@@ -163,13 +163,20 @@ fn records(start_seq: usize, count: usize, time_unix_nano: i64) -> Vec<LogRecord
 }
 
 /// Direct write-boundary command: one such command becomes one transaction.
+fn insert_command(start_seq: usize, count: usize, time_unix_nano: i64) -> WriteCommand {
+    WriteCommand::InsertLogs(LogWriteBatch::new(
+        BatchOrigin::default(),
+        WriteBatch::from_vec(records(start_seq, count, time_unix_nano)),
+        vec![RecordSegment {
+            commit_seq: 1,
+            records: count,
+            complete: true,
+        }],
+    ))
+}
+
 fn logs_write_command(count: usize) -> WriteCommand {
-    WriteCommand::InsertLogs(LogWriteBatch {
-        origin: BatchOrigin::default(),
-        records: WriteBatch::from_vec(records(0, count, unix_nano_now())),
-        commit_seqs: Vec::new(),
-        segments: Vec::new(),
-    })
+    insert_command(0, count, unix_nano_now())
 }
 
 fn logs_chunk(count: usize) -> IngestMessage {
@@ -289,12 +296,7 @@ fn populate(pipeline: &Pipeline, count: usize, time_unix_nano: i64) {
         let target = pipeline.storage.stats().records_written + batch as u64;
         pipeline
             .producer
-            .send(WriteCommand::InsertLogs(LogWriteBatch {
-                origin: BatchOrigin::default(),
-                records: WriteBatch::from_vec(records(sent, batch, time_unix_nano)),
-                commit_seqs: Vec::new(),
-                segments: Vec::new(),
-            }))
+            .send(insert_command(sent, batch, time_unix_nano))
             .expect("writer alive");
         wait_written(&pipeline.storage, target);
         sent += batch;
@@ -319,9 +321,7 @@ fn bench_prune(c: &mut Criterion) {
                 pipeline
                     .producer
                     .send(WriteCommand::Maintenance(MaintenanceOperation::Prune(
-                        // Age-based deletion of the log-event rows prepared
-                        // above.
-                        Some(Duration::from_secs(3_600)),
+                        Duration::from_secs(3_600),
                     )))
                     .expect("writer alive");
                 wait_maintenance_run(&pipeline.storage, runs);
@@ -349,7 +349,9 @@ fn bench_checkpoint(c: &mut Criterion) {
                 let runs = pipeline.storage.stats().maintenance_runs;
                 pipeline
                     .producer
-                    .send(WriteCommand::Checkpoint(CheckpointMode::Truncate))
+                    .send(WriteCommand::Maintenance(MaintenanceOperation::Checkpoint(
+                        CheckpointMode::Truncate,
+                    )))
                     .expect("writer alive");
                 wait_maintenance_run(&pipeline.storage, runs);
                 pipeline

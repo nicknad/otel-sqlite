@@ -5,7 +5,7 @@
 //! here; this module owns the transaction boundary, retry/salvage policy and
 //! commit-ticket settlement.
 //!
-//! Settlement is reachable only after [`run_transaction`] committed. A strict
+//! Settlement is reachable only after [`commit_transaction`] committed. A strict
 //! group transaction that hits a poison error rolls back as a unit and falls
 //! back to the proven per-batch policy, so `SalvageOutcome::by_ticket` never
 //! has to be merged across commands.
@@ -26,7 +26,6 @@ pub(crate) struct InsertGroup {
     budget: usize,
     batches: Vec<LogWriteBatch>,
     records: usize,
-    non_empty: usize,
 }
 
 /// One non-blocking pull while a group is assembled.
@@ -43,25 +42,38 @@ impl InsertGroup {
             budget,
             batches: Vec::new(),
             records: 0,
-            non_empty: 0,
         }
     }
 
-    /// Accepts the first batch unconditionally so one oversized command always
-    /// makes progress. A later batch that would exceed the budget is returned
-    /// to the writer's lookahead slot.
+    /// Starts a group from the command that triggered collection. The first
+    /// batch is accepted unconditionally so one oversized command always makes
+    /// progress.
+    pub(crate) fn with_first(budget: usize, first: LogWriteBatch) -> Self {
+        let mut group = Self::new(budget);
+        group.push(first);
+        group
+    }
+
+    /// Accepts the next batch unless it would exceed the budget; the rejected
+    /// batch is returned to the writer's lookahead slot.
     #[allow(clippy::result_large_err)]
     pub(crate) fn try_push(&mut self, batch: LogWriteBatch) -> Result<(), LogWriteBatch> {
-        let added = batch.records.len();
-        if !self.batches.is_empty() && self.records.saturating_add(added) > self.budget {
+        if !self.batches.is_empty()
+            && self.records.saturating_add(batch.records.len()) > self.budget
+        {
             return Err(batch);
         }
-        self.records = self.records.saturating_add(added);
-        if added > 0 {
-            self.non_empty += 1;
-        }
-        self.batches.push(batch);
+        self.push(batch);
         Ok(())
+    }
+
+    fn push(&mut self, batch: LogWriteBatch) {
+        debug_assert!(
+            !batch.records.is_empty(),
+            "the insert batcher never emits empty batches"
+        );
+        self.records = self.records.saturating_add(batch.records.len());
+        self.batches.push(batch);
     }
 
     pub(crate) const fn at_budget(&self) -> bool {
@@ -70,12 +82,6 @@ impl InsertGroup {
 
     pub(crate) const fn records(&self) -> usize {
         self.records
-    }
-
-    /// Number of batches that actually carry rows. Tracked while collecting so
-    /// callers never have to walk the group again just to count them.
-    pub(crate) const fn non_empty(&self) -> usize {
-        self.non_empty
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -95,10 +101,7 @@ pub(crate) fn collect_group(
     budget: usize,
     mut pull: impl FnMut() -> Pull,
 ) -> (InsertGroup, Option<WriteCommand>) {
-    let mut group = InsertGroup::new(budget);
-    group.records = first.records.len();
-    group.non_empty = usize::from(!first.records.is_empty());
-    group.batches.push(first);
+    let mut group = InsertGroup::with_first(budget, first);
     let mut boundary = None;
     while !group.at_budget() {
         match pull() {
@@ -119,8 +122,8 @@ pub(crate) fn collect_group(
 }
 
 /// Persists one group under the writer's error policy and settles every batch
-/// only after the commit. Empty-only groups void their tickets without opening
-/// a transaction.
+/// only after the commit. A poison failure falls back to the per-batch
+/// strict-then-salvage path so healthy rows still commit.
 pub(crate) fn persist_group(
     conn: &mut Connection,
     stats: &WriterStats,
@@ -128,54 +131,33 @@ pub(crate) fn persist_group(
     group: &InsertGroup,
     scratch: &mut InsertScratch,
 ) -> Result<(), StorageError> {
-    if group.records() == 0 {
-        settle_group(ledger, group);
-        return Ok(());
-    }
-
-    let mut attempt = 0u32;
-    loop {
-        let outcome = run_transaction(conn, stats, |tx| {
+    let outcome = run_with_retries(stats, "logs group", || {
+        commit_transaction(conn, stats, |tx| {
             let mut written = 0u64;
             for batch in group.iter() {
-                if !batch.records.is_empty() {
-                    written += command::insert_logs(tx, batch, scratch)?;
-                }
+                written += command::insert_logs(tx, batch, scratch)?;
             }
-            Ok(written)
-        });
-        match outcome {
-            Ok(()) => {
-                settle_group(ledger, group);
-                return Ok(());
-            }
-            Err((error, FailureClass::Poison)) => {
-                tracing::warn!(
-                    batches = group.len(),
-                    %error,
-                    "poisonous group rejected by sqlite; falling back to per-batch salvage"
-                );
-                ::metrics::counter!("storage_group_poison_fallbacks_total").increment(1);
-                for batch in group.iter() {
-                    persist_one(conn, stats, ledger, batch, scratch)?;
-                }
-                return Ok(());
-            }
-            Err((error, FailureClass::Retryable)) if attempt < MAX_TRANSIENT_RETRIES => {
-                let delay = backoff_delay(attempt);
-                attempt += 1;
-                stats.transient_retries.fetch_add(1, Ordering::Relaxed);
-                ::metrics::counter!("storage_transient_retries_total").increment(1);
-                tracing::warn!(
-                    %error,
-                    attempt,
-                    ?delay,
-                    "transient sqlite failure; retrying grouped transaction"
-                );
-                std::thread::sleep(delay);
-            }
-            Err((error, _)) => return Err(error),
+            Ok(((), CommitReport::written(written)))
+        })
+    });
+    match outcome {
+        Ok(()) => {
+            settle_group(ledger, group);
+            Ok(())
         }
+        Err((error, FailureClass::Poison)) => {
+            tracing::warn!(
+                batches = group.len(),
+                %error,
+                "poisonous group rejected by sqlite; falling back to per-batch salvage"
+            );
+            ::metrics::counter!("storage_group_poison_fallbacks_total").increment(1);
+            for batch in group.iter() {
+                persist_one(conn, stats, ledger, batch, scratch)?;
+            }
+            Ok(())
+        }
+        Err((error, _)) => Err(error),
     }
 }
 
@@ -189,42 +171,52 @@ pub(crate) fn persist_one(
     batch: &LogWriteBatch,
     scratch: &mut InsertScratch,
 ) -> Result<(), StorageError> {
-    if batch.records.is_empty() {
-        for commit_seq in &batch.commit_seqs {
-            ledger.void(*commit_seq);
+    let strict = run_with_retries(stats, "logs", || {
+        commit_transaction(conn, stats, |tx| {
+            let written = command::insert_logs(tx, batch, scratch)?;
+            Ok(((), CommitReport::written(written)))
+        })
+    });
+    match strict {
+        Ok(()) => {
+            settle_log_batch(ledger, batch, None);
+            Ok(())
         }
-        return Ok(());
+        Err((cause, FailureClass::Poison)) => {
+            tracing::warn!(
+                signal = "logs",
+                %cause,
+                "poisonous batch rejected by sqlite; attempting salvage pass"
+            );
+            // Salvage is exceptional, so it gets its own scratch, created only
+            // if the strict pass actually needs a second chance.
+            let mut salvage_scratch = InsertScratch::new();
+            let outcome = run_with_retries(stats, "logs salvage", || {
+                commit_transaction(conn, stats, |tx| {
+                    let outcome = command::insert_logs_tolerant(tx, batch, &mut salvage_scratch)?;
+                    let report = CommitReport::salvage(&outcome);
+                    Ok((outcome, report))
+                })
+            })
+            .map_err(|(error, _)| error)?;
+            tracing::warn!(
+                signal = "logs",
+                kept = outcome.kept,
+                dropped = outcome.dropped,
+                cause = %cause,
+                "salvage pass complete: healthy rows committed, poisonous rows quarantined"
+            );
+            settle_log_batch(ledger, batch, Some(outcome));
+            Ok(())
+        }
+        Err((error, _)) => Err(error),
     }
-    // Salvage is exceptional, so it gets its own scratch, created only if the
-    // strict pass actually needs a second chance.
-    let mut salvage_scratch = None;
-    let salvage = persist_with_policy(
-        conn,
-        stats,
-        "logs",
-        |tx| command::insert_logs(tx, batch, scratch),
-        |tx| {
-            command::insert_logs_tolerant(
-                tx,
-                batch,
-                salvage_scratch.get_or_insert_with(InsertScratch::new),
-            )
-        },
-    )?;
-    settle_log_batch(ledger, batch, salvage);
-    Ok(())
 }
 
 /// Settles every batch of a successfully committed group in queue order.
 fn settle_group(ledger: &CommitLedger, group: &InsertGroup) {
     for batch in group.iter() {
-        if batch.records.is_empty() {
-            for commit_seq in &batch.commit_seqs {
-                ledger.void(*commit_seq);
-            }
-        } else {
-            settle_log_batch(ledger, batch, None);
-        }
+        settle_log_batch(ledger, batch, None);
     }
 }
 
@@ -241,67 +233,68 @@ fn backoff_delay(attempt: u32) -> Duration {
         .min(Duration::from_secs(4))
 }
 
-/// Persistence policy for one transaction.
-///
-/// * strict pass first; on success the transaction is done.
-/// * **Poison** errors (constraint violations, bad inputs) trigger exactly
-///   one salvage pass in tolerant mode: healthy rows commit, offending rows
-///   are dropped-and-counted as `quarantined_records`. The affected tickets
-///   settle as failed so their handlers report `partial_success`; nothing is
-///   lost silently and nothing stalls.
-/// * **Retryable** errors (BUSY/LOCKED) are retried up to
-///   `MAX_TRANSIENT_RETRIES` times with exponential backoff; exhaustion
-///   escalates to fatal.
-/// * **Fatal** errors propagate immediately: the writer exits, closes the
-///   ledger and lets watchdog/supervisor handle restart.
-fn persist_with_policy(
-    conn: &mut Connection,
+/// Runs one classified transaction attempt, retrying retryable contention
+/// (BUSY/LOCKED) with exponential backoff. Poison and fatal failures are
+/// returned to the caller, which owns the salvage/abort decision.
+fn run_with_retries<T>(
     stats: &WriterStats,
     signal: &'static str,
-    mut strict: impl FnMut(&rusqlite::Transaction<'_>) -> Result<u64, StorageError>,
-    salvage: impl FnMut(&rusqlite::Transaction<'_>) -> Result<command::SalvageOutcome, StorageError>,
-) -> Result<Option<command::SalvageOutcome>, StorageError> {
+    mut run: impl FnMut() -> Result<T, (StorageError, FailureClass)>,
+) -> Result<T, (StorageError, FailureClass)> {
     let mut attempt = 0u32;
     loop {
-        let outcome = run_transaction(conn, stats, &mut strict);
-        match outcome {
-            Ok(()) => return Ok(None),
-            Err((error, class)) => match class {
-                FailureClass::Poison => {
-                    tracing::warn!(
-                        signal,
-                        %error,
-                        "poisonous batch rejected by sqlite; attempting salvage pass"
-                    );
-                    return finish_salvage(conn, stats, signal, salvage, error).map(Some);
-                }
-                FailureClass::Retryable if attempt < MAX_TRANSIENT_RETRIES => {
-                    let delay = backoff_delay(attempt);
-                    attempt += 1;
-                    stats.transient_retries.fetch_add(1, Ordering::Relaxed);
-                    ::metrics::counter!("storage_transient_retries_total").increment(1);
-                    tracing::warn!(
-                        signal,
-                        %error,
-                        attempt,
-                        ?delay,
-                        "transient sqlite failure; retrying batch"
-                    );
-                    std::thread::sleep(delay);
-                }
-                FailureClass::Retryable | FailureClass::Fatal => return Err(error),
-            },
+        match run() {
+            Ok(value) => return Ok(value),
+            Err((error, FailureClass::Retryable)) if attempt < MAX_TRANSIENT_RETRIES => {
+                let delay = backoff_delay(attempt);
+                attempt += 1;
+                stats.transient_retries.fetch_add(1, Ordering::Relaxed);
+                ::metrics::counter!("storage_transient_retries_total").increment(1);
+                tracing::warn!(
+                    signal,
+                    %error,
+                    attempt,
+                    ?delay,
+                    "transient sqlite failure; retrying transaction"
+                );
+                std::thread::sleep(delay);
+            }
+            Err(failure) => return Err(failure),
         }
     }
 }
 
-/// Runs one strict transaction, mapping failures to their classification so
-/// the policy loop above can decide without re-matching errors.
-fn run_transaction(
+/// What one committed transaction persisted. Strict and salvage commits report
+/// through the same helper so their counters and metrics cannot drift apart.
+struct CommitReport {
+    records_written: u64,
+    quarantined: u64,
+}
+
+impl CommitReport {
+    const fn written(records_written: u64) -> Self {
+        Self {
+            records_written,
+            quarantined: 0,
+        }
+    }
+
+    fn salvage(outcome: &command::SalvageOutcome) -> Self {
+        Self {
+            records_written: outcome.kept,
+            quarantined: outcome.dropped,
+        }
+    }
+}
+
+/// Runs one transaction, mapping failures to their classification so the retry
+/// policy can decide without re-matching errors. The body returns its result
+/// plus the report the shared commit helper publishes.
+fn commit_transaction<T>(
     conn: &mut Connection,
     stats: &WriterStats,
-    mut persist: impl FnMut(&rusqlite::Transaction<'_>) -> Result<u64, StorageError>,
-) -> Result<(), (StorageError, FailureClass)> {
+    mut persist: impl FnMut(&rusqlite::Transaction<'_>) -> Result<(T, CommitReport), StorageError>,
+) -> Result<T, (StorageError, FailureClass)> {
     let started = Instant::now();
     let tx = match conn.transaction() {
         Ok(tx) => tx,
@@ -312,85 +305,55 @@ fn run_transaction(
         }
     };
     match persist(&tx) {
-        Ok(written) => {
+        Ok((value, report)) => {
             if let Err(error) = tx.commit() {
                 let error = StorageError::from(error);
                 let class = error.class();
+                record_failure(stats, &error);
                 return Err((error, class));
             }
-            stats.records_written.fetch_add(written, Ordering::Relaxed);
-            stats.transactions_committed.fetch_add(1, Ordering::Relaxed);
-            stats.mark_progress();
-            ::metrics::counter!("storage_records_written_total").increment(written);
-            ::metrics::histogram!("storage_transaction_batch_size").record(written as f64);
-            ::metrics::histogram!("storage_transaction_duration")
-                .record(started.elapsed().as_secs_f64());
-            let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-            tracing::debug!(
-                records = written,
-                duration_us = elapsed_us,
-                "transaction committed"
-            );
-            Ok(())
+            report_commit(stats, report, started.elapsed());
+            Ok(value)
         }
         Err(error) => {
             let _ = tx.rollback();
-            stats.errors.fetch_add(1, Ordering::Relaxed);
-            ::metrics::counter!("storage_errors_total").increment(1);
             let class = error.class();
-            tracing::error!(%error, ?class, "transaction failed, rolled back");
+            record_failure(stats, &error);
             Err((error, class))
         }
     }
 }
 
-/// Second-chance pass for poisoned batches: tolerant mode keeps healthy rows
-/// and drops-and-counts only the offending ones.
-fn finish_salvage(
-    conn: &mut Connection,
-    stats: &WriterStats,
-    signal: &'static str,
-    mut salvage: impl FnMut(&rusqlite::Transaction<'_>) -> Result<command::SalvageOutcome, StorageError>,
-    cause: StorageError,
-) -> Result<command::SalvageOutcome, StorageError> {
-    let started = Instant::now();
-    let tx = conn.transaction()?;
-    match salvage(&tx) {
-        Ok(outcome) => {
-            tx.commit().map_err(StorageError::from)?;
-            stats
-                .records_written
-                .fetch_add(outcome.kept, Ordering::Relaxed);
-            stats
-                .quarantined_records
-                .fetch_add(outcome.dropped, Ordering::Relaxed);
-            stats.transactions_committed.fetch_add(1, Ordering::Relaxed);
-            stats.mark_progress();
-            ::metrics::counter!("storage_quarantined_records_total").increment(outcome.dropped);
-            ::metrics::histogram!("storage_transaction_duration")
-                .record(started.elapsed().as_secs_f64());
-            tracing::warn!(
-                signal,
-                kept = outcome.kept,
-                dropped = outcome.dropped,
-                cause = %cause,
-                "salvage pass complete: healthy rows committed, poisonous rows quarantined"
-            );
-            Ok(outcome)
-        }
-        Err(salvage_error) => {
-            let _ = tx.rollback();
-            stats.errors.fetch_add(1, Ordering::Relaxed);
-            ::metrics::counter!("storage_errors_total").increment(1);
-            tracing::error!(
-                signal,
-                %salvage_error,
-                cause = %cause,
-                "salvage pass failed; treating as fatal"
-            );
-            Err(salvage_error)
-        }
+/// Publishes the counters, metrics and logs shared by every successful
+/// transaction, whether strict or salvaged.
+fn report_commit(stats: &WriterStats, report: CommitReport, elapsed: Duration) {
+    stats
+        .records_written
+        .fetch_add(report.records_written, Ordering::Relaxed);
+    if report.quarantined > 0 {
+        stats
+            .quarantined_records
+            .fetch_add(report.quarantined, Ordering::Relaxed);
+        ::metrics::counter!("storage_quarantined_records_total").increment(report.quarantined);
     }
+    stats.transactions_committed.fetch_add(1, Ordering::Relaxed);
+    stats.mark_progress();
+    ::metrics::counter!("storage_records_written_total").increment(report.records_written);
+    ::metrics::histogram!("storage_transaction_batch_size").record(report.records_written as f64);
+    ::metrics::histogram!("storage_transaction_duration").record(elapsed.as_secs_f64());
+    let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+    tracing::debug!(
+        records = report.records_written,
+        duration_us = elapsed_us,
+        "transaction committed"
+    );
+}
+
+fn record_failure(stats: &WriterStats, error: &StorageError) {
+    stats.errors.fetch_add(1, Ordering::Relaxed);
+    ::metrics::counter!("storage_errors_total").increment(1);
+    let class = error.class();
+    tracing::error!(%error, ?class, "transaction failed, rolled back");
 }
 
 /// Publishes a persisted batch to the commit ledger.
@@ -403,22 +366,9 @@ fn settle_log_batch(
     batch: &LogWriteBatch,
     salvage: Option<command::SalvageOutcome>,
 ) {
-    if batch.segments.is_empty() {
-        // Legacy/bench batches carry no per-record ticket map. Treat every
-        // referenced ticket as complete; a salvage drop fails all of them.
-        let dropped = salvage.as_ref().map_or(0, |outcome| outcome.dropped);
-        for commit_seq in &batch.commit_seqs {
-            if dropped > 0 {
-                ledger.note_dropped(*commit_seq, dropped);
-            }
-            ledger.complete(*commit_seq);
-        }
-        return;
-    }
-
     match salvage {
         None => {
-            for segment in &batch.segments {
+            for segment in batch.segments() {
                 ledger.note_committed(segment.commit_seq, segment.records as u64);
                 if segment.complete {
                     ledger.complete(segment.commit_seq);
@@ -428,16 +378,20 @@ fn settle_log_batch(
         Some(outcome) => {
             // `by_ticket` is already summed for the whole batch, so note it
             // once per ticket rather than once per segment.
-            for commit_seq in &batch.commit_seqs {
-                let (kept, dropped) = outcome.by_ticket.get(commit_seq).copied().unwrap_or((0, 0));
+            for commit_seq in batch.commit_seqs() {
+                let (kept, dropped) = outcome
+                    .by_ticket
+                    .get(&commit_seq)
+                    .copied()
+                    .unwrap_or((0, 0));
                 if kept > 0 {
-                    ledger.note_committed(*commit_seq, kept);
+                    ledger.note_committed(commit_seq, kept);
                 }
                 if dropped > 0 {
-                    ledger.note_dropped(*commit_seq, dropped);
+                    ledger.note_dropped(commit_seq, dropped);
                 }
             }
-            for segment in &batch.segments {
+            for segment in batch.segments() {
                 if segment.complete {
                     ledger.complete(segment.commit_seq);
                 }
@@ -455,19 +409,26 @@ mod tests {
     };
     use std::collections::VecDeque;
 
+    fn batch_with_ticket(records: usize, ticket: u64) -> LogWriteBatch {
+        LogWriteBatch::new(
+            BatchOrigin::default(),
+            WriteBatch::from_vec((0..records).map(|_| LogRecord::default()).collect()),
+            vec![RecordSegment {
+                commit_seq: ticket,
+                records,
+                complete: true,
+            }],
+        )
+    }
+
     fn batch(records: usize) -> LogWriteBatch {
-        LogWriteBatch {
-            origin: BatchOrigin::default(),
-            records: WriteBatch::from_vec((0..records).map(|_| LogRecord::default()).collect()),
-            commit_seqs: Vec::new(),
-            segments: Vec::new(),
-        }
+        batch_with_ticket(records, 1)
     }
 
     fn ticket_batch(bodies: &[&str], ticket: u64) -> LogWriteBatch {
-        LogWriteBatch {
-            origin: BatchOrigin::default(),
-            records: WriteBatch::from_vec(
+        LogWriteBatch::new(
+            BatchOrigin::default(),
+            WriteBatch::from_vec(
                 bodies
                     .iter()
                     .map(|body| LogRecord {
@@ -476,13 +437,12 @@ mod tests {
                     })
                     .collect(),
             ),
-            commit_seqs: vec![ticket],
-            segments: vec![RecordSegment {
+            vec![RecordSegment {
                 commit_seq: ticket,
                 records: bodies.len(),
                 complete: true,
             }],
-        }
+        )
     }
 
     #[test]
@@ -551,14 +511,9 @@ mod tests {
         let ledger = CommitLedger::new();
         let mut group = InsertGroup::new(100);
         for (records, ticket) in [(2usize, 1u64), (3, 2)] {
-            let mut batch = batch(records);
-            batch.commit_seqs = vec![ticket];
-            batch.segments = vec![RecordSegment {
-                commit_seq: ticket,
-                records,
-                complete: true,
-            }];
-            group.try_push(batch).expect("fits");
+            group
+                .try_push(batch_with_ticket(records, ticket))
+                .expect("fits");
         }
 
         persist_group(
@@ -588,38 +543,6 @@ mod tests {
             ledger.watermark().committed_through,
             2,
             "both tickets settle after the shared commit"
-        );
-    }
-
-    #[test]
-    fn empty_group_settles_tickets_without_opening_a_transaction() {
-        let stats = WriterStats::new();
-        let ledger = CommitLedger::new();
-        let mut group = InsertGroup::new(10);
-        let mut empty = batch(0);
-        empty.commit_seqs = vec![7];
-        group.try_push(empty).expect("empty batch accepted");
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("group-empty.db");
-        let mut conn = crate::sqlite::open(&path, SyncMode::default()).expect("open database");
-        crate::migration::migrate(&mut conn).expect("migrate");
-        persist_group(
-            &mut conn,
-            &stats,
-            &ledger,
-            &group,
-            &mut InsertScratch::new(),
-        )
-        .expect("settle empty group");
-
-        assert_eq!(stats.transactions_committed.load(Ordering::Relaxed), 0);
-        assert!(
-            matches!(
-                ledger.state(7),
-                otel_sqlite_core::storage::TicketState::Completed
-            ),
-            "an empty batch settles its ticket without a transaction"
         );
     }
 

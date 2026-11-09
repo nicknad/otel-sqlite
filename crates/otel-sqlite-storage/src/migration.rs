@@ -150,7 +150,7 @@ pub fn version_too_new_message(applied: &str, latest_known: &str) -> String {
 
 /// Whether `name` is a table in the opened database. Uses `sqlite_master`
 /// directly so a missing table is data, not an error.
-pub(crate) fn table_exists(conn: &Connection, name: &str) -> Result<bool, StorageError> {
+pub(crate) fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
         [name],

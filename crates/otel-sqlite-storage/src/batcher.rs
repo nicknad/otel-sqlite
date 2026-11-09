@@ -222,12 +222,11 @@ fn submit_log_batch(
     submission: Submission<LogRecord>,
     stats: &BatcherStats,
 ) -> bool {
-    let command = WriteCommand::InsertLogs(LogWriteBatch {
-        origin: submission.origin,
-        records: submission.records,
-        commit_seqs: submission.commit_seqs,
-        segments: submission.segments,
-    });
+    let command = WriteCommand::InsertLogs(LogWriteBatch::new(
+        submission.origin,
+        submission.records,
+        submission.segments,
+    ));
     let submitted = submit(commands, command, stats);
     if submitted {
         stats.batches_emitted.fetch_add(1, Ordering::Relaxed);
@@ -507,7 +506,7 @@ mod tests {
             .into_iter()
             .filter_map(|command| match command {
                 WriteCommand::InsertLogs(batch) => {
-                    Some((batch.origin.schema_url.clone(), batch.commit_seqs))
+                    Some((batch.origin.schema_url.clone(), batch.commit_seqs()))
                 }
                 _ => None,
             })

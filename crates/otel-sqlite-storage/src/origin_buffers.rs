@@ -35,8 +35,6 @@ use otel_sqlite_core::storage::{
 pub(crate) struct Submission<T> {
     pub(crate) origin: BatchOrigin,
     pub(crate) records: WriteBatch<T>,
-    /// Every ticket referenced by this submission, sorted ascending.
-    pub(crate) commit_seqs: Vec<u64>,
     /// Ordered partition of `records`; `complete` marks the segment carrying
     /// the last record of its ticket.
     pub(crate) segments: Vec<RecordSegment>,
@@ -48,30 +46,24 @@ impl<T> Submission<T> {
         records: WriteBatch<T>,
         segments: Vec<RecordSegment>,
     ) -> Self {
-        // Segment order follows ingestion order, so tickets are normally
-        // already sorted and duplicates are adjacent. Only pay for a sort when
-        // an unusual producer breaks that order.
-        let mut commit_seqs = Vec::with_capacity(segments.len());
-        let mut sorted = true;
-        for segment in &segments {
-            if let Some(&last) = commit_seqs.last() {
-                sorted &= last <= segment.commit_seq;
-                if last == segment.commit_seq {
-                    continue;
-                }
-            }
-            commit_seqs.push(segment.commit_seq);
-        }
-        if !sorted {
-            commit_seqs.sort_unstable();
-            commit_seqs.dedup();
-        }
         Self {
             origin,
             records,
-            commit_seqs,
             segments,
         }
+    }
+
+    /// Every distinct ticket referenced by this submission, ascending.
+    #[cfg(test)]
+    pub(crate) fn commit_seqs(&self) -> Vec<u64> {
+        let mut tickets: Vec<u64> = self
+            .segments
+            .iter()
+            .map(|segment| segment.commit_seq)
+            .collect();
+        tickets.sort_unstable();
+        tickets.dedup();
+        tickets
     }
 }
 
@@ -269,14 +261,14 @@ mod tests {
         let mut buffers = OriginBuffers::<LogRecord>::new(config(4, 60_000));
 
         let pushed = buffers.push(origin("a"), vec![], 0);
-        assert!(pushed.is_empty());
+        assert_eq!(pushed.len(), 0);
 
         let pushed = buffers.push(
             origin("a"),
             (0..2).map(|_| LogRecord::default()).collect(),
             3,
         );
-        assert!(pushed.is_empty());
+        assert_eq!(pushed.len(), 0);
         assert_eq!(buffers.buffered(), 2);
         assert!(buffers.deadline().is_some());
 
@@ -287,7 +279,7 @@ mod tests {
             (0..3).map(|_| LogRecord::default()).collect(),
             5,
         );
-        assert!(pushed.is_empty());
+        assert_eq!(pushed.len(), 0);
 
         let submissions = buffers.push(
             origin("a"),
@@ -304,7 +296,7 @@ mod tests {
         assert!(submissions.iter().all(|s| s.origin.schema_url == "a"));
         // Ticket 3 ends inside the first full batch; ticket 7 is split, so
         // only its final flush may complete it.
-        assert_eq!(submissions[0].commit_seqs, vec![3, 7]);
+        assert_eq!(submissions[0].commit_seqs(), vec![3, 7]);
         assert_eq!(
             submissions[0].segments,
             vec![
@@ -320,7 +312,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(submissions[1].commit_seqs, vec![7]);
+        assert_eq!(submissions[1].commit_seqs(), vec![7]);
         assert_eq!(
             submissions[1].segments,
             vec![RecordSegment {
@@ -337,12 +329,12 @@ mod tests {
             submissions
                 .iter()
                 .map(|s| (
-                    s.origin.schema_url.as_str(),
+                    s.origin.schema_url.clone(),
                     s.records.len(),
-                    s.commit_seqs.as_slice()
+                    s.commit_seqs()
                 ))
                 .collect::<Vec<_>>(),
-            vec![("a", 3, [7].as_slice()), ("b", 3, [5].as_slice())]
+            vec![("a".to_owned(), 3, vec![7]), ("b".to_owned(), 3, vec![5])]
         );
         assert_eq!(
             submissions[0].segments,
@@ -361,7 +353,7 @@ mod tests {
             }]
         );
         assert_eq!(buffers.buffered(), 0);
-        assert!(buffers.flush_all().is_empty());
+        assert_eq!(buffers.flush_all().len(), 0);
     }
 
     #[test]
@@ -389,9 +381,9 @@ mod tests {
         );
 
         let submissions = buffers.flush_all();
-        assert!(pushed.is_empty());
+        assert_eq!(pushed.len(), 0);
         assert_eq!(submissions.len(), 1);
-        assert_eq!(submissions[0].commit_seqs, vec![1, 3]);
+        assert_eq!(submissions[0].commit_seqs(), vec![1, 3]);
         assert_eq!(
             submissions[0].segments,
             vec![

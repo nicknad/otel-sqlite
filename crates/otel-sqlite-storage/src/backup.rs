@@ -226,21 +226,11 @@ fn map_sqlite_error(path: &Path, error: rusqlite::Error) -> BackupError {
     }
 }
 
-/// Whether `name` is a table in the opened database.
-fn has_table(conn: &Connection, name: &str) -> Result<bool, BackupError> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-        [name],
-        |row| row.get(0),
-    )?;
-    Ok(count > 0)
-}
-
 /// Reads the canonical table row counts from an open connection. A valid
 /// SQLite file without the canonical tables (any non-otel database) yields
 /// `None` instead of a misleading `no such table` failure.
 fn row_counts(conn: &Connection) -> Result<Option<RowCounts>, BackupError> {
-    if !has_table(conn, "log_event")? {
+    if !crate::migration::table_exists(conn, "log_event")? {
         return Ok(None);
     }
     let count =
@@ -425,10 +415,8 @@ impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
         if let Some(path) = self.0.take() {
             let _ = fs::remove_file(&path);
-            for suffix in ["-wal", "-shm", "-journal"] {
-                let mut sidecar = path.clone().into_os_string();
-                sidecar.push(suffix);
-                let _ = fs::remove_file(PathBuf::from(sidecar));
+            for suffix in crate::permissions::SIDECAR_SUFFIXES {
+                let _ = fs::remove_file(crate::permissions::sidecar_path(&path, suffix));
             }
         }
     }
@@ -445,7 +433,7 @@ pub fn restore_into(
     dest_dir: &Path,
     key_path: Option<&Path>,
 ) -> Result<RestoreReport, BackupError> {
-    let target = dest_dir.join("otel-logs.db");
+    let target = dest_dir.join(crate::config::DEFAULT_DB_FILENAME);
     if target.exists() {
         return Err(BackupError::DestinationExists(target));
     }
