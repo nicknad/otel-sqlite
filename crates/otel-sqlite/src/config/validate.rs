@@ -170,15 +170,21 @@ fn validate_quota(config: &Config) -> Result<()> {
 }
 
 fn validate_maintenance(config: &Config) -> Result<()> {
+    // Runtime-owned invariants (non-zero retry delay and purge schedule).
+    config
+        .maintenance
+        .validate()
+        .context("invalid maintenance configuration")?;
+    // CLI-specific upper bounds on the durations operators can express.
     validate_duration("maintenance.retry_delay", config.maintenance.retry_delay)?;
     validate_optional_duration(
-        "maintenance.retention",
-        config.maintenance.retention,
+        "maintenance.purge.retention",
+        config.maintenance.purge.map(|schedule| schedule.retention),
         MAX_RETENTION,
     )?;
     validate_optional_duration(
-        "maintenance.purge_interval",
-        config.maintenance.purge_interval,
+        "maintenance.purge.interval",
+        config.maintenance.purge.map(|schedule| schedule.interval),
         MAX_TIMEOUT,
     )?;
     validate_optional_duration(
@@ -208,6 +214,8 @@ fn validate_maintenance(config: &Config) -> Result<()> {
 }
 
 fn validate_watchdog(config: &Config) -> Result<()> {
+    // CLI-specific duration bounds; the runtime owns every ordering/range
+    // invariant (including the batcher-age rule).
     validate_duration("watchdog.tick_interval", config.watchdog.tick_interval)?;
     validate_duration("watchdog.degraded_after", config.watchdog.degraded_after)?;
     validate_duration("watchdog.unhealthy_after", config.watchdog.unhealthy_after)?;
@@ -216,30 +224,10 @@ fn validate_watchdog(config: &Config) -> Result<()> {
         "watchdog.maintenance_stall_after",
         config.watchdog.maintenance_stall_after,
     )?;
-    if config.watchdog.maintenance_stall_after < config.watchdog.unhealthy_after {
-        bail!("watchdog.maintenance_stall_after must be at least unhealthy_after");
-    }
-    if config.watchdog.degraded_after >= config.watchdog.unhealthy_after {
-        bail!("watchdog.degraded_after must be less than unhealthy_after");
-    }
-    // A partial batch legitimately keeps the writer idle until its age
-    // deadline expires. If that deadline can outlive the first health
-    // threshold, a low-volume stream looks stalled and the watchdog would halt
-    // a healthy process.
-    if config.batcher_max_batch_age >= config.watchdog.degraded_after {
-        bail!(
-            "batcher_max_batch_age ({:?}) must be less than watchdog.degraded_after ({:?}); \
-             a buffered batch keeps the writer idle until it expires",
-            config.batcher_max_batch_age,
-            config.watchdog.degraded_after,
-        );
-    }
-    if !config.watchdog.queue_pressure_ratio.is_finite()
-        || !(0.0..=1.0).contains(&config.watchdog.queue_pressure_ratio)
-        || config.watchdog.queue_pressure_ratio == 0.0
-    {
-        bail!("watchdog.queue_pressure_ratio must be finite and in the range (0, 1]");
-    }
+    config
+        .watchdog
+        .validate_batch_age(config.batcher_max_batch_age)
+        .context("invalid watchdog configuration")?;
     Ok(())
 }
 

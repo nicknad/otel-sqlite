@@ -318,9 +318,10 @@ mod tests {
             assert!(text.contains("-----BEGIN "), "{name} must be PEM");
         }
 
-        // Invalid client names are rejected before any signing happens.
+        // Path traversal names must be rejected, not written as files.
         let bad = GenCertsArgs {
             clients: vec!["../evil".to_owned()],
+            out_dir: dir.path().to_path_buf(),
             ..GenCertsArgs::default()
         };
         assert!(run(&bad).is_err(), "path traversal names must be rejected");

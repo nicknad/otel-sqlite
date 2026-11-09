@@ -13,14 +13,14 @@ use anyhow::{Context, Result};
 use crate::config::Config;
 
 pub(crate) async fn run_healthcheck() -> Result<()> {
-    // Config may be unreadable in exotic setups; fall back to plain defaults
-    // so the probe still works for the common no-TLS case.
-    let config = Config::from_env().unwrap_or_default();
+    // The probe checks the configured server, so an unreadable or invalid
+    // config is a probe failure rather than something to paper over.
+    let config = Config::from_env().context("failed to load healthcheck configuration")?;
     let endpoint = std::env::var("OTEL_SQLITE_HEALTHCHECK_ENDPOINT")
         .ok()
         .filter(|endpoint| !endpoint.trim().is_empty())
         .unwrap_or_else(|| derive_healthcheck_endpoint(&config));
-    let tls = build_probe_tls(&config, &endpoint);
+    let tls = build_probe_tls(&config, &endpoint).context("failed to prepare healthcheck TLS")?;
     let result = probe_health(&endpoint, tls.as_ref()).await;
     match result {
         Ok(tonic_health::pb::health_check_response::ServingStatus::Serving) => {
@@ -63,8 +63,10 @@ struct ProbeTls {
     identity: Option<(Vec<u8>, Vec<u8>)>,
 }
 
-fn build_probe_tls(config: &Config, endpoint: &str) -> Option<ProbeTls> {
-    let tls = config.tls.as_ref()?;
+fn build_probe_tls(config: &Config, endpoint: &str) -> Result<Option<ProbeTls>> {
+    let Some(tls) = config.tls.as_ref() else {
+        return Ok(None);
+    };
     // Trust the client CA when mTLS is enabled, otherwise the CA that issued
     // the server leaf. `gen-certs` writes `ca.pem` next to `server.pem`, so
     // sibling discovery makes the default server-only TLS setup probe
@@ -79,22 +81,35 @@ fn build_probe_tls(config: &Config, endpoint: &str) -> Option<ProbeTls> {
             sibling.is_file().then_some(sibling)
         })
         .unwrap_or_else(|| tls.cert.clone());
-    let ca_pem = std::fs::read(&ca_path)
-        .with_context(|| format!("read healthcheck CA {}", ca_path.display()))
-        .ok()?;
+    let ca_pem = std::fs::read(&ca_path).with_context(|| {
+        format!(
+            "failed to read healthcheck CA certificate {}",
+            ca_path.display()
+        )
+    })?;
     let domain_name = healthcheck_domain_name(endpoint);
     let identity = if tls.client_ca.is_some() {
-        let cert = std::fs::read(&tls.cert).ok()?;
-        let key = std::fs::read(&tls.key).ok()?;
+        let cert = std::fs::read(&tls.cert).with_context(|| {
+            format!(
+                "failed to read healthcheck client certificate {}",
+                tls.cert.display()
+            )
+        })?;
+        let key = std::fs::read(&tls.key).with_context(|| {
+            format!(
+                "failed to read healthcheck client key {}",
+                tls.key.display()
+            )
+        })?;
         Some((cert, key))
     } else {
         None
     };
-    Some(ProbeTls {
+    Ok(Some(ProbeTls {
         ca_pem,
         domain_name,
         identity,
-    })
+    }))
 }
 
 /// Host part of a derived `http(s)://host:port` endpoint for TLS server-name
@@ -237,7 +252,9 @@ mod tests {
             }),
             ..Config::default()
         };
-        let probe = build_probe_tls(&config, "https://127.0.0.1:4317").expect("probe TLS");
+        let probe = build_probe_tls(&config, "https://127.0.0.1:4317")
+            .expect("probe TLS reads")
+            .expect("TLS is configured");
         let ca = std::fs::read(dir.path().join("ca.pem")).expect("read ca.pem");
         let leaf = std::fs::read(dir.path().join("server.pem")).expect("read server.pem");
         assert_eq!(probe.ca_pem, ca, "must trust the issuing CA");
@@ -271,8 +288,9 @@ mod tests {
             }),
             ..Config::default()
         };
-        let probe =
-            build_probe_tls(&config, "https://localhost:24419").expect("probe TLS with identity");
+        let probe = build_probe_tls(&config, "https://localhost:24419")
+            .expect("probe TLS reads")
+            .expect("TLS is configured");
         assert_eq!(probe.domain_name, "localhost");
         assert!(probe.identity.is_some(), "mTLS must present an identity");
     }

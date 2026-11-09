@@ -21,7 +21,7 @@ use std::time::Duration;
 use otel_sqlite_core::storage::SyncMode;
 use otel_sqlite_e2e::crash::{CrashServerConfig, LoadParams, run_load, write_server_config};
 use otel_sqlite_e2e::generator::WorkloadSpec;
-use otel_sqlite_storage::backup;
+use otel_sqlite_storage::{backup, latest_schema_version};
 
 /// The binary under test: `OTEL_SQLITE_BIN` (backup tests), then the
 /// `OTEL_SQLITE_CRASH_BIN` override (shared with the crash suite in CI),
@@ -261,7 +261,8 @@ async fn backup_restore_round_trip_against_the_external_binary() {
         "restore must contain exactly the snapshot rows"
     );
     assert_eq!(
-        restore_report["verified_after"]["schema_version"], "006",
+        restore_report["verified_after"]["schema_version"],
+        latest_schema_version(),
         "restored database must carry the current schema"
     );
 
@@ -295,7 +296,10 @@ async fn backup_restore_round_trip_against_the_external_binary() {
         restored_rows + outcome_b.counters.records_accepted as i64,
         "rows written after restore must add to the restored base"
     );
-    assert_eq!(after_restart.schema_version.as_deref(), Some("006"));
+    assert_eq!(
+        after_restart.schema_version.as_deref(),
+        Some(latest_schema_version())
+    );
 
     let _ = kill_process(&mut server2);
 }
@@ -385,7 +389,10 @@ async fn encrypted_backup_restore_against_the_external_binary() {
         snapshot_rows
     );
     assert_eq!(restore_report["verified_after"]["integrity"], "ok");
-    assert_eq!(restore_report["verified_after"]["schema_version"], "006");
+    assert_eq!(
+        restore_report["verified_after"]["schema_version"],
+        latest_schema_version()
+    );
 }
 
 /// `verify` must exit non-zero on a corrupted database — the exit code is the
@@ -408,7 +415,7 @@ fn verify_subcommand_exits_nonzero_on_corruption() {
     let valid = dir2.path().join("otel-logs.db");
     {
         let mut conn = rusqlite::Connection::open(&valid).expect("open db");
-        otel_sqlite_storage::migrate_up_to(&mut conn, "003").expect("migrate to current schema");
+        otel_sqlite_storage::migrate_up_to(&mut conn, "003").expect("build an older schema");
     }
     let truncated = dir.path().join("truncated.db");
     let bytes = std::fs::read(&valid).expect("read valid db");

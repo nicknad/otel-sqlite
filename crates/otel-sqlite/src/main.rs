@@ -16,25 +16,22 @@ use tokio::sync::watch;
 use config::Config;
 use otel_sqlite_runtime::{HealthSampleSource, MaintenanceWorker, Watchdog};
 
-/// Adapts the storage health probe to the watchdog's evidence contract.
+/// Adapts the storage health probe to both runtime evidence contracts: the
+/// watchdog's [`HealthSampleSource`] and the gRPC [`ServingCheck`].
 ///
-/// The watchdog stays decoupled from the storage crate; this adapter is the
-/// only place that knows both sides. Storage already produces the shared
-/// [`PipelineSample`] from lock-free atomic loads, so the watchdog can sample
-/// even while the pipeline is wedged.
-struct StorageHealthSource(StorageHealth);
+/// The runtime and ingress crates stay decoupled from storage; this adapter
+/// is the only place that knows both sides. Storage already produces the
+/// shared [`PipelineSample`] from lock-free atomic loads, so both consumers
+/// can sample even while the pipeline is wedged.
+struct StoragePipelineHealth(StorageHealth);
 
-impl HealthSampleSource for StorageHealthSource {
+impl HealthSampleSource for StoragePipelineHealth {
     fn sample(&self) -> PipelineSample {
         self.0.sample()
     }
 }
 
-/// Answers gRPC health from live pipeline evidence: serving only while both
-/// pipeline threads run.
-struct StorageServingCheck(StorageHealth);
-
-impl ServingCheck for StorageServingCheck {
+impl ServingCheck for StoragePipelineHealth {
     fn is_serving(&self) -> bool {
         let sample = self.0.sample();
         sample.writer_running && sample.batcher_running
@@ -187,21 +184,23 @@ async fn main() -> Result<()> {
 
     // The maintenance worker is another producer of the same command queue;
     // the single SQLite writer keeps executing everything.
-    let maintenance =
-        MaintenanceWorker::new(storage.producer(), config.maintenance.clone()).spawn();
+    let maintenance = MaintenanceWorker::new(storage.producer(), config.maintenance.clone())
+        .spawn()
+        .context("failed to start the maintenance worker")?;
 
     // The watchdog observes pipeline evidence and may halt ingestion on an
     // unhealthy verdict; graceful drain and joins stay in main's hands.
+    let health = storage.health();
     let (halt_tx, halt_rx) = watch::channel(false);
     let watchdog = Watchdog::new(
-        StorageHealthSource(storage.health()),
+        StoragePipelineHealth(health.clone()),
         config.watchdog.clone(),
         halt_tx,
     )
     .context("invalid watchdog configuration")?
-    .spawn();
+    .spawn()
+    .context("failed to start the watchdog")?;
 
-    println!("otel-sqlite starting with config: {config:?}");
     println!(
         "ingress listening on {} (sqlite: {})",
         ingress_config.listen_address,
@@ -213,7 +212,7 @@ async fn main() -> Result<()> {
         queue,
         halt_rx,
         commit_ledger,
-        std::sync::Arc::new(StorageServingCheck(storage.health())),
+        std::sync::Arc::new(StoragePipelineHealth(health)),
     )
     .await;
 

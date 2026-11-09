@@ -10,7 +10,7 @@ use otel_sqlite_ingress::{
     MAX_ATTRIBUTE_KEY_BYTES, MAX_ATTRIBUTE_VALUE_BYTES, MAX_ATTRIBUTES_PER_RECORD, MAX_BODY_BYTES,
     MAX_MAPPING_CONCURRENCY, TlsConfig,
 };
-use otel_sqlite_runtime::WatchdogConfig;
+use otel_sqlite_runtime::{MaintenanceConfig, PurgeSchedule, WatchdogConfig};
 
 use super::*;
 
@@ -214,15 +214,15 @@ fn nested_sections_merge_field_wise() {
 
     assert_eq!(config.maintenance.checkpoint_mode, CheckpointMode::Truncate);
     assert_eq!(
-        config.maintenance.retention,
-        Some(Duration::from_secs(7 * 24 * 3_600))
+        config.maintenance.purge,
+        Some(PurgeSchedule {
+            retention: Duration::from_secs(7 * 24 * 3_600),
+            // Retention with no explicit cadence uses the documented default.
+            interval: Duration::from_secs(15 * 60),
+        })
     );
     assert_eq!(config.maintenance.vacuum_interval, None);
     // Untouched siblings keep their defaults.
-    assert_eq!(
-        config.maintenance.purge_interval,
-        Some(Duration::from_secs(15 * 60))
-    );
     assert_eq!(
         config.maintenance.checkpoint_interval,
         Some(Duration::from_secs(5 * 60))
@@ -239,7 +239,10 @@ fn retention_accepts_uniform_and_table_forms() {
     file_config("[maintenance]\nretention = 60")
         .apply_to(&mut config)
         .expect("applies");
-    assert_eq!(config.maintenance.retention, Some(Duration::from_secs(60)));
+    assert_eq!(
+        config.maintenance.purge.map(|purge| purge.retention),
+        Some(Duration::from_secs(60))
+    );
 
     // Table form with the explicit `logs` key.
     let mut config = Config::default();
@@ -247,7 +250,7 @@ fn retention_accepts_uniform_and_table_forms() {
         .apply_to(&mut config)
         .expect("applies");
     assert_eq!(
-        config.maintenance.retention,
+        config.maintenance.purge.map(|purge| purge.retention),
         Some(Duration::from_secs(7 * 86_400))
     );
 
@@ -256,7 +259,7 @@ fn retention_accepts_uniform_and_table_forms() {
     file_config("[maintenance]\nretention = \"off\"")
         .apply_to(&mut config)
         .expect("applies");
-    assert_eq!(config.maintenance.retention, None);
+    assert_eq!(config.maintenance.purge, None);
 
     // Inline-table form is equivalent to the section form.
     let mut config = Config::default();
@@ -264,7 +267,7 @@ fn retention_accepts_uniform_and_table_forms() {
         .apply_to(&mut config)
         .expect("applies");
     assert_eq!(
-        config.maintenance.retention,
+        config.maintenance.purge.map(|purge| purge.retention),
         Some(Duration::from_secs(86_400))
     );
 
@@ -281,6 +284,61 @@ fn retention_accepts_uniform_and_table_forms() {
             .contains("OTLP metrics signal was removed"),
         "error must explain the removal: {error}"
     );
+}
+
+#[test]
+fn purge_schedule_semantics() {
+    // Retention absent => purging is off, even if a cadence is configured.
+    let mut config = Config::default();
+    file_config("").apply_to(&mut config).expect("applies");
+    assert_eq!(config.maintenance.purge, None);
+    file_config("[maintenance]\npurge_interval = \"1h\"")
+        .apply_to(&mut config)
+        .expect("applies");
+    assert_eq!(
+        config.maintenance.purge, None,
+        "a cadence without retention cannot purge"
+    );
+
+    // Retention enabled + cadence absent => documented 15 min default.
+    let mut config = Config::default();
+    file_config("[maintenance]\nretention = \"7d\"")
+        .apply_to(&mut config)
+        .expect("applies");
+    assert_eq!(
+        config.maintenance.purge,
+        Some(PurgeSchedule {
+            retention: Duration::from_secs(7 * 86_400),
+            interval: Duration::from_secs(15 * 60),
+        })
+    );
+
+    // Retention enabled + explicit cadence => that cadence.
+    let mut config = Config::default();
+    file_config("[maintenance]\nretention = \"7d\"\npurge_interval = \"1h\"")
+        .apply_to(&mut config)
+        .expect("applies");
+    assert_eq!(
+        config.maintenance.purge,
+        Some(PurgeSchedule {
+            retention: Duration::from_secs(7 * 86_400),
+            interval: Duration::from_secs(3_600),
+        })
+    );
+
+    // Retention enabled + explicit opt-out => purging off.
+    let mut config = Config::default();
+    file_config("[maintenance]\nretention = \"7d\"\npurge_interval = \"off\"")
+        .apply_to(&mut config)
+        .expect("applies");
+    assert_eq!(config.maintenance.purge, None);
+
+    // Retention off + explicit cadence => purging off.
+    let mut config = Config::default();
+    file_config("[maintenance]\nretention = \"off\"\npurge_interval = \"1h\"")
+        .apply_to(&mut config)
+        .expect("applies");
+    assert_eq!(config.maintenance.purge, None);
 }
 
 #[test]
@@ -472,7 +530,7 @@ fn validation_rejects_unsafe_or_out_of_range_values() {
     macro_rules! assert_invalid {
         ($key:literal, $config:expr) => {
             let error = $config.validate().expect_err("invalid config must fail");
-            assert!(error.to_string().contains($key), "{}: {error}", $key);
+            assert!(format!("{error:#}").contains($key), "{}: {error:#}", $key);
         };
     }
     assert_invalid!(
@@ -580,6 +638,32 @@ fn validation_rejects_unsafe_or_out_of_range_values() {
             ..Config::default()
         }
     );
+    assert_invalid!(
+        "maintenance.purge.interval",
+        Config {
+            maintenance: MaintenanceConfig {
+                purge: Some(PurgeSchedule {
+                    retention: Duration::from_secs(60),
+                    interval: Duration::ZERO,
+                }),
+                ..MaintenanceConfig::default()
+            },
+            ..Config::default()
+        }
+    );
+    assert_invalid!(
+        "maintenance.purge.retention",
+        Config {
+            maintenance: MaintenanceConfig {
+                purge: Some(PurgeSchedule {
+                    retention: MAX_RETENTION + Duration::from_secs(1),
+                    interval: Duration::from_secs(60),
+                }),
+                ..MaintenanceConfig::default()
+            },
+            ..Config::default()
+        }
+    );
 
     assert_invalid!(
         "allow_remote_metrics",
@@ -628,8 +712,8 @@ fn validation_rejects_a_batch_age_that_outlives_the_watchdog_threshold() {
         .validate()
         .expect_err("a batch age above degraded_after must fail");
     assert!(
-        error.to_string().contains("batcher_max_batch_age"),
-        "{error}"
+        format!("{error:#}").contains("expected batch age"),
+        "{error:#}"
     );
 
     // Raising the threshold above the batch age makes the same config valid.
@@ -849,7 +933,7 @@ fn from_file_overrides_defaults_and_keeps_rest() {
     assert_eq!(config.sqlite_path, PathBuf::from("/tmp/otel.db"));
     assert_eq!(config.shutdown_timeout, Duration::from_secs(45));
     assert_eq!(
-        config.maintenance.retention,
+        config.maintenance.purge.map(|purge| purge.retention),
         Some(Duration::from_secs(7 * 86_400))
     );
     assert_eq!(config.ingest_queue_capacity, 50_000);
