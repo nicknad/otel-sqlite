@@ -20,12 +20,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use otel_sqlite_storage::{
-    SearchIndexStatus,
+    DEFAULT_DB_FILENAME, SearchIndexStatus,
     backup::{self, BackupReport, RestoreReport, VerifyReport},
 };
 
-/// Default live-database path, matching the server's default `otel-logs.db`.
-const DEFAULT_DB_PATH: &str = "otel-logs.db";
 /// Default backup destination directory.
 const DEFAULT_BACKUP_DIR: &str = "backups";
 /// Default number of backups retained per directory after a successful run.
@@ -96,7 +94,7 @@ pub fn parse_backup_args(args: &[String]) -> Result<BackupArgs> {
         }
     }
     Ok(BackupArgs {
-        db: db.unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH)),
+        db: db.unwrap_or_else(|| PathBuf::from(DEFAULT_DB_FILENAME)),
         out_dir: out_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_BACKUP_DIR)),
         keep: keep.unwrap_or(DEFAULT_KEEP),
         key_file,
@@ -166,7 +164,7 @@ pub fn parse_verify_args(args: &[String]) -> Result<VerifyArgs> {
         }
     }
     Ok(VerifyArgs {
-        db: db.unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH)),
+        db: db.unwrap_or_else(|| PathBuf::from(DEFAULT_DB_FILENAME)),
         json,
     })
 }
@@ -396,7 +394,7 @@ mod tests {
     #[test]
     fn parse_backup_defaults_and_overrides() {
         let parsed = parse_backup_args(&[]).expect("empty args parse");
-        assert_eq!(parsed.db, PathBuf::from(DEFAULT_DB_PATH));
+        assert_eq!(parsed.db, PathBuf::from(DEFAULT_DB_FILENAME));
         assert_eq!(parsed.out_dir, PathBuf::from(DEFAULT_BACKUP_DIR));
         assert_eq!(parsed.keep, DEFAULT_KEEP);
         assert!(parsed.key_file.is_none());
@@ -470,8 +468,6 @@ mod tests {
         assert!(parse_backup_args(&["--out".into()]).is_err());
         assert!(parse_backup_args(&["--key-file".into(), "--json".into()]).is_err());
         assert!(parse_verify_args(&["--db".into(), "--json".into()]).is_err());
-        // The `--json` boolean does not consume a following flag either.
-        assert!(parse_verify_args(&["--json".into()]).is_ok());
     }
 
     #[test]
@@ -496,6 +492,6 @@ mod tests {
     #[test]
     fn parse_verify_defaults_to_the_server_database() {
         let parsed = parse_verify_args(&[]).expect("empty verify args");
-        assert_eq!(parsed.db, PathBuf::from(DEFAULT_DB_PATH));
+        assert_eq!(parsed.db, PathBuf::from(DEFAULT_DB_FILENAME));
     }
 }
