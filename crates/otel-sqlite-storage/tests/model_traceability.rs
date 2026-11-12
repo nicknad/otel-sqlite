@@ -315,9 +315,11 @@ fn stored_columns() -> BTreeSet<String> {
 }
 
 fn columns_of(conn: &Connection, table: &str) -> Vec<String> {
-    conn.prepare(&format!("PRAGMA table_info(\"{table}\")"))
+    // The table-valued pragma takes the name as a bound parameter, so no SQL
+    // text is built from it.
+    conn.prepare("SELECT name FROM pragma_table_info(?1)")
         .expect("prepare table_info")
-        .query_map([], |row| row.get::<_, String>(1))
+        .query_map([table], |row| row.get::<_, String>(0))
         .expect("read table_info")
         .map(|row| row.expect("column row"))
         .collect()
