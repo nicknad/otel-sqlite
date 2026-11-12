@@ -30,6 +30,14 @@ Suppress semgrep inline only with `// nosemgrep: <rule-id>` + reason
 Toolchain: rustup/Cargo, lefthook, `uv`-installed semgrep, cargo-deny,
 cargo-audit ≥0.22.2, Docker Compose (container + constrained perf tests).
 
+## Vocabulary
+
+[GLOSSARY.md](GLOSSARY.md) is the canonical name for each domain concept, with
+the words to avoid. When a term is resolved or renamed, update it there in the
+same PR. Prose, commit messages and config keys use the canonical term; a code
+identifier that disagrees with it is listed in
+[docs/models/README.md](docs/models/README.md), not silently renamed.
+
 ## Testing expectations
 
 Features need tests beyond "RPC returned OK" — verify contents, counters,

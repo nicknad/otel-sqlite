@@ -1,0 +1,42 @@
+%% HAND-WRITTEN (not generated). The path a log record takes through the
+%% application, with the module that owns each conversion. The seams are the
+%% interesting part: three codecs turn a proto message into a row.
+flowchart TD
+    client["OTLP client / SDK / Collector exporter"]
+
+    subgraph ingress_crate["otel-sqlite-ingress"]
+        grpc["grpc.rs + logs.rs<br/>LogsService.Export"]
+        validate["mapping/logs.rs::validate_request<br/>size + depth bounds"]
+        mapping["mapping/logs.rs + common.rs<br/>proto -> LogRecord, Resource, LogScope"]
+        grpc --> validate --> mapping
+    end
+
+    subgraph core_crate["otel-sqlite-core"]
+        model["model/log.rs<br/>LogRecord, LogScope<br/>model/resource.rs, attribute.rs, severity.rs"]
+    end
+
+    subgraph storage_crate["otel-sqlite-storage"]
+        ingest_q[("bounded ingest queue<br/>all-or-nothing admission")]
+        batcher["batcher.rs<br/>insert batcher"]
+        cmd_q[("bounded command queue<br/>single consumer")]
+        writer["writer.rs<br/>the only SQLite connection"]
+        identity["command/identity.rs<br/>Resource -> log_resource upsert"]
+        insert["command/logs.rs<br/>LogRecord -> log_event insert"]
+        ingest_q --> batcher --> cmd_q --> writer
+        writer --> identity
+        writer --> insert
+    end
+
+    runtime["otel-sqlite-runtime<br/>scheduler.rs / worker.rs<br/>retention, checkpoint, ANALYZE, VACUUM"]
+
+    client -->|"OTLP/gRPC"| grpc
+    mapping -->|"LogChunk: BatchOrigin + records"| ingest_q
+    mapping -.->|"constructs"| model
+    insert -.->|"reads"| model
+    runtime -->|"ordinary write commands"| cmd_q
+
+    identity --> resource_tbl[("log_resource")]
+    insert --> event_tbl[("log_event")]
+    insert -.->|"AFTER INSERT trigger"| fts_tbl[("logs_fts (FTS5)")]
+    event_tbl --> view_tbl[("logs view")]
+    resource_tbl --> view_tbl

@@ -1,0 +1,79 @@
+%% HAND-WRITTEN (not generated). The wire model: how an OTLP logs export nests.
+%% Source of truth: crates/otel-sqlite-ingress/proto/opentelemetry/proto/**.
+%% Field-level fidelity per message is in fidelity-matrix.md; this diagram only
+%% shows containment and repetition, which is what explains the row shapes.
+classDiagram
+    class ExportLogsServiceRequest {
+        +ResourceLogs[] resource_logs
+    }
+    class ResourceLogs {
+        +Resource resource
+        +ScopeLogs[] scope_logs
+        +string schema_url
+    }
+    class ScopeLogs {
+        +InstrumentationScope scope
+        +LogRecord[] log_records
+        +string schema_url
+    }
+    class Resource {
+        +KeyValue[] attributes
+        +uint32 dropped_attributes_count
+        +EntityRef[] entity_refs
+    }
+    class InstrumentationScope {
+        +string name
+        +string version
+        +KeyValue[] attributes
+        +uint32 dropped_attributes_count
+    }
+    class LogRecord {
+        +fixed64 time_unix_nano
+        +fixed64 observed_time_unix_nano
+        +SeverityNumber severity_number
+        +string severity_text
+        +AnyValue body
+        +KeyValue[] attributes
+        +uint32 dropped_attributes_count
+        +fixed32 flags
+        +bytes trace_id
+        +bytes span_id
+        +string event_name
+    }
+    class KeyValue {
+        +string key
+        +AnyValue value
+        +int32 key_strindex
+    }
+    class AnyValue {
+        <<union>>
+        +string string_value
+        +bool bool_value
+        +int64 int_value
+        +double double_value
+        +ArrayValue array_value
+        +KeyValueList kvlist_value
+        +bytes bytes_value
+        +int32 string_value_strindex
+    }
+    class ArrayValue {
+        +AnyValue[] values
+    }
+    class KeyValueList {
+        +KeyValue[] values
+    }
+
+    ExportLogsServiceRequest --> ResourceLogs : resource_logs
+    ResourceLogs --> Resource : resource
+    ResourceLogs --> ScopeLogs : scope_logs
+    ScopeLogs --> InstrumentationScope : scope
+    ScopeLogs --> LogRecord : log_records
+    Resource --> KeyValue : attributes
+    InstrumentationScope --> KeyValue : attributes
+    LogRecord --> KeyValue : attributes
+    LogRecord --> AnyValue : body
+    KeyValue --> AnyValue : value
+    AnyValue --> ArrayValue : array_value
+    AnyValue --> KeyValueList : kvlist_value
+    ArrayValue --> AnyValue : values
+    KeyValueList --> KeyValue : values

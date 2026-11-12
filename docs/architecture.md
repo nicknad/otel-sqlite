@@ -49,7 +49,7 @@ Preserved by all future work:
 - SQLite errors classify into retryable, poisonous, and fatal; poisoned
   rows quarantine while healthy rows commit, and the affected request is
   reported as a partial success, never a plain 2xx.
-- Retention covers log events, transactional orphan-resource collection,
+- Retention covers log records, transactional orphan-resource collection,
   and incremental FTS maintenance.
 - TLS/mTLS, bearer-token auth, gRPC health, Prometheus metrics, startup
   storage readiness, Docker volume placement, and in-binary healthcheck exist.

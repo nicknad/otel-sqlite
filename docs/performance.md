@@ -125,7 +125,7 @@ Reproduce: check out `git_revision` from JSON, same rustc, same
 | `core` | `batching` | `InsertBatcher` push/merge/split; `WriteCommand` |
 | `ingress` | `conversion` | `ResourceLogs` → model (size/attr scaling) |
 | `ingress` | `queue` | bounded channel round trips; concurrent enqueue |
-| `storage` | `inserts` | txn-size sweep, ingest path, prune/checkpoint/vacuum |
+| `storage` | `inserts` | txn-size sweep, ingest path, purge/checkpoint/vacuum |
 | `e2e` | `pipeline` | handler → batcher → writer → commit (no gRPC) |
 
 ```bash
@@ -155,9 +155,9 @@ median       46.9µs  98.6µs  701µs   5.55ms  27.9ms  (~45µs fixed + ~5.7µs/
    keeps full throughput with half the memory/backlog vs 1 000.
 2. Plumbing adds <2% at production sizes (`ingest_path` +90 µs vs 1k batch)
    — optimize per-row cost (INSERT + JSON + index/FTS), not channels.
-3. Prune ≈ insert cost (~10 µs/row); VACUUM stalls the single writer —
+3. Purge ≈ insert cost (~10 µs/row); VACUUM stalls the single writer —
    keep it on its slow schedule. Maintenance @10k rows: analyze 9 ms,
-   checkpoint 27 ms, prune/vacuum ~98 ms.
+   checkpoint 27 ms, purge/vacuum ~98 ms.
 
 ## 6. Known performance bottlenecks (open)
 

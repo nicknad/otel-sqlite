@@ -36,7 +36,7 @@ Binary is compatible when its `MIGRATIONS` contains every stamped version
 
 | Version | Contents |
 |---|---|
-| `000` | Legacy baseline (frozen, `migrations/upgrades/`): resources, log events, FTS, scope/metric tables, views |
+| `000` | Legacy baseline (frozen, `migrations/upgrades/`): resources, log records, FTS, scope/metric tables, views |
 | `001` | FTS rebuild as contentless FTS5 (`contentless_delete=1`) + triggers + backfill (**breaking** FTS shape) |
 | `003` | New log/scope columns (`scope_attributes_json`, `scope_schema_url`, …) with defaults; views gain columns (old `SELECT`s keep working) |
 | `005` | **Drops OTLP metrics signal** (views `metrics`/`metric_buckets`, tables `scope`/`metric`/`metric_series`/`metric_data_point). **Destructive, irreversible.** Logs, `logs` view, FTS untouched. |

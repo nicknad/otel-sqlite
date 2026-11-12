@@ -10,6 +10,9 @@ insert batcher → bounded command queue → single SQLite writer (WAL)`.
   (`cargo run --release -p otel-sqlite-e2e -- --scenario baseline`)
 - Architecture & invariants: [docs/architecture.md](docs/architecture.md)
 - Statecharts: [docs/statecharts/](docs/statecharts/)
+- Data models (wire → domain → schema, plus mapping fidelity):
+  [docs/models/](docs/models/)
+- Vocabulary: [GLOSSARY.md](GLOSSARY.md)
 - Local CI (run `.github/workflows/ci.yml` with `act`):
   [tools/local-ci/](tools/local-ci/)
 
@@ -81,8 +84,8 @@ daily, `VACUUM` daily; retention off unless configured:
 retention = "7d"            # or [maintenance.retention] logs = "7d"
 ```
 
-Purge deletes expired events plus orphaned resources, so nothing grows
-unbounded. The search index is trigger-maintained, so pruned events leave no
+Purge deletes expired log records plus orphaned resources, so nothing grows
+unbounded. The search index is trigger-maintained, so purged records leave no
 stale hits. It is body-only by default (`[search] mode = "body"`); `full`
 keeps the legacy six-column index and `off` removes trigger maintenance
 entirely. `rebuild_fts_interval` (off by default) restarts the bounded

@@ -1,0 +1,90 @@
+%% GENERATED FILE - do not edit by hand. Pure Mermaid: render with any
+%% Mermaid viewer or a `mermaid` fenced block.
+%% Source: pub struct / pub enum declarations in crates/otel-sqlite-core/src/model/*.rs.
+%% Module owning every type: `otel_sqlite_core::model` (re-export); each class
+%% names its defining file in the comment above it.
+%% Regenerate: UPDATE_MODEL_DOCS=1 cargo test -p otel-sqlite-core --test domain_diagram
+%% Arrows are derived from field/variant types: `Vec<T>` means many.
+%% Enum variants render as `+payload Variant`; `Vec<u8>` is `Vec_u8` and
+%% `Arc<LogScope>` collapses to `LogScope` (shared, not copied per record).
+%% Self-references (`AttributeValue::Array(Vec<AttributeValue>)`) have no arrow.
+classDiagram
+    %% Attribute: struct in crates/otel-sqlite-core/src/model/attribute.rs
+    class Attribute {
+        +String key
+        +AttributeValue value
+    }
+    %% AttributeValue: enum in crates/otel-sqlite-core/src/model/attribute.rs
+    class AttributeValue {
+        +Null
+        +String String
+        +i64 Int
+        +f64 Double
+        +bool Bool
+        +Vec_u8 Bytes
+        +Vec_AttributeValue Array
+        +Vec_Attribute Kvlist
+    }
+    %% LogRecord: struct in crates/otel-sqlite-core/src/model/log.rs
+    class LogRecord {
+        +i64 time_unix_nano
+        +i64 observed_time_unix_nano
+        +Severity severity_number
+        +String severity_text
+        +u8_16 trace_id
+        +u8_8 span_id
+        +String body
+        +Option_String body_json
+        +Vec_Attribute attributes
+        +u32 dropped_attributes_count
+        +u32 flags
+        +String event_name
+        +LogScope scope
+    }
+    %% LogScope: struct in crates/otel-sqlite-core/src/model/log.rs
+    class LogScope {
+        +String name
+        +String version
+        +String schema_url
+        +String attributes_json
+    }
+    %% Resource: struct in crates/otel-sqlite-core/src/model/resource.rs
+    class Resource {
+        +String id
+        +Vec_Attribute attributes
+        +String schema_url
+    }
+    %% Severity: enum in crates/otel-sqlite-core/src/model/severity.rs
+    class Severity {
+        +Unspecified
+        +Trace
+        +Trace2
+        +Trace3
+        +Trace4
+        +Debug
+        +Debug2
+        +Debug3
+        +Debug4
+        +Info
+        +Info2
+        +Info3
+        +Info4
+        +Warn
+        +Warn2
+        +Warn3
+        +Warn4
+        +Error
+        +Error2
+        +Error3
+        +Error4
+        +Fatal
+        +Fatal2
+        +Fatal3
+        +Fatal4
+    }
+    Attribute --> AttributeValue : value (one)
+    AttributeValue --> Attribute : Kvlist (many)
+    LogRecord --> Attribute : attributes (many)
+    LogRecord --> LogScope : scope (one)
+    LogRecord --> Severity : severity_number (one)
+    Resource --> Attribute : attributes (many)

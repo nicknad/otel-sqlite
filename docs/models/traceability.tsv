@@ -1,0 +1,69 @@
+# Traceability of the OTLP logs wire model (vendored protobufs) into the
+# in-memory domain model and the SQLite columns it lands in.
+#
+# Machine-checked by crates/otel-sqlite-storage/tests/model_traceability.rs:
+#  * every field of the messages below is classified by at least one row,
+#  * every row names a field that exists in the vendored protos,
+#  * every stored column of the migrated schema is produced by some row,
+#  * every `loss_counter` value exists in the ingress sources and every counter
+#    reason emitted by the ingress appears here.
+#
+# One proto field may fan out to several rows when persistence denormalizes it
+# (a scope's name, version and attributes all land on every log_event row).
+#
+# classification vocabulary:
+#   mapped     same value reaches storage (renamed or not)
+#   re-encoded same information, different representation (JSON, BLOB, text)
+#   coerced    normalized per spec, losing the original form
+#   dropped    intentionally discarded, no column and no counter
+#   structural grouping wrapper with no stored counterpart of its own
+#   derived    computed by the sink; may still be derived from a proto field
+#
+# Column   = the stored column the value reaches (fidelity-matrix.md lists them).
+proto_message	proto_field	domain_type	domain_field	column	classification	loss_counter	note
+opentelemetry.proto.logs.v1.LogRecord	time_unix_nano	LogRecord	time_unix_nano	log_event.timestamp_ns	mapped	timestamp_overflow	unset 0 is replaced by the observed timestamp per the proto's recommended fallback; values above i64::MAX saturate instead of wrapping negative
+opentelemetry.proto.logs.v1.LogRecord	observed_time_unix_nano	LogRecord	observed_time_unix_nano	log_event.observed_timestamp_ns	mapped	timestamp_overflow	same saturation rule as time_unix_nano
+opentelemetry.proto.logs.v1.LogRecord	severity_number	LogRecord	severity_number	log_event.severity_number	coerced	unknown_severity	stored as the OTLP numeric value 0..=24; anything outside that range becomes UNSPECIFIED (0)
+opentelemetry.proto.logs.v1.LogRecord	severity_text	LogRecord	severity_text	log_event.severity_text	mapped		kept verbatim; empty string is stored as NULL
+opentelemetry.proto.logs.v1.LogRecord	body	LogRecord	body	log_event.body	re-encoded		scalar bodies render as text (bytes as lossy UTF-8, int/double/bool as their decimal form); structured bodies persist canonical JSON through LogRecord::body_json into the same column
+opentelemetry.proto.logs.v1.LogRecord	attributes	LogRecord	attributes	log_event.attributes_json	re-encoded		canonical JSON object: keys sorted ascending, duplicate keys collapse to the last value, bytes hex-encoded
+opentelemetry.proto.logs.v1.LogRecord	dropped_attributes_count	LogRecord	dropped_attributes_count	log_event.dropped_attributes_count	mapped		kept verbatim; counts names dropped by the producer, not by this sink
+opentelemetry.proto.logs.v1.LogRecord	flags	LogRecord	flags	log_event.flags	mapped		stored as the full 32-bit bit-field; readers must mask LOG_RECORD_FLAGS_TRACE_FLAGS_MASK before reading trace flags
+opentelemetry.proto.logs.v1.LogRecord	trace_id	LogRecord	trace_id	log_event.trace_id	re-encoded	invalid_trace_id	16 bytes to BLOB; absent stores NULL; present but wrong length or all zeroes stores NULL and counts
+opentelemetry.proto.logs.v1.LogRecord	span_id	LogRecord	span_id	log_event.span_id	re-encoded	invalid_span_id	8 bytes to BLOB; absent stores NULL; present but wrong length or all zeroes stores NULL and counts
+opentelemetry.proto.logs.v1.LogRecord	event_name	LogRecord	event_name	log_event.event_name	mapped		identifies the record as an Event when set, per the proto comment; empty string stored as NULL
+opentelemetry.proto.logs.v1.ScopeLogs	scope	LogScope	name	log_event.scope_name	mapped		scope is denormalized onto every log_event row instead of a scope dimension table
+opentelemetry.proto.logs.v1.ScopeLogs	scope	LogScope	version	log_event.scope_version	mapped		empty version stored as NULL
+opentelemetry.proto.logs.v1.ScopeLogs	scope	LogScope	attributes_json	log_event.scope_attributes_json	re-encoded		canonical JSON rendered once per ScopeLogs group and shared by every record through Arc<LogScope>
+opentelemetry.proto.logs.v1.ScopeLogs	log_records	LogRecord			structural		the record vector itself; each element becomes one log_event row
+opentelemetry.proto.logs.v1.ScopeLogs	schema_url	LogScope	schema_url	log_event.scope_schema_url	mapped		per-scope schema URL; never merged with the resource schema URL
+opentelemetry.proto.logs.v1.ResourceLogs	resource	Resource		log_resource.id	structural		resource group; persisted once per distinct derived id
+opentelemetry.proto.logs.v1.ResourceLogs	scope_logs	LogScope			structural		the scope group vector; one shared LogScope per element
+opentelemetry.proto.logs.v1.ResourceLogs	schema_url	Resource	schema_url	log_resource.schema_url	mapped		resource-level schema URL; empty stored as NULL
+opentelemetry.proto.resource.v1.Resource	attributes	Resource	attributes	log_resource.attributes_json	re-encoded		canonical JSON using the same encoding rules as every other attribute column
+opentelemetry.proto.resource.v1.Resource	attributes	Resource	service_name	log_resource.service_name	derived		extracted from the service.name attribute; last duplicate wins; empty string when absent
+opentelemetry.proto.resource.v1.Resource	attributes	Resource	host_name	log_resource.host_name	derived		extracted from the host.name attribute; NULL when absent or not a string
+opentelemetry.proto.resource.v1.Resource	dropped_attributes_count				dropped		no column and no counter: only the log record's own dropped count is persisted
+opentelemetry.proto.resource.v1.Resource	entity_refs				dropped		Development-status entity references; not stored
+opentelemetry.proto.common.v1.InstrumentationScope	name	LogScope	name	log_event.scope_name	mapped		empty scope name stored as NULL
+opentelemetry.proto.common.v1.InstrumentationScope	version	LogScope	version	log_event.scope_version	mapped		empty scope version stored as NULL
+opentelemetry.proto.common.v1.InstrumentationScope	attributes	LogScope	attributes_json	log_event.scope_attributes_json	re-encoded		scope attributes are never merged into the log record's attributes_json
+opentelemetry.proto.common.v1.InstrumentationScope	dropped_attributes_count				dropped		no column and no counter: scope-level drops are invisible to readers
+opentelemetry.proto.common.v1.KeyValue	key	Attribute	key	log_event.attributes_json	mapped		becomes a JSON object key; duplicates collapse to the last value
+opentelemetry.proto.common.v1.KeyValue	value	Attribute	value	log_event.attributes_json	re-encoded		rendered through AttributeValue's canonical encoding, so nested values use the same rules
+opentelemetry.proto.common.v1.KeyValue	key_strindex				dropped		Profiling-only dictionary reference: silently ignored by destructuring; unlike string_value_strindex this loss is not counted
+opentelemetry.proto.common.v1.AnyValue	string_value	AttributeValue	String	log_event.attributes_json	mapped		JSON string
+opentelemetry.proto.common.v1.AnyValue	bool_value	AttributeValue	Bool	log_event.attributes_json	mapped		JSON boolean
+opentelemetry.proto.common.v1.AnyValue	int_value	AttributeValue	Int	log_event.attributes_json	mapped		JSON number (int64 preserved exactly)
+opentelemetry.proto.common.v1.AnyValue	double_value	AttributeValue	Double	log_event.attributes_json	re-encoded		non-finite values (NaN, +Inf, -Inf) become JSON null instead of failing serialization
+opentelemetry.proto.common.v1.AnyValue	array_value	AttributeValue	Array	log_event.attributes_json	re-encoded		arrays stay arrays rather than being flattened to a string
+opentelemetry.proto.common.v1.AnyValue	kvlist_value	AttributeValue	Kvlist	log_event.attributes_json	re-encoded		keys sorted ascending with duplicate keys collapsed to the last value
+opentelemetry.proto.common.v1.AnyValue	bytes_value	AttributeValue	Bytes	log_event.attributes_json	re-encoded		hex-encoded inside JSON columns; lossy UTF-8 when the value is a log body
+opentelemetry.proto.common.v1.AnyValue	string_value_strindex			log_event.attributes_json	coerced	string_value_strindex	Profiling-only dictionary reference: the value becomes JSON null and the loss is counted, following the proto note to treat it as absent
+opentelemetry.proto.common.v1.ArrayValue	values	AttributeValue	Array	log_event.attributes_json	structural		wrapper that makes a repeated AnyValue legal where `oneof` cannot repeat
+opentelemetry.proto.common.v1.KeyValueList	values	AttributeValue	Kvlist	log_event.attributes_json	structural		wrapper that makes a repeated KeyValue legal where `oneof` cannot repeat
+opentelemetry.proto.collector.logs.v1.ExportLogsServiceRequest	resource_logs	ResourceLogs			structural		the RPC request body; one element per resource group, each becoming one chunk
+		Resource	id	log_resource.id	derived		SHA-256 over length-prefixed service_name, host_name, schema_url and canonical attributes JSON; insert is ON CONFLICT (id) DO NOTHING, so the first sighting wins
+		Resource	id	log_event.resource_id	derived		foreign key to the derived resource id; ON DELETE CASCADE
+		LogRecord	id	log_event.id	derived		INTEGER PRIMARY KEY, i.e. the rowid alias; the FTS index uses it as its rowid
+				log_resource.created_at	derived		first-insert timestamp only, because later upserts hit ON CONFLICT DO NOTHING

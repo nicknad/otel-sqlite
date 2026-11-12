@@ -1,0 +1,81 @@
+%% GENERATED FILE - do not edit by hand. Pure Mermaid: render with any
+%% Mermaid viewer or a `mermaid` fenced block.
+%% Source: the schema of a database migrated through 006 (see migrations/*.sql replay order).
+%% Regenerate: UPDATE_MODEL_DOCS=1 cargo test -p otel-sqlite-storage --test schema_diagram
+%% Signal scope: logs only; migration 005 dropped every metric table.
+%% `logs` is a view, `logs_fts` a contentless FTS5 index kept in sync by triggers;
+%% both are dashed because neither owns storage of its own.
+%% `schema_migrations` is the migration ledger, not log data.
+erDiagram
+    log_event ||..o{ logs : "read-side projection of log_event + log_resource"
+    log_event ||..o{ logs_fts : "rowid = log_event.id, maintained by AFTER INSERT/DELETE triggers"
+    log_resource ||--o{ log_event : "resource_id (on delete CASCADE)"
+    log_event {
+        INTEGER id PK
+        TEXT resource_id "not null"
+        INTEGER timestamp_ns "not null"
+        INTEGER observed_timestamp_ns "not null"
+        INTEGER severity_number "not null"
+        TEXT severity_text
+        BLOB trace_id
+        BLOB span_id
+        TEXT body
+        TEXT event_name
+        INTEGER flags "not null; default 0"
+        INTEGER dropped_attributes_count "not null; default 0"
+        TEXT scope_name
+        TEXT scope_version
+        TEXT attributes_json "not null; default '{}'"
+        TEXT scope_attributes_json "not null; default '{}'"
+        TEXT scope_schema_url
+    }
+    log_resource {
+        TEXT id PK
+        TEXT service_name "not null"
+        TEXT host_name
+        TEXT schema_url
+        TEXT attributes_json "not null; default '{}'"
+        TEXT created_at "not null; default CURRENT_TIMESTAMP"
+    }
+    logs {
+        INTEGER id
+        TEXT resource_id
+        INTEGER timestamp_ns
+        INTEGER observed_timestamp_ns
+        INTEGER severity_number
+        TEXT severity_text
+        BLOB trace_id
+        BLOB span_id
+        TEXT body
+        TEXT event_name
+        INTEGER flags
+        INTEGER dropped_attributes_count
+        TEXT scope_name
+        TEXT scope_version
+        TEXT scope_attributes_json
+        TEXT scope_schema_url
+        TEXT attributes_json
+        TEXT service_name
+        TEXT host_name
+        TEXT resource_schema_url
+    }
+    %% logs is a view
+    logs_fts {
+        ANY body
+    }
+    %% logs_fts is a virtual table
+    schema_migrations {
+        TEXT version PK
+        TEXT applied_at "not null; default CURRENT_TIMESTAMP"
+        TEXT description
+    }
+    search_index_state {
+        INTEGER id PK
+        TEXT mode "not null"
+        TEXT status "not null"
+        INTEGER last_rowid "not null; default 0"
+        INTEGER rebuild_until
+        TEXT updated_at "not null; default CURRENT_TIMESTAMP"
+    }
+    %% indexes: idx_log_event_resource_timestamp(log_event: resource_id, timestamp_ns); idx_log_event_timestamp(log_event: timestamp_ns); idx_log_event_trace_timestamp(log_event: timestamp_ns, trace_id); idx_log_resource_service(log_resource: service_name)
+    %% triggers: logs_fts_ad; logs_fts_ai
