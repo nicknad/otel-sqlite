@@ -183,7 +183,8 @@ pub fn open_immutable(db_path: &Path) -> Result<Connection, BackupError> {
 /// unreserved characters and `/` literal, which covers ordinary POSIX paths.
 fn encode_uri_path(path: &Path) -> String {
     #[cfg(windows)]
-    let path = std::borrow::Cow::Owned(path.to_string_lossy().replace('\\', "/"));
+    let path: std::borrow::Cow<'_, str> =
+        std::borrow::Cow::Owned(path.to_string_lossy().replace('\\', "/"));
     #[cfg(not(windows))]
     let path = path.to_string_lossy();
 
