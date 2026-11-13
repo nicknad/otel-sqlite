@@ -24,7 +24,7 @@ jobs:
       - name: Assemble self-test directory
         run: |
           mkdir -p /tmp/selftest
-          cp .semgrep-proposed.yml /tmp/selftest/rules.yml
+          cp .semgrep.yml /tmp/selftest/rules.yml
           cp -r semgrep-tests/. /tmp/selftest/
 
       - name: Rule fixtures (proposed pack)
