@@ -1,0 +1,23 @@
+name: semgrep-selftest
+
+# TEMPORARY: validates the fixtures in semgrep-tests/ against the proposed rule
+# pack. Not intended to be merged as-is.
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:1.176.0
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Rule fixtures (proposed pack)
+        working-directory: semgrep-tests
+        run: semgrep test --config ../.semgrep-proposed.yml .
