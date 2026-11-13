@@ -18,6 +18,15 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # `semgrep test` wants the rules at the root of the directory it is
+      # pointed at, so assemble one instead of keeping a second copy of the
+      # pack in the tree (a copy would silently drift).
+      - name: Assemble self-test directory
+        run: |
+          mkdir -p /tmp/selftest
+          cp .semgrep-proposed.yml /tmp/selftest/rules.yml
+          cp -r semgrep-tests/. /tmp/selftest/
+
       - name: Rule fixtures (proposed pack)
-        working-directory: semgrep-tests
-        run: semgrep test --config ../.semgrep-proposed.yml .
+        working-directory: /tmp/selftest
+        run: semgrep test .
