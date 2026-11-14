@@ -1,0 +1,18 @@
+# Cargo configuration shared by every checkout of this workspace.
+#
+# Dependency cooldowns (`min-publish-age`, stable in Rust 1.100): version
+# resolution skips any crate version published more recently than the window
+# below, so a malicious or broken release has days to be caught by scanners and
+# the community before `cargo update` selects it. Complements `cargo-deny` /
+# `cargo-audit`, which can only react to advisories.
+#
+# Scope and escape hatches:
+# * Resolution-only. `--locked` builds and the committed `Cargo.lock` are
+#   unaffected: the pin is chosen when a human runs `cargo update`, never
+#   silently mid-build.
+# * `cargo install` ignores it (pin with `cargo install foo@1.2.3`).
+# * Versions whose index entry has no `pubtime` are never held back.
+# * One-off override when a fix is needed immediately:
+#     CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update <crate>
+[registry]
+global-min-publish-age = "3 days"
