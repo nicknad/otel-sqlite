@@ -299,8 +299,7 @@ impl TempDirGuard {
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or_default()
+                    .map_or_default(|d| d.as_millis())
             );
             std::env::temp_dir().join(unique)
         };

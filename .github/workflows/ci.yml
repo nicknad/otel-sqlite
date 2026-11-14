@@ -2,9 +2,10 @@
 #
 # Runner requirements (GitHub-hosted `ubuntu-latest` covers all of these):
 # * The pure-Rust jobs (`lint-and-test`, `crash-recovery-release`,
-#   `e2e-benchmark`, `cargo-deny`, `cargo-audit`) run inside a `rust:1.98-slim-bookworm`
-#   container (matching the local dev toolchain; the workspace MSRV stays at
-#   `rust-version` 1.89.0 and the production Dockerfile still builds on 1.89).
+#   `e2e-benchmark`, `cargo-deny`, `cargo-audit`) run inside a `rust:1.100-slim-bookworm`
+#   container. That image is also the workspace MSRV (`rust-version` 1.100.0)
+#   and the production Dockerfile builder, so the declared floor is exercised
+#   by every release-gate run instead of being an untested claim.
 # * The Docker jobs (`fuzz-smoke`, `fuzz-nightly`, `crash-e2e-container`,
 #   `container-smoke`) run on the host runner, which provides a working Docker
 #   daemon and `docker compose`.
@@ -37,7 +38,7 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.98-slim-bookworm
+      image: rust:1.100-slim-bookworm
     steps:
       - name: Install git (slim image prerequisite for checkout)
         run: apt-get update -qq && apt-get install -y -qq git
@@ -76,7 +77,7 @@ jobs:
   crash-recovery-release:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.98-slim-bookworm
+      image: rust:1.100-slim-bookworm
     steps:
       - name: Install git (slim image prerequisite for checkout)
         run: apt-get update -qq && apt-get install -y -qq git
@@ -116,7 +117,7 @@ jobs:
   e2e-benchmark:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.98-slim-bookworm
+      image: rust:1.100-slim-bookworm
     steps:
       - name: Install git (slim image prerequisite for checkout)
         run: apt-get update -qq && apt-get install -y -qq git
@@ -156,7 +157,7 @@ jobs:
   cargo-deny:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.98-slim-bookworm
+      image: rust:1.100-slim-bookworm
     steps:
       - name: Install git (slim image prerequisite for checkout)
         run: apt-get update -qq && apt-get install -y -qq git
@@ -176,7 +177,7 @@ jobs:
   cargo-audit:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.98-slim-bookworm
+      image: rust:1.100-slim-bookworm
     steps:
       - name: Install git (slim image prerequisite for checkout)
         run: apt-get update -qq && apt-get install -y -qq git

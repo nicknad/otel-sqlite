@@ -6,7 +6,7 @@ pushing: format, clippy, tests, deny, audit, semgrep, optionally Docker jobs.
 
 Install: `winget install nektos.act` / `scoop install act`
 (Windows), `brew install act` (macOS/Linux), plus a running Docker daemon
-(first run pulls `catthehacker` + `rust:1.98-slim` images).
+(first run pulls `catthehacker` + `rust:1.100-slim` images).
 
 ```text
 .\tools\local-ci\run.ps1   # Windows

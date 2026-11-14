@@ -136,8 +136,7 @@ pub fn inspect_schema(conn: &Connection) -> Result<SchemaStatus, StorageError> {
 pub fn latest_schema_version() -> &'static str {
     MIGRATIONS
         .last()
-        .map(|migration| migration.version)
-        .unwrap_or_default()
+        .map_or_default(|migration| migration.version)
 }
 
 /// Message for a database stamped by a binary newer than this one.

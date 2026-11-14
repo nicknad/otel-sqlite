@@ -27,7 +27,7 @@
 
 services:
   build:
-    image: rust:1.89
+    image: rust:1.100
     working_dir: /work
     environment:
       CARGO_TARGET_DIR: /work/target-container
@@ -38,7 +38,7 @@ services:
     command: cargo bench --no-run -p otel-sqlite-core -p otel-sqlite-ingress -p otel-sqlite-storage -p otel-sqlite-e2e
 
   bench:
-    image: rust:1.89
+    image: rust:1.100
     working_dir: /work
     depends_on:
       build:
@@ -69,7 +69,7 @@ services:
   #     cargo bench -p otel-sqlite-storage --bench inserts -- \
   #     --noplot --warm-up-time 1 --measurement-time 3 --save-baseline cpu2
   bench2:
-    image: rust:1.89
+    image: rust:1.100
     working_dir: /work
     depends_on:
       build:
@@ -86,7 +86,7 @@ services:
     cpuset: "0,1"
 
   bench4:
-    image: rust:1.89
+    image: rust:1.100
     working_dir: /work
     depends_on:
       build:

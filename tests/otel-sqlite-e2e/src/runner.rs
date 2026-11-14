@@ -240,8 +240,7 @@ pub(crate) async fn run_load(request: LoadRequest) -> anyhow::Result<LoadRun> {
         let _ = handle.await;
     }
     let samples = Arc::into_inner(samples)
-        .map(|sink| sink.into_inner().expect("sample sink lock"))
-        .unwrap_or_default();
+        .map_or_default(|sink| sink.into_inner().expect("sample sink lock"));
 
     if let Some(error) = first_worker_error {
         return Err(error.context(format!("load against '{endpoint}' lost a producer")));

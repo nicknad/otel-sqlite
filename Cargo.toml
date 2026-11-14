@@ -10,7 +10,7 @@ version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "OTLP logs sink for SQLite with batched single-writer queues"
-rust-version = "1.89.0"
+rust-version = "1.100.0"
 
 [workspace.dependencies]
 aes-gcm = "0.11"
@@ -72,9 +72,14 @@ pedantic = { level = "warn", priority = -1 }
 # Internal API surface: `#[must_use]` suggestions on every getter are noise.
 must_use_candidate = "allow"
 return_self_not_must_use = "allow"
+# 1.100's `duration_suboptimal_units` rewrites readable duration arithmetic into
+# magic constants: `from_secs(10 * 365 * 24 * 60 * 60)` becomes
+# `from_hours(87_600)` and `from_secs(7 * 86_400)` becomes `from_hours(168)`.
+# The products state the intent ("ten years", "one week"); the numbers do not.
 # Doc style: backtick formatting and per-panic/error sections are aspirational,
 # not enforced; the codebase documents behaviour in prose instead.
 doc_markdown = "allow"
+duration_suboptimal_units = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 # This pipeline intentionally converts raw OTLP counters/timestamps between

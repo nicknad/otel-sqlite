@@ -121,16 +121,14 @@ fn convert_scope_records(scope: ScopeLogs) -> Result<Vec<LogRecord>, IngressErro
     if log_records.is_empty() {
         return Ok(Vec::new());
     }
-    let (scope_name, scope_version, scope_attributes) = scope
-        .map(
-            |InstrumentationScope {
-                 name,
-                 version,
-                 attributes,
-                 ..
-             }| (name, version, attributes),
-        )
-        .unwrap_or_default();
+    let (scope_name, scope_version, scope_attributes) = scope.map_or_default(
+        |InstrumentationScope {
+             name,
+             version,
+             attributes,
+             ..
+         }| (name, version, attributes),
+    );
     let scope_attributes = attributes(scope_attributes)?;
     // One shared scope per `ScopeLogs` group: every record references the
     // same allocation and reuses the canonical attributes JSON rendered here.

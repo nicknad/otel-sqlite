@@ -20,7 +20,7 @@
 # nightly features. Override at build time with `--build-arg TOOLCHAIN=...`.
 # ------------------------------------------------------------
 
-FROM rust:1.89-bookworm
+FROM rust:1.100-bookworm
 
 ARG TOOLCHAIN=nightly-2026-10-16
 # Pinned cargo-fuzz release (installed with --locked) so the image is

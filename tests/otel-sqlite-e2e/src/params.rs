@@ -67,7 +67,6 @@ pub(crate) fn sanitize(label: &str) -> String {
 pub(crate) fn fresh_run_id(label: &str, seed: u64) -> String {
     let unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
+        .map_or_default(|d| d.as_secs());
     format!("{}-{seed}-{unix_secs}", sanitize(label))
 }

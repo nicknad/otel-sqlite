@@ -137,8 +137,7 @@ async fn http_get(url: &str) -> Result<(u16, String)> {
         .with_context(|| format!("malformed HTTP response from {url}: {text:.80}"))?;
     let body = text
         .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_owned())
-        .unwrap_or_default();
+        .map_or_default(|(_, body)| body.to_owned());
     Ok((status, body))
 }
 
