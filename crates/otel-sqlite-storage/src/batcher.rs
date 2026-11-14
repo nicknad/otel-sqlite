@@ -25,6 +25,7 @@
 //!
 //! The per-origin accumulation state itself lives in `crate::origin_buffers`.
 
+use std::mem::DropGuard;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -34,7 +35,7 @@ use otel_sqlite_core::storage::{
     CommitLedger, IngestMessage, InsertBatcherConfig, LogWriteBatch, WriteCommand,
 };
 
-use crate::LedgerCloseOnDrop;
+use crate::close_ledger_on_drop;
 use crate::fault;
 use crate::origin_buffers::{OriginBuffers, Submission};
 use crate::stats::BatcherStats;
@@ -72,9 +73,9 @@ pub(crate) fn run(
     stats.mark_progress();
 
     // Closes the ledger if the batcher dies (panic or early return) while the
-    // writer may still owe nothing: disarmed only when the writer remains
+    // writer may still owe nothing: dismissed only when the writer remains
     // alive and therefore owns the close at its own exit.
-    let mut close_ledger = LedgerCloseOnDrop::new(ledger);
+    let close_ledger = close_ledger_on_drop(ledger);
     let mut logs = OriginBuffers::<LogRecord>::new(config);
 
     let fault_after = fault::armed_after(fault::BATCHER_AFTER_N);
@@ -162,7 +163,7 @@ pub(crate) fn run(
     }
     if alive {
         // The writer is still draining and closes the ledger itself at exit.
-        close_ledger.disarm();
+        DropGuard::dismiss(close_ledger);
     } else {
         let abandoned = logs.buffered() as u64;
         if abandoned > 0 {
@@ -178,7 +179,7 @@ pub(crate) fn run(
         // The writer is gone: records held here were dropped, so no pending
         // ticket can ever be completed. Fail every durable-ack waiter now.
         ledger.close();
-        close_ledger.disarm();
+        DropGuard::dismiss(close_ledger);
     }
 
     stats.observe_buffered(0);

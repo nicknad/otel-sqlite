@@ -31,8 +31,8 @@ use otel_sqlite_core::storage::{CheckpointMode, CommitLedger, MaintenanceOperati
 use otel_sqlite_core::unix_nano_now;
 use rusqlite::Connection;
 
-use crate::LedgerCloseOnDrop;
 use crate::StorageConfig;
+use crate::close_ledger_on_drop;
 use crate::command::InsertScratch;
 use crate::error::StorageError;
 use crate::fault;
@@ -62,7 +62,7 @@ pub(crate) fn run(
     // Closes on every exit path *including unwinding*: a panic must fail
     // durable-ack waiters instead of leaving them hanging on a dead writer.
     // `CommitLedger::close` is idempotent, so the normal path is unaffected.
-    let _close_ledger = LedgerCloseOnDrop::new(ledger);
+    let _close_ledger = close_ledger_on_drop(ledger);
     run_inner(receiver, config, ledger, stats, ready_tx)
 }
 
@@ -399,7 +399,7 @@ mod tests {
     fn ledger_guard_closes_the_ledger_on_drop() {
         let ledger = CommitLedger::new();
         {
-            let _guard = LedgerCloseOnDrop::new(&ledger);
+            let _guard = close_ledger_on_drop(&ledger);
         }
         assert!(ledger.watermark().closed);
     }

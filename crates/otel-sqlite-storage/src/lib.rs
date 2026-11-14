@@ -17,6 +17,7 @@ mod stats;
 mod transaction_group;
 mod writer;
 
+use std::mem::DropGuard;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
@@ -47,31 +48,20 @@ pub use otel_sqlite_core::PipelineSample;
 
 /// Closes the [`CommitLedger`] when dropped, so durable-ack waiters fail fast
 /// instead of hanging on tickets that can never commit. Covers every exit path
-/// including unwinding, because [`CommitLedger::close`] is idempotent;
-/// [`disarm`](LedgerCloseOnDrop::disarm) hands the close to whichever pipeline
-/// thread outlives this one.
-pub(crate) struct LedgerCloseOnDrop<'a> {
-    ledger: Option<&'a CommitLedger>,
-}
+/// including unwinding, because [`CommitLedger::close`] is idempotent.
+///
+/// A name for [`DropGuard`]: the close is the `fn` pointer in the alias, and
+/// [`close_ledger_on_drop`] is the one place the close-on-drop pair is written.
+/// [`DropGuard::dismiss`] hands the close to whichever pipeline thread outlives
+/// this one.
+pub(crate) type LedgerCloseOnDrop<'a> = DropGuard<&'a CommitLedger, fn(&CommitLedger)>;
 
-impl<'a> LedgerCloseOnDrop<'a> {
-    pub(crate) const fn new(ledger: &'a CommitLedger) -> Self {
-        Self {
-            ledger: Some(ledger),
-        }
-    }
-
-    pub(crate) fn disarm(&mut self) {
-        self.ledger = None;
-    }
-}
-
-impl Drop for LedgerCloseOnDrop<'_> {
-    fn drop(&mut self) {
-        if let Some(ledger) = self.ledger {
-            ledger.close();
-        }
-    }
+/// Arms "close the ledger on drop" and returns the guard that does it.
+///
+/// Bind the guard to a named variable; `let _ = ...` closes the ledger on the
+/// spot instead of at the end of the scope.
+pub(crate) fn close_ledger_on_drop(ledger: &CommitLedger) -> LedgerCloseOnDrop<'_> {
+    DropGuard::new(ledger, |ledger: &CommitLedger| ledger.close())
 }
 
 #[derive(Debug)]
