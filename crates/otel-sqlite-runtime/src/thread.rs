@@ -7,6 +7,7 @@
 //! behaviour does.
 
 use std::io;
+use std::mem::DropGuard;
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
@@ -80,19 +81,23 @@ pub(crate) fn shutdown_signalled(shutdown: &Receiver<()>) -> bool {
 
 /// Publishes a thread's liveness for as long as the guard lives, including
 /// unwind paths (a panic must not leave the gauge stuck at 1).
+///
+/// The struct survives only to host [`ActiveGauge::new`]: a type alias cannot
+/// carry an inherent constructor. The retraction is [`DropGuard`]'s, so the
+/// publish and retract halves sit next to each other instead of in a separate
+/// `Drop` impl. The field is `_`-named because nothing reads it; it exists to
+/// be dropped.
 pub(crate) struct ActiveGauge {
-    metric: &'static str,
+    _guard: DropGuard<&'static str, fn(&'static str)>,
 }
 
 impl ActiveGauge {
     pub(crate) fn new(metric: &'static str) -> Self {
         ::metrics::gauge!(metric).set(1.0);
-        Self { metric }
-    }
-}
-
-impl Drop for ActiveGauge {
-    fn drop(&mut self) {
-        ::metrics::gauge!(self.metric).set(0.0);
+        Self {
+            _guard: DropGuard::new(metric, |metric: &'static str| {
+                ::metrics::gauge!(metric).set(0.0);
+            }),
+        }
     }
 }

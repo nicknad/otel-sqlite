@@ -16,6 +16,7 @@
 //! exit path, including panics. The watchdog only ever reads these values;
 //! nothing here blocks or wakes the observed threads.
 
+use std::mem::DropGuard;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use otel_sqlite_core::PipelineSample;
@@ -91,7 +92,7 @@ impl WriterStats {
     /// unwound). Bind it to a named variable — `let _ = ...` would drop it
     /// immediately.
     pub(crate) fn running_guard(&self) -> RunningGuard<'_> {
-        RunningGuard::new(&self.running)
+        publish_running(&self.running)
     }
 
     /// Publishes the authoritative backlog while a command executes: commands
@@ -102,40 +103,64 @@ impl WriterStats {
         self.queue_depth
             .store(queued_after_dequeue, Ordering::Relaxed);
         self.in_flight.store(1, Ordering::Relaxed);
-        InFlightGuard(self)
+        DropGuard::new(self, |stats: &WriterStats| {
+            stats.in_flight.store(0, Ordering::Relaxed);
+        })
     }
 
     /// Publishes "maintenance in progress" until the returned guard is
     /// dropped (or unwound), timestamping the start for stall detection.
+    ///
+    /// The timestamp is stored before the flag so a sample can never read a
+    /// live window with a zero start; the guard clears the flag before zeroing
+    /// the timestamp, and the watchdog only consults elapsed time while the
+    /// flag is set, so the one torn read stays the benign half.
     pub(crate) fn maintenance_guard(&self) -> MaintenanceGuard<'_> {
         self.maintenance_started_ms
             .store(monotonic_millis(), Ordering::Relaxed);
         self.maintenance_in_progress.store(true, Ordering::Relaxed);
-        MaintenanceGuard(self)
+        DropGuard::new(self, |stats: &WriterStats| {
+            stats
+                .maintenance_in_progress
+                .store(false, Ordering::Relaxed);
+            stats.maintenance_started_ms.store(0, Ordering::Relaxed);
+        })
     }
 }
 
 /// RAII in-flight marker for the writer's current command. See
 /// [`WriterStats::begin_command`].
-pub(crate) struct InFlightGuard<'a>(&'a WriterStats);
-
-impl Drop for InFlightGuard<'_> {
-    fn drop(&mut self) {
-        self.0.in_flight.store(0, Ordering::Relaxed);
-    }
-}
+///
+/// A name for [`DropGuard`], not a type of its own: the retraction is the `fn`
+/// pointer in the alias, so every guard `begin_command` hands back withdraws
+/// the claim the same way. A destructor that had to capture state instead of
+/// receiving `&WriterStats` would make this alias unnameable, which is why the
+/// guard carries the stats by reference.
+pub(crate) type InFlightGuard<'a> = DropGuard<&'a WriterStats, fn(&WriterStats)>;
 
 /// RAII maintenance flag: set on creation, cleared (with the start timestamp)
 /// on drop, covering normal returns, `?` and panics alike.
-pub(crate) struct MaintenanceGuard<'a>(&'a WriterStats);
+///
+/// A name for [`DropGuard`]; see [`InFlightGuard`] for why the alias exists.
+pub(crate) type MaintenanceGuard<'a> = DropGuard<&'a WriterStats, fn(&WriterStats)>;
 
-impl Drop for MaintenanceGuard<'_> {
-    fn drop(&mut self) {
-        self.0
-            .maintenance_in_progress
-            .store(false, Ordering::Relaxed);
-        self.0.maintenance_started_ms.store(0, Ordering::Relaxed);
-    }
+/// RAII liveness flag: `running = true` while the guard lives and `false` once
+/// it is dropped, covering normal returns, error propagation (`?`) and panics
+/// alike.
+///
+/// A name for [`DropGuard`]. The arm/clear pair itself lives in
+/// [`publish_running`], so both stats structs share one implementation.
+pub(crate) type RunningGuard<'a> = DropGuard<&'a AtomicBool, fn(&AtomicBool)>;
+
+/// Arms a liveness flag and returns the guard that clears it on drop.
+///
+/// The one place the set-true/clear-on-drop pair is written, for
+/// [`WriterStats`] and [`BatcherStats`] alike.
+fn publish_running(flag: &AtomicBool) -> RunningGuard<'_> {
+    flag.store(true, Ordering::Relaxed);
+    DropGuard::new(flag, |running: &AtomicBool| {
+        running.store(false, Ordering::Relaxed);
+    })
 }
 
 /// Insert-batcher counters (`batcher` thread), surfaced through
@@ -179,7 +204,7 @@ impl BatcherStats {
     /// unwound). Bind it to a named variable — `let _ = ...` would drop it
     /// immediately.
     pub(crate) fn running_guard(&self) -> RunningGuard<'_> {
-        RunningGuard::new(&self.running)
+        publish_running(&self.running)
     }
 
     pub(crate) fn observe_buffered(&self, buffered: usize) {
@@ -190,23 +215,6 @@ impl BatcherStats {
     /// Publishes the ingress-channel backlog sampled by the batcher loop.
     pub(crate) fn observe_ingest_queue(&self, depth: usize) {
         self.ingest_queue_depth.store(depth, Ordering::Relaxed);
-    }
-}
-
-/// RAII liveness flag: sets `running = true` on creation and `false` on drop,
-/// covering normal returns, error propagation (`?`) and panics alike.
-pub(crate) struct RunningGuard<'a>(&'a AtomicBool);
-
-impl<'a> RunningGuard<'a> {
-    fn new(flag: &'a AtomicBool) -> Self {
-        flag.store(true, Ordering::Relaxed);
-        Self(flag)
-    }
-}
-
-impl Drop for RunningGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Relaxed);
     }
 }
 
