@@ -522,8 +522,23 @@ mod tests {
 
     #[test]
     fn full_command_queue_applies_backpressure_instead_of_dropping() {
+        // The ingest channel is the only buffer the ingress side owns, so its
+        // depth plus the batches the batcher can still be holding decide how
+        // much work the pipeline absorbs while the writer is stalled. The
+        // batcher pulls at most two more chunks before it parks in the blocking
+        // send onto the (capacity one) command queue: the chunk whose
+        // submission fills that queue and the chunk whose submission then has
+        // to wait behind it.
+        const INGEST_CAPACITY: usize = 8;
+        const IN_FLIGHT_CHUNKS: usize = 2;
+        // A run of rejections that is never interrupted is the only proof that
+        // the batcher has parked for good; the send budget keeps a regression
+        // that silently drops instead of blocking from spinning forever.
+        const SETTLED_REJECTIONS: usize = 64;
+        const MAX_SENDS: usize = 10_000;
+
         let (commands_tx, commands_rx) = crossbeam_channel::bounded(1);
-        let (input, receiver) = crossbeam_channel::bounded(8);
+        let (input, receiver) = crossbeam_channel::bounded(INGEST_CAPACITY);
         let stats = Arc::new(BatcherStats::default());
         let ledger = CommitLedger::new();
         let thread_stats = Arc::clone(&stats);
@@ -539,31 +554,40 @@ mod tests {
             );
         });
 
-        // Chunks are exactly one storage batch each.
+        // Chunks are exactly one storage batch each, so every accepted chunk
+        // becomes exactly one batch. Asserting that the stalled pipeline holds
+        // no more than its capacity is a scheduling-independent statement about
+        // backpressure; sampling the channel at one instant is not.
         let mut accepted = 0usize;
         let send_chunk = |input: &crossbeam_channel::Sender<IngestMessage>| {
             input.try_send(chunk("a", 10)).is_ok()
         };
+        let stalled_capacity = INGEST_CAPACITY + IN_FLIGHT_CHUNKS;
 
-        assert!(send_chunk(&input), "first chunk is accepted");
-        accepted += 1;
-        std::thread::sleep(Duration::from_millis(50));
-
-        // The batcher ends up blocked inside its blocking send onto the full
-        // command queue: the ingest channel must saturate (backpressure)
-        // rather than dropping or overwriting any completed batch.
-        let mut saturated = false;
-        for _ in 0..32 {
+        // Saturation is observed, never sampled: a successful send right after
+        // a rejection only means the batcher pulled one more chunk on its way
+        // to parking. The test keeps pushing until the rejections stop being
+        // interrupted, which they cannot do unless the backpressure is real and
+        // permanent.
+        let mut rejected_in_a_row = 0usize;
+        for _ in 0..MAX_SENDS {
             if send_chunk(&input) {
                 accepted += 1;
+                rejected_in_a_row = 0;
             } else {
-                saturated = true;
+                rejected_in_a_row += 1;
+                if rejected_in_a_row == SETTLED_REJECTIONS {
+                    break;
+                }
             }
         }
-        assert!(saturated, "ingest channel must saturate under load");
+        assert_eq!(
+            rejected_in_a_row, SETTLED_REJECTIONS,
+            "ingest channel must saturate under load"
+        );
         assert!(
-            input.try_send(chunk("a", 10)).is_err(),
-            "backpressure must persist while the writer does not drain"
+            accepted <= stalled_capacity,
+            "backpressure must persist while the writer does not drain: {accepted} chunks accepted, but a stalled pipeline can only hold {stalled_capacity}"
         );
 
         // Draining the writer side unblocks the chain; everything accepted is
