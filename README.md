@@ -69,6 +69,18 @@ The insert batcher (same crate) and maintenance worker
 (`otel-sqlite-runtime`) are **producers** on the shared bounded command
 queue; ingress reaches the batcher via the bounded ingest queue.
 
+The pipeline is assembled in exactly one place:
+`crates/otel-sqlite/src/pipeline.rs` (the package's library target, shared
+with the embedded test harnesses). Booting it opens storage — migrations, the
+startup checkpoint and file permissions gate the boot — and starts the
+maintenance worker and the watchdog; the returned handle owns every piece.
+Draining it is one bounded operation: a flush barrier, stopping the watchdog
+and maintenance scheduling, dropping the producers, and joining the writer
+within the configured shutdown budget — refused with stranded-chunk evidence
+when the pipeline is already dead. The embedded e2e harness boots this same
+assembly, so its scenarios exercise the real watchdog and maintenance worker
+too.
+
 ### Maintenance worker
 
 Own thread, scheduling only: evaluates due operations (retention purge,

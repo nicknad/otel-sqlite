@@ -1,52 +1,55 @@
-//! Embedded server: boots the real pipeline with the production OTLP service
-//! assembly (see `crates/otel-sqlite/src/main.rs`):
+//! Embedded server: boots the REAL pipeline assembly through
+//! `otel_sqlite::Pipeline` — the same boot and drain the production binary
+//! uses, including the maintenance worker and the watchdog:
 //!
 //! ```text
-//! tonic gRPC (real TCP) -> IngressLogsService from `logs_service` (gzip,
-//!     decode-size/auth/stream limits) -> storage insert batcher thread
+//! tonic gRPC (real TCP) -> IngressLogsService from `Pipeline::logs_service`
+//!     (gzip, decode-size/auth/stream limits) -> storage insert batcher thread
 //!     -> bounded WriteCommand queue -> single Storage writer thread -> SQLite WAL
 //! ```
 //!
-//! The service wiring is the shared `otel_sqlite_ingress::logs_service`, so
-//! request handling, mapping, gzip, decoding limits, insert batching, queue
-//! backpressure and SQLite persistence are the production implementations.
-//! Only the transport lifecycle and benchmark profile differ:
+//! The request contract, the workers and the drain are the production
+//! implementations. Only the transport lifecycle and the benchmark profile
+//! differ:
 //!
 //! 1. The gRPC server is driven by a programmatic shutdown channel instead of
-//!    waiting for Ctrl+C/SIGTERM (`ingress::serve` blocks on OS signals).
+//!    waiting for Ctrl+C/SIGTERM (`Pipeline::serve` blocks on OS signals).
+//!    It also stops when the real watchdog halts ingestion, mirroring the
+//!    production behavior.
 //! 2. [`benchmark_profile`] tightens per-record caps and raises stream
-//!    concurrency for short benchmark runs; those values are not production
-//!    defaults.
+//!    concurrency for short benchmark runs; every other value comes from the
+//!    crates' public defaults.
+//! 3. [`RuntimePolicy`] selects the worker schedules: the default is the
+//!    production policy, and tests may override the purge cadence to observe
+//!    maintenance work (see `tests/e2e.rs`).
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use otel_sqlite_core::storage::{IngestMessage, InsertBatcherConfig};
-use otel_sqlite_ingress::{BearerInterceptor, IngressConfig, logs_service};
-use otel_sqlite_storage::{Storage, StorageConfig};
+use otel_sqlite::{Pipeline, PipelineSpecs};
+use otel_sqlite_core::storage::InsertBatcherConfig;
+use otel_sqlite_ingress::IngressConfig;
+use otel_sqlite_runtime::{MaintenanceConfig, WatchdogConfig};
+use otel_sqlite_storage::StorageConfig;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
 
 /// Benchmark pipeline profile.
 ///
-/// The handlers and pipeline wiring are the production implementations, but
-/// this profile is deliberately NOT a verbatim copy of the production
-/// defaults in `crates/otel-sqlite/src/config.rs`: most per-record caps are
-/// tighter (harness payloads are tiny, and tighter caps make the validation
-/// and backpressure paths cheap to reach in short runs) and the stream count
-/// is higher (so the concurrency ramp can hold more simultaneous clients).
-/// Values that do match production are imported from the ingress crate so
-/// they cannot drift silently; each field below is annotated.
+/// The handlers, workers and pipeline wiring are the production
+/// implementations, but this profile is deliberately NOT a verbatim copy of
+/// the production defaults in `crates/otel-sqlite/src/config.rs`: the
+/// per-record caps below are tighter (harness payloads are tiny, and tighter
+/// caps make the validation and backpressure paths cheap to reach in short
+/// runs) and the stream count is higher (so the concurrency ramp can hold
+/// more simultaneous clients). Every value that matches production comes from
+/// the crates' own defaults, so it cannot drift.
 pub mod benchmark_profile {
     use super::{Duration, IngressConfig, InsertBatcherConfig, PathBuf, StorageConfig};
-    use otel_sqlite_core::storage::{DurabilityMode, SyncMode};
-    use otel_sqlite_ingress::{
-        DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_MAX_RECV_MSG_SIZE,
-        DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES, DEFAULT_SHUTDOWN_TIMEOUT,
-        MAX_MAPPING_CONCURRENCY,
-    };
+    use otel_sqlite_core::storage::SyncMode;
+    use otel_sqlite_ingress::MAX_MAPPING_CONCURRENCY;
     use otel_sqlite_storage::FtsMode;
 
     pub const INGEST_QUEUE_CAPACITY: usize = 50_000;
@@ -60,25 +63,27 @@ pub mod benchmark_profile {
     /// must fail loudly instead of hanging when a phase never completes.
     pub(crate) const SHUTDOWN_PHASE_TIMEOUT: Duration = Duration::from_secs(60);
 
+    /// OTLP ingress for benchmark runs: the crate defaults plus exactly the
+    /// overrides that differ from production.
     pub fn ingress_config(listen_address: String) -> IngressConfig {
         IngressConfig {
             listen_address,
-            max_recv_msg_size: DEFAULT_MAX_RECV_MSG_SIZE, // production
             // Production default is 64; raised so ramp scenarios can hold
             // more simultaneous clients.
             max_concurrent_streams: 256,
             // 2 × the raised stream cap, clamped to the accepted maximum.
             mapping_concurrency: MAX_MAPPING_CONCURRENCY,
-            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT, // production
-            max_records_per_request: DEFAULT_MAX_RECORDS_PER_REQUEST, // production
-            max_attributes_per_record: 128,             // production 1_000
-            max_attribute_key_bytes: 256,               // production 512
-            max_attribute_value_bytes: 4096,            // production 64 KiB
-            max_body_bytes: 65536,                      // production 1 MiB
-            max_scope_metadata_expansion_bytes: DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES,
-            durability_mode: DurabilityMode::Commit,
-            tls: None,
-            auth: None,
+            // Tighter than the production caps (1_000 / 512 / 64 KiB / 1 MiB)
+            // so the validation and backpressure paths are cheap to reach
+            // with tiny harness payloads.
+            max_attributes_per_record: 128,
+            max_attribute_key_bytes: 256,
+            max_attribute_value_bytes: 4096,
+            max_body_bytes: 65536,
+            // Everything else — decode size, shutdown timeout, per-request
+            // cap, scope-metadata cap, durability mode, TLS, auth — is the
+            // crate default, i.e. the production value.
+            ..IngressConfig::default()
         }
     }
 
@@ -131,46 +136,78 @@ pub mod benchmark_profile {
     }
 }
 
+/// Runtime worker policy for the embedded assembly: the maintenance schedule
+/// and the watchdog observation policy the production binary runs.
+///
+/// `EmbeddedServer::start` uses `Default`, which is the production policy
+/// (nothing fires within a benchmark run); tests override the purge cadence
+/// through `EmbeddedServer::start_with` to observe scheduled maintenance
+/// through the real worker.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimePolicy {
+    pub maintenance: MaintenanceConfig,
+    pub watchdog: WatchdogConfig,
+}
+
 pub struct EmbeddedServer {
     endpoint: String,
     db_path: PathBuf,
-    ingest_tx: Option<otel_sqlite_ingress::IngestSender>,
-    storage: Option<Storage>,
+    pipeline: Option<Pipeline>,
     shutdown_tx: watch::Sender<bool>,
     serve_handle: JoinHandle<anyhow::Result<()>>,
 }
 
 impl EmbeddedServer {
-    /// Start the full pipeline. Mirrors `crates/otel-sqlite/src/main.rs`.
+    /// Start the real pipeline with the production worker policy.
     pub async fn start(listen_addr: &str, data_dir: &Path) -> anyhow::Result<Self> {
-        let config = benchmark_profile::ingress_config(listen_addr.to_owned());
+        Self::start_with(listen_addr, data_dir, RuntimePolicy::default()).await
+    }
+
+    /// Start the real pipeline assembly with an explicit worker policy.
+    ///
+    /// Boots through `otel_sqlite::Pipeline::boot` — the same assembly
+    /// `crates/otel-sqlite/src/main.rs` boots — so storage readiness
+    /// (migrations, startup checkpoint, permissions) gates the start, and
+    /// the maintenance worker and the watchdog run for real.
+    pub async fn start_with(
+        listen_addr: &str,
+        data_dir: &Path,
+        policy: RuntimePolicy,
+    ) -> anyhow::Result<Self> {
+        let ingress_config = benchmark_profile::ingress_config(listen_addr.to_owned());
         let storage_config = benchmark_profile::storage_config(
             data_dir.join(otel_sqlite_storage::DEFAULT_DB_FILENAME),
         );
 
-        let addr: SocketAddr = config.socket_addr()?;
+        let pipeline = Pipeline::boot(PipelineSpecs {
+            ingest_queue_capacity: benchmark_profile::INGEST_QUEUE_CAPACITY,
+            ingress: ingress_config.clone(),
+            storage: storage_config,
+            maintenance: policy.maintenance,
+            watchdog: policy.watchdog,
+        })
+        .map_err(|error| anyhow::anyhow!("failed to boot the pipeline assembly: {error}"))?;
 
-        let (ingest_tx, receiver) =
-            otel_sqlite_ingress::channel(benchmark_profile::INGEST_QUEUE_CAPACITY);
-        let storage = Storage::open(receiver, storage_config)
-            .map_err(|error| anyhow::anyhow!("failed to start sqlite storage: {error}"))?;
-        let commit_ledger = storage.commit_ledger();
+        let addr: SocketAddr = ingress_config.socket_addr()?;
 
-        let logs_service = logs_service(
-            &config,
-            ingest_tx.clone(),
-            commit_ledger,
-            BearerInterceptor::disabled(),
-        );
-
+        // The harness owns its transport lifecycle: it drives the same
+        // production logs service on its own listener and stops it on its own
+        // signal — or when the real watchdog halts ingestion.
+        let logs = pipeline
+            .logs_service()
+            .map_err(|error| anyhow::anyhow!("failed to build the logs service: {error}"))?;
+        let mut halt_rx = pipeline.halt_signal();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let max_concurrent_streams = config.max_concurrent_streams;
+        let max_concurrent_streams = ingress_config.max_concurrent_streams;
         let serve_handle = tokio::spawn(async move {
             Server::builder()
                 .max_concurrent_streams(max_concurrent_streams)
-                .add_service(logs_service)
+                .add_service(logs)
                 .serve_with_shutdown(addr, async move {
-                    let _ = shutdown_rx.changed().await;
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => {},
+                        _ = halt_rx.changed() => {},
+                    }
                 })
                 .await
                 .map_err(|error| anyhow::anyhow!("gRPC serve failed: {error}"))
@@ -182,8 +219,7 @@ impl EmbeddedServer {
         Ok(Self {
             endpoint,
             db_path: data_dir.join(otel_sqlite_storage::DEFAULT_DB_FILENAME),
-            ingest_tx: Some(ingest_tx),
-            storage: Some(storage),
+            pipeline: Some(pipeline),
             shutdown_tx,
             serve_handle,
         })
@@ -200,87 +236,43 @@ impl EmbeddedServer {
     /// Order barrier: everything ingested before this reaches SQLite before
     /// anything ingested afterwards is observed.
     ///
-    /// Bounded by design. The barrier is a plain command on the same bounded
-    /// ingest queue as record chunks, so injecting it can block when the
-    /// pipeline is saturated — and blocks *forever* if the batcher died while
-    /// the queue stays open. The wrapper's control send is serialized with
-    /// request reservations, so the barrier can never steal a slot a concurrent
-    /// all-or-nothing enqueue is relying on. This method therefore:
-    ///
-    /// 1. refuses up front when a pipeline thread is already dead (the
-    ///    stranded-record count is reported, not silently ignored),
-    /// 2. sends with `send_timeout` in a retry loop until `budget` expires,
-    /// 3. reports a disconnected queue instead of discarding the error.
-    ///
+    /// The barrier protocol — refuse-when-dead, bounded retry,
+    /// stranded-chunk reporting — lives in `otel_sqlite::Pipeline::flush`.
     /// Callers must give this the same deadline they give the subsequent
     /// drain poll so one overall budget covers the whole drain phase.
     pub fn flush(&self, budget: Duration) -> anyhow::Result<()> {
-        let Some(tx) = &self.ingest_tx else {
+        let Some(pipeline) = &self.pipeline else {
             anyhow::bail!("embedded server already shut down");
         };
-        let started = std::time::Instant::now();
-
-        if let Some(sample) = self.health_sample()
-            && (!sample.writer_running || !sample.batcher_running)
-        {
-            let stats = self.stats();
-            anyhow::bail!(
-                "cannot flush: storage worker dead before barrier (writer_running={}, \
-                 batcher_running={}, records_written={}, dropped_records={}, errors={})",
-                sample.writer_running,
-                sample.batcher_running,
-                stats.map_or(0, |s| s.records_written),
-                stats.map_or(0, |s| s.dropped_records),
-                stats.map_or(0, |s| s.errors),
-            );
-        }
-
-        loop {
-            match tx.send_timeout(IngestMessage::Flush, Duration::from_millis(250)) {
-                Ok(()) => return Ok(()),
-                Err(otel_sqlite_ingress::SendTimeoutFailure::Timeout) => {
-                    if started.elapsed() >= budget {
-                        anyhow::bail!(
-                            "flush barrier not accepted within {:.1}s (ingest queue depth {}); \
-                             the batcher stopped consuming without disconnecting",
-                            budget.as_secs_f64(),
-                            tx.len(),
-                        );
-                    }
-                }
-                Err(otel_sqlite_ingress::SendTimeoutFailure::Disconnected) => {
-                    anyhow::bail!(
-                        "flush barrier rejected: ingest queue disconnected (batcher gone) with \
-                         {} chunks stranded inside",
-                        tx.len(),
-                    );
-                }
-            }
-        }
+        pipeline.flush(budget)?;
+        Ok(())
     }
 
     /// Storage-side counters snapshot.
     pub fn stats(&self) -> Option<otel_sqlite_storage::StorageStatsSnapshot> {
-        self.storage.as_ref().map(Storage::stats)
+        self.pipeline.as_ref().map(Pipeline::stats)
     }
 
     /// Liveness/progress evidence for the storage threads, or `None` after
     /// shutdown. Cheap lock-free read; safe to poll from anywhere.
-    pub fn health_sample(&self) -> Option<otel_sqlite_storage::PipelineSample> {
-        self.storage
-            .as_ref()
-            .map(|storage| storage.health().sample())
+    pub fn health_sample(&self) -> Option<otel_sqlite_core::PipelineSample> {
+        self.pipeline.as_ref().map(Pipeline::health_sample)
     }
 
-    /// Graceful stop mirroring the production Ctrl+C path:
-    /// stop accepting requests -> drop ingest senders (batcher drains its
-    /// input, flushes partial batches and closes the command queue)
-    /// -> join both threads (writer drains queued commands, truncates WAL).
+    /// Whether the real watchdog halted ingestion during this run; `None`
+    /// after shutdown.
+    pub fn watchdog_halted(&self) -> Option<bool> {
+        self.pipeline.as_ref().map(Pipeline::watchdog_halted)
+    }
+
+    /// Graceful stop mirroring the production Ctrl+C path: stop the harness
+    /// transport -> drain the real assembly (flush barrier -> stop watchdog ->
+    /// stop maintenance -> drop producers -> bounded writer join).
     ///
-    /// Every await is bounded: a wedged gRPC drain or a storage thread that
-    /// never finishes must surface as an error naming the phase instead of
-    /// hanging this process forever. (The underlying threads are leaked on
-    /// such an error; the harness exits non-zero immediately afterwards.)
+    /// Every await is bounded: a wedged gRPC drain or a pipeline that never
+    /// finishes must surface as an error naming the phase instead of hanging
+    /// this process forever. (The underlying threads are leaked on such an
+    /// error; the harness exits non-zero immediately afterwards.)
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
         use benchmark_profile::SHUTDOWN_PHASE_TIMEOUT;
 
@@ -295,19 +287,32 @@ impl EmbeddedServer {
             return Err(anyhow::anyhow!("gRPC serve failed: {error}"));
         }
 
-        drop(self.ingest_tx.take());
-        if let Some(mut storage) = self.storage.take() {
-            let join = tokio::task::spawn_blocking(move || storage.join());
-            tokio::time::timeout(SHUTDOWN_PHASE_TIMEOUT, join)
+        if let Some(pipeline) = self.pipeline.take() {
+            let drain = tokio::task::spawn_blocking(move || pipeline.drain());
+            let report = tokio::time::timeout(SHUTDOWN_PHASE_TIMEOUT, drain)
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!(
-                        "storage threads did not finish draining within \
-                         {SHUTDOWN_PHASE_TIMEOUT:?}; writer or batcher is wedged"
+                        "pipeline drain did not finish within {SHUTDOWN_PHASE_TIMEOUT:?}; writer or batcher is wedged"
                     )
                 })?
-                .map_err(|error| anyhow::anyhow!("storage join task panicked: {error}"))?
-                .map_err(|error| anyhow::anyhow!("storage failed during shutdown: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("pipeline drain task panicked: {error}"))?;
+            if let Some(error) = report.storage_error {
+                return Err(anyhow::anyhow!(
+                    "sqlite storage writer terminated with failure: {error}"
+                ));
+            }
+            if let Some(error) = report.watchdog_error {
+                return Err(anyhow::anyhow!("watchdog terminated with failure: {error}"));
+            }
+            if let Some(error) = report.maintenance_error {
+                return Err(anyhow::anyhow!(
+                    "maintenance worker terminated with failure: {error}"
+                ));
+            }
+            if let Some(refusal) = report.barrier {
+                return Err(anyhow::anyhow!("drain flush barrier refused: {refusal}"));
+            }
         }
         Ok(())
     }
@@ -325,6 +330,6 @@ async fn wait_until_listening(addr: SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
-// `Storage::open` blocks until the writer finished bootstrapping (database
+// `Pipeline::boot` blocks until the writer finished bootstrapping (database
 // open, schema migrated), so the embedded server is storage-ready the moment
-// `start()` returns; no extra schema-readiness poll is needed.
+// `start_with` returns; no extra schema-readiness poll is needed.
