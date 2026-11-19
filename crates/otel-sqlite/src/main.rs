@@ -204,7 +204,7 @@ async fn main() -> Result<()> {
     println!(
         "ingress listening on {} (sqlite: {})",
         ingress_config.listen_address,
-        config.sqlite_path.display()
+        config.storage.sqlite_path.display()
     );
 
     let serve_result = otel_sqlite_ingress::serve_with_shutdown(

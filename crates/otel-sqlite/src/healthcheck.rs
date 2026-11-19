@@ -39,8 +39,8 @@ pub(crate) async fn run_healthcheck() -> Result<()> {
 }
 
 fn derive_healthcheck_endpoint(config: &Config) -> String {
-    let scheme = config.tls.as_ref().map_or("http", |_| "https");
-    let listen = config.listen_address.trim();
+    let scheme = config.ingress.tls.as_ref().map_or("http", |_| "https");
+    let listen = config.ingress.listen_address.trim();
     // Dial side: a wildcard or all-interfaces bind is reachable via loopback.
     // IPv6 forms included: `[::]:port` is the v6 wildcard just as `0.0.0.0:`
     // is the v4 one, and a bare `:port` expands the same way.
@@ -64,7 +64,7 @@ struct ProbeTls {
 }
 
 fn build_probe_tls(config: &Config, endpoint: &str) -> Result<Option<ProbeTls>> {
-    let Some(tls) = config.tls.as_ref() else {
+    let Some(tls) = config.ingress.tls.as_ref() else {
         return Ok(None);
     };
     // Trust the client CA when mTLS is enabled, otherwise the CA that issued
@@ -179,12 +179,15 @@ mod tests {
 
     fn config_with(listen_address: &str, tls: bool) -> Config {
         Config {
-            listen_address: listen_address.to_owned(),
-            tls: tls.then(|| otel_sqlite_ingress::TlsConfig {
-                cert: "server.pem".into(),
-                key: "server.key".into(),
-                client_ca: None,
-            }),
+            ingress: otel_sqlite_ingress::IngressConfig {
+                listen_address: listen_address.to_owned(),
+                tls: tls.then(|| otel_sqlite_ingress::TlsConfig {
+                    cert: "server.pem".into(),
+                    key: "server.key".into(),
+                    client_ca: None,
+                }),
+                ..otel_sqlite_ingress::IngressConfig::default()
+            },
             ..Config::default()
         }
     }
@@ -245,11 +248,14 @@ mod tests {
         .expect("generate PKI");
 
         let config = Config {
-            tls: Some(otel_sqlite_ingress::TlsConfig {
-                cert: dir.path().join("server.pem"),
-                key: dir.path().join("server.key"),
-                client_ca: None,
-            }),
+            ingress: otel_sqlite_ingress::IngressConfig {
+                tls: Some(otel_sqlite_ingress::TlsConfig {
+                    cert: dir.path().join("server.pem"),
+                    key: dir.path().join("server.key"),
+                    client_ca: None,
+                }),
+                ..otel_sqlite_ingress::IngressConfig::default()
+            },
             ..Config::default()
         };
         let probe = build_probe_tls(&config, "https://127.0.0.1:4317")
@@ -280,12 +286,15 @@ mod tests {
         .expect("generate PKI");
 
         let config = Config {
-            listen_address: "127.0.0.1:4317".to_owned(),
-            tls: Some(otel_sqlite_ingress::TlsConfig {
-                cert: dir.path().join("server.pem"),
-                key: dir.path().join("server.key"),
-                client_ca: Some(dir.path().join("ca.pem")),
-            }),
+            ingress: otel_sqlite_ingress::IngressConfig {
+                listen_address: "127.0.0.1:4317".to_owned(),
+                tls: Some(otel_sqlite_ingress::TlsConfig {
+                    cert: dir.path().join("server.pem"),
+                    key: dir.path().join("server.key"),
+                    client_ca: Some(dir.path().join("ca.pem")),
+                }),
+                ..otel_sqlite_ingress::IngressConfig::default()
+            },
             ..Config::default()
         };
         let probe = build_probe_tls(&config, "https://localhost:24419")

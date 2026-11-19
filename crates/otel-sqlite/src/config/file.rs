@@ -13,18 +13,16 @@ use super::search::SearchSection;
 use super::tls::TlsSection;
 use super::watchdog::WatchdogSection;
 
-/// Mirror of [`Config`] where every field is optional; `None` means "keep
-/// the built-in default".
+/// The operator's TOML contract: every key the file accepts, with its exact
+/// spelling, in one table (`deny_unknown_fields` keeps typos fatal). Keys are
+/// grouped by the crate that owns the effective value; `apply_to` hands each
+/// group to that crate's config in one contiguous block, so no binary type
+/// ever restates a section's fields.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct FileConfig {
+    // Keys owned by the ingress crate's config.
     listen_address: Option<String>,
-    sqlite_path: Option<PathBuf>,
-    ingest_queue_capacity: Option<usize>,
-    command_queue_capacity: Option<usize>,
-    batcher_max_batch_records: Option<usize>,
-    batcher_max_batch_age: Option<RawDuration>,
-    group_commit_max_records: Option<usize>,
     grpc_max_recv_msg_size: Option<usize>,
     grpc_max_concurrent_streams: Option<u32>,
     mapping_concurrency: Option<usize>,
@@ -34,91 +32,102 @@ pub(crate) struct FileConfig {
     max_attribute_value_bytes: Option<usize>,
     max_body_bytes: Option<usize>,
     max_scope_metadata_expansion_bytes: Option<usize>,
-    max_db_bytes: Option<u64>,
     shutdown_timeout: Option<RawDuration>,
-    maintenance: Option<MaintenanceSection>,
+    tls: Option<TlsSection>,
+    auth: Option<AuthSection>,
+    // Keys owned by the storage crate's config.
+    sqlite_path: Option<PathBuf>,
+    command_queue_capacity: Option<usize>,
+    batcher_max_batch_records: Option<usize>,
+    batcher_max_batch_age: Option<RawDuration>,
+    group_commit_max_records: Option<usize>,
+    max_db_bytes: Option<u64>,
     search: Option<SearchSection>,
-    watchdog: Option<WatchdogSection>,
-    durability: Option<DurabilitySection>,
+    // Keys the binary itself owns.
+    ingest_queue_capacity: Option<usize>,
     metrics_address: Option<String>,
     allow_remote_metrics: Option<bool>,
     allow_insecure_remote: Option<bool>,
-    tls: Option<TlsSection>,
-    auth: Option<AuthSection>,
+    // Runtime-owned sections.
+    maintenance: Option<MaintenanceSection>,
+    watchdog: Option<WatchdogSection>,
+    // Cross-crate section: ack policy (ingress) and SQLite sync (storage).
+    durability: Option<DurabilitySection>,
 }
 
 impl FileConfig {
     pub(crate) fn apply_to(self, config: &mut Config) -> Result<()> {
+        // Ingress-owned keys write straight into the ingress crate's config.
         if let Some(value) = self.listen_address {
-            config.listen_address = value;
+            config.ingress.listen_address = value;
         }
-        if let Some(value) = self.sqlite_path {
-            config.sqlite_path = value;
+        if let Some(value) = self.grpc_max_recv_msg_size {
+            config.ingress.max_recv_msg_size = value;
         }
-        if let Some(value) = self.ingest_queue_capacity {
-            config.ingest_queue_capacity = value;
+        if let Some(value) = self.grpc_max_concurrent_streams {
+            config.ingress.max_concurrent_streams = value;
         }
-        if let Some(value) = self.command_queue_capacity {
-            config.command_queue_capacity = value;
+        if let Some(value) = self.mapping_concurrency {
+            config.ingress.mapping_concurrency = value;
         }
-        if let Some(value) = self.batcher_max_batch_records {
-            config.batcher_max_batch_records = value;
+        if let Some(value) = self.max_records_per_request {
+            config.ingress.max_records_per_request = value;
+        }
+        if let Some(value) = self.max_attributes_per_record {
+            config.ingress.max_attributes_per_record = value;
+        }
+        if let Some(value) = self.max_attribute_key_bytes {
+            config.ingress.max_attribute_key_bytes = value;
+        }
+        if let Some(value) = self.max_attribute_value_bytes {
+            config.ingress.max_attribute_value_bytes = value;
+        }
+        if let Some(value) = self.max_body_bytes {
+            config.ingress.max_body_bytes = value;
+        }
+        if let Some(value) = self.max_scope_metadata_expansion_bytes {
+            config.ingress.max_scope_metadata_expansion_bytes = value;
         }
         apply_required_duration(
-            &mut config.batcher_max_batch_age,
+            &mut config.ingress.shutdown_timeout,
+            self.shutdown_timeout,
+            "shutdown_timeout",
+        )?;
+        if let Some(section) = self.tls {
+            config.ingress.tls = Some(section.apply_to()?);
+        }
+        if let Some(section) = self.auth {
+            config.ingress.auth = section.apply_to()?;
+        }
+
+        // Storage-owned keys write straight into the storage crate's config.
+        if let Some(value) = self.sqlite_path {
+            config.storage.sqlite_path = value;
+        }
+        if let Some(value) = self.command_queue_capacity {
+            config.storage.command_queue_capacity = value;
+        }
+        if let Some(value) = self.batcher_max_batch_records {
+            config.storage.insert_batcher.max_batch_records = value;
+        }
+        apply_required_duration(
+            &mut config.storage.insert_batcher.max_batch_age,
             self.batcher_max_batch_age,
             "batcher_max_batch_age",
         )?;
         if let Some(value) = self.group_commit_max_records {
-            config.group_commit_max_records = value;
-        }
-        if let Some(value) = self.grpc_max_recv_msg_size {
-            config.grpc_max_recv_msg_size = value;
-        }
-        if let Some(value) = self.grpc_max_concurrent_streams {
-            config.grpc_max_concurrent_streams = value;
-        }
-        if let Some(value) = self.mapping_concurrency {
-            config.mapping_concurrency = value;
-        }
-        if let Some(value) = self.max_records_per_request {
-            config.max_records_per_request = value;
-        }
-        if let Some(value) = self.max_attributes_per_record {
-            config.max_attributes_per_record = value;
-        }
-        if let Some(value) = self.max_attribute_key_bytes {
-            config.max_attribute_key_bytes = value;
-        }
-        if let Some(value) = self.max_attribute_value_bytes {
-            config.max_attribute_value_bytes = value;
-        }
-        if let Some(value) = self.max_body_bytes {
-            config.max_body_bytes = value;
-        }
-        if let Some(value) = self.max_scope_metadata_expansion_bytes {
-            config.max_scope_metadata_expansion_bytes = value;
+            config.storage.group_commit_max_records = value;
         }
         if let Some(value) = self.max_db_bytes {
-            config.max_db_bytes = Some(value);
-        }
-        apply_required_duration(
-            &mut config.shutdown_timeout,
-            self.shutdown_timeout,
-            "shutdown_timeout",
-        )?;
-
-        if let Some(section) = self.maintenance {
-            section.apply_to(&mut config.maintenance)?;
+            config.storage.max_db_bytes = Some(value);
         }
         if let Some(section) = self.search {
             section.apply_to(config)?;
         }
-        if let Some(section) = self.watchdog {
-            section.apply_to(&mut config.watchdog)?;
-        }
-        if let Some(section) = self.durability {
-            section.apply_to(config)?;
+
+        // Binary-owned assembly and admin knobs.
+        if let Some(value) = self.ingest_queue_capacity {
+            config.ingest_queue_capacity = value;
         }
         if let Some(value) = self.metrics_address {
             config.metrics_address = parse_optional_address(&value, "metrics_address")?;
@@ -129,11 +138,16 @@ impl FileConfig {
         if let Some(value) = self.allow_insecure_remote {
             config.allow_insecure_remote = value;
         }
-        if let Some(section) = self.tls {
-            config.tls = Some(section.apply_to()?);
+
+        // Runtime-owned sections and the cross-crate [durability] overlay.
+        if let Some(section) = self.maintenance {
+            section.apply_to(&mut config.maintenance)?;
         }
-        if let Some(section) = self.auth {
-            config.auth = section.apply_to()?;
+        if let Some(section) = self.watchdog {
+            section.apply_to(&mut config.watchdog)?;
+        }
+        if let Some(section) = self.durability {
+            section.apply_to(config)?;
         }
         Ok(())
     }

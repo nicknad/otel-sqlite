@@ -3,14 +3,14 @@ use std::time::Duration;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use otel_sqlite_core::storage::{CheckpointMode, DurabilityMode, SyncMode};
+use otel_sqlite_core::storage::{CheckpointMode, DurabilityMode, InsertBatcherConfig, SyncMode};
 use otel_sqlite_ingress::{
     AuthConfig, DEFAULT_LISTEN_ADDRESS, DEFAULT_MAPPING_CONCURRENCY,
     DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_RECORDS_PER_REQUEST, DEFAULT_SHUTDOWN_TIMEOUT,
-    MAX_ATTRIBUTE_KEY_BYTES, MAX_ATTRIBUTE_VALUE_BYTES, MAX_ATTRIBUTES_PER_RECORD, MAX_BODY_BYTES,
-    MAX_MAPPING_CONCURRENCY, TlsConfig,
+    IngressConfig, TlsConfig,
 };
 use otel_sqlite_runtime::{MaintenanceConfig, PurgeSchedule, WatchdogConfig};
+use otel_sqlite_storage::{FtsMode, MAX_GROUP_COMMIT_RECORDS, StorageConfig};
 
 use super::*;
 
@@ -27,38 +27,64 @@ fn temp_config_path(tag: &str) -> PathBuf {
     ))
 }
 
+/// Config with one section overridden; everything else keeps defaults.
+fn with_ingress(ingress: IngressConfig) -> Config {
+    Config {
+        ingress,
+        ..Config::default()
+    }
+}
+
+/// Config with one section overridden; everything else keeps defaults.
+fn with_storage(storage: StorageConfig) -> Config {
+    Config {
+        storage,
+        ..Config::default()
+    }
+}
+
 #[test]
 fn empty_overlay_keeps_defaults() {
     let mut config = Config::default();
     file_config("").apply_to(&mut config).expect("applies");
-    assert_eq!(config.listen_address, DEFAULT_LISTEN_ADDRESS);
+    assert_eq!(config.ingress.listen_address, DEFAULT_LISTEN_ADDRESS);
     assert!(
-        is_loopback_listen(&config.listen_address),
+        is_loopback_listen(&config.ingress.listen_address),
         "default listen_address must be loopback-only (H1), got {}",
-        config.listen_address
+        config.ingress.listen_address
     );
-    assert_eq!(config.sqlite_path, PathBuf::from("otel-logs.db"));
+    assert_eq!(config.storage.sqlite_path, PathBuf::from("otel-logs.db"));
     assert_eq!(config.ingest_queue_capacity, DEFAULT_INGEST_QUEUE_CAPACITY);
     assert_eq!(
-        config.command_queue_capacity,
+        config.storage.command_queue_capacity,
         otel_sqlite_storage::DEFAULT_COMMAND_QUEUE_CAPACITY
     );
-    assert_eq!(config.batcher_max_batch_age, Duration::from_millis(10));
     assert_eq!(
-        config.group_commit_max_records,
+        config.storage.insert_batcher.max_batch_records,
+        otel_sqlite_core::storage::DEFAULT_MAX_INSERT_BATCH_RECORDS
+    );
+    assert_eq!(
+        config.storage.insert_batcher.max_batch_age,
+        Duration::from_millis(10)
+    );
+    assert_eq!(
+        config.storage.group_commit_max_records,
         otel_sqlite_storage::DEFAULT_GROUP_COMMIT_RECORDS
     );
-    assert_eq!(config.search_mode, otel_sqlite_storage::FtsMode::Body);
+    assert_eq!(config.storage.fts_mode, FtsMode::Body);
     assert_eq!(
-        config.grpc_max_concurrent_streams,
+        config.ingress.max_concurrent_streams,
         DEFAULT_MAX_CONCURRENT_STREAMS
     );
-    assert_eq!(config.mapping_concurrency, DEFAULT_MAPPING_CONCURRENCY);
     assert_eq!(
-        config.max_records_per_request,
+        config.ingress.mapping_concurrency,
+        DEFAULT_MAPPING_CONCURRENCY
+    );
+    assert_eq!(
+        config.ingress.max_records_per_request,
         DEFAULT_MAX_RECORDS_PER_REQUEST
     );
-    assert_eq!(config.shutdown_timeout, DEFAULT_SHUTDOWN_TIMEOUT);
+    assert_eq!(config.ingress.shutdown_timeout, DEFAULT_SHUTDOWN_TIMEOUT);
     assert_eq!(
         config.ingress_config().max_records_per_request,
         DEFAULT_MAX_RECORDS_PER_REQUEST
@@ -95,44 +121,49 @@ fn top_level_keys_override_defaults() {
     )
     .apply_to(&mut config)
     .expect("applies");
-    assert_eq!(config.listen_address, "[::1]:4317");
-    assert_eq!(config.sqlite_path, PathBuf::from("data/logs.db"));
+    assert_eq!(config.ingress.listen_address, "[::1]:4317");
+    assert_eq!(config.storage.sqlite_path, PathBuf::from("data/logs.db"));
     assert_eq!(config.ingest_queue_capacity, 10);
-    assert_eq!(config.command_queue_capacity, 20);
-    assert_eq!(config.batcher_max_batch_records, 42);
-    assert_eq!(config.batcher_max_batch_age, Duration::from_millis(250));
-    assert_eq!(config.group_commit_max_records, 17);
-    assert_eq!(config.search_mode, otel_sqlite_storage::FtsMode::Full);
-    assert_eq!(config.grpc_max_recv_msg_size, 1024);
-    assert_eq!(config.grpc_max_concurrent_streams, 8);
-    assert_eq!(config.mapping_concurrency, 64);
-    assert_eq!(config.max_records_per_request, 777);
-    assert_eq!(config.max_attributes_per_record, 111);
-    assert_eq!(config.max_attribute_key_bytes, 222);
-    assert_eq!(config.max_attribute_value_bytes, 333);
-    assert_eq!(config.max_body_bytes, 444);
-    assert_eq!(config.max_scope_metadata_expansion_bytes, 8192);
-    assert_eq!(config.shutdown_timeout, Duration::from_secs(90));
+    assert_eq!(config.storage.command_queue_capacity, 20);
+    assert_eq!(config.storage.insert_batcher.max_batch_records, 42);
+    assert_eq!(
+        config.storage.insert_batcher.max_batch_age,
+        Duration::from_millis(250)
+    );
+    assert_eq!(config.storage.group_commit_max_records, 17);
+    assert_eq!(config.storage.fts_mode, FtsMode::Full);
+    assert_eq!(config.ingress.max_recv_msg_size, 1024);
+    assert_eq!(config.ingress.max_concurrent_streams, 8);
+    assert_eq!(config.ingress.mapping_concurrency, 64);
+    assert_eq!(config.ingress.max_records_per_request, 777);
+    assert_eq!(config.ingress.max_attributes_per_record, 111);
+    assert_eq!(config.ingress.max_attribute_key_bytes, 222);
+    assert_eq!(config.ingress.max_attribute_value_bytes, 333);
+    assert_eq!(config.ingress.max_body_bytes, 444);
+    assert_eq!(config.ingress.max_scope_metadata_expansion_bytes, 8192);
+    assert_eq!(config.ingress.shutdown_timeout, Duration::from_secs(90));
 }
 
 #[test]
 fn size_quota_parses_validates_and_reaches_storage() {
     let mut config = Config::default();
-    assert_eq!(config.max_db_bytes, None, "unbounded by default");
+    assert_eq!(config.storage.max_db_bytes, None, "unbounded by default");
     file_config("max_db_bytes = 1073741824\n")
         .apply_to(&mut config)
         .expect("applies");
-    assert_eq!(config.max_db_bytes, Some(1_073_741_824));
+    assert_eq!(config.storage.max_db_bytes, Some(1_073_741_824));
     config.validate().expect("1 GiB quota is valid");
     assert_eq!(config.storage_config().max_db_bytes, Some(1_073_741_824));
     let dump = config.dump_json().expect("dumps");
     assert!(dump.contains("max_db_bytes"), "dump must expose the quota");
 
-    // Below 1 MiB the writer would evict on nearly every batch: reject.
-    let tiny = Config {
+    // Below 1 MiB the writer would evict on nearly every batch: reject. The
+    // rule is owned by the storage crate, so a direct constructor fails too
+    // (see otel-sqlite-storage's config tests for the full sweep).
+    let tiny = with_storage(StorageConfig {
         max_db_bytes: Some(1024),
-        ..Config::default()
-    };
+        ..StorageConfig::default()
+    });
     assert!(tiny.validate().is_err(), "sub-MiB quotas must be rejected");
 }
 
@@ -143,20 +174,20 @@ fn search_mode_parsing_and_group_commit_range_are_validated() {
         .apply_to(&mut config)
         .expect_err("unknown search mode must be rejected");
 
-    let too_large = Config {
-        group_commit_max_records: otel_sqlite_storage::MAX_GROUP_COMMIT_RECORDS + 1,
-        ..Config::default()
-    };
+    let too_large = with_storage(StorageConfig {
+        group_commit_max_records: MAX_GROUP_COMMIT_RECORDS + 1,
+        ..StorageConfig::default()
+    });
     assert!(
         too_large.validate().is_err(),
         "over-limit group commit must be rejected"
     );
 
-    let disabled = Config {
+    let disabled = with_storage(StorageConfig {
         group_commit_max_records: 0,
-        search_mode: otel_sqlite_storage::FtsMode::Off,
-        ..Config::default()
-    };
+        fts_mode: FtsMode::Off,
+        ..StorageConfig::default()
+    });
     disabled
         .validate()
         .expect("0 disables grouping; off is valid");
@@ -168,10 +199,7 @@ fn search_mode_parsing_and_group_commit_range_are_validated() {
         0,
         "the knob must reach the writer"
     );
-    assert_eq!(
-        disabled.storage_config().fts_mode,
-        otel_sqlite_storage::FtsMode::Off
-    );
+    assert_eq!(disabled.storage_config().fts_mode, FtsMode::Off);
 }
 
 #[test]
@@ -188,8 +216,11 @@ fn duration_formats_are_accepted() {
     )
     .apply_to(&mut config)
     .expect("applies");
-    assert_eq!(config.batcher_max_batch_age, Duration::from_millis(250));
-    assert_eq!(config.shutdown_timeout, Duration::from_secs(3_600));
+    assert_eq!(
+        config.storage.insert_batcher.max_batch_age,
+        Duration::from_millis(250)
+    );
+    assert_eq!(config.ingress.shutdown_timeout, Duration::from_secs(3_600));
     assert_eq!(config.watchdog.tick_interval, Duration::from_secs(120));
     assert_eq!(config.watchdog.unhealthy_after, Duration::from_secs(86_400));
 }
@@ -384,8 +415,8 @@ fn mandatory_duration_rejects_off() {
 fn durability_section_defaults_to_commit_and_normal_sync() {
     let mut config = Config::default();
     file_config("").apply_to(&mut config).expect("applies");
-    assert_eq!(config.durability_mode, DurabilityMode::Commit);
-    assert_eq!(config.sqlite_synchronous, SyncMode::Normal);
+    assert_eq!(config.ingress.durability_mode, DurabilityMode::Commit);
+    assert_eq!(config.storage.synchronous, SyncMode::Normal);
 
     file_config(
         r#"
@@ -396,8 +427,8 @@ fn durability_section_defaults_to_commit_and_normal_sync() {
     )
     .apply_to(&mut config)
     .expect("applies");
-    assert_eq!(config.durability_mode, DurabilityMode::Enqueue);
-    assert_eq!(config.sqlite_synchronous, SyncMode::Full);
+    assert_eq!(config.ingress.durability_mode, DurabilityMode::Enqueue);
+    assert_eq!(config.storage.synchronous, SyncMode::Full);
     // The knobs flow through to the per-crate configs.
     assert_eq!(
         config.ingress_config().durability_mode,
@@ -412,7 +443,7 @@ fn durability_section_is_case_insensitive_and_rejects_unknown_values() {
     file_config("[durability]\nmode = \"Commit\"")
         .apply_to(&mut config)
         .expect("applies");
-    assert_eq!(config.durability_mode, DurabilityMode::Commit);
+    assert_eq!(config.ingress.durability_mode, DurabilityMode::Commit);
 
     let mut config = Config::default();
     let result = file_config("[durability]\nmode = \"durable\"").apply_to(&mut config);
@@ -427,8 +458,8 @@ fn durability_section_is_case_insensitive_and_rejects_unknown_values() {
 fn tls_and_auth_sections_parse_and_validate() {
     let mut config = Config::default();
     file_config("").apply_to(&mut config).expect("applies");
-    assert!(config.tls.is_none());
-    assert!(config.auth.is_none());
+    assert!(config.ingress.tls.is_none());
+    assert!(config.ingress.auth.is_none());
 
     // mTLS + token auth together.
     file_config(
@@ -445,10 +476,10 @@ fn tls_and_auth_sections_parse_and_validate() {
     )
     .apply_to(&mut config)
     .expect("applies");
-    let tls = config.tls.as_ref().expect("tls set");
+    let tls = config.ingress.tls.as_ref().expect("tls set");
     assert_eq!(tls.cert, PathBuf::from("/certs/server.pem"));
     assert_eq!(tls.client_ca, Some(PathBuf::from("/certs/ca.pem")));
-    let auth = config.auth.as_ref().expect("auth set");
+    let auth = config.ingress.auth.as_ref().expect("auth set");
     assert_eq!(auth.token_file, PathBuf::from("/etc/otel.txt"));
 
     // Server TLS without mTLS is valid too.
@@ -456,7 +487,15 @@ fn tls_and_auth_sections_parse_and_validate() {
     file_config("[tls]\ncert = \"s.pem\"\nkey = \"s.key\"")
         .apply_to(&mut config)
         .expect("applies");
-    assert!(config.tls.as_ref().expect("tls").client_ca.is_none());
+    assert!(
+        config
+            .ingress
+            .tls
+            .as_ref()
+            .expect("tls")
+            .client_ca
+            .is_none()
+    );
 
     // [tls] without cert/key is a config error.
     for incomplete in ["[tls]\nkey = \"k\"", "[tls]\ncert = \"c\""] {
@@ -533,13 +572,7 @@ fn validation_rejects_unsafe_or_out_of_range_values() {
             assert!(format!("{error:#}").contains($key), "{}: {error:#}", $key);
         };
     }
-    assert_invalid!(
-        "listen_address",
-        Config {
-            listen_address: ":0".to_owned(),
-            ..Config::default()
-        }
-    );
+    // Binary-owned assembly knob.
     assert_invalid!(
         "ingest_queue_capacity",
         Config {
@@ -547,97 +580,15 @@ fn validation_rejects_unsafe_or_out_of_range_values() {
             ..Config::default()
         }
     );
+    // Cross-section listen gate: non-zero port.
     assert_invalid!(
-        "command_queue_capacity",
-        Config {
-            command_queue_capacity: MAX_INGEST_QUEUE_CAPACITY + 1,
-            ..Config::default()
-        }
+        "listen_address",
+        with_ingress(IngressConfig {
+            listen_address: ":0".to_owned(),
+            ..IngressConfig::default()
+        })
     );
-    assert_invalid!(
-        "batcher_max_batch_records",
-        Config {
-            batcher_max_batch_records: 0,
-            ..Config::default()
-        }
-    );
-    assert_invalid!(
-        "grpc_max_recv_msg_size",
-        Config {
-            grpc_max_recv_msg_size: 512,
-            ..Config::default()
-        }
-    );
-    assert_invalid!(
-        "grpc_max_concurrent_streams",
-        Config {
-            grpc_max_concurrent_streams: 0,
-            ..Config::default()
-        }
-    );
-    assert_invalid!(
-        "mapping_concurrency",
-        Config {
-            mapping_concurrency: 0,
-            ..Config::default()
-        }
-    );
-    assert_invalid!(
-        "mapping_concurrency",
-        Config {
-            mapping_concurrency: MAX_MAPPING_CONCURRENCY + 1,
-            ..Config::default()
-        }
-    );
-    assert_invalid!(
-        "grpc_max_concurrent_streams",
-        Config {
-            grpc_max_concurrent_streams: MAX_GRPC_CONCURRENT_STREAMS + 1,
-            ..Config::default()
-        }
-    );
-    assert_invalid!(
-        "max_records_per_request",
-        Config {
-            max_records_per_request: MAX_RECORDS_PER_REQUEST + 1,
-            ..Config::default()
-        }
-    );
-    assert_invalid!(
-        "max_attributes_per_record",
-        Config {
-            max_attributes_per_record: MAX_ATTRIBUTES_PER_RECORD + 1,
-            ..Config::default()
-        }
-    );
-    assert_invalid!(
-        "max_attribute_key_bytes",
-        Config {
-            max_attribute_key_bytes: MAX_ATTRIBUTE_KEY_BYTES + 1,
-            ..Config::default()
-        }
-    );
-    assert_invalid!(
-        "max_attribute_value_bytes",
-        Config {
-            max_attribute_value_bytes: MAX_ATTRIBUTE_VALUE_BYTES + 1,
-            ..Config::default()
-        }
-    );
-    assert_invalid!(
-        "max_body_bytes",
-        Config {
-            max_body_bytes: MAX_BODY_BYTES + 1,
-            ..Config::default()
-        }
-    );
-    assert_invalid!(
-        "shutdown_timeout",
-        Config {
-            shutdown_timeout: Duration::ZERO,
-            ..Config::default()
-        }
-    );
+    // Runtime-owned zero rule, reached through the binary's delegation.
     assert_invalid!(
         "maintenance.purge.interval",
         Config {
@@ -651,6 +602,7 @@ fn validation_rejects_unsafe_or_out_of_range_values() {
             ..Config::default()
         }
     );
+    // CLI-wide retention ceiling.
     assert_invalid!(
         "maintenance.purge.retention",
         Config {
@@ -664,7 +616,7 @@ fn validation_rejects_unsafe_or_out_of_range_values() {
             ..Config::default()
         }
     );
-
+    // Remote metrics exposure gate.
     assert_invalid!(
         "allow_remote_metrics",
         Config {
@@ -699,15 +651,48 @@ fn validation_rejects_unsafe_or_out_of_range_values() {
     );
 }
 
+#[test]
+fn section_invariants_are_delegated_to_the_owning_crates() {
+    // Per-section bounds now live in the owning crates; the binary's
+    // validate must still run them (this is the delegation contract).
+    let error = with_ingress(IngressConfig {
+        max_recv_msg_size: 512,
+        ..IngressConfig::default()
+    })
+    .validate()
+    .expect_err("the ingress crate must reject a sub-floor wire budget");
+    assert!(
+        format!("{error:#}").contains("grpc_max_recv_msg_size"),
+        "{error:#}"
+    );
+
+    let error = with_storage(StorageConfig {
+        insert_batcher: InsertBatcherConfig {
+            max_batch_records: 0,
+            max_batch_age: Duration::from_millis(10),
+        },
+        ..StorageConfig::default()
+    })
+    .validate()
+    .expect_err("the storage crate must reject a zero batch");
+    assert!(
+        format!("{error:#}").contains("batcher_max_batch_records"),
+        "{error:#}"
+    );
+}
+
 /// A buffered batch legitimately keeps the writer idle until its age deadline;
 /// if that can outlive the first health threshold, the watchdog would halt a
 /// healthy low-volume pipeline.
 #[test]
 fn validation_rejects_a_batch_age_that_outlives_the_watchdog_threshold() {
-    let mut config = Config {
-        batcher_max_batch_age: Duration::from_secs(60),
-        ..Config::default()
-    };
+    let mut config = with_storage(StorageConfig {
+        insert_batcher: InsertBatcherConfig {
+            max_batch_records: 500,
+            max_batch_age: Duration::from_secs(60),
+        },
+        ..StorageConfig::default()
+    });
     let error = config
         .validate()
         .expect_err("a batch age above degraded_after must fail");
@@ -734,20 +719,20 @@ fn validation_requires_readable_tls_and_auth_files() {
         std::fs::write(path, "test").expect("write test file");
     }
 
-    let mut config = Config {
+    let mut config = with_ingress(IngressConfig {
         tls: Some(TlsConfig {
             cert: cert.clone(),
             key: key.clone(),
             client_ca: Some(ca),
         }),
         auth: Some(AuthConfig { token_file: token }),
-        ..Config::default()
-    };
+        ..IngressConfig::default()
+    });
     config
         .validate()
         .expect("readable security files are valid");
 
-    config.tls.as_mut().expect("tls").key = dir.path().join("missing.key");
+    config.ingress.tls.as_mut().expect("tls").key = dir.path().join("missing.key");
     let error = config.validate().expect_err("missing TLS key must fail");
     assert!(error.to_string().contains("tls.key"));
 }
@@ -759,14 +744,14 @@ fn validation_rejects_directories_as_security_files() {
     std::fs::write(&cert, "test").expect("write test file");
     // On unix `File::open` happily opens a directory; validation must
     // reject it because a directory is not usable certificate material.
-    let config = Config {
+    let config = with_ingress(IngressConfig {
         tls: Some(TlsConfig {
             cert,
             key: dir.path().to_path_buf(),
             client_ca: None,
         }),
-        ..Config::default()
-    };
+        ..IngressConfig::default()
+    });
     let error = config
         .validate()
         .expect_err("a directory must not pass as tls.key");
@@ -778,11 +763,10 @@ fn validation_rejects_directories_as_security_files() {
 
 #[test]
 fn effective_dump_contains_runtime_values() {
-    let config = Config {
+    let config = with_ingress(IngressConfig {
         max_records_per_request: 321,
-        metrics_address: None,
-        ..Config::default()
-    };
+        ..IngressConfig::default()
+    });
     let dump = config.dump_json().expect("serializes");
     assert!(dump.contains("\"max_records_per_request\": 321"));
     assert!(dump.contains("\"metrics_address\": null"));
@@ -809,6 +793,22 @@ fn effective_dump_contains_runtime_values() {
 }
 
 #[test]
+fn storage_drain_shares_the_ingress_shutdown_budget() {
+    // One graceful-shutdown budget serves both drains; the value lives on
+    // the ingress config and storage_config() takes its copy from there.
+    let mut config = Config::default();
+    config.ingress.shutdown_timeout = Duration::from_secs(90);
+    assert_eq!(
+        config.ingress_config().shutdown_timeout,
+        Duration::from_secs(90)
+    );
+    assert_eq!(
+        config.storage_config().shutdown_timeout,
+        Duration::from_secs(90)
+    );
+}
+
+#[test]
 fn metrics_url_uses_a_usable_host() {
     assert_eq!(
         metrics_display_url(":8888"),
@@ -831,18 +831,18 @@ fn metrics_url_uses_a_usable_host() {
 #[test]
 fn non_loopback_listen_requires_tls_or_explicit_opt_in() {
     // Loopback binds stay usable without TLS (the default).
-    Config {
+    with_ingress(IngressConfig {
         listen_address: "127.0.0.1:4317".to_owned(),
-        ..Config::default()
-    }
+        ..IngressConfig::default()
+    })
     .validate()
     .expect("loopback without TLS is valid");
 
     // A wildcard bind without TLS fails closed with a prescriptive error.
-    let error = Config {
+    let error = with_ingress(IngressConfig {
         listen_address: "0.0.0.0:4317".to_owned(),
-        ..Config::default()
-    }
+        ..IngressConfig::default()
+    })
     .validate()
     .expect_err("cleartext remote bind must fail");
     assert!(
@@ -852,7 +852,10 @@ fn non_loopback_listen_requires_tls_or_explicit_opt_in() {
 
     // The explicit isolated-network opt-in restores the old behaviour.
     Config {
-        listen_address: "0.0.0.0:4317".to_owned(),
+        ingress: IngressConfig {
+            listen_address: "0.0.0.0:4317".to_owned(),
+            ..IngressConfig::default()
+        },
         allow_insecure_remote: true,
         ..Config::default()
     }
@@ -865,15 +868,15 @@ fn non_loopback_listen_requires_tls_or_explicit_opt_in() {
     let key = dir.path().join("server.key");
     std::fs::write(&cert, "test").expect("write test file");
     std::fs::write(&key, "test").expect("write test file");
-    Config {
+    with_ingress(IngressConfig {
         listen_address: "0.0.0.0:4317".to_owned(),
         tls: Some(TlsConfig {
             cert,
             key,
             client_ca: None,
         }),
-        ..Config::default()
-    }
+        ..IngressConfig::default()
+    })
     .validate()
     .expect("remote bind with TLS is valid");
 }
@@ -928,10 +931,10 @@ fn from_file_overrides_defaults_and_keeps_rest() {
     let _ = std::fs::remove_file(&path);
 
     let config = config.expect("valid config file");
-    assert_eq!(config.listen_address, ":1234");
+    assert_eq!(config.ingress.listen_address, ":1234");
     assert!(config.allow_insecure_remote);
-    assert_eq!(config.sqlite_path, PathBuf::from("/tmp/otel.db"));
-    assert_eq!(config.shutdown_timeout, Duration::from_secs(45));
+    assert_eq!(config.storage.sqlite_path, PathBuf::from("/tmp/otel.db"));
+    assert_eq!(config.ingress.shutdown_timeout, Duration::from_secs(45));
     assert_eq!(
         config.maintenance.purge.map(|purge| purge.retention),
         Some(Duration::from_secs(7 * 86_400))

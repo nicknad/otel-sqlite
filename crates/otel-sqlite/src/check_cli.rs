@@ -234,6 +234,7 @@ fn evaluate(config: &Config, source: &'static str, path: Option<PathBuf>) -> Che
     let tls = material_check(
         "TLS material",
         config
+            .ingress
             .tls
             .as_ref()
             .map(|tls| validate_tls_material(tls).map_err(|error| error.to_string())),
@@ -242,7 +243,7 @@ fn evaluate(config: &Config, source: &'static str, path: Option<PathBuf>) -> Che
 
     let auth = material_check(
         "bearer-token file",
-        config.auth.as_ref().map(|auth| {
+        config.ingress.auth.as_ref().map(|auth| {
             TokenFileVault::open(&auth.token_file)
                 .map(|_| ())
                 .map_err(|error| error.to_string())
@@ -251,8 +252,8 @@ fn evaluate(config: &Config, source: &'static str, path: Option<PathBuf>) -> Che
     );
 
     let database = check_database(
-        &config.sqlite_path,
-        config.search_mode,
+        &config.storage.sqlite_path,
+        config.storage.fts_mode,
         &mut warnings,
         &mut errors,
     );
@@ -504,7 +505,7 @@ mod tests {
     use std::fs;
 
     use otel_sqlite_ingress::{AuthConfig, TlsConfig};
-    use otel_sqlite_storage::migrate_up_to;
+    use otel_sqlite_storage::{StorageConfig, migrate_up_to};
     use rusqlite::Connection;
 
     use super::*;
@@ -515,7 +516,10 @@ mod tests {
 
     fn config_for(sqlite_path: PathBuf) -> Config {
         Config {
-            sqlite_path,
+            storage: StorageConfig {
+                sqlite_path,
+                ..StorageConfig::default()
+            },
             ..Config::default()
         }
     }
@@ -674,7 +678,7 @@ mod tests {
         fs::write(&key, b"not a key").expect("write key");
 
         let mut config = config_for(dir.path().join("missing.db"));
-        config.tls = Some(TlsConfig {
+        config.ingress.tls = Some(TlsConfig {
             cert,
             key,
             client_ca: None,
@@ -704,7 +708,7 @@ mod tests {
         fs::write(&key_path, key.serialize_pem()).expect("write key");
 
         let mut config = config_for(dir.path().join("missing.db"));
-        config.tls = Some(TlsConfig {
+        config.ingress.tls = Some(TlsConfig {
             cert: cert_path,
             key: key_path,
             client_ca: None,
@@ -722,7 +726,7 @@ mod tests {
         fs::write(&token_file, b"").expect("empty token file");
 
         let mut config = config_for(dir.path().join("missing.db"));
-        config.auth = Some(AuthConfig { token_file });
+        config.ingress.auth = Some(AuthConfig { token_file });
         let report = evaluate(&config, "defaults", None);
 
         assert!(!report.ok);
@@ -736,7 +740,7 @@ mod tests {
         fs::write(&token_file, b"token-a\ntoken-b\n").expect("token file");
 
         let mut config = config_for(dir.path().join("missing.db"));
-        config.auth = Some(AuthConfig { token_file });
+        config.ingress.auth = Some(AuthConfig { token_file });
         let report = evaluate(&config, "defaults", None);
 
         assert!(

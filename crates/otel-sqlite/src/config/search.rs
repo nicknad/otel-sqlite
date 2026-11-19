@@ -14,7 +14,7 @@ pub(crate) struct SearchSection {
 impl SearchSection {
     pub(crate) fn apply_to(self, config: &mut Config) -> Result<()> {
         if let Some(raw) = self.mode {
-            config.search_mode = FtsMode::parse(&raw)
+            config.storage.fts_mode = FtsMode::parse(&raw)
                 .with_context(|| format!("unknown search.mode `{raw}` (expected off|body|full)"))?;
         }
         Ok(())

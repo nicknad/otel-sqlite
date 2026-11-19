@@ -14,12 +14,12 @@ pub(crate) struct DurabilitySection {
 impl DurabilitySection {
     pub(crate) fn apply_to(self, config: &mut Config) -> Result<()> {
         if let Some(mode) = self.mode {
-            config.durability_mode = DurabilityMode::parse(&mode).ok_or_else(|| {
+            config.ingress.durability_mode = DurabilityMode::parse(&mode).ok_or_else(|| {
                 anyhow::anyhow!("unknown durability.mode `{mode}` (expected commit|enqueue)")
             })?;
         }
         if let Some(sync) = self.synchronous {
-            config.sqlite_synchronous = SyncMode::parse(&sync).ok_or_else(|| {
+            config.storage.synchronous = SyncMode::parse(&sync).ok_or_else(|| {
                 anyhow::anyhow!("unknown durability.synchronous `{sync}` (expected normal|full)")
             })?;
         }

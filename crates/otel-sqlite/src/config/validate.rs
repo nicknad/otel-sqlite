@@ -3,24 +3,32 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use otel_sqlite_ingress::expand_bind_address;
-use otel_sqlite_storage::warn_if_world_readable;
+use otel_sqlite_storage::{FtsMode, warn_if_world_readable};
 
-use super::{
-    Config, MAX_ATTRIBUTE_KEY_BYTES, MAX_ATTRIBUTE_VALUE_BYTES, MAX_ATTRIBUTES_PER_RECORD,
-    MAX_BODY_BYTES, MAX_GRPC_CONCURRENT_STREAMS, MAX_GRPC_RECV_MSG_SIZE, MAX_INGEST_QUEUE_CAPACITY,
-    MAX_MAPPING_CONCURRENCY, MAX_RECORDS_PER_REQUEST, MAX_RETENTION,
-    MAX_SCOPE_METADATA_EXPANSION_BYTES, MAX_TIMEOUT, MIN_DB_QUOTA_BYTES, is_loopback_listen,
-};
-use otel_sqlite_storage::{FtsMode, MAX_GROUP_COMMIT_RECORDS};
+use super::{Config, MAX_INGEST_QUEUE_CAPACITY, MAX_RETENTION, MAX_TIMEOUT, is_loopback_listen};
 
 /// Validates the complete effective configuration before any listener or
-/// worker is started. One function per section so limits, durations and
-/// security gates evolve independently.
+/// worker is started.
+///
+/// Per-section defaults and invariants live with the owning crates —
+/// [`otel_sqlite_ingress::IngressConfig::validate`] for the ingress section,
+/// [`otel_sqlite_storage::StorageConfig::validate`] for storage,
+/// [`otel_sqlite_runtime::MaintenanceConfig::validate`] and
+/// [`otel_sqlite_runtime::WatchdogConfig::validate_batch_age`] for the
+/// runtime workers. This module keeps only the cross-section gates: rules
+/// that compare knobs from more than one section, plus the assembly knobs
+/// and duration ceilings the CLI itself owns.
 pub(crate) fn validate_config(config: &Config) -> Result<()> {
+    config
+        .ingress
+        .validate()
+        .context("invalid ingress configuration")?;
+    config
+        .storage
+        .validate()
+        .context("invalid storage configuration")?;
     validate_listen(config)?;
-    validate_queues_and_grpc(config)?;
-    validate_mapping_limits(config)?;
-    validate_quota(config)?;
+    validate_queues_and_durations(config)?;
     validate_maintenance(config)?;
     validate_watchdog(config)?;
     validate_endpoints(config)?;
@@ -28,10 +36,13 @@ pub(crate) fn validate_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Listen address checks and the cleartext-exposure gate: `listen_address`
+/// and `[tls]` are ingress-owned, the opt-in is binary-owned, so the rule
+/// itself belongs to the assembly.
 fn validate_listen(config: &Config) -> Result<()> {
-    let listen = expand_bind_address(&config.listen_address)
+    let listen = expand_bind_address(&config.ingress.listen_address)
         .parse::<std::net::SocketAddr>()
-        .with_context(|| format!("invalid listen_address `{}`", config.listen_address))?;
+        .with_context(|| format!("invalid listen_address `{}`", config.ingress.listen_address))?;
     if listen.port() == 0 {
         bail!("listen_address must use a non-zero port");
     }
@@ -40,149 +51,82 @@ fn validate_listen(config: &Config) -> Result<()> {
     // inject their own). Bearer auth alone does not satisfy this — the
     // token itself would travel in cleartext — so only a TLS identity or
     // the explicit isolated-network opt-in gets past here.
-    if !is_loopback_listen(&config.listen_address) && config.tls.is_none() {
+    if !is_loopback_listen(&config.ingress.listen_address) && config.ingress.tls.is_none() {
         if !config.allow_insecure_remote {
             bail!(
                 "listen_address `{}` is non-loopback but no [tls] is configured; \
                  telemetry and bearer tokens would travel in cleartext. Configure [tls] \
                  (see `otel-sqlite gen-certs`) or set allow_insecure_remote = true only \
                  for an isolated network you trust",
-                config.listen_address
+                config.ingress.listen_address
             );
         }
         tracing::warn!(
-            listen_address = config.listen_address.as_str(),
+            listen_address = config.ingress.listen_address.as_str(),
             "ingress binds a non-loopback address without TLS; traffic is cleartext",
         );
     }
     Ok(())
 }
 
-fn validate_queues_and_grpc(config: &Config) -> Result<()> {
+/// Binary-owned assembly knobs plus the duration ceilings the CLI applies
+/// across sections. Zero and nonsense values are already rejected by the
+/// owning crates, so only the cross-section pieces live here.
+fn validate_queues_and_durations(config: &Config) -> Result<()> {
     validate_range(
         "ingest_queue_capacity",
         config.ingest_queue_capacity,
         1,
         MAX_INGEST_QUEUE_CAPACITY,
     )?;
-    validate_range(
-        "command_queue_capacity",
-        config.command_queue_capacity,
-        1,
-        MAX_INGEST_QUEUE_CAPACITY,
-    )?;
-    validate_range(
-        "batcher_max_batch_records",
-        config.batcher_max_batch_records,
-        1,
-        super::MAX_BATCH_RECORDS,
-    )?;
-    validate_range(
-        "group_commit_max_records",
-        config.group_commit_max_records,
-        0,
-        MAX_GROUP_COMMIT_RECORDS,
-    )?;
-    if config.group_commit_max_records > 0
-        && config.group_commit_max_records < config.batcher_max_batch_records
+    // Cross-section advisory: a group-commit ceiling below the insert-batch
+    // capacity cannot coalesce a full batch.
+    if config.storage.group_commit_max_records > 0
+        && config.storage.group_commit_max_records < config.storage.insert_batcher.max_batch_records
     {
         tracing::warn!(
-            group_commit_max_records = config.group_commit_max_records,
-            batcher_max_batch_records = config.batcher_max_batch_records,
+            group_commit_max_records = config.storage.group_commit_max_records,
+            batcher_max_batch_records = config.storage.insert_batcher.max_batch_records,
             "group_commit_max_records is below batcher_max_batch_records; full batches will not coalesce"
         );
     }
-    validate_range(
-        "grpc_max_recv_msg_size",
-        config.grpc_max_recv_msg_size,
-        1024,
-        MAX_GRPC_RECV_MSG_SIZE,
+    // The owning crates reject zero for both of these; the CLI keeps only
+    // the uniform ceiling.
+    validate_duration_ceiling(
+        "batcher_max_batch_age",
+        config.storage.insert_batcher.max_batch_age,
+        MAX_TIMEOUT,
     )?;
-    validate_range(
-        "grpc_max_concurrent_streams",
-        config.grpc_max_concurrent_streams,
-        1,
-        MAX_GRPC_CONCURRENT_STREAMS,
-    )?;
-    validate_range(
-        "mapping_concurrency",
-        config.mapping_concurrency,
-        1,
-        MAX_MAPPING_CONCURRENCY,
-    )?;
-    // Very large wire budgets multiply by the stream count into gigabytes
-    // of worst-case inbound buffering; make sure operators raising them
-    // past these marks see the cost in the logs (startup only).
-    if config.grpc_max_recv_msg_size > 64 * 1024 * 1024 {
-        tracing::warn!(
-            grpc_max_recv_msg_size = config.grpc_max_recv_msg_size,
-            grpc_max_concurrent_streams = config.grpc_max_concurrent_streams,
-            "large grpc_max_recv_msg_size multiplies by the stream count into GiB-scale inbound buffering; raise host memory accordingly",
-        );
-    }
-    validate_duration("batcher_max_batch_age", config.batcher_max_batch_age)?;
-    validate_duration("shutdown_timeout", config.shutdown_timeout)?;
-    Ok(())
-}
-
-fn validate_mapping_limits(config: &Config) -> Result<()> {
-    validate_range(
-        "max_records_per_request",
-        config.max_records_per_request,
-        1,
-        MAX_RECORDS_PER_REQUEST,
-    )?;
-    validate_range(
-        "max_attributes_per_record",
-        config.max_attributes_per_record,
-        1,
-        MAX_ATTRIBUTES_PER_RECORD,
-    )?;
-    validate_range(
-        "max_attribute_key_bytes",
-        config.max_attribute_key_bytes,
-        1,
-        MAX_ATTRIBUTE_KEY_BYTES,
-    )?;
-    validate_range(
-        "max_attribute_value_bytes",
-        config.max_attribute_value_bytes,
-        1,
-        MAX_ATTRIBUTE_VALUE_BYTES,
-    )?;
-    validate_range("max_body_bytes", config.max_body_bytes, 1, MAX_BODY_BYTES)?;
-    validate_range(
-        "max_scope_metadata_expansion_bytes",
-        config.max_scope_metadata_expansion_bytes,
-        1024,
-        MAX_SCOPE_METADATA_EXPANSION_BYTES,
+    validate_duration_ceiling(
+        "shutdown_timeout",
+        config.ingress.shutdown_timeout,
+        MAX_TIMEOUT,
     )?;
     Ok(())
 }
 
-fn validate_quota(config: &Config) -> Result<()> {
-    if let Some(quota) = config.max_db_bytes
-        && quota < MIN_DB_QUOTA_BYTES
-    {
-        bail!("max_db_bytes must be at least {MIN_DB_QUOTA_BYTES} bytes (1 MiB); got {quota}");
-    }
-    Ok(())
-}
-
+/// Maintenance schedule: runtime-owned zero rules (via delegation) plus the
+/// CLI duration ceilings and the search-mode interplay.
 fn validate_maintenance(config: &Config) -> Result<()> {
     // Runtime-owned invariants (non-zero retry delay and purge schedule).
     config
         .maintenance
         .validate()
         .context("invalid maintenance configuration")?;
-    // CLI-specific upper bounds on the durations operators can express.
-    validate_duration("maintenance.retry_delay", config.maintenance.retry_delay)?;
-    validate_optional_duration(
+    // CLI-specific upper bounds on the durations operators can express. The
+    // purge cadence zero rule is runtime-owned; the optional intervals keep
+    // their CLI-only zero rejection ("off" is the documented way to disable).
+    validate_duration_ceiling(
+        "maintenance.retry_delay",
+        config.maintenance.retry_delay,
+        MAX_TIMEOUT,
+    )?;
+    validate_optional_duration_ceiling(
         "maintenance.purge.retention",
         config.maintenance.purge.map(|schedule| schedule.retention),
         MAX_RETENTION,
     )?;
-    validate_optional_duration(
+    validate_optional_duration_ceiling(
         "maintenance.purge.interval",
         config.maintenance.purge.map(|schedule| schedule.interval),
         MAX_TIMEOUT,
@@ -207,26 +151,46 @@ fn validate_maintenance(config: &Config) -> Result<()> {
         config.maintenance.rebuild_fts_interval,
         MAX_RETENTION,
     )?;
-    if config.search_mode == FtsMode::Off && config.maintenance.rebuild_fts_interval.is_some() {
+    // Cross-section by nature: the schedule knob is meaningless when the
+    // storage-owned index mode disables maintenance of the index.
+    if config.storage.fts_mode == FtsMode::Off && config.maintenance.rebuild_fts_interval.is_some()
+    {
         tracing::warn!("search.mode = \"off\" makes maintenance.rebuild_fts_interval a no-op");
     }
     Ok(())
 }
 
+/// Watchdog policy: runtime-owned ordering and zero rules (via delegation)
+/// plus the CLI duration ceilings and the batch-age interplay.
 fn validate_watchdog(config: &Config) -> Result<()> {
-    // CLI-specific duration bounds; the runtime owns every ordering/range
-    // invariant (including the batcher-age rule).
+    // The runtime clamps a small tick instead of rejecting it; the CLI keeps
+    // the historical hard rejection so the TOML contract stays as strict.
     validate_duration("watchdog.tick_interval", config.watchdog.tick_interval)?;
-    validate_duration("watchdog.degraded_after", config.watchdog.degraded_after)?;
-    validate_duration("watchdog.unhealthy_after", config.watchdog.unhealthy_after)?;
-    validate_duration("watchdog.ack_stall_after", config.watchdog.ack_stall_after)?;
-    validate_duration(
+    validate_duration_ceiling(
+        "watchdog.degraded_after",
+        config.watchdog.degraded_after,
+        MAX_TIMEOUT,
+    )?;
+    validate_duration_ceiling(
+        "watchdog.unhealthy_after",
+        config.watchdog.unhealthy_after,
+        MAX_TIMEOUT,
+    )?;
+    validate_duration_ceiling(
+        "watchdog.ack_stall_after",
+        config.watchdog.ack_stall_after,
+        MAX_TIMEOUT,
+    )?;
+    validate_duration_ceiling(
         "watchdog.maintenance_stall_after",
         config.watchdog.maintenance_stall_after,
+        MAX_TIMEOUT,
     )?;
+    // Cross-section: the oldest buffered record must not outlive the first
+    // health threshold, or a healthy low-volume pipeline would be halted.
     config
         .watchdog
-        .validate_batch_age(config.batcher_max_batch_age)
+        .validate_batch_age(config.storage.insert_batcher.max_batch_age)
         .context("invalid watchdog configuration")?;
     Ok(())
 }
@@ -249,14 +213,14 @@ fn validate_endpoints(config: &Config) -> Result<()> {
 }
 
 fn validate_security(config: &Config) -> Result<()> {
-    if let Some(tls) = &config.tls {
+    if let Some(tls) = &config.ingress.tls {
         readable_file("tls.cert", &tls.cert)?;
         readable_file("tls.key", &tls.key)?;
         if let Some(ca) = &tls.client_ca {
             readable_file("tls.client_ca", ca)?;
         }
     }
-    if let Some(auth) = &config.auth {
+    if let Some(auth) = &config.ingress.auth {
         readable_file("auth.token_file", &auth.token_file)?;
     }
     Ok(())
@@ -290,6 +254,32 @@ pub(crate) fn validate_optional_duration(
         bail!(
             "config key `{key}` must be greater than 0 and no more than {maximum:?}; got {value:?}"
         );
+    }
+    Ok(())
+}
+
+/// Ceiling-only duration check: the owning crate already rejects zero and
+/// nonsense values, so only the CLI-wide ceiling is checked here.
+pub(crate) fn validate_duration_ceiling(
+    key: &str,
+    value: Duration,
+    maximum: Duration,
+) -> Result<()> {
+    if value > maximum {
+        bail!("config key `{key}` must be no more than {maximum:?}; got {value:?}");
+    }
+    Ok(())
+}
+
+/// Ceiling-only check for optional durations whose zero rule is owned
+/// elsewhere (`PurgeSchedule` is runtime-owned and rejects zero itself).
+pub(crate) fn validate_optional_duration_ceiling(
+    key: &str,
+    value: Option<Duration>,
+    maximum: Duration,
+) -> Result<()> {
+    if value.is_some_and(|value| value > maximum) {
+        bail!("config key `{key}` must be no more than {maximum:?}; got {value:?}");
     }
     Ok(())
 }
