@@ -196,6 +196,7 @@ impl Config {
             "batcher_max_batch_records": self.storage.insert_batcher.max_batch_records,
             "batcher_max_batch_age_ms": self.storage.insert_batcher.max_batch_age.as_millis(),
             "group_commit_max_records": self.storage.group_commit_max_records,
+            "group_commit_linger_us": self.storage.group_commit_linger.as_micros(),
             "search_mode": self.storage.fts_mode.as_str(),
             "grpc_max_recv_msg_size": self.ingress.max_recv_msg_size,
             "grpc_max_concurrent_streams": self.ingress.max_concurrent_streams,

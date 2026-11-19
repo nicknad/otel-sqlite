@@ -197,12 +197,14 @@ Already done (regression suites only):
   (`core/src/model/attribute.rs`).
 - The writer coalesces consecutive insert commands up to
   `group_commit_max_records` (default 1000, `0` disables). It only helps when
-  a command backlog exists; when the writer keeps up, a group has one command.
-  Measure it with high resource cardinality (`--resources`), not the default
-  four resources. `OTEL_SQLITE_E2E_GROUP_COMMIT` overrides the harness budget
-  (`0` disables grouping) and `OTEL_SQLITE_E2E_SEARCH_MODE` overrides
-  `off|body|full`; the JSON report's `configuration` block records the
-  effective values.
+  a command backlog exists; when the writer keeps up, a group has one command
+  — unless `group_commit_linger` holds it open (see the linger section
+  below). Measure it with high resource cardinality (`--resources`), not the
+  default four resources. `OTEL_SQLITE_E2E_GROUP_COMMIT` overrides the
+  harness budget (`0` disables grouping), `OTEL_SQLITE_E2E_GROUP_COMMIT_LINGER`
+  overrides the linger window (`250us`, `2ms`, `off`), and
+  `OTEL_SQLITE_E2E_SEARCH_MODE` overrides `off|body|full`; the JSON report's
+  `configuration` block records the effective values.
 - `[search] mode = "body"` (default) indexes only `log_event.body` and removes
   the per-row `log_resource` join from the insert trigger. `full` restores the
   six-column cost; `off` removes trigger maintenance. Every insert benchmark
@@ -230,5 +232,84 @@ with ack p99 192-293 ms. Grouping therefore lifts the writer's saturation
 point ~2.5x and roughly halves tail latency in this workload. Embedded mode
 shares the process with the load generator, so treat these as relative
 numbers rather than a production ceiling.
+
+### Commit linger window (`group_commit_linger`, default off)
+
+Temporal batching for the writer's group commit: an insert group that
+drains the queue under `group_commit_max_records` stays open for commands
+arriving within one fixed window. The deadline is armed when the group opens
+and never reset (the batcher's record-age anchoring rule, for the same
+reason); flush, maintenance and shutdown barriers plus a queue disconnect
+close a group immediately, so ordering and the shutdown drain are untouched
+(`docs/adr/0002-commit-linger-window.md`). The added latency lands only on
+`durability = "commit"` acknowledgements, which wait for the transaction.
+
+Dose-response probe (release example; Poisson arrivals decoupled from the
+ack loop, so closed-loop convoys cannot mask the window):
+
+```bash
+cargo run --release -p otel-sqlite-storage --example linger_sweep -- \
+    --rate 300 --duration-secs 10 --lingers 0,250us,500us,1ms,2ms,5ms
+# --sync full: every commit is an fsync, so txn/s == fsync/s
+```
+
+This Windows host, `synchronous = normal`, 300 one-record commands/s
+(mean gap 3.3 ms), 10 s windows:
+
+| linger | acks/s | p50 ms | p95 ms | p99 ms | rec/txn | txn/s |
+|---|---:|---:|---:|---:|---:|---:|
+| off | 294 | 0.66 | 2.36 | 17.03 | 1.10 | 266.9 |
+| 250 µs | 302 | 1.71 | 9.66 | 21.10 | 2.04 | 148.2 |
+| 500 µs | 286 | 2.01 | 11.10 | 23.10 | 2.07 | 138.3 |
+| 1 ms | 295 | 2.51 | 10.76 | 23.61 | 2.19 | 134.5 |
+| 2 ms | 303 | 3.43 | 12.07 | 22.73 | 2.59 | 116.9 |
+| 5 ms | 285 | 6.21 | 14.01 | 22.14 | 3.30 | 86.5 |
+
+`synchronous = full` at 200 rec/s — every commit is one fsync, so
+`txn/s` doubles as the fsync frequency:
+
+| linger | p50 ms | p95 ms | p99 ms | rec/txn | fsync/s |
+|---|---:|---:|---:|---:|---:|
+| off | 2.25 | 3.86 | 7.50 | 1.10 | 190.4 |
+| 250 µs | 3.66 | 12.31 | 16.92 | 1.90 | 105.7 |
+| 500 µs | 4.06 | 12.04 | 16.23 | 1.96 | 102.5 |
+| 1 ms | 4.54 | 14.03 | 17.63 | 2.00 | 97.4 |
+| 2 ms | 5.71 | 14.47 | 19.80 | 2.22 | 87.8 |
+| 5 ms | 8.12 | 16.14 | 21.03 | 2.85 | 72.2 |
+
+Throughput is rate-bound and unchanged in every row. The p50 cost tracks
+the window; commits — and fsyncs under `full` — fall roughly 2-3x across
+the 250 µs-5 ms range. The 250 µs row batches more than ideal Poisson math
+(`1 + rate × window`) predicts: on Windows, condvar waits behind
+`recv_timeout` carry a timer-granularity floor of roughly +2-3 ms, so
+sub-millisecond settings behave like "a few ms" here. Linux futex waits
+are precise; treat sub-ms windows as a Linux-only tuning range.
+
+Through the real OTLP pipeline (`--scenario baseline --clients 32
+`--records-per-request 1 --resources 500 --rate 300`), closed-loop durable
+acks self-synchronize into convoys: the batcher's 10 ms age plus
+commit-aligned ack release cluster arrivals even with the linger off
+(~4.2 rec/txn), so the window's marginal effect there is smaller (72 → 53
+txn/s) while its p50 cost shows up through the stretched convoy period.
+Under `OTEL_SQLITE_E2E_SYNC=full` the same shape still halves the fsync
+rate: 111.5 → 55.7 fsync/s at 2 ms. Reproduce the embedded sweep with:
+
+```sh
+for L in off 250us 500us 1ms 2ms 5ms; do
+  OTEL_SQLITE_E2E_GROUP_COMMIT_LINGER=$L cargo run --release -p otel-sqlite-e2e -- \
+    --scenario baseline --clients 32 --records-per-request 1 --resources 500 \
+    --rate 300 --duration-secs 30 --warmup-secs 5 --output results/sweep-$L.json
+done
+# add OTEL_SQLITE_E2E_SYNC=full for the fsync-frequency pass
+```
+
+(Embedded mode shares the process with the load generator: relative
+numbers.)
+
+Operator summary: leave the window off unless commit overhead or fsync
+accounting matters (slow storage, `synchronous = full`); 2 ms is a
+reasonable first setting — roughly 2.5x fewer commits for ~3 ms of
+commit-ack p50 at low volume, with no effect on barriers, drain or
+throughput.
 
 Next: re-profile before the prepared-rows stage; do it only on evidence.

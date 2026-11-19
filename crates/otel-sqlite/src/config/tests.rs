@@ -69,6 +69,10 @@ fn empty_overlay_keeps_defaults() {
         config.storage.group_commit_max_records,
         otel_sqlite_storage::DEFAULT_GROUP_COMMIT_RECORDS
     );
+    assert_eq!(
+        config.storage.group_commit_linger,
+        otel_sqlite_storage::DEFAULT_GROUP_COMMIT_LINGER
+    );
     assert_eq!(config.storage.fts_mode, FtsMode::Body);
     assert_eq!(
         config.ingress.max_concurrent_streams,
@@ -102,6 +106,7 @@ fn top_level_keys_override_defaults() {
         batcher_max_batch_records = 42
         batcher_max_batch_age = "250ms"
         group_commit_max_records = 17
+        group_commit_linger = "2ms"
          grpc_max_recv_msg_size = 1024
          grpc_max_concurrent_streams = 8
          mapping_concurrency = 64
@@ -129,6 +134,7 @@ fn top_level_keys_override_defaults() {
         Duration::from_millis(250)
     );
     assert_eq!(config.storage.group_commit_max_records, 17);
+    assert_eq!(config.storage.group_commit_linger, Duration::from_millis(2));
     assert_eq!(config.storage.fts_mode, FtsMode::Full);
     assert_eq!(config.ingress.max_recv_msg_size, 1024);
     assert_eq!(config.ingress.max_concurrent_streams, 8);
@@ -201,11 +207,44 @@ fn search_mode_parsing_and_group_commit_range_are_validated() {
 }
 
 #[test]
+fn group_commit_linger_parses_validates_and_dumps() {
+    // Sub-millisecond windows parse exactly; "off" restores the default.
+    let mut config = Config::default();
+    file_config("group_commit_linger = \"250us\"\n")
+        .apply_to(&mut config)
+        .expect("applies");
+    assert_eq!(
+        config.storage.group_commit_linger,
+        Duration::from_micros(250)
+    );
+    config.validate().expect("a 250us window is valid");
+    let dump = config.dump_json().expect("dumps");
+    assert!(dump.contains("group_commit_linger_us"), "{dump}");
+
+    file_config("group_commit_linger = \"off\"\n")
+        .apply_to(&mut config)
+        .expect("applies");
+    assert_eq!(config.storage.group_commit_linger, Duration::ZERO);
+
+    // The ceiling is owned by the storage crate; direct construction must
+    // fail closed too.
+    let too_long = with_storage(StorageConfig {
+        group_commit_linger: Duration::from_secs(2),
+        ..StorageConfig::default()
+    });
+    assert!(
+        too_long.validate().is_err(),
+        "an over-ceiling window must be rejected"
+    );
+}
+
+#[test]
 fn duration_formats_are_accepted() {
     let mut config = Config::default();
     file_config(
         r#"
         batcher_max_batch_age = "250ms"
+        group_commit_linger = "250us"
         shutdown_timeout = "1h"
         [watchdog]
         tick_interval = "2m"
@@ -217,6 +256,10 @@ fn duration_formats_are_accepted() {
     assert_eq!(
         config.storage.insert_batcher.max_batch_age,
         Duration::from_millis(250)
+    );
+    assert_eq!(
+        config.storage.group_commit_linger,
+        Duration::from_micros(250)
     );
     assert_eq!(config.ingress.shutdown_timeout, Duration::from_secs(3_600));
     assert_eq!(config.watchdog.tick_interval, Duration::from_secs(120));

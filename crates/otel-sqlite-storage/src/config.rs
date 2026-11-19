@@ -22,6 +22,17 @@ pub const DEFAULT_GROUP_COMMIT_RECORDS: usize = 1_000;
 
 pub const MAX_GROUP_COMMIT_RECORDS: usize = 20_000;
 
+/// Default temporal window a coalesced insert transaction may stay open for
+/// straggler commands. `ZERO` (off) keeps the historical behaviour: only
+/// commands already queued are grouped, collection never waits.
+pub const DEFAULT_GROUP_COMMIT_LINGER: Duration = Duration::ZERO;
+
+/// Largest accepted `group_commit_linger`. One second is already 200x the
+/// largest measured-beneficial window (5 ms) and stays orders of magnitude
+/// below every watchdog threshold, so a mid-group wait can never be mistaken
+/// for a stalled pipeline.
+pub const MAX_GROUP_COMMIT_LINGER: Duration = Duration::from_secs(1);
+
 /// Largest accepted `batcher_max_batch_records`. Batch capacity beyond this
 /// point multiplies flush latency and writer transaction size for no measured
 /// throughput gain (see core's `DEFAULT_MAX_INSERT_BATCH_RECORDS`).
@@ -61,6 +72,14 @@ pub struct StorageConfig {
     /// insert commands already in the queue are coalesced; collection never
     /// waits to fill a group.
     pub group_commit_max_records: usize,
+    /// Fixed temporal window an under-budget insert group may stay open for
+    /// straggler commands. `ZERO` (the default) disables it: collection never
+    /// waits. When set, the window opens when the group forms and is never
+    /// reset by later arrivals; the added latency lands only on
+    /// `durability = "commit"` acknowledgements, which wait for the
+    /// transaction, and boundaries (flush, maintenance, shutdown) plus the
+    /// record budget still close a group immediately.
+    pub group_commit_linger: Duration,
     /// Installed search-index policy. The index is derived data, so the
     /// configured mode is reconciled at startup and never blocks readiness.
     pub fts_mode: FtsMode,
@@ -90,6 +109,7 @@ impl Default for StorageConfig {
             insert_batcher: InsertBatcherConfig::default(),
             command_queue_capacity: DEFAULT_COMMAND_QUEUE_CAPACITY,
             group_commit_max_records: DEFAULT_GROUP_COMMIT_RECORDS,
+            group_commit_linger: DEFAULT_GROUP_COMMIT_LINGER,
             fts_mode: FtsMode::default(),
             max_db_bytes: None,
             synchronous: SyncMode::default(),
@@ -118,16 +138,22 @@ pub enum StorageConfigError {
     /// A zero batch age would flush every non-empty buffer immediately.
     #[error("config key `batcher_max_batch_age` must be greater than zero")]
     ZeroBatchAge,
+    /// The linger window exceeds the largest accepted value.
+    #[error(
+        "config key `group_commit_linger` must be no more than {MAX_GROUP_COMMIT_LINGER:?}; got {value:?}"
+    )]
+    LingerTooLarge { value: Duration },
 }
 
 impl StorageConfig {
     /// Rejects values that would stall or thrash the single-writer pipeline:
     /// an empty insert batch, a zero batch age, an empty or oversized command
-    /// queue, a group-commit ceiling out of range, or a quota the writer
-    /// would evict against on nearly every batch.
+    /// queue, a group-commit ceiling out of range, a linger window past its
+    /// ceiling, or a quota the writer would evict against on nearly every
+    /// batch.
     ///
     /// The binary applies the same rules while loading its config file;
-    /// [`crate::Storage::open`] re-checks the two rules a direct constructor
+    /// [`crate::Storage::open`] re-checks the rules a direct constructor
     /// could otherwise smuggle past an embedder, keeping this type the
     /// single owner of every storage invariant.
     pub fn validate(&self) -> Result<(), StorageConfigError> {
@@ -152,6 +178,11 @@ impl StorageConfig {
             0,
             MAX_GROUP_COMMIT_RECORDS,
         )?;
+        if self.group_commit_linger > MAX_GROUP_COMMIT_LINGER {
+            return Err(StorageConfigError::LingerTooLarge {
+                value: self.group_commit_linger,
+            });
+        }
         if let Some(quota) = self.max_db_bytes
             && quota < MIN_DB_QUOTA_BYTES
         {
@@ -234,6 +265,10 @@ mod tests {
             ..StorageConfig::default()
         });
         reject!(StorageConfig {
+            group_commit_linger: Duration::from_secs(2),
+            ..StorageConfig::default()
+        });
+        reject!(StorageConfig {
             max_db_bytes: Some(1024),
             ..StorageConfig::default()
         });
@@ -247,6 +282,24 @@ mod tests {
         }
         .validate()
         .expect("0 disables grouping and must be valid");
+    }
+
+    #[test]
+    fn linger_window_validates_between_zero_and_its_ceiling() {
+        let error = StorageConfig {
+            group_commit_linger: Duration::from_secs(2),
+            ..StorageConfig::default()
+        }
+        .validate()
+        .expect_err("a window past its ceiling must fail");
+        assert!(error.to_string().contains("group_commit_linger"), "{error}");
+
+        StorageConfig {
+            group_commit_linger: MAX_GROUP_COMMIT_LINGER,
+            ..StorageConfig::default()
+        }
+        .validate()
+        .expect("the ceiling itself is valid");
     }
 
     #[test]

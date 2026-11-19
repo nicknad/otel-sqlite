@@ -112,6 +112,40 @@ pub mod benchmark_profile {
             .unwrap_or(otel_sqlite_storage::DEFAULT_GROUP_COMMIT_RECORDS)
     }
 
+    /// Fixed linger window one writer transaction may stay open for
+    /// stragglers, overridable with `OTEL_SQLITE_E2E_GROUP_COMMIT_LINGER`
+    /// (a unit-suffixed string such as `"250us"`, `"2ms"`, `"0.5s"`; a
+    /// bare integer counts milliseconds; `"off"` disables). Default:
+    /// production default (disabled). Unparsable values fall back to the
+    /// default, mirroring the sibling knobs above.
+    pub fn group_commit_linger() -> Duration {
+        fn parse(raw: &str) -> Option<Duration> {
+            let raw = raw.trim();
+            if raw.eq_ignore_ascii_case("off") {
+                return Some(Duration::ZERO);
+            }
+            let split_at = raw
+                .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .unwrap_or(raw.len());
+            let (number, unit) = raw.split_at(split_at);
+            let amount: f64 = number.parse().ok()?;
+            let micros = amount
+                * match unit.trim() {
+                    "us" | "usec" | "µs" => 1.0,
+                    // A bare integer is milliseconds, keeping sweep scripts
+                    // simple: 2 == 2 ms.
+                    "ms" | "" => 1_000.0,
+                    "s" => 1_000_000.0,
+                    _ => return None,
+                };
+            Some(Duration::from_micros(micros.round() as u64))
+        }
+        std::env::var("OTEL_SQLITE_E2E_GROUP_COMMIT_LINGER")
+            .ok()
+            .and_then(|value| parse(&value))
+            .unwrap_or(otel_sqlite_storage::DEFAULT_GROUP_COMMIT_LINGER)
+    }
+
     /// Installed log search-index mode, overridable with
     /// `OTEL_SQLITE_E2E_SEARCH_MODE=off|body|full` (default `body`).
     pub fn search_mode() -> FtsMode {
@@ -127,6 +161,7 @@ pub mod benchmark_profile {
             insert_batcher: InsertBatcherConfig::new(MAX_BATCH_RECORDS, MAX_BATCH_AGE),
             command_queue_capacity: COMMAND_QUEUE_CAPACITY,
             group_commit_max_records: group_commit_max_records(),
+            group_commit_linger: group_commit_linger(),
             fts_mode: search_mode(),
             max_db_bytes: None,
             synchronous: sync_mode(),

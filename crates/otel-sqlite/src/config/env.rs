@@ -103,6 +103,7 @@ const MAPPINGS: &[Mapping] = &[
     ),
     mapping!("BATCHER_MAX_BATCH_AGE", "batcher_max_batch_age", Any),
     mapping!("GROUP_COMMIT_MAX_RECORDS", "group_commit_max_records", Int),
+    mapping!("GROUP_COMMIT_LINGER", "group_commit_linger", Any),
     mapping!("MAX_DB_BYTES", "max_db_bytes", Int),
     mapping!("INGEST_QUEUE_CAPACITY", "ingest_queue_capacity", Int),
     mapping!("METRICS_ADDRESS", "metrics_address", Str),
@@ -382,6 +383,7 @@ mod tests {
             &mut config,
             vars(&[
                 ("OTEL_SQLITE_SHUTDOWN_TIMEOUT", "45s"),
+                ("OTEL_SQLITE_GROUP_COMMIT_LINGER", "2ms"),
                 ("OTEL_SQLITE_MAX_DB_BYTES", "123"),
                 ("OTEL_SQLITE_MAINTENANCE_RETENTION", "7d"),
                 ("OTEL_SQLITE_WATCHDOG_QUEUE_PRESSURE_RATIO", "0.5"),
@@ -392,6 +394,7 @@ mod tests {
         .expect("valid typed overlays must apply");
         assert_eq!(config.ingress.shutdown_timeout, Duration::from_secs(45));
         assert_eq!(config.storage.max_db_bytes, Some(123));
+        assert_eq!(config.storage.group_commit_linger, Duration::from_millis(2));
         let purge = config
             .maintenance
             .purge

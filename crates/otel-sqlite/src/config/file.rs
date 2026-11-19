@@ -7,7 +7,7 @@ use serde::Deserialize;
 use super::Config;
 use super::auth::AuthSection;
 use super::durability::DurabilitySection;
-use super::duration::{RawDuration, apply_required_duration};
+use super::duration::{RawDuration, apply_required_duration, apply_zeroable_duration};
 use super::maintenance::MaintenanceSection;
 use super::search::SearchSection;
 use super::tls::TlsSection;
@@ -41,6 +41,7 @@ pub(crate) struct FileConfig {
     batcher_max_batch_records: Option<usize>,
     batcher_max_batch_age: Option<RawDuration>,
     group_commit_max_records: Option<usize>,
+    group_commit_linger: Option<RawDuration>,
     max_db_bytes: Option<u64>,
     search: Option<SearchSection>,
     // Keys the binary itself owns.
@@ -118,6 +119,10 @@ impl FileConfig {
         if let Some(value) = self.group_commit_max_records {
             config.storage.group_commit_max_records = value;
         }
+        apply_zeroable_duration(
+            &mut config.storage.group_commit_linger,
+            self.group_commit_linger,
+        );
         if let Some(value) = self.max_db_bytes {
             config.storage.max_db_bytes = Some(value);
         }

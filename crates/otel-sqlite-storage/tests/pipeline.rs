@@ -19,12 +19,14 @@
 //! Verified here against a real database: completeness (nothing lost),
 //! uniqueness (nothing duplicated), storage-batch splitting at the configured
 //! capacity, timer-driven flushes of partial batches, ordering guarantees,
-//! deterministic shutdown draining, and backpressure without silent drops.
+//! deterministic shutdown draining, backpressure without silent drops, and
+//! the commit linger window (transaction sharing inside a fixed window,
+//! drain never waiting the window out).
 
 // Integration tests may assert with unwrap(); production code must not.
 #![allow(clippy::unwrap_used)]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::TrySendError;
 use otel_sqlite_core::model::{LogRecord, Resource, Severity};
@@ -485,6 +487,98 @@ fn voided_ticket_does_not_stall_subsequent_commits() {
 
     drop(sender);
     storage.join().unwrap();
+
+    let conn = open_readonly(&db_path);
+    assert_eq!(row_count(&conn), 10);
+}
+
+/// Two origins aging out 15 ms apart land inside a 300 ms linger window, so
+/// both commands share one transaction; a third origin arriving after the
+/// window closed commits in its own.
+#[test]
+fn linger_window_shares_one_transaction_for_stragglers() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("linger.db");
+
+    let (sender, receiver) = crossbeam_channel::bounded(8);
+    let storage_config = StorageConfig {
+        group_commit_max_records: 100,
+        group_commit_linger: Duration::from_millis(300),
+        ..config(db_path.clone(), 100, 30)
+    };
+    let mut storage = Storage::open(receiver, storage_config).unwrap();
+
+    // Distinct origins emit distinct write commands at their own age
+    // deadlines: svc-a at ~30 ms, svc-b at ~45 ms — both inside the window.
+    sender
+        .send(logs_chunk_with_service("svc-a", 0, 10))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(15));
+    sender
+        .send(logs_chunk_with_service("svc-b", 10, 10))
+        .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            storage.stats().records_written == 20
+        }),
+        "both stragglers must persist"
+    );
+    assert_eq!(
+        storage.stats().transactions_committed,
+        1,
+        "commands arriving within the window share one transaction"
+    );
+
+    // Long after the window closed: the third command commits alone.
+    std::thread::sleep(Duration::from_millis(400));
+    sender
+        .send(logs_chunk_with_service("svc-c", 20, 10))
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            storage.stats().records_written == 30 && storage.stats().transactions_committed == 2
+        }),
+        "a command after the window must commit in its own transaction"
+    );
+
+    sender.send(IngestMessage::Flush).unwrap();
+    drop(sender);
+    storage.join().unwrap();
+
+    let conn = open_readonly(&db_path);
+    assert_eq!(row_count(&conn), 30);
+}
+
+/// A wide-open linger window must not delay the shutdown drain: the queue
+/// disconnect closes a mid-linger group the moment every producer is gone.
+#[test]
+fn shutdown_drain_does_not_wait_out_the_linger_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("linger-drain.db");
+
+    let (sender, receiver) = crossbeam_channel::bounded(8);
+    let storage_config = StorageConfig {
+        group_commit_linger: Duration::from_millis(900),
+        ..config(db_path.clone(), 100, 30)
+    };
+    let mut storage = Storage::open(receiver, storage_config).unwrap();
+
+    sender
+        .send(logs_chunk_with_service("svc-a", 0, 10))
+        .unwrap();
+    // The batcher ages the chunk out at ~30 ms; give the writer time to
+    // open the linger window before the drain starts.
+    std::thread::sleep(Duration::from_millis(120));
+
+    let started = Instant::now();
+    drop(sender);
+    storage.join().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(600),
+        "the drain must not wait out the window, took {:?}",
+        started.elapsed()
+    );
 
     let conn = open_readonly(&db_path);
     assert_eq!(row_count(&conn), 10);

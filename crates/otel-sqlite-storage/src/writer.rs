@@ -4,7 +4,8 @@
 //! command it receives already carries a storage-sized [`WriteBatch`] built by
 //! the insert batcher. Consecutive insert commands already sitting in the
 //! bounded command queue are coalesced into one transaction up to
-//! `group_commit_max_records`; collection never waits to fill a group.
+//! `group_commit_max_records`; collection waits to fill a group only inside
+//! the optional `group_commit_linger` window, which is off by default.
 //!
 //! When the queue is empty the thread blocks inside `recv()` — there is no
 //! polling. While a search-index rebuild is pending it uses a short
@@ -41,7 +42,7 @@ use crate::migration;
 use crate::search::{RebuildStep, SearchIndex};
 use crate::sqlite;
 use crate::stats::WriterStats;
-use crate::transaction_group::{self, Pull, collect_group};
+use crate::transaction_group::{self, LingerWindow, Pull, PullMode, collect_group};
 
 /// Search-index work done while the command queue is idle.
 const SEARCH_REBUILD_IDLE_ROWS: usize = 2_000;
@@ -242,7 +243,10 @@ fn run_inner(
 
 /// Executes one dequeued command. Consecutive insert commands are coalesced
 /// into one transaction up to `group_budget`; everything else is a hard group
-/// boundary. Returns the number of queue commands consumed.
+/// boundary. With `group_commit_linger` armed, a group that drains the queue
+/// under budget waits out the fixed window for stragglers — boundaries,
+/// budget and a disconnect still close it immediately. Returns the number of
+/// queue commands consumed.
 #[allow(clippy::too_many_arguments)]
 fn execute_next(
     conn: &mut Connection,
@@ -259,13 +263,21 @@ fn execute_next(
 ) -> Result<u64, StorageError> {
     match command {
         WriteCommand::InsertLogs(batch) => {
-            let (group, boundary) =
-                collect_group(batch, group_budget, || match receiver.try_recv() {
+            let linger = LingerWindow::armed(config.group_commit_linger);
+            let (group, boundary) = collect_group(batch, group_budget, linger, |mode| match mode {
+                PullMode::Drain => match receiver.try_recv() {
                     Ok(WriteCommand::InsertLogs(batch)) => Pull::Insert(batch),
                     Ok(other) => Pull::Boundary(other),
                     Err(TryRecvError::Empty) => Pull::Empty,
                     Err(TryRecvError::Disconnected) => Pull::Disconnected,
-                });
+                },
+                PullMode::Await(remaining) => match receiver.recv_timeout(remaining) {
+                    Ok(WriteCommand::InsertLogs(batch)) => Pull::Insert(batch),
+                    Ok(other) => Pull::Boundary(other),
+                    Err(RecvTimeoutError::Timeout) => Pull::Empty,
+                    Err(RecvTimeoutError::Disconnected) => Pull::Disconnected,
+                },
+            });
             *pending = boundary;
             let consumed = group.len() as u64;
             ::metrics::counter!("storage_commands_total", "kind" => "insert_logs")

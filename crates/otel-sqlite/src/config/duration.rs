@@ -6,9 +6,10 @@ use serde::Deserialize;
 /// A duration knob as written in the config file.
 ///
 /// Accepted forms: a bare integer (interpreted as seconds) or a string with
-/// an explicit unit such as `"250ms"`, `"10s"`, `"5m"`, `"2h"`, `"1d"`.
-/// The markers `"off"`, `"none"`, `"never"`, `"disabled"` and the empty
-/// string mean "explicitly disabled" for knobs that support switching off.
+/// an explicit unit such as `"250us"`, `"250ms"`, `"10s"`, `"5m"`, `"2h"`,
+/// `"1d"`. The markers `"off"`, `"none"`, `"never"`, `"disabled"` and the
+/// empty string mean "explicitly disabled" for knobs that support switching
+/// off.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RawDuration {
     Enabled(Duration),
@@ -35,7 +36,15 @@ impl RawDuration {
             .parse()
             .map_err(|_| format!("duration `{text}` does not start with a number"))?;
         let unit = unit.trim();
-        let scale_secs = if unit.eq_ignore_ascii_case("ms")
+        let scale_secs = if unit.eq_ignore_ascii_case("us")
+            || unit.eq_ignore_ascii_case("µs")
+            || unit.eq_ignore_ascii_case("usec")
+            || unit.eq_ignore_ascii_case("micros")
+            || unit.eq_ignore_ascii_case("microsecond")
+            || unit.eq_ignore_ascii_case("microseconds")
+        {
+            0.000_001
+        } else if unit.eq_ignore_ascii_case("ms")
             || unit.eq_ignore_ascii_case("millis")
             || unit.eq_ignore_ascii_case("millisecond")
             || unit.eq_ignore_ascii_case("milliseconds")
@@ -70,8 +79,11 @@ impl RawDuration {
         } else {
             return Err(format!("unknown duration unit `{unit}` in `{text}`"));
         };
-        Ok(Self::Enabled(Duration::from_millis(
-            (amount * scale_secs * 1_000.0).round() as u64,
+        // Microsecond granularity keeps sub-millisecond knobs (the commit
+        // linger window) exact instead of rounding them up to whole
+        // milliseconds.
+        Ok(Self::Enabled(Duration::from_micros(
+            (amount * scale_secs * 1_000_000.0).round() as u64,
         )))
     }
 }
@@ -107,6 +119,18 @@ pub(crate) fn apply_required_duration(
         }
     }
     Ok(())
+}
+
+/// Applies a duration whose "off" spelling means zero rather than absent:
+/// `group_commit_linger = "off"` restores the never-wait default instead
+/// of being rejected the way a required duration would be.
+pub(crate) fn apply_zeroable_duration(target: &mut Duration, raw: Option<RawDuration>) {
+    if let Some(raw) = raw {
+        match raw {
+            RawDuration::Enabled(value) => *target = value,
+            RawDuration::Disabled => *target = Duration::ZERO,
+        }
+    }
 }
 
 pub(crate) fn apply_optional_duration(target: &mut Option<Duration>, raw: Option<RawDuration>) {

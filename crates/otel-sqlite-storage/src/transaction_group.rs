@@ -1,7 +1,9 @@
 //! Writer-side insert transaction policy.
 //!
 //! [`InsertGroup`] coalesces consecutive `InsertLogs` commands the writer has
-//! already dequeued. The writer collects without blocking and passes the group
+//! already dequeued. The writer collects through a two-mode pull — drain
+//! everything already queued, then, when a [`LingerWindow`] is armed, wait out
+//! the remainder of that window for straggler commands — and passes the group
 //! here; this module owns the transaction boundary, retry/salvage policy and
 //! commit-ticket settlement.
 //!
@@ -28,12 +30,57 @@ pub(crate) struct InsertGroup {
     records: usize,
 }
 
-/// One non-blocking pull while a group is assembled.
+/// One pull result while a group is assembled.
 pub(crate) enum Pull {
     Insert(LogWriteBatch),
     Boundary(WriteCommand),
     Empty,
     Disconnected,
+}
+
+/// How the writer should look for the next command while a group assembles.
+///
+/// [`Drain`] never blocks; [`Await`] blocks for at most the remaining window
+/// and reports the window expiring as [`Pull::Empty`], so a deadline can never
+/// be reset by traffic.
+pub(crate) enum PullMode {
+    /// Take a command only if one is already queued.
+    Drain,
+    /// Block up to the remaining linger window for one more command.
+    Await(Duration),
+}
+
+/// Fixed temporal window one insert group may stay open for stragglers.
+///
+/// The deadline is armed once, when the group opens, and never postponed by
+/// later arrivals — the same anchoring rule the insert batcher applies to its
+/// record-age deadline, and for the same reason: continuous traffic must not
+/// be able to extend a wait indefinitely. [`LingerWindow::off`] (the
+/// `group_commit_linger = 0` default) keeps collection non-blocking.
+pub(crate) struct LingerWindow {
+    deadline: Option<Instant>,
+}
+
+impl LingerWindow {
+    /// No window: collection stops as soon as the queue runs dry.
+    pub(crate) const fn off() -> Self {
+        Self { deadline: None }
+    }
+
+    /// Arms a window of `linger`, saturating instead of panicking when
+    /// `Instant` cannot represent the far end.
+    pub(crate) fn armed(linger: Duration) -> Self {
+        if linger.is_zero() {
+            Self::off()
+        } else {
+            Self {
+                deadline: Some(otel_sqlite_core::saturating_deadline(
+                    Instant::now(),
+                    linger,
+                )),
+            }
+        }
+    }
 }
 
 impl InsertGroup {
@@ -94,28 +141,54 @@ impl InsertGroup {
 }
 
 /// Collects the head insert plus every consecutive insert that fits the
-/// budget. Never blocks and never reorders. The first non-insert command is
-/// returned as the boundary the writer must execute after this group.
+/// budget. Never reorders. The first non-insert command is returned as the
+/// boundary the writer must execute after this group.
+///
+/// With a [`LingerWindow`] armed, a group that drains the queue under budget
+/// waits inside the fixed window for straggler commands instead of committing
+/// immediately; the deadline is anchored at group open, so continuous traffic
+/// can extend neither this group's nor any later wait. Budget, boundaries and
+/// a queue disconnect all close the group early — a barrier never waits, and
+/// neither does a shutdown drain.
 pub(crate) fn collect_group(
     first: LogWriteBatch,
     budget: usize,
-    mut pull: impl FnMut() -> Pull,
+    linger: LingerWindow,
+    mut pull: impl FnMut(PullMode) -> Pull,
 ) -> (InsertGroup, Option<WriteCommand>) {
     let mut group = InsertGroup::with_first(budget, first);
     let mut boundary = None;
-    while !group.at_budget() {
-        match pull() {
-            Pull::Insert(batch) => {
-                if let Err(batch) = group.try_push(batch) {
-                    boundary = Some(WriteCommand::InsertLogs(batch));
-                    break;
-                }
-            }
-            Pull::Boundary(command) => {
-                boundary = Some(command);
+    // `live` marks "the queue may still hold a command": every arrival sends
+    // collection back to the non-blocking drain first, so a burst that lands
+    // during the wait is picked up in one pass instead of one await per
+    // command.
+    let mut live = true;
+    let mut disconnected = false;
+    while !group.at_budget() && boundary.is_none() && !disconnected {
+        let mode = if live {
+            PullMode::Drain
+        } else {
+            let Some(deadline) = linger.deadline else {
+                break;
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 break;
             }
-            Pull::Empty | Pull::Disconnected => break,
+            PullMode::Await(remaining)
+        };
+        match pull(mode) {
+            Pull::Insert(batch) => {
+                live = true;
+                if let Err(batch) = group.try_push(batch) {
+                    boundary = Some(WriteCommand::InsertLogs(batch));
+                }
+            }
+            Pull::Boundary(command) => boundary = Some(command),
+            // Drain: nothing queued. Await: the window expired. Either way
+            // the next look must change phase or stop.
+            Pull::Empty => live = false,
+            Pull::Disconnected => disconnected = true,
         }
     }
     (group, boundary)
@@ -472,8 +545,9 @@ mod tests {
             Pull::Boundary(WriteCommand::Flush),
             Pull::Insert(batch(99)),
         ]);
-        let (group, boundary) =
-            collect_group(batch(1), 100, || pulls.pop_front().unwrap_or(Pull::Empty));
+        let (group, boundary) = collect_group(batch(1), 100, LingerWindow::off(), |_mode| {
+            pulls.pop_front().unwrap_or(Pull::Empty)
+        });
         assert_eq!(group.len(), 2);
         assert_eq!(group.records(), 3);
         assert!(matches!(boundary, Some(WriteCommand::Flush)));
@@ -482,11 +556,14 @@ mod tests {
 
     #[test]
     fn collect_stops_on_empty_and_disconnect() {
-        let (group, boundary) = collect_group(batch(1), 100, || Pull::Empty);
+        let (group, boundary) =
+            collect_group(batch(1), 100, LingerWindow::off(), |_mode| Pull::Empty);
         assert_eq!(group.len(), 1);
         assert!(boundary.is_none());
 
-        let (group, boundary) = collect_group(batch(1), 100, || Pull::Disconnected);
+        let (group, boundary) = collect_group(batch(1), 100, LingerWindow::off(), |_mode| {
+            Pull::Disconnected
+        });
         assert_eq!(group.len(), 1);
         assert!(boundary.is_none());
     }
@@ -494,10 +571,161 @@ mod tests {
     #[test]
     fn collect_never_exceeds_the_budget() {
         let mut pulls = VecDeque::from([Pull::Insert(batch(3)), Pull::Insert(batch(3))]);
-        let (group, boundary) =
-            collect_group(batch(3), 5, || pulls.pop_front().unwrap_or(Pull::Empty));
+        let (group, boundary) = collect_group(batch(3), 5, LingerWindow::off(), |_mode| {
+            pulls.pop_front().unwrap_or(Pull::Empty)
+        });
         assert_eq!(group.records(), 3, "the second batch would exceed 5");
         assert!(matches!(boundary, Some(WriteCommand::InsertLogs(_))));
+    }
+
+    /// The linger phases, in order: drain, await, drain again (an arrival
+    /// may have brought friends), await. The final await sleeps past the real
+    /// deadline so the loop observes expiry instead of looping forever.
+    #[test]
+    fn linger_joins_stragglers_arriving_within_the_window() {
+        let mut phases: Vec<&'static str> = Vec::new();
+        let (group, boundary) = collect_group(
+            batch(1),
+            100,
+            LingerWindow::armed(Duration::from_millis(200)),
+            |mode| {
+                phases.push(match mode {
+                    PullMode::Drain => "drain",
+                    PullMode::Await(_) => "await",
+                });
+                match phases.len() {
+                    // Drain passes: the queue is dry both times.
+                    1 | 3 => Pull::Empty,
+                    2 => Pull::Insert(batch(2)),
+                    _ => {
+                        std::thread::sleep(Duration::from_millis(250));
+                        Pull::Empty
+                    }
+                }
+            },
+        );
+        assert_eq!(group.records(), 3, "the straggler joins the group");
+        assert!(boundary.is_none());
+        assert_eq!(phases, ["drain", "await", "drain", "await"]);
+    }
+
+    /// The window belongs to the group, not to each arrival: the second
+    /// await must see a *smaller* remaining window than the first, proving
+    /// the deadline was not reset when the straggler landed.
+    #[test]
+    fn linger_deadline_is_anchored_to_group_open() {
+        let mut windows: Vec<Duration> = Vec::new();
+        let (group, boundary) = collect_group(
+            batch(1),
+            100,
+            LingerWindow::armed(Duration::from_millis(400)),
+            |mode| match mode {
+                PullMode::Drain => Pull::Empty,
+                PullMode::Await(remaining) => {
+                    windows.push(remaining);
+                    if windows.len() == 1 {
+                        // Time passes before the straggler arrives.
+                        std::thread::sleep(Duration::from_millis(80));
+                        Pull::Insert(batch(2))
+                    } else {
+                        std::thread::sleep(remaining);
+                        Pull::Empty
+                    }
+                }
+            },
+        );
+        assert_eq!(group.records(), 3);
+        assert!(boundary.is_none());
+        assert_eq!(windows.len(), 2, "one await per straggler plus the expiry");
+        assert!(
+            windows[1] <= Duration::from_millis(320),
+            "the deadline must not reset: windows were {windows:?}"
+        );
+        assert!(!windows[1].is_zero());
+    }
+
+    /// Barriers and disconnects close a lingering group immediately: the
+    /// flush command comes back as the boundary, never absorbed.
+    #[test]
+    fn linger_stops_at_boundaries_and_disconnect() {
+        let linger = LingerWindow::armed(Duration::from_secs(2));
+        let (group, boundary) = collect_group(batch(1), 100, linger, |mode| match mode {
+            PullMode::Drain => Pull::Empty,
+            PullMode::Await(_) => Pull::Boundary(WriteCommand::Flush),
+        });
+        assert_eq!(group.records(), 1);
+        assert!(matches!(boundary, Some(WriteCommand::Flush)));
+
+        let linger = LingerWindow::armed(Duration::from_secs(2));
+        let (group, boundary) = collect_group(batch(1), 100, linger, |mode| match mode {
+            PullMode::Drain => Pull::Empty,
+            PullMode::Await(_) => Pull::Disconnected,
+        });
+        assert_eq!(group.records(), 1);
+        assert!(boundary.is_none(), "disconnect commits what is held");
+    }
+
+    /// An over-budget straggler during the wait becomes the next group's
+    /// head instead of being absorbed.
+    #[test]
+    fn linger_overflow_straggler_is_returned_as_the_boundary() {
+        let (group, boundary) = collect_group(
+            batch(3),
+            5,
+            LingerWindow::armed(Duration::from_secs(2)),
+            |mode| match mode {
+                PullMode::Drain => Pull::Empty,
+                PullMode::Await(_) => Pull::Insert(batch(3)),
+            },
+        );
+        assert_eq!(group.records(), 3, "3 + 3 would exceed the budget of 5");
+        assert!(matches!(boundary, Some(WriteCommand::InsertLogs(_))));
+    }
+
+    /// A zero linger is exactly the historical never-wait behaviour: one
+    /// drain, no await.
+    #[test]
+    fn zero_linger_never_awaits() {
+        let mut awaits = 0usize;
+        let (group, boundary) = collect_group(
+            batch(1),
+            100,
+            LingerWindow::armed(Duration::ZERO),
+            |mode| match mode {
+                PullMode::Drain => Pull::Empty,
+                PullMode::Await(_) => {
+                    awaits += 1;
+                    Pull::Empty
+                }
+            },
+        );
+        assert_eq!(group.records(), 1);
+        assert!(boundary.is_none());
+        assert_eq!(awaits, 0);
+    }
+
+    /// The saturating deadline holds even for absurd windows.
+    #[test]
+    fn absurd_linger_saturates_instead_of_panicking() {
+        let mut awaits = 0usize;
+        let (group, boundary) = collect_group(
+            batch(1),
+            100,
+            LingerWindow::armed(Duration::MAX),
+            |mode| match mode {
+                PullMode::Drain => Pull::Empty,
+                PullMode::Await(_) => {
+                    awaits += 1;
+                    if awaits == 1 {
+                        Pull::Insert(batch(2))
+                    } else {
+                        Pull::Disconnected
+                    }
+                }
+            },
+        );
+        assert_eq!(group.records(), 3);
+        assert!(boundary.is_none());
     }
 
     #[test]

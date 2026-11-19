@@ -224,4 +224,8 @@ selected tests passed.
   every grouped ticket settles only after the shared commit, and `Flush`,
   checkpoint and maintenance remain hard boundaries. Group formation is
   untimed and outside the model, but it does not weaken the modeled per-batch
-  settlement rules.
+  settlement rules. The optional `group_commit_linger` window (off by
+  default) holds an under-budget group open for stragglers with a deadline
+  anchored at group open and never reset; boundaries and a queue disconnect
+  still close a group immediately, so the modeled ordering rules are
+  unchanged.

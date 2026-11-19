@@ -134,8 +134,13 @@ background rebuild — recovery for a corrupted index only.
 The writer coalesces consecutive insert commands into one SQLite transaction
 up to `group_commit_max_records` (default 1000, `0` disables). This targets
 high resource cardinality, where the per-origin batcher emits many tiny
-batches at its age deadline. Collection never waits: only commands already
-queued are grouped.
+batches at its age deadline. Collection waits only when
+`group_commit_linger` is set (default off): an under-budget group then stays
+open for stragglers arriving within one fixed window — the deadline is armed
+when the group opens and never reset, so continuous traffic cannot extend it.
+The window delays only the commit, so its latency lands on
+`durability = "commit"` acknowledgements alone; flush, maintenance and
+shutdown barriers close a group immediately.
 
 ### Durability & acknowledgement
 
@@ -200,6 +205,7 @@ max_records_per_request = 100000
 # mapping_concurrency = 128       # max mapping jobs; bounds abandoned-work memory
 # allow_remote_metrics = true        # explicit opt-in; prefer protected proxy
 # group_commit_max_records = 1000    # 0 = one transaction per insert command
+# group_commit_linger = "2ms"         # straggler window per transaction; off (default) never waits
 
 [search]
 mode = "body"                       # "off" | "body" | "full"

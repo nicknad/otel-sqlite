@@ -217,6 +217,7 @@ struct ConfigurationSummary {
     batcher_max_batch_age_ms: u64,
     command_queue_capacity: usize,
     group_commit_max_records: usize,
+    group_commit_linger_us: u64,
     search_mode: String,
     drain_timeout_secs: u64,
     overrides_applied: params::Overrides,
@@ -472,6 +473,10 @@ async fn main() -> Result<()> {
             .unwrap_or(u64::MAX),
             command_queue_capacity: server::benchmark_profile::COMMAND_QUEUE_CAPACITY,
             group_commit_max_records: server::benchmark_profile::group_commit_max_records(),
+            group_commit_linger_us: u64::try_from(
+                server::benchmark_profile::group_commit_linger().as_micros(),
+            )
+            .unwrap_or(u64::MAX),
             search_mode: server::benchmark_profile::search_mode().as_str().to_owned(),
             drain_timeout_secs: args.drain_timeout_secs,
             overrides_applied: overrides,
