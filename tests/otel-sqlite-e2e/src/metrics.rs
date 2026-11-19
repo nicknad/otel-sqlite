@@ -339,7 +339,6 @@ impl TelemetryHandle {
         self.registry.reset_windows();
     }
 
-    /// Close the current measurement window and return its aggregate report.
     pub fn end_window(&self) -> WindowReport {
         self.registry.window_report()
     }

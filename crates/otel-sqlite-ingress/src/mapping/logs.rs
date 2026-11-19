@@ -241,7 +241,6 @@ fn body_value(value: super::AnyValue) -> Result<(String, Option<String>), Ingres
         Some(super::AnyValueKind::DoubleValue(value)) => Ok((value.to_string(), None)),
         Some(super::AnyValueKind::BoolValue(value)) => Ok((value.to_string(), None)),
         Some(super::AnyValueKind::BytesValue(value)) => {
-            // Nothing to decode for an empty payload.
             if value.is_empty() {
                 return Ok((String::new(), None));
             }

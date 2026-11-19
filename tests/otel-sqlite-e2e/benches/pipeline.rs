@@ -34,7 +34,6 @@ use otel_sqlite_ingress::mapping::pb::collector::logs::v1::logs_service_server::
 use otel_sqlite_storage::Storage;
 use tempfile::TempDir;
 
-/// Busy-waits until the writer has committed `target` records total.
 fn wait_written(storage: &Storage, target: u64) {
     let deadline = Instant::now() + Duration::from_secs(60);
     while storage.stats().records_written < target {

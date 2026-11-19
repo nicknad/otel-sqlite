@@ -27,7 +27,6 @@ use otel_sqlite_runtime::{MaintenanceConfig, PurgeSchedule};
 use otel_sqlite_test_support::wait_until;
 use tonic::Request;
 
-/// Finds a free loopback port by binding and releasing a listener.
 fn free_loopback_port() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local address");

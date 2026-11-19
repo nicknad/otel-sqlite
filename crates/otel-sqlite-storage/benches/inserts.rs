@@ -196,10 +196,6 @@ fn maintenance_config(
     group
 }
 
-// ---------------------------------------------------------------------------
-// Fixed pipeline overhead
-// ---------------------------------------------------------------------------
-
 /// Opening (migration, WAL pragmas, thread spawn) plus graceful shutdown
 /// (drain, final TRUNCATE checkpoint). Every other benchmark here pays this
 /// cost implicitly through its per-iteration setup/teardown.
@@ -217,10 +213,6 @@ fn bench_pipeline_overhead(c: &mut Criterion) {
 
     group.finish();
 }
-
-// ---------------------------------------------------------------------------
-// Transaction-size sweep (write boundary)
-// ---------------------------------------------------------------------------
 
 /// One `WriteCommand::InsertLogs` per iteration == exactly one transaction.
 /// Reveals where bigger transactions stop paying off.
@@ -250,10 +242,6 @@ fn bench_write_batch(c: &mut Criterion) {
 
     group.finish();
 }
-
-// ---------------------------------------------------------------------------
-// Ingress-side path including the real insert batcher
-// ---------------------------------------------------------------------------
 
 /// `LogChunk -> InsertBatcher -> command queue -> writer -> commit`, forced
 /// out by a Flush barrier so the age timer never contributes.

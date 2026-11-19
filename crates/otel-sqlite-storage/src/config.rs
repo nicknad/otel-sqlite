@@ -20,7 +20,6 @@ pub const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 50_000;
 /// default-sized batches or hundreds of tiny per-origin batches.
 pub const DEFAULT_GROUP_COMMIT_RECORDS: usize = 1_000;
 
-/// Largest accepted `group_commit_max_records`.
 pub const MAX_GROUP_COMMIT_RECORDS: usize = 20_000;
 
 /// Largest accepted `batcher_max_batch_records`. Batch capacity beyond this

@@ -68,9 +68,7 @@ use tonic_health::pb::HealthCheckRequest;
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
 
-// ---------------------------------------------------------------------------
 // PKI + config helpers
-// ---------------------------------------------------------------------------
 
 /// A tempdir holding PEM material. [`Pki::generate`] builds the real CA +
 /// server + client, [`Pki::generate_rogue`] a separate root that signs only a
@@ -316,9 +314,7 @@ impl ServingCheck for ReadinessFlag {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Server bootstrap helper
-// ---------------------------------------------------------------------------
 
 /// A live `serve_with_shutdown` instance on a loopback port.
 struct BootedServer {
@@ -451,9 +447,7 @@ async fn export_over_tls(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Capture substrate for the credential-leak assertions
-// ---------------------------------------------------------------------------
 
 static LOG_BUF: LazyLock<Arc<Mutex<Vec<u8>>>> = LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
 static METRIC_SINK: LazyLock<Arc<Mutex<Vec<String>>>> =
@@ -556,9 +550,7 @@ fn install_capture_subscribers() {
     });
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn server_certificate_hostname_san_validation_rejects_wrong_names() {
@@ -1337,9 +1329,7 @@ async fn bearer_credentials_never_escape_into_logs_metrics_status_or_database() 
     );
 }
 
-// ---------------------------------------------------------------------------
 // Non-mutating TLS material validation (used by `otel-sqlite check`)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn tls_material_preflight_accepts_a_valid_identity() {

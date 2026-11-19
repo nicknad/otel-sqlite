@@ -21,12 +21,10 @@ pub(crate) fn spawn_named(
     thread::Builder::new().name(name.to_owned()).spawn(body)
 }
 
-/// The joined thread panicked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("periodic thread panicked")]
 pub(crate) struct ThreadPanicked;
 
-/// Owns a spawned thread's shutdown signal and join handle.
 #[derive(Debug)]
 pub(crate) struct WorkerHandle {
     shutdown: Option<Sender<()>>,
@@ -49,7 +47,6 @@ impl WorkerHandle {
         }
     }
 
-    /// Signals shutdown and joins the thread.
     pub(crate) fn stop(self) -> Result<(), ThreadPanicked> {
         self.shutdown();
         self.join()

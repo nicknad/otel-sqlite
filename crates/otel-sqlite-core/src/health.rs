@@ -13,9 +13,7 @@
 /// transactional snapshot. No I/O and no blocking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineSample {
-    /// Whether the SQLite writer thread is still running.
     pub writer_running: bool,
-    /// Whether the insert batcher thread is still running.
     pub batcher_running: bool,
     /// Milliseconds since the writer last executed a command successfully.
     pub writer_idle_ms: u64,

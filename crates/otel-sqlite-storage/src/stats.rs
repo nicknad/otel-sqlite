@@ -82,7 +82,6 @@ impl WriterStats {
             .store(monotonic_millis(), Ordering::Relaxed);
     }
 
-    /// Publishes the current command-queue backlog.
     pub(crate) fn observe_queue_depth(&self, depth: usize) {
         self.queue_depth.store(depth, Ordering::Relaxed);
         ::metrics::gauge!("storage_queue_depth").set(depth as f64);

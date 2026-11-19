@@ -10,8 +10,6 @@ use anyhow::bail;
 use crate::client::ClientCountersSnapshot;
 use crate::interval_set::IntervalSet;
 
-/// Client counters plus the ledger-derived rejected/ambiguous sequence sets
-/// for one run.
 #[derive(Debug, Clone)]
 pub struct RunAccounting {
     pub counters: ClientCountersSnapshot,

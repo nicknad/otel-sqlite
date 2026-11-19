@@ -27,7 +27,6 @@ fn temp_config_path(tag: &str) -> PathBuf {
     ))
 }
 
-/// Config with one section overridden; everything else keeps defaults.
 fn with_ingress(ingress: IngressConfig) -> Config {
     Config {
         ingress,
@@ -35,7 +34,6 @@ fn with_ingress(ingress: IngressConfig) -> Config {
     }
 }
 
-/// Config with one section overridden; everything else keeps defaults.
 fn with_storage(storage: StorageConfig) -> Config {
     Config {
         storage,
@@ -248,7 +246,6 @@ fn nested_sections_merge_field_wise() {
         config.maintenance.purge,
         Some(PurgeSchedule {
             retention: Duration::from_secs(7 * 24 * 3_600),
-            // Retention with no explicit cadence uses the documented default.
             interval: Duration::from_secs(15 * 60),
         })
     );

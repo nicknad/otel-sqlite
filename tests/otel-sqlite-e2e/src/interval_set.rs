@@ -48,7 +48,6 @@ impl IntervalSet {
             .is_ok()
     }
 
-    /// `self` minus `other`, as a new set.
     #[must_use]
     pub fn subtract(&self, other: &IntervalSet) -> IntervalSet {
         let mut result: Vec<(u64, u64)> = Vec::new();

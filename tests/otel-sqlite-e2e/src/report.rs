@@ -202,7 +202,6 @@ pub struct ScenarioReport {
     pub steps: Vec<StepReport>,
 }
 
-/// Concise human-readable summary for one completed step.
 pub fn print_step_summary(report: &StepReport) {
     let results = &report.results;
     println!();

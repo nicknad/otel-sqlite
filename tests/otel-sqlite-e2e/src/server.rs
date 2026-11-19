@@ -248,7 +248,6 @@ impl EmbeddedServer {
         Ok(())
     }
 
-    /// Storage-side counters snapshot.
     pub fn stats(&self) -> Option<otel_sqlite_storage::StorageStatsSnapshot> {
         self.pipeline.as_ref().map(Pipeline::stats)
     }

@@ -194,7 +194,6 @@ fn flush_buffers(
     stats: &BatcherStats,
     alive: &mut bool,
 ) {
-    // A barrier over an empty accumulator has no partial batch to hand over.
     if logs.buffered() == 0 {
         return;
     }

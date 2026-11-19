@@ -312,7 +312,6 @@ fn objects_match(conn: &Connection, mode: FtsMode) -> Result<bool, StorageError>
     Ok(true)
 }
 
-/// Stored `sqlite_master.sql` for one table or trigger.
 fn object_sql(conn: &Connection, name: &str) -> Result<Option<String>, StorageError> {
     Ok(conn
         .query_row(

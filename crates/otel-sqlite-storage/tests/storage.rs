@@ -612,7 +612,6 @@ fn mapping_fidelity_persists_canonical_structured_values() -> Result<(), Box<dyn
     };
     let mut storage = Storage::open(receiver, config)?;
 
-    // --- logs: structured body, nested attribute, scope attrs/schema URL ---
     sender.send(IngestMessage::Logs(LogChunk {
         origin: BatchOrigin {
             resource: Some(Resource::new(vec![("service.name", "checkout").into()])),

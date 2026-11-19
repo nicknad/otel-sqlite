@@ -351,7 +351,6 @@ impl TokenFileVault {
         }
     }
 
-    /// Number of valid tokens currently known; used by tests.
     #[cfg(test)]
     pub(crate) fn loaded_token_count(&self) -> usize {
         self.read_cached().hashes.len()
@@ -434,11 +433,9 @@ fn read_token_file(path: &Path) -> Result<ParsedTokens, LoadError> {
     if bytes.len() as u64 > MAX_TOKEN_FILE_BYTES {
         return Err(LoadError::TooLarge(bytes.len() as u64));
     }
-    // An empty file has nothing to decode or parse.
     if bytes.is_empty() {
         return Ok(ParsedTokens::default());
     }
-    // Invalid UTF-8 fails exactly like the previous `read_to_string` path.
     let text = std::str::from_utf8(&bytes).map_err(|error| {
         LoadError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     })?;

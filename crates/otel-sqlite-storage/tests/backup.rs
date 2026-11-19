@@ -305,7 +305,6 @@ fn encryption_round_trip_rejects_wrong_key_and_tampering() {
     assert_eq!(report.verified_after.integrity, "ok");
 }
 
-/// A key file that is not exactly 32 bytes is rejected.
 #[test]
 fn encryption_rejects_bad_key_lengths() {
     let dir = tempfile::tempdir().unwrap();
@@ -359,7 +358,6 @@ fn prune_keeps_newest_and_leaves_live_db_and_unrelated_files_alone() {
             .set_times(mtime)
             .unwrap();
     }
-    // The live database and an unrelated file must survive pruning.
     std::fs::write(dir.path().join("otel-logs.db"), "live").unwrap();
     std::fs::write(dir.path().join("notes.txt"), "notes").unwrap();
 
@@ -419,7 +417,6 @@ fn prune_ignores_transient_artifacts() {
     assert!(!dir.path().join(names[1]).exists());
 }
 
-/// Backup artifact names are unique per second and match the retention prefix.
 #[test]
 fn backup_filenames_are_unique_and_retention_friendly() {
     // 2026-08-30T12:34:56Z = 1788093296 epoch seconds.
@@ -427,7 +424,6 @@ fn backup_filenames_are_unique_and_retention_friendly() {
     assert_eq!(plain, "otel-logs.db.20260830T123456Z.bak");
     let encrypted = backup::backup_filename(1_788_093_296, true);
     assert_eq!(encrypted, "otel-logs.db.20260830T123456Z.otsb");
-    // Never collides with the live database file.
     assert_ne!(plain, "otel-logs.db");
 }
 

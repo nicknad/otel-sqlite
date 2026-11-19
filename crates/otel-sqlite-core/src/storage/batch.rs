@@ -22,12 +22,10 @@ impl<T> WriteBatch<T> {
         Self { records }
     }
 
-    /// Number of records held by this batch.
     pub fn len(&self) -> usize {
         self.records.len()
     }
 
-    /// `true` when the batch carries no records.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }

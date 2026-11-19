@@ -80,7 +80,6 @@ pub trait HealthSampleSource: Send + Sync + 'static {
     fn sample(&self) -> PipelineSample;
 }
 
-/// Outcome of evaluating one sample against the configured thresholds.
 struct Evaluation {
     state: HealthState,
     reason: Reason,
@@ -409,7 +408,6 @@ fn queue_pressure_threshold(capacity: usize, ratio: f32) -> usize {
 /// [`WatchdogConfig`] is a public type and callers may still pass tiny values.
 const MIN_TICK_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Clamps the configured interval into a range that cannot spin.
 fn normalized_tick_interval(interval: Duration) -> Duration {
     interval.max(MIN_TICK_INTERVAL)
 }
@@ -456,8 +454,6 @@ impl Watchdog {
         })
     }
 
-    /// Starts the watchdog on its own thread and returns a handle controlling
-    /// its lifecycle.
     pub fn spawn(self) -> Result<WatchdogHandle, WatchdogError> {
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let halted = Arc::new(AtomicBool::new(false));
@@ -480,7 +476,6 @@ impl Watchdog {
     }
 }
 
-/// Control handle for a spawned [`Watchdog`].
 #[derive(Debug)]
 pub struct WatchdogHandle {
     worker: WorkerHandle,

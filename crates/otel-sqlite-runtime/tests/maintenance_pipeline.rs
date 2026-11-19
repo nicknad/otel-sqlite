@@ -43,7 +43,7 @@ fn storage_config(db_path: std::path::PathBuf) -> StorageConfig {
 fn maintenance_config() -> MaintenanceConfig {
     MaintenanceConfig {
         purge: Some(PurgeSchedule {
-            retention: Duration::from_secs(3_600), // 1 hour
+            retention: Duration::from_secs(3_600),
             interval: Duration::from_millis(50),
         }),
         checkpoint_interval: None,

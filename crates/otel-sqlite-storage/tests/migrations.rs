@@ -211,7 +211,6 @@ fn database_stamped_001_upgrades_through_current_schema() {
     assert_upgraded(&db);
 }
 
-/// A database stamped at version 002 upgrades to the current schema.
 #[test]
 fn database_stamped_002_upgrades_through_current_schema() {
     let dir = tempfile::tempdir().unwrap();

@@ -32,8 +32,6 @@ impl MaintenanceSection {
         let interval = match self.purge_interval {
             Some(RawDuration::Enabled(interval)) => Some(interval),
             Some(RawDuration::Disabled) => None,
-            // Retention enabled without an explicit cadence uses the
-            // documented default.
             None => Some(DEFAULT_PURGE_INTERVAL),
         };
         config.purge = match (retention, interval) {
@@ -114,7 +112,6 @@ pub(crate) fn resolve_retention(raw: Option<toml::Value>) -> Result<Option<Durat
         .map_err(|error| anyhow::anyhow!("invalid retention window: {error}"))?;
     Ok(match window {
         RawDuration::Enabled(window) => Some(window),
-        // Explicit opt-out ("off") disables purging.
         RawDuration::Disabled => None,
     })
 }

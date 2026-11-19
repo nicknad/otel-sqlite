@@ -239,10 +239,6 @@ struct BenchmarkOutput {
     post_shutdown_storage: Option<FinalStorage>,
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
@@ -322,10 +318,6 @@ impl Drop for TempDirGuard {
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -36,7 +36,6 @@ const MIN_RETRY_DELAY: Duration = Duration::from_millis(10);
 /// command it already accepted.
 const HEAVY_MAINTENANCE_BACKLOG_LIMIT: usize = 1_000;
 
-/// Outcome of one scheduler tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TickOutcome {
     /// The queue is still open; schedule the next tick normally.
@@ -262,7 +261,6 @@ impl Scheduler {
     }
 }
 
-/// Whether this operation should wait for the ingestion backlog to drain.
 const fn should_defer_heavy(operation: MaintenanceOperation, queue_depth: usize) -> bool {
     operation.is_heavy() && queue_depth > HEAVY_MAINTENANCE_BACKLOG_LIMIT
 }

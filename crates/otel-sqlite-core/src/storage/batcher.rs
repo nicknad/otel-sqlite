@@ -28,7 +28,6 @@ use super::batch::WriteBatch;
 /// the worst-case flush backlog compared to 1_000.
 pub const DEFAULT_MAX_INSERT_BATCH_RECORDS: usize = 500;
 
-/// Default maximum batch age (`max_batch_age`).
 pub const DEFAULT_MAX_INSERT_BATCH_AGE: Duration = Duration::from_millis(10);
 
 /// Limits controlling how [`InsertBatcher`] groups records.
@@ -100,7 +99,6 @@ impl<T> InsertBatcher<T> {
         self.buffer.len()
     }
 
-    /// `true` when nothing is buffered.
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }

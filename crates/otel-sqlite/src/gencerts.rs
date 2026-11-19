@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use otel_sqlite_storage::restrict_permissions;
 
-/// One parsed command line for the subcommand.
 #[derive(Debug, Default)]
 pub struct GenCertsArgs {
     pub hosts: Vec<String>,

@@ -100,7 +100,6 @@ pub const MAX_RECV_MSG_SIZE: usize = 256 * 1024 * 1024;
 /// the memory headroom (`streams * max_recv_msg_size`).
 pub const MAX_CONCURRENT_STREAMS: u32 = 1_024;
 
-/// Largest accepted `max_records_per_request`.
 pub const MAX_RECORDS_PER_REQUEST: usize = 1_000_000;
 
 /// Operator-tunable upper bounds accepted by [`IngressConfig::validate`]
@@ -281,7 +280,6 @@ impl IngressConfig {
         Ok(())
     }
 
-    /// Range check shared by every ingress knob.
     fn ensure_range(
         key: &'static str,
         value: usize,

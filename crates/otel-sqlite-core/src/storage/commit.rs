@@ -58,7 +58,6 @@ pub struct TicketProgress {
     pub dropped: u64,
 }
 
-/// Current state of one commit ticket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketState {
     /// Neither completed nor failed yet. `progress` reports the records that
@@ -70,7 +69,6 @@ pub enum TicketState {
     Failed { progress: TicketProgress },
 }
 
-/// Result of waiting for one ticket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitOutcome {
     /// Every record behind the ticket is durable.

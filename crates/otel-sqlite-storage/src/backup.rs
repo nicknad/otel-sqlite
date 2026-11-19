@@ -45,7 +45,6 @@ use zeroize::Zeroizing;
 
 use crate::search::{SearchIndexStatus, inspect_search_index};
 
-/// Magic bytes identifying an otel-sqlite encrypted backup file.
 pub const BACKUP_FILE_MAGIC: &[u8; 8] = b"OTSQBAK1";
 /// Legacy whole-file format version (kept for `decrypt_to` compatibility).
 pub const BACKUP_FILE_VERSION_V1: u8 = 1;
@@ -57,7 +56,6 @@ const NONCE_LEN: usize = 12;
 /// Plaintext bytes per v2 streaming frame. 64 KiB bounds RAM to ~128 KiB
 /// (plaintext + ciphertext buffers) regardless of database size.
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
-/// AES-GCM authentication tag length.
 const GCM_TAG_LEN: usize = 16;
 /// Maximum accepted v2 frame ciphertext length (one full chunk + tag).
 /// Caps allocation on corrupt `len` prefixes.
@@ -600,7 +598,6 @@ pub fn unique_backup_path(dir: &Path, epoch_secs: u64, encrypted: bool) -> PathB
     unreachable!("a free filename always exists")
 }
 
-/// SHA-256 of a file's bytes, hex-encoded.
 pub fn sha256_hex(path: &Path) -> Result<String, BackupError> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();

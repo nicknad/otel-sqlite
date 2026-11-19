@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::client::{OutcomeKind, RequestResult};
 use crate::interval_set::IntervalSet;
 
-/// Collects per-run sequence accounting for post-run validation.
 pub(crate) struct Ledger {
     rejected_ranges: Mutex<Vec<(u64, u64)>>,
     ambiguous_ranges: Mutex<Vec<(u64, u64)>>,

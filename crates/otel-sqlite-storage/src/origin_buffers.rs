@@ -129,7 +129,6 @@ impl<T> OriginBuffer<T> {
 
 pub(crate) struct OriginBuffers<T> {
     config: InsertBatcherConfig,
-    /// One buffer per active origin.
     buffers: Vec<(BatchOrigin, OriginBuffer<T>)>,
     /// Cached total so the driver's per-event health sample stays O(1).
     buffered_records: usize,
@@ -218,7 +217,6 @@ impl<T> OriginBuffers<T> {
         let mut submissions = Vec::new();
         let mut flushed_records = 0usize;
         for (origin, buffer) in &mut self.buffers {
-            // Buffers that hold nothing cannot produce a submission.
             if buffer.batcher.is_empty() {
                 continue;
             }

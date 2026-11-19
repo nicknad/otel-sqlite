@@ -40,8 +40,6 @@ impl MaintenanceWorker {
         Self { sink, config }
     }
 
-    /// Starts the worker on its own thread and returns a handle controlling
-    /// its lifecycle.
     pub fn spawn(self) -> Result<MaintenanceHandle, MaintenanceWorkerError> {
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let join_handle = spawn_named("otel-sqlite-maintenance", move || {
@@ -55,7 +53,6 @@ impl MaintenanceWorker {
     }
 }
 
-/// Control handle for a spawned [`MaintenanceWorker`].
 #[derive(Debug)]
 pub struct MaintenanceHandle {
     worker: WorkerHandle,
