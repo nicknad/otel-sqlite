@@ -34,8 +34,10 @@ clap = { workspace = true }
 crossbeam-channel = { workspace = true }
 hdrhistogram = { workspace = true }
 metrics = { workspace = true }
+otel-sqlite = { workspace = true }
 otel-sqlite-core = { workspace = true }
 otel-sqlite-ingress = { workspace = true }
+otel-sqlite-runtime = { workspace = true }
 otel-sqlite-storage = { workspace = true }
 otel-sqlite-test-support = { workspace = true }
 rand = { workspace = true }
