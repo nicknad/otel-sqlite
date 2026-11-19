@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use otel_sqlite_core::storage::DurabilityMode;
+use thiserror::Error;
 
 use crate::error::IngressError;
 
@@ -90,8 +91,21 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 /// memory the request could already have used on the wire.
 pub const DEFAULT_MAX_SCOPE_METADATA_EXPANSION_BYTES: usize = 16 * 1024 * 1024;
 
-/// Operator-tunable upper bounds accepted by `Config::validate` (generous;
-/// the wire budget `grpc_max_recv_msg_size` remains the total-request backstop).
+/// Largest accepted `max_recv_msg_size` (the per-request wire budget).
+pub const MAX_RECV_MSG_SIZE: usize = 256 * 1024 * 1024;
+
+/// Upper bound accepted for `max_concurrent_streams`. Streams are the global
+/// inbound-parallelism multiplier, so values above this need an explicit
+/// code change — not just a config edit — as justification that the host has
+/// the memory headroom (`streams * max_recv_msg_size`).
+pub const MAX_CONCURRENT_STREAMS: u32 = 1_024;
+
+/// Largest accepted `max_records_per_request`.
+pub const MAX_RECORDS_PER_REQUEST: usize = 1_000_000;
+
+/// Operator-tunable upper bounds accepted by [`IngressConfig::validate`]
+/// (generous; the wire budget `grpc_max_recv_msg_size` remains the
+/// total-request backstop).
 pub const MAX_ATTRIBUTES_PER_RECORD: usize = 100_000;
 pub const MAX_ATTRIBUTE_KEY_BYTES: usize = 16_384;
 pub const MAX_ATTRIBUTE_VALUE_BYTES: usize = 4 * 1024 * 1024;
@@ -159,7 +173,132 @@ pub fn expand_bind_address(address: &str) -> String {
     }
 }
 
+/// An [`IngressConfig`] that cannot serve traffic.
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum IngressConfigError {
+    /// A knob sits outside the range this crate publishes for it.
+    #[error("config key `{key}` must be in the range {minimum}..={maximum}; got {value}")]
+    OutOfRange {
+        key: &'static str,
+        minimum: u64,
+        maximum: u64,
+        value: u64,
+    },
+    /// `listen_address` does not parse as `IP:port` or a bare `:port`.
+    #[error("invalid listen_address `{listen_address}`: {source}")]
+    InvalidListenAddress {
+        listen_address: String,
+        source: std::net::AddrParseError,
+    },
+    /// The graceful-drain budget must be positive.
+    #[error("config key `shutdown_timeout` must be greater than zero")]
+    ZeroShutdownTimeout,
+}
+
 impl IngressConfig {
+    /// Rejects values no ingress can serve: a bind address that does not
+    /// parse, a zero drain budget, and any wire or mapping limit outside its
+    /// published range.
+    ///
+    /// The binary applies the same rules while loading its config file; this
+    /// method protects library embedders that build the struct directly,
+    /// keeping this type the single owner of every ingress invariant.
+    pub fn validate(&self) -> Result<(), IngressConfigError> {
+        expand_bind_address(&self.listen_address)
+            .parse::<SocketAddr>()
+            .map_err(|source| IngressConfigError::InvalidListenAddress {
+                listen_address: self.listen_address.clone(),
+                source,
+            })?;
+        if self.shutdown_timeout.is_zero() {
+            return Err(IngressConfigError::ZeroShutdownTimeout);
+        }
+        // A message floor of 1 KiB rejects obviously broken budgets while
+        // staying far above header overhead.
+        Self::ensure_range(
+            "grpc_max_recv_msg_size",
+            self.max_recv_msg_size,
+            1024,
+            MAX_RECV_MSG_SIZE,
+        )?;
+        Self::ensure_range(
+            "grpc_max_concurrent_streams",
+            self.max_concurrent_streams as usize,
+            1,
+            MAX_CONCURRENT_STREAMS as usize,
+        )?;
+        Self::ensure_range(
+            "mapping_concurrency",
+            self.mapping_concurrency,
+            1,
+            MAX_MAPPING_CONCURRENCY,
+        )?;
+        Self::ensure_range(
+            "max_records_per_request",
+            self.max_records_per_request,
+            1,
+            MAX_RECORDS_PER_REQUEST,
+        )?;
+        Self::ensure_range(
+            "max_attributes_per_record",
+            self.max_attributes_per_record,
+            1,
+            MAX_ATTRIBUTES_PER_RECORD,
+        )?;
+        Self::ensure_range(
+            "max_attribute_key_bytes",
+            self.max_attribute_key_bytes,
+            1,
+            MAX_ATTRIBUTE_KEY_BYTES,
+        )?;
+        Self::ensure_range(
+            "max_attribute_value_bytes",
+            self.max_attribute_value_bytes,
+            1,
+            MAX_ATTRIBUTE_VALUE_BYTES,
+        )?;
+        Self::ensure_range("max_body_bytes", self.max_body_bytes, 1, MAX_BODY_BYTES)?;
+        // One wire budget of scope expansion is the floor: below it, a modest
+        // scope block repeated across a full request would be rejected
+        // wholesale instead of bounding the expansion.
+        Self::ensure_range(
+            "max_scope_metadata_expansion_bytes",
+            self.max_scope_metadata_expansion_bytes,
+            1024,
+            MAX_SCOPE_METADATA_EXPANSION_BYTES,
+        )?;
+        // Very large wire budgets multiply by the stream count into
+        // gigabytes of worst-case inbound buffering; make sure operators
+        // raising them past this mark see the cost in the logs (startup
+        // only).
+        if self.max_recv_msg_size > 64 * 1024 * 1024 {
+            tracing::warn!(
+                grpc_max_recv_msg_size = self.max_recv_msg_size,
+                grpc_max_concurrent_streams = self.max_concurrent_streams,
+                "large grpc_max_recv_msg_size multiplies by the stream count into GiB-scale inbound buffering; raise host memory accordingly",
+            );
+        }
+        Ok(())
+    }
+
+    /// Range check shared by every ingress knob.
+    fn ensure_range(
+        key: &'static str,
+        value: usize,
+        minimum: usize,
+        maximum: usize,
+    ) -> Result<(), IngressConfigError> {
+        if value < minimum || value > maximum {
+            return Err(IngressConfigError::OutOfRange {
+                key,
+                minimum: minimum as u64,
+                maximum: maximum as u64,
+                value: value as u64,
+            });
+        }
+        Ok(())
+    }
+
     /// Parses [`IngressConfig::listen_address`] into a socket address.
     ///
     /// Accepts only `IP:port` or a bare `:port` (which binds all
@@ -225,5 +364,146 @@ mod tests {
             message.contains("bare `:port` binds all interfaces"),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn default_config_is_valid() {
+        IngressConfig::default()
+            .validate()
+            .expect("defaults must be usable");
+    }
+
+    #[test]
+    fn direct_construction_rejects_out_of_range_knobs() {
+        macro_rules! reject {
+            ($config:expr) => {
+                assert!(
+                    $config.validate().is_err(),
+                    "direct construction must reject nonsense values"
+                );
+            };
+        }
+        reject!(IngressConfig {
+            listen_address: "not-an-address".to_owned(),
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            shutdown_timeout: Duration::ZERO,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_recv_msg_size: 1023,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_recv_msg_size: MAX_RECV_MSG_SIZE + 1,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_concurrent_streams: 0,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_concurrent_streams: MAX_CONCURRENT_STREAMS + 1,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            mapping_concurrency: 0,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            mapping_concurrency: MAX_MAPPING_CONCURRENCY + 1,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_records_per_request: 0,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_records_per_request: MAX_RECORDS_PER_REQUEST + 1,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_attributes_per_record: 0,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_attributes_per_record: MAX_ATTRIBUTES_PER_RECORD + 1,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_attribute_key_bytes: 0,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_attribute_key_bytes: MAX_ATTRIBUTE_KEY_BYTES + 1,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_attribute_value_bytes: 0,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_attribute_value_bytes: MAX_ATTRIBUTE_VALUE_BYTES + 1,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_body_bytes: 0,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_body_bytes: MAX_BODY_BYTES + 1,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_scope_metadata_expansion_bytes: 1023,
+            ..IngressConfig::default()
+        });
+        reject!(IngressConfig {
+            max_scope_metadata_expansion_bytes: MAX_SCOPE_METADATA_EXPANSION_BYTES + 1,
+            ..IngressConfig::default()
+        });
+    }
+
+    #[test]
+    fn boundary_values_validate() {
+        IngressConfig {
+            max_recv_msg_size: 1024,
+            max_concurrent_streams: MAX_CONCURRENT_STREAMS,
+            mapping_concurrency: MAX_MAPPING_CONCURRENCY,
+            max_records_per_request: MAX_RECORDS_PER_REQUEST,
+            max_attributes_per_record: MAX_ATTRIBUTES_PER_RECORD,
+            max_attribute_key_bytes: MAX_ATTRIBUTE_KEY_BYTES,
+            max_attribute_value_bytes: MAX_ATTRIBUTE_VALUE_BYTES,
+            max_body_bytes: MAX_BODY_BYTES,
+            max_scope_metadata_expansion_bytes: MAX_SCOPE_METADATA_EXPANSION_BYTES,
+            ..IngressConfig::default()
+        }
+        .validate()
+        .expect("every knob at its accepted boundary must validate");
+    }
+
+    #[test]
+    fn validate_errors_name_the_key_and_the_range() {
+        let error = IngressConfig {
+            max_recv_msg_size: 1023,
+            ..IngressConfig::default()
+        }
+        .validate()
+        .expect_err("a sub-floor wire budget must fail");
+        let message = error.to_string();
+        assert!(message.contains("grpc_max_recv_msg_size"), "{message}");
+        assert!(
+            message.contains("1024..=") && message.contains("got 1023"),
+            "{message}"
+        );
+
+        let error = IngressConfig {
+            listen_address: "localhost:4317".to_owned(),
+            ..IngressConfig::default()
+        }
+        .validate()
+        .expect_err("hostnames must fail validation");
+        assert!(error.to_string().contains("listen_address"), "{}", error);
     }
 }

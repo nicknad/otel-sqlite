@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use otel_sqlite_core::storage::{InsertBatcherConfig, SyncMode};
+use thiserror::Error;
 
 use crate::search::FtsMode;
 
@@ -21,6 +22,20 @@ pub const DEFAULT_GROUP_COMMIT_RECORDS: usize = 1_000;
 
 /// Largest accepted `group_commit_max_records`.
 pub const MAX_GROUP_COMMIT_RECORDS: usize = 20_000;
+
+/// Largest accepted `batcher_max_batch_records`. Batch capacity beyond this
+/// point multiplies flush latency and writer transaction size for no measured
+/// throughput gain (see core's `DEFAULT_MAX_INSERT_BATCH_RECORDS`).
+pub const MAX_BATCH_RECORDS: usize = 100_000;
+
+/// Largest accepted `command_queue_capacity`. The queue is the pipeline's
+/// backpressure buffer; deeper queues hide saturation longer and cost memory
+/// per slot.
+pub const MAX_COMMAND_QUEUE_CAPACITY: usize = 1_000_000;
+
+/// Minimum accepted `max_db_bytes` quota: below 1 MiB the writer would evict
+/// on nearly every batch (a fresh migrated database already exceeds it).
+pub const MIN_DB_QUOTA_BYTES: u64 = 1024 * 1024;
 
 /// How long [`crate::Storage::open`] waits for the writer thread to finish
 /// bootstrapping (open + migrate) before giving up.
@@ -82,5 +97,185 @@ impl Default for StorageConfig {
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
         }
+    }
+}
+
+/// A [`StorageConfig`] that cannot back a healthy pipeline.
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum StorageConfigError {
+    /// A knob sits outside the range this crate publishes for it.
+    #[error("config key `{key}` must be in the range {minimum}..={maximum}; got {value}")]
+    OutOfRange {
+        key: &'static str,
+        minimum: u64,
+        maximum: u64,
+        value: u64,
+    },
+    /// The size quota is smaller than a freshly migrated database.
+    #[error(
+        "config key `max_db_bytes` must be at least {MIN_DB_QUOTA_BYTES} bytes (1 MiB); got {value}"
+    )]
+    QuotaTooSmall { value: u64 },
+    /// A zero batch age would flush every non-empty buffer immediately.
+    #[error("config key `batcher_max_batch_age` must be greater than zero")]
+    ZeroBatchAge,
+}
+
+impl StorageConfig {
+    /// Rejects values that would stall or thrash the single-writer pipeline:
+    /// an empty insert batch, a zero batch age, an empty or oversized command
+    /// queue, a group-commit ceiling out of range, or a quota the writer
+    /// would evict against on nearly every batch.
+    ///
+    /// The binary applies the same rules while loading its config file;
+    /// [`crate::Storage::open`] re-checks the two rules a direct constructor
+    /// could otherwise smuggle past an embedder, keeping this type the
+    /// single owner of every storage invariant.
+    pub fn validate(&self) -> Result<(), StorageConfigError> {
+        Self::ensure_range(
+            "batcher_max_batch_records",
+            self.insert_batcher.max_batch_records,
+            1,
+            MAX_BATCH_RECORDS,
+        )?;
+        if self.insert_batcher.max_batch_age.is_zero() {
+            return Err(StorageConfigError::ZeroBatchAge);
+        }
+        Self::ensure_range(
+            "command_queue_capacity",
+            self.command_queue_capacity,
+            1,
+            MAX_COMMAND_QUEUE_CAPACITY,
+        )?;
+        Self::ensure_range(
+            "group_commit_max_records",
+            self.group_commit_max_records,
+            0,
+            MAX_GROUP_COMMIT_RECORDS,
+        )?;
+        if let Some(quota) = self.max_db_bytes
+            && quota < MIN_DB_QUOTA_BYTES
+        {
+            return Err(StorageConfigError::QuotaTooSmall { value: quota });
+        }
+        Ok(())
+    }
+
+    /// Range check shared by every storage knob.
+    fn ensure_range(
+        key: &'static str,
+        value: usize,
+        minimum: usize,
+        maximum: usize,
+    ) -> Result<(), StorageConfigError> {
+        if value < minimum || value > maximum {
+            return Err(StorageConfigError::OutOfRange {
+                key,
+                minimum: minimum as u64,
+                maximum: maximum as u64,
+                value: value as u64,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_valid() {
+        StorageConfig::default()
+            .validate()
+            .expect("defaults must be usable");
+    }
+
+    #[test]
+    fn direct_construction_rejects_out_of_range_knobs() {
+        macro_rules! reject {
+            ($config:expr) => {
+                assert!(
+                    $config.validate().is_err(),
+                    "direct construction must reject nonsense values"
+                );
+            };
+        }
+        reject!(StorageConfig {
+            insert_batcher: InsertBatcherConfig {
+                max_batch_records: 0,
+                max_batch_age: Duration::from_millis(10),
+            },
+            ..StorageConfig::default()
+        });
+        reject!(StorageConfig {
+            insert_batcher: InsertBatcherConfig {
+                max_batch_records: MAX_BATCH_RECORDS + 1,
+                max_batch_age: Duration::from_millis(10),
+            },
+            ..StorageConfig::default()
+        });
+        reject!(StorageConfig {
+            insert_batcher: InsertBatcherConfig {
+                max_batch_records: 500,
+                max_batch_age: Duration::ZERO,
+            },
+            ..StorageConfig::default()
+        });
+        reject!(StorageConfig {
+            command_queue_capacity: 0,
+            ..StorageConfig::default()
+        });
+        reject!(StorageConfig {
+            command_queue_capacity: MAX_COMMAND_QUEUE_CAPACITY + 1,
+            ..StorageConfig::default()
+        });
+        reject!(StorageConfig {
+            group_commit_max_records: MAX_GROUP_COMMIT_RECORDS + 1,
+            ..StorageConfig::default()
+        });
+        reject!(StorageConfig {
+            max_db_bytes: Some(1024),
+            ..StorageConfig::default()
+        });
+    }
+
+    #[test]
+    fn group_commit_zero_disables_and_validates() {
+        StorageConfig {
+            group_commit_max_records: 0,
+            ..StorageConfig::default()
+        }
+        .validate()
+        .expect("0 disables grouping and must be valid");
+    }
+
+    #[test]
+    fn quota_floor_is_accepted() {
+        StorageConfig {
+            max_db_bytes: Some(MIN_DB_QUOTA_BYTES),
+            ..StorageConfig::default()
+        }
+        .validate()
+        .expect("the 1 MiB quota floor is valid");
+    }
+
+    #[test]
+    fn validate_errors_name_the_key_and_the_range() {
+        let error = StorageConfig {
+            insert_batcher: InsertBatcherConfig {
+                max_batch_records: 0,
+                max_batch_age: Duration::from_millis(10),
+            },
+            ..StorageConfig::default()
+        }
+        .validate()
+        .expect_err("a zero batch must fail");
+        let message = error.to_string();
+        assert!(message.contains("batcher_max_batch_records"), "{message}");
+        assert!(
+            message.contains("1..=") && message.contains("got 0"),
+            "{message}"
+        );
     }
 }
