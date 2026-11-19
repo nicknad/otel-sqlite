@@ -182,3 +182,46 @@ second under sustained load. `RebuildFts` restarts that background rebuild and
 is a no-op when the index is disabled. Search results are partial while the
 state row says `rebuilding`; `otel-sqlite check` and `verify` report that state
 instead of treating the derived index as corruption.
+
+### 3.8 Pipeline assembly and drain
+
+`crates/otel-sqlite/src/pipeline.rs`, re-exported from the package's library
+target (`otel_sqlite::{Pipeline, PipelineSpecs, ...}`) so harnesses reach it
+too, is the single assembly site. Before it existed, three places assembled
+the pipeline by hand — the binary, the embedded e2e harness (which silently
+omitted the watchdog and the maintenance worker, so no e2e scenario could
+exercise a watchdog halt or a purge cadence), and per-test wiring — and each
+re-learned the same boot and teardown protocols.
+
+`Pipeline::boot(PipelineSpecs)` takes the four crate configs plus the ingest
+queue capacity and returns a handle owning the storage handle, the maintenance
+worker, the watchdog, the retained ingest producer, the commit ledger and the
+health adapter both evidence consumers sample. Boot is the readiness gate:
+`Storage::open` still blocks on migrations, the startup checkpoint and file
+hardening, and a boot that fails partway stops and joins whatever had already
+started. `Pipeline::serve` is the production transport (blocks until an OS
+signal or the watchdog halt); harnesses that own their transport take
+`Pipeline::logs_service` plus `Pipeline::halt_signal` instead. Both stop
+serving on the watchdog's one-shot halt.
+
+The drain is one operation, `Pipeline::drain()`, preserving the shutdown
+ordering that partial teardown would otherwise lose: flush barrier → stop
+observation (halt evidence captured first) → stop maintenance scheduling →
+drop the last producer → bounded join within the storage shutdown budget
+captured at boot. Every phase runs even if an earlier one failed — aborting
+would leave the maintenance worker holding the command queue open and the
+writer undrained, so buffered records would be lost when the process exits —
+and every failure lands in the returned `DrainReport`. The barrier refuses
+with stranded-chunk evidence when the pipeline is already dead
+(`FlushRefused`), instead of blocking; the bounded join reports a wedged
+writer instead of hanging shutdown. The same barrier is available mid-run as
+`Pipeline::flush`, which is what the e2e drain step uses as its order
+barrier.
+
+The embedded e2e server (`tests/otel-sqlite-e2e/src/server.rs`) boots this
+same assembly — real watchdog, real maintenance worker — via a
+`RuntimePolicy` knob, and `tests/otel-sqlite-e2e/tests/e2e.rs` asserts the
+previously unreachable purge cadence plus watchdog non-halt evidence through
+it. Storage-crate tests that drive `Storage` directly with raw `Flush`
+messages are intentionally unchanged: they test sub-assemblies below this
+seam.

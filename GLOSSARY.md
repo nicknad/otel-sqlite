@@ -109,6 +109,13 @@ A success reply that is sent only once the data is committed and would survive
 a crash.
 _Avoid_: ack, confirmation, receipt
 
+**Drain**:
+Flushing the assembled pipeline to completion once ingress stopped: a bounded
+flush barrier, dropping the producers, and joining the writer within a
+configured budget. Refused, with the stranded evidence reported, when the
+pipeline is already dead.
+_Avoid_: teardown, graceful stop, close, final flush
+
 **Retention**:
 The age after which log records are no longer kept.
 _Avoid_: TTL, expiry, cleanup
