@@ -127,6 +127,9 @@ jobs:
     env:
       IMAGE: ${{ needs.resolve.outputs.image }}
     steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
       - name: Merge per-arch tags into one manifest list
         run: >
           docker buildx imagetools create
