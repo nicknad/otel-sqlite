@@ -8,35 +8,10 @@ mod gencerts;
 mod healthcheck;
 
 use anyhow::{Context, Result};
-use otel_sqlite_core::PipelineSample;
-use otel_sqlite_ingress::{ServingCheck, expand_bind_address};
-use otel_sqlite_storage::{Storage, StorageHealth};
-use tokio::sync::watch;
+use otel_sqlite::{Pipeline, PipelineSpecs};
+use otel_sqlite_ingress::expand_bind_address;
 
 use config::Config;
-use otel_sqlite_runtime::{HealthSampleSource, MaintenanceWorker, Watchdog};
-
-/// Adapts the storage health probe to both runtime evidence contracts: the
-/// watchdog's [`HealthSampleSource`] and the gRPC [`ServingCheck`].
-///
-/// The runtime and ingress crates stay decoupled from storage; this adapter
-/// is the only place that knows both sides. Storage already produces the
-/// shared [`PipelineSample`] from lock-free atomic loads, so both consumers
-/// can sample even while the pipeline is wedged.
-struct StoragePipelineHealth(StorageHealth);
-
-impl HealthSampleSource for StoragePipelineHealth {
-    fn sample(&self) -> PipelineSample {
-        self.0.sample()
-    }
-}
-
-impl ServingCheck for StoragePipelineHealth {
-    fn is_serving(&self) -> bool {
-        let sample = self.0.sample();
-        sample.writer_running && sample.batcher_running
-    }
-}
 
 fn install_metrics_exporter(address: &str) -> Result<()> {
     use metrics_exporter_prometheus::PrometheusBuilder;
@@ -170,36 +145,19 @@ async fn main() -> Result<()> {
         None => println!("prometheus metrics disabled (set metrics_address to enable)"),
     }
 
-    let (queue, receiver) = otel_sqlite_ingress::channel(config.ingest_queue_capacity);
-    let storage_config = config.storage_config();
-    // Kept out of `storage_config`: it is moved into `Storage::open`, but the
-    // shutdown budget is needed again when joining the pipeline below.
-    let storage_shutdown_timeout = storage_config.shutdown_timeout;
-    let mut storage =
-        Storage::open(receiver, storage_config).context("failed to start sqlite storage")?;
-
-    // Durable acks: ingress holds export responses until the writer publishes
-    // the matching commit tickets on this shared ledger.
-    let commit_ledger = storage.commit_ledger();
-
-    // The maintenance worker is another producer of the same command queue;
-    // the single SQLite writer keeps executing everything.
-    let maintenance = MaintenanceWorker::new(storage.producer(), config.maintenance.clone())
-        .spawn()
-        .context("failed to start the maintenance worker")?;
-
-    // The watchdog observes pipeline evidence and may halt ingestion on an
-    // unhealthy verdict; graceful drain and joins stay in main's hands.
-    let health = storage.health();
-    let (halt_tx, halt_rx) = watch::channel(false);
-    let watchdog = Watchdog::new(
-        StoragePipelineHealth(health.clone()),
-        config.watchdog.clone(),
-        halt_tx,
-    )
-    .context("invalid watchdog configuration")?
-    .spawn()
-    .context("failed to start the watchdog")?;
+    // The one pipeline assembly. Boot covers readiness: Storage::open inside
+    // it blocks on migrations, the startup checkpoint and file permissions,
+    // so the returned handle is storage-ready the moment boot returns. The
+    // handle owns storage, the maintenance worker, the watchdog and the
+    // ingest producer from here on.
+    let pipeline = Pipeline::boot(PipelineSpecs {
+        ingest_queue_capacity: config.ingest_queue_capacity,
+        ingress: ingress_config.clone(),
+        storage: config.storage_config(),
+        maintenance: config.maintenance.clone(),
+        watchdog: config.watchdog.clone(),
+    })
+    .context("failed to boot the pipeline")?;
 
     println!(
         "ingress listening on {} (sqlite: {})",
@@ -207,49 +165,37 @@ async fn main() -> Result<()> {
         config.sqlite_path.display()
     );
 
-    let serve_result = otel_sqlite_ingress::serve_with_shutdown(
-        ingress_config,
-        queue,
-        halt_rx,
-        commit_ledger,
-        std::sync::Arc::new(StoragePipelineHealth(health)),
-    )
-    .await;
+    let serve_result = pipeline.serve().await;
 
-    // Shutdown order: ingress stopped (serve returned) -> stop observation ->
-    // stop maintenance scheduling -> let the writer drain and exit.
-    //
-    // Every step runs even if an earlier one failed: aborting here would leave
-    // the maintenance worker holding the command queue open and the writer
-    // undrained, so records already buffered in the pipeline would be lost
-    // when the process exits.
-    let halt_requested = watchdog.requested_halt();
-    let watchdog_error = watchdog.stop().err();
-    let maintenance_error = maintenance.stop().err();
-    // Bounded drain: a wedged SQLite (stalled I/O, oversized final
-    // checkpoint) must not hang process shutdown forever. The timeout is
-    // reported after teardown so the OS reaps the stuck threads and the
-    // container supervisor restarts a clean process.
-    let storage_error = storage.join_timeout(storage_shutdown_timeout).err();
+    // Shutdown order lives behind Pipeline::drain: ingress stopped (serve
+    // returned) -> flush barrier -> stop observation -> stop maintenance
+    // scheduling -> let the writer drain and exit. Every step runs even if an
+    // earlier one failed; see the pipeline module docs for why partial
+    // teardown would lose log records buffered in the pipeline.
+    let report = pipeline.drain();
 
-    if halt_requested {
+    if report.halt_requested {
         eprintln!("watchdog halted ingestion: unrecoverable pipeline fault detected");
     }
+    if let Some(refusal) = &report.barrier {
+        eprintln!("flush barrier refused during drain: {refusal}");
+    }
 
-    let stats = storage.stats();
     println!(
         "shutdown complete: records_written={}, transactions={}, batches_received={}",
-        stats.records_written, stats.transactions_committed, stats.batches_received
+        report.stats.records_written,
+        report.stats.transactions_committed,
+        report.stats.batches_received
     );
 
     serve_result.context("ingress server terminated unexpectedly")?;
-    if let Some(error) = watchdog_error {
+    if let Some(error) = report.watchdog_error {
         return Err(anyhow::Error::new(error).context("watchdog terminated with failure"));
     }
-    if let Some(error) = maintenance_error {
+    if let Some(error) = report.maintenance_error {
         return Err(anyhow::Error::new(error).context("maintenance worker terminated with failure"));
     }
-    if let Some(error) = storage_error {
+    if let Some(error) = report.storage_error {
         return Err(
             anyhow::Error::new(error).context("sqlite storage writer terminated with failure")
         );
