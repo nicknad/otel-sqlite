@@ -43,7 +43,6 @@ criterion = { version = "0.8", features = ["html_reports"] }
 # `gzip`: the OpenTelemetry Collector's OTLP exporter compresses with gzip
 # by default; without this feature the ingress answers `Unimplemented`
 # (permanent error) and the exporter drops the batch.
-tonic = { version = "0.14.8", features = ["tls-ring", "gzip"] }
 tonic-health = "0.14.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 otel-sqlite = { path = "crates/otel-sqlite", version = "0.2.0" }
