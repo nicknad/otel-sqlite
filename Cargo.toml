@@ -6,7 +6,7 @@ members = [
     "crates/otel-sqlite-storage", "crates/test-support", "tests/otel-sqlite-e2e"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 description = "OTLP logs sink for SQLite with batched single-writer queues"
@@ -45,13 +45,13 @@ criterion = { version = "0.8", features = ["html_reports"] }
 # (permanent error) and the exporter drops the batch.
 tonic-health = "0.14.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-otel-sqlite = { path = "crates/otel-sqlite", version = "0.3.0" }
-otel-sqlite-core = { path = "crates/otel-sqlite-core", version = "0.3.0" }
-otel-sqlite-ingress = { path = "crates/otel-sqlite-ingress", version = "0.3.0" }
-otel-sqlite-runtime = { path = "crates/otel-sqlite-runtime", version = "0.3.0" }
-otel-sqlite-storage = { path = "crates/otel-sqlite-storage", version = "0.3.0" }
-otel-sqlite-test-support = { path = "crates/test-support", version = "0.3.0" }
-otel-sqlite-e2e = { path = "tests/otel-sqlite-e2e", version = "0.3.0" }
+otel-sqlite = { path = "crates/otel-sqlite", version = "0.4.0" }
+otel-sqlite-core = { path = "crates/otel-sqlite-core", version = "0.4.0" }
+otel-sqlite-ingress = { path = "crates/otel-sqlite-ingress", version = "0.4.0" }
+otel-sqlite-runtime = { path = "crates/otel-sqlite-runtime", version = "0.4.0" }
+otel-sqlite-storage = { path = "crates/otel-sqlite-storage", version = "0.4.0" }
+otel-sqlite-test-support = { path = "crates/test-support", version = "0.4.0" }
+otel-sqlite-e2e = { path = "tests/otel-sqlite-e2e", version = "0.4.0" }
 
 # Lint policy shared by every crate via `[lints] workspace = true`.
 #
