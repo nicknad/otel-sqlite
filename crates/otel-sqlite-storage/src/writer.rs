@@ -51,6 +51,11 @@ const SEARCH_REBUILD_UNDER_LOAD_ROWS: usize = 500;
 const SEARCH_REBUILD_UNDER_LOAD_INTERVAL: Duration = Duration::from_secs(1);
 /// Wake-up interval while a rebuild is pending and the queue is empty.
 const SEARCH_REBUILD_TICK: Duration = Duration::from_millis(10);
+/// Log events a single prune must delete before whole-index statistics are
+/// worth recomputing in full. Below this the periodic `PRAGMA optimize` tick is
+/// enough; above it the planner would limp on statistics describing a table
+/// that no longer exists in that shape.
+const PRUNE_FULL_ANALYZE_ROWS: usize = 50_000;
 
 pub(crate) fn run(
     receiver: Receiver<WriteCommand>,
@@ -301,6 +306,10 @@ fn run_rebuild_step(
         }
         RebuildStep::Complete => {
             tracing::info!("search index rebuild complete");
+            // The rebuild rewrote the whole FTS index, so its statistics are
+            // stale by construction: one of the two cases that justify a full
+            // `ANALYZE`.
+            maintenance::analyze(conn)?;
         }
     }
     stats.mark_progress();
@@ -317,7 +326,9 @@ fn run_maintenance(
     stats: &WriterStats,
 ) -> Result<(), StorageError> {
     match operation {
-        MaintenanceOperation::Analyze => maintenance::analyze(conn)?,
+        // The periodic tick is cheap by contract: `PRAGMA optimize` is a no-op
+        // when statistics are current, where `ANALYZE` would scan every index.
+        MaintenanceOperation::Analyze => maintenance::optimize(conn)?,
         MaintenanceOperation::Checkpoint(mode) => maintenance::checkpoint(conn, mode)?,
         MaintenanceOperation::Vacuum => maintenance::vacuum(conn)?,
         MaintenanceOperation::RebuildFts => {
@@ -340,6 +351,16 @@ fn run_maintenance(
                     orphaned_resources = report.resources,
                     "retention prune applied"
                 );
+            }
+            if report.total() >= PRUNE_FULL_ANALYZE_ROWS {
+                // A large backlog moved enough rows that per-table statistics
+                // no longer describe the table; recompute them now rather than
+                // waiting for the next periodic tick.
+                tracing::info!(
+                    log_events = report.log_events,
+                    "large prune: refreshing planner statistics"
+                );
+                maintenance::analyze(conn)?;
             }
         }
     }

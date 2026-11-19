@@ -14,6 +14,23 @@ pub(crate) fn checkpoint(conn: &Connection, mode: CheckpointMode) -> Result<(), 
 /// for large retention backlogs; a crash between batches resumes cleanly.
 const PRUNE_BATCH_ROWS: usize = 5_000;
 
+/// Refreshes planner statistics for the periodic maintenance tick.
+///
+/// `PRAGMA optimize` re-runs `ANALYZE` only on tables whose content changed
+/// enough for the planner to care, and does nothing otherwise. That matters
+/// because this runs on the single writer: a bare `ANALYZE` scans every index
+/// (`log_event` plus the contentless FTS shadow tables) and stalls ingestion
+/// for as long as the scan takes, on a schedule, forever.
+pub(crate) fn optimize(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch("PRAGMA optimize;")?;
+    Ok(())
+}
+
+/// Full `ANALYZE`: every index, unconditionally.
+///
+/// Deliberately not the periodic tick. Whole-index statistics only go stale in
+/// bulk — a prune that removed a large retention backlog, or a completed FTS
+/// rebuild — so this is called for those one-shot cases and nowhere else.
 pub(crate) fn analyze(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch("ANALYZE;")?;
     Ok(())
@@ -368,6 +385,39 @@ mod tests {
         assert!(
             remaining_logs(&conn) > 0,
             "eviction must stop once the file fits the quota, not wipe the table"
+        );
+    }
+
+    /// The periodic tick must not scan every index. `PRAGMA optimize` leaves
+    /// statistics behind on the first run and then becomes a no-op, so it can
+    /// run on the single writer without a stop-the-world `ANALYZE`.
+    #[test]
+    fn optimize_refreshes_statistics_without_a_full_scan() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("optimize.db");
+        let mut conn = crate::sqlite::open(&path, SyncMode::default()).expect("open");
+        crate::migration::migrate(&mut conn).expect("migrate");
+        seed_logs(&mut conn, "r", 500);
+
+        optimize(&conn).expect("optimize");
+
+        let statistics: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_stat1", [], |row| row.get(0))
+            .expect("read sqlite_stat1");
+        assert!(
+            statistics > 0,
+            "the first optimize must leave planner statistics behind"
+        );
+
+        // Statistics are current now: a second pass over unchanged content is
+        // allowed to do nothing, and must not fail either way.
+        optimize(&conn).expect("optimize again");
+        let again: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_stat1", [], |row| row.get(0))
+            .expect("read sqlite_stat1");
+        assert_eq!(
+            again, statistics,
+            "a no-op optimize must not add statistics rows"
         );
     }
 }
