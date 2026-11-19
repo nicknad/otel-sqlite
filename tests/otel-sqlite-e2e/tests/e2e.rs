@@ -26,7 +26,6 @@ use otel_sqlite_ingress::mapping::pb::logs::v1::{
 use otel_sqlite_runtime::{MaintenanceConfig, PurgeSchedule};
 use otel_sqlite_test_support::wait_until;
 use tonic::Request;
-use tonic::transport::Channel;
 
 /// Finds a free loopback port by binding and releasing a listener.
 fn free_loopback_port() -> String {
@@ -216,10 +215,11 @@ async fn maintenance_purge_cadence_runs_through_the_real_assembly() {
         "the real watchdog must not halt a healthy pipeline"
     );
 
+    let final_db_path = server.db_path().to_path_buf();
     server.shutdown().await.expect("graceful shutdown");
     // The current record survives the drain.
     assert_eq!(
-        db::count_all_log_events(server.db_path()).expect("row count"),
+        db::count_all_log_events(&final_db_path).expect("row count"),
         1
     );
 }
