@@ -36,8 +36,9 @@ fn print_usage() {
 Usage:
   otel-sqlite [COMMAND] [OPTIONS]
 
-With no command, starts the server. Configuration is read from the TOML
-file named by OTEL_SQLITE_CFG_PATH; without it the built-in defaults apply.
+With no command, starts the server. Configuration is built from the
+built-in defaults, the TOML file named by OTEL_SQLITE_CFG_PATH (when set),
+and OTEL_SQLITE_* environment overlays (environment wins over the file).
 
 Commands:
   healthcheck   probe the local gRPC health service (Docker HEALTHCHECK)
@@ -118,14 +119,25 @@ async fn main() -> Result<()> {
     }
 
     // Defaults first, then the TOML file named by OTEL_SQLITE_CFG_PATH (when
-    // set) overlays only the keys it defines.
-    let config = Config::from_env().context("failed to load configuration")?;
+    // set), then the OTEL_SQLITE_* environment overlays: each step overlays
+    // only the keys it defines, and the environment wins.
+    let (config, overrides) =
+        Config::from_env_detailed().context("failed to load configuration")?;
     match Config::env_config_path() {
         Some(path) => println!("loaded config overrides from {}", path.display()),
         None => println!(
             "{} not set; using built-in defaults",
             config::CONFIG_PATH_ENV_VAR
         ),
+    }
+    if !overrides.applied.is_empty() {
+        println!(
+            "applied environment overrides: {}",
+            overrides.applied.join(", ")
+        );
+    }
+    for name in &overrides.ignored {
+        eprintln!("warning: ignoring unrecognized environment variable {name}");
     }
     println!(
         "effective configuration: {}",

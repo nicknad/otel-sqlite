@@ -1,0 +1,218 @@
+# Publish the multi-arch production image to GHCR.
+#
+# Contract under test ("a stranger runs one command with zero flags and it
+# works"), enforced against the image AS PUBLISHED:
+#   * per-arch native builds (no QEMU) on amd64 and arm64 runners;
+#   * trivy CVE gate before anything is pushed (fixable HIGH|CRITICAL block;
+#     reviewed exceptions in .trivyignore);
+#   * one merged manifest list tagged vX.Y.Z, X.Y and latest;
+#   * provenance + SBOM attestations (buildx) and keyless cosign signing;
+#   * acceptance on BOTH architectures pulling the published image by digest:
+#     zero-flag start, real OTLP round-trip, SIGTERM drain, restart survival;
+#   * the README quickstart block executed verbatim.
+#
+# The local-build contract (healthcheck, non-root, /data volume) is gated on
+# every push by ci.yml's container-smoke on both architectures.
+
+name: Publish
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write # cosign keyless signing via GitHub OIDC
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 0.2.0 (a leading v is accepted)"
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      minor: ${{ steps.version.outputs.minor }}
+      image: ${{ steps.version.outputs.image }}
+    steps:
+      - name: Resolve and validate the release version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="${{ inputs.version }}"
+          else
+            RAW="${GITHUB_REF_NAME}"
+          fi
+          V="${RAW#v}"
+          if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "error: release version must be X.Y.Z, got '$RAW'" >&2
+            exit 1
+          fi
+          MINOR="$(printf '%s' "$V" | cut -d. -f1-2)"
+          OWNER="$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "version=v$V"
+            echo "minor=$MINOR"
+            echo "image=ghcr.io/$OWNER/otel-sqlite"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    env:
+      IMAGE: ${{ needs.resolve.outputs.image }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up buildx builder
+        run: docker buildx create --use --name builder
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Build for CVE scanning (local, no attestations)
+        run: >
+          docker buildx build
+          --platform linux/${{ matrix.arch }}
+          --build-arg REVISION="${{ github.sha }}"
+          --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          --pull
+          --cache-from type=gha --cache-to type=gha,mode=max
+          --load
+          --tag otel-sqlite-scan:latest .
+
+      - name: CVE gate (fixable HIGH|CRITICAL; exceptions in .trivyignore)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          image-ref: otel-sqlite-scan:latest
+          scan-type: image
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          scanners: vuln
+          ignore: .trivyignore
+
+      - name: Push per-arch tag with provenance and SBOM attestations
+        run: >
+          docker buildx build
+          --platform linux/${{ matrix.arch }}
+          --build-arg REVISION="${{ github.sha }}"
+          --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          --pull
+          --cache-from type=gha --cache-to type=gha,mode=max
+          --provenance=mode=max --sbom=true
+          --tag "${IMAGE}:${{ needs.resolve.outputs.version }}-${{ matrix.arch }}"
+          --push .
+
+  merge:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.digest.outputs.value }}
+    env:
+      IMAGE: ${{ needs.resolve.outputs.image }}
+    steps:
+      - name: Merge per-arch tags into one manifest list
+        run: >
+          docker buildx imagetools create
+          --tag "${IMAGE}:${{ needs.resolve.outputs.version }}"
+          --tag "${IMAGE}:${{ needs.resolve.outputs.minor }}"
+          --tag "${IMAGE}:latest"
+          "${IMAGE}:${{ needs.resolve.outputs.version }}-amd64"
+          "${IMAGE}:${{ needs.resolve.outputs.version }}-arm64"
+
+      - name: Record the merged digest
+        id: digest
+        run: |
+          DIGEST="$(docker buildx imagetools inspect --raw "${IMAGE}:${{ needs.resolve.outputs.version }}" | sha256sum | cut -d' ' -f1)"
+          echo "value=sha256:$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Release summary
+        run: |
+          {
+            echo "## Published ${IMAGE}:${{ needs.resolve.outputs.version }}"
+            echo
+            echo 'Pin releases by digest:'
+            echo
+            echo '```'
+            echo "${IMAGE}@${{ steps.digest.outputs.value }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  sign:
+    needs: [resolve, merge]
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ needs.resolve.outputs.image }}
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Keyless-sign the merged manifest by digest
+        run: cosign sign --yes "${IMAGE}@${{ needs.merge.outputs.digest }}"
+
+  acceptance:
+    needs: [resolve, merge]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Pull the published image by digest
+        run: docker pull "${{ needs.resolve.outputs.image }}@${{ needs.merge.outputs.digest }}"
+
+      - name: Acceptance (zero-flag, OTLP round-trip, SIGTERM drain, restart)
+        run: >
+          OTEL_SQLITE_IMAGE="${{ needs.resolve.outputs.image }}@${{ needs.merge.outputs.digest }}"
+          bash tests/docker/acceptance.sh
+
+  readme-quickstart:
+    needs: [resolve, merge]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Pull the published image by digest
+        run: docker pull "${{ needs.resolve.outputs.image }}@${{ needs.merge.outputs.digest }}"
+
+      - name: Run the README quickstart verbatim
+        run: >
+          OTEL_SQLITE_IMAGE="${{ needs.resolve.outputs.image }}@${{ needs.merge.outputs.digest }}"
+          bash tests/docker/readme-quickstart.sh

@@ -1,0 +1,17 @@
+# Container default configuration for otel-sqlite.
+#
+# The binary's built-in defaults bind loopback only (fails closed on bare
+# metal). This image overlay makes `docker run` with zero flags work: OTLP on
+# all interfaces, so `-p 4317:4317` reaches the sink.
+#
+# Cleartext: anyone who can reach the container can send logs. Keep it on an
+# isolated/trusted network, or bring [tls] (and optionally [auth]) via
+# OTEL_SQLITE_* environment variables or a mounted config - see
+# docs/operations/docker.md - or front it with a TLS-terminating proxy.
+#
+# Override anything per setting with OTEL_SQLITE_* environment variables
+# (environment wins over this file), or mount your own TOML anywhere and
+# point OTEL_SQLITE_CFG_PATH at it.
+
+listen_address = ":4317"
+allow_insecure_remote = true

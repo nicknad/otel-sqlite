@@ -1,17 +1,23 @@
 # ------------------------------------------------------------
-# docker build \
-#   --build-arg REVISION="$(git rev-parse HEAD)" \
-#   --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-#   -t otel-sqlite:0.1.0 .
-
-# docker run --rm \
-#     -v otel-sqlite-data:/data \
-#     -v "$PWD/otel-sqlite.toml:/data/otel-sqlite.toml:ro" \
-#     -e OTEL_SQLITE_CFG_PATH=/data/otel-sqlite.toml \
+# Production image for otel-sqlite.
+#
+# Local build:
+#   docker build \
+#     --build-arg REVISION="$(git rev-parse HEAD)" \
+#     --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+#     -t otel-sqlite:local .
+#
+# Published image (multi-arch manifest: linux/amd64 + linux/arm64):
+#   docker run -d --name otel-sqlite \
 #     -p 4317:4317 \
-#     otel-sqlite
-# The config must set listen_address to 0.0.0.0 (with allow_insecure_remote
-# or [tls]); the default binds loopback only.
+#     -v otel-sqlite-data:/data \
+#     ghcr.io/nicknad/otel-sqlite:latest
+#
+# Zero flags work: the image ships a default config at
+# /etc/otel-sqlite/otel-sqlite.toml (selected via OTEL_SQLITE_CFG_PATH) that
+# binds OTLP on all interfaces with cleartext. Override per setting with
+# OTEL_SQLITE_* environment variables (environment wins over the file), or
+# mount your own TOML and point OTEL_SQLITE_CFG_PATH at it.
 # ------------------------------------------------------------
 
 FROM rust:1.100-bookworm AS builder
@@ -65,11 +71,17 @@ COPY --from=builder \
 RUN mkdir -p /data \
     && chown -R otel-sqlite:otel-sqlite /data
 
+# Container default config: wildcard bind + cleartext so `docker run` needs
+# no flags. Root-owned and world-readable (no secrets); per-setting env
+# overrides and a mounted config file beat this file.
+COPY docker/otel-sqlite.default.toml /etc/otel-sqlite/otel-sqlite.toml
+
 VOLUME ["/data"]
 
 USER otel-sqlite
 
-ENV RUST_LOG=info
+ENV RUST_LOG=info \
+    OTEL_SQLITE_CFG_PATH=/etc/otel-sqlite/otel-sqlite.toml
 
 # The database (and its WAL sidecars) must live inside the volume: /data is
 # the workdir so the relative default `otel-logs.db` resolves there.

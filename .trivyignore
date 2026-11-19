@@ -1,0 +1,8 @@
+# Reviewed exceptions for the production image trivy gate (publish workflow).
+#
+# The gate fails on fixable HIGH|CRITICAL vulnerabilities; unfixed base-image
+# issues are reported but do not block (see the trivy step's --ignore-unfixed).
+# Add an entry ONLY with a one-line review note, and delete entries when the
+# base image is rebuilt:
+#
+#   CVE-0000-0000   # reviewed: <who, when, why it cannot be exploited>

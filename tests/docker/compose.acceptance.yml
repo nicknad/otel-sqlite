@@ -1,0 +1,49 @@
+# Acceptance test for a PUBLISHED image (pulled by digest from GHCR).
+#
+#   OTEL_SQLITE_IMAGE=ghcr.io/nicknad/otel-sqlite@sha256:... \
+#     bash tests/docker/acceptance.sh
+#
+# The `sink` runs the published image with ZERO flags - no config mount, no
+# env - which is exactly the contract under test: the image's baked default
+# config must bind OTLP on all interfaces, or the load client below could
+# never reach it across the compose network. The `loadgen` runs the benchmark
+# image's otel-sqlite-stack-crash (the same load/validate accounting the
+# crash suite uses) against it.
+#
+# Resource profile mirrors the docker suite's sidecar budget (2 CPUs /
+# 512 MiB) so the verdict says something about the documented envelope.
+
+name: otel-sqlite-acceptance
+
+x-bench-image: &bench-image otel-sqlite-bench:latest
+
+services:
+  sink:
+    image: ${OTEL_SQLITE_IMAGE:?set OTEL_SQLITE_IMAGE to the published image ref}
+    container_name: acceptance-sink
+    working_dir: /data
+    volumes:
+      - acceptance-data:/data
+    restart: "no"
+    mem_limit: 512m
+    cpus: "2"
+    # The published image's built-in HEALTHCHECK ships with it.
+
+  loadgen:
+    image: *bench-image
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile.benchmark
+    entrypoint: ["/usr/local/bin/otel-sqlite-stack-crash"]
+    environment:
+      RUST_LOG: warn
+    volumes:
+      - acceptance-data:/data
+      - acceptance-artifacts:/artifacts
+    depends_on:
+      sink:
+        condition: service_healthy
+
+volumes:
+  acceptance-data:
+  acceptance-artifacts:

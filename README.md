@@ -15,6 +15,34 @@ insert batcher → bounded command queue → single SQLite writer (WAL)`.
 - Vocabulary: [GLOSSARY.md](GLOSSARY.md)
 - Local CI (run `.github/workflows/ci.yml` with `act`):
   [tools/local-ci/](tools/local-ci/)
+- Docker operations (env vars, TLS, backups, upgrades, digest pinning):
+  [docs/operations/docker.md](docs/operations/docker.md)
+- Releasing the image to GHCR (tags, attestations, cosign, CVE gate):
+  [docs/operations/release.md](docs/operations/release.md)
+
+## Quickstart
+
+Runs with zero configuration — the image ships a default config that binds
+OTLP on all interfaces and puts SQLite on a named volume:
+
+```sh
+docker run -d --name otel-sqlite \
+  -p 4317:4317 \
+  -v otel-sqlite-data:/data \
+  ghcr.io/nicknad/otel-sqlite:latest
+
+docker logs otel-sqlite
+```
+
+Point any OTLP/gRPC log exporter at `localhost:4317`; logs land in SQLite in
+the `otel-sqlite-data` volume. This exact block is CI-verified verbatim
+against the published image on both linux/amd64 and linux/arm64.
+
+> **Cleartext warning:** the container default accepts OTLP from every network
+> the container is on. Keep it isolated/trusted, or bring `[tls]` + `[auth]`
+> (env vars or a mounted config — see
+> [docs/operations/docker.md](docs/operations/docker.md)); pin releases by
+digest for reproducible deploys.
 
 ## Project scope
 
@@ -184,21 +212,29 @@ explicit opt-in.
 
 ### Running with Docker
 
-Image runs as non-root `otel-sqlite`, `WORKDIR /data` — mount a volume or
-data stays ephemeral. Default bind is loopback, so publishing a port needs
-a wildcard bind (cleartext needs `allow_insecure_remote`, or configure
-`[tls]`):
+The image runs as non-root `otel-sqlite` with `WORKDIR /data` and ships a
+container default config at `/etc/otel-sqlite/otel-sqlite.toml` (selected via
+`OTEL_SQLITE_CFG_PATH`): a wildcard bind with cleartext so the quickstart
+needs zero flags. The binary's own default stays loopback-only — fails closed
+on bare metal.
+
+Override anything per setting with `OTEL_SQLITE_*` environment variables
+(environment wins over the file), or mount your own TOML and point
+`OTEL_SQLITE_CFG_PATH` at it:
 
 ```sh
 docker run -d -v otel-sqlite-data:/data \
   -v "$PWD/otel-sqlite.toml:/data/otel-sqlite.toml:ro" \
   -e OTEL_SQLITE_CFG_PATH=/data/otel-sqlite.toml \
-  -p 4317:4317 otel-sqlite
+  -p 4317:4317 ghcr.io/nicknad/otel-sqlite:latest
 ```
 
 Built-in `HEALTHCHECK` (`otel-sqlite healthcheck`) probes
 `grpc.health.v1.Check` on localhost; override with
-`OTEL_SQLITE_HEALTHCHECK_ENDPOINT` for custom ports.
+`OTEL_SQLITE_HEALTHCHECK_ENDPOINT` for custom ports. The full env-var
+reference, the compose example and image-specific operations (TLS via env,
+backups, upgrades, arm64, digest pinning):
+[docs/operations/docker.md](docs/operations/docker.md).
 
 ### Backups, restore and upgrades
 

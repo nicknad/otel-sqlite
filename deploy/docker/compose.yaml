@@ -1,0 +1,29 @@
+# Secondary quickstart: the declarative form of the README one-liner.
+#
+#   docker compose -f deploy/docker/compose.yaml up -d
+#
+# TLS + bearer tokens need no config mount: the commented environment
+# overrides are the same ones the binary documents
+# (docs/operations/docker.md). Generate certificates with
+# `otel-sqlite gen-certs` first.
+
+services:
+  otel-sqlite:
+    image: ghcr.io/nicknad/otel-sqlite:latest
+    container_name: otel-sqlite
+    ports:
+      - "4317:4317"
+    volumes:
+      - otel-sqlite-data:/data
+    restart: unless-stopped
+    # TLS + bearer tokens without a config mount:
+    #   volumes (add): - ./certs:/certs:ro - ./clients.txt:/run/secrets/tokens:ro
+    #   environment:
+    #     OTEL_SQLITE_TLS_CERT: /certs/server.pem
+    #     OTEL_SQLITE_TLS_KEY: /certs/server.key
+    #     OTEL_SQLITE_TLS_CLIENT_CA: /certs/ca.pem
+    #     OTEL_SQLITE_AUTH_MODE: token
+    #     OTEL_SQLITE_AUTH_TOKEN_FILE: /run/secrets/tokens
+
+volumes:
+  otel-sqlite-data:

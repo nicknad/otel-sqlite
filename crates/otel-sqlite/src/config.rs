@@ -2,6 +2,7 @@ mod auth;
 mod dump;
 mod durability;
 mod duration;
+mod env;
 mod file;
 mod maintenance;
 mod search;
@@ -12,6 +13,7 @@ mod watchdog;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use env::EnvOverrides;
 pub(crate) use file::FileConfig;
 
 use std::path::{Path, PathBuf};
@@ -111,15 +113,25 @@ impl Config {
     /// omitted keys keep their defaults, recursively through the
     /// `[maintenance]` and `[watchdog]` sections.
     pub fn from_env() -> Result<Self> {
-        // `from_file` validates before returning; the defaults path must do
-        // the same, so validation runs exactly once per path.
-        if let Some(path) = Self::env_config_path() {
-            Self::from_file(&path)
-        } else {
-            let config = Self::default();
-            config.validate()?;
-            Ok(config)
-        }
+        Self::from_env_detailed().map(|(config, _)| config)
+    }
+
+    /// Like [`Config::from_env`], also reporting the environment overlays:
+    /// which variables were applied and which `OTEL_SQLITE_*` variables were
+    /// ignored (reserved for other components or not recognized settings).
+    ///
+    /// Precedence: built-in defaults, then the file named by
+    /// [`CONFIG_PATH_ENV_VAR`], then the environment — the environment wins,
+    /// so a container can override its image's config file per setting
+    /// without mounting anything.
+    pub fn from_env_detailed() -> Result<(Self, EnvOverrides)> {
+        let mut config = match Self::env_config_path() {
+            Some(path) => Self::with_file_overlay(Self::default(), &path)?,
+            None => Self::default(),
+        };
+        let overrides = env::apply(&mut config)?;
+        config.validate()?;
+        Ok((config, overrides))
     }
 
     /// Config file path from the environment, `None` when unset or empty.
@@ -134,16 +146,27 @@ impl Config {
     }
 
     /// Defaults overlaid with the settings in `path`.
+    ///
+    /// Environment overlays are deliberately not applied here: an explicit
+    /// file path (the `check --config` preflight) validates exactly what the
+    /// file says. The serving path composes file and environment via
+    /// [`Config::from_env_detailed`].
     pub fn from_file(path: &Path) -> Result<Self> {
+        let config = Self::with_file_overlay(Self::default(), path)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Applies one config file's overlay onto `config`, without validating;
+    /// the composed paths validate once, after every layer is applied.
+    fn with_file_overlay(mut config: Self, path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let mut config = Self::default();
         let overlay: FileConfig = toml::from_str(&text)
             .with_context(|| format!("failed to parse config file {}", path.display()))?;
         overlay
             .apply_to(&mut config)
             .with_context(|| format!("invalid settings in config file {}", path.display()))?;
-        config.validate()?;
         Ok(config)
     }
 

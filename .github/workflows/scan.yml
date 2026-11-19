@@ -1,0 +1,58 @@
+# CVE drift radar: build the production image from a freshly pulled base and
+# run the release trivy gate against it - weekly, and on demand - WITHOUT
+# pushing anything.
+#
+# Purpose: release day must never be the first time trivy runs. A red weekly
+# report says "the bookworm-slim tag drifted; rebuild or review" days before a
+# release is attempted. The gate settings mirror publish.yml exactly (fixable
+# HIGH|CRITICAL, --ignore-unfixed, .trivyignore), so a green Monday means a
+# green release day for the base layer.
+
+name: CVE scan
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: "0 3 * * 1" # Mondays 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  scan:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up buildx builder
+        run: docker buildx create --use --name builder
+
+      - name: Build from a freshly pulled base
+        run: >
+          docker buildx build
+          --pull
+          --platform linux/${{ matrix.arch }}
+          --build-arg REVISION="${{ github.sha }}"
+          --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          --cache-from type=gha --cache-to type=gha,mode=max
+          --load
+          --tag otel-sqlite-scan:latest .
+
+      - name: CVE gate (same rule as the release workflow)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          image-ref: otel-sqlite-scan:latest
+          scan-type: image
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          scanners: vuln
+          ignore: .trivyignore
