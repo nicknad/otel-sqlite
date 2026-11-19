@@ -148,6 +148,15 @@ The bounded, resumable backfill of the search index that follows a mode change
 or the asynchronous `006` upgrade; results are partial until it finishes.
 _Avoid_: reindex, refresh
 
+### Configuration
+
+**Cross-section gate**:
+A validation rule kept by the binary because it compares knobs from more
+than one config section, or guards an assembly knob no single crate owns:
+cleartext/TLS exposure, remote metrics, listen/metrics address checks, the
+watchdog-vs-batch-age rule.
+_Avoid_: global check, top-level validation
+
 ## Spelling and capitalization
 
 - *OpenTelemetry* is one unhyphenated capitalized word.

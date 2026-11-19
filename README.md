@@ -165,8 +165,10 @@ max_records_per_request = 100000
 mode = "body"                       # "off" | "body" | "full"
 ```
 
-Config validates before listeners/workers start; effective config prints as
-JSON. Remote metrics need explicit opt-in.
+Config validates before listeners/workers start — each crate owns its
+section's defaults and invariants, and the binary adds only cross-section
+gates — and the effective config prints as JSON. Remote metrics need
+explicit opt-in.
 
 ### Running with Docker
 

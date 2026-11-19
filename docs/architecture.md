@@ -134,21 +134,35 @@ same volume.
 
 ### 3.5 Configuration and validation
 
-Defaults centralize through shared ingress/storage constants.
-`Config::from_env` / `from_file` validates before metrics, listeners,
-storage, or workers start. `max_records_per_request` propagates into
-ingress. Mapping runs under a process-wide `mapping_concurrency` budget:
-because tokio cannot cancel `spawn_blocking`, the permit is held by the
-blocking job until it really finishes, so a timed-out export frees its
-stream slot while its abandoned mapping stays counted — retained mapping
-memory is bounded by `mapping_concurrency × grpc_max_recv_msg_size`.
-Remote metrics need `allow_remote_metrics = true`. TLS/auth files are
-readability-checked. `group_commit_max_records` and `[search] mode` propagate
-into the storage writer; `check` also reports a rebuilding search index or a
-configured/installed mode mismatch. Effective config prints as JSON at startup.
-`otel-sqlite check` runs the same validation plus PEM parsing and a
-read-only schema inspection as a non-mutating preflight (`check --json` for
-automation).
+Each crate owns its config section end to end: defaults, the effective
+type, and the invariants. `IngressConfig::validate` rejects an unusable
+bind address and every wire or mapping limit outside its published range —
+the ingress crate is the single owner of those bounds, so direct
+constructors fail exactly like the TOML path. `StorageConfig::validate`
+owns insert-batch sizing, the command queue, group commit and the size
+quota; the runtime's `MaintenanceConfig`/`WatchdogConfig` keep owning their
+schedule and verdict invariants. The binary's `Config` stores those crate
+types directly (no restated per-crate fields) and adds only what no crate
+owns: the pipeline-assembly knob `ingest_queue_capacity`, the admin
+metrics endpoint, and the cross-section gates in `validate.rs` —
+cleartext/TLS exposure (`allow_insecure_remote`), remote metrics
+(`allow_remote_metrics`), listen/metrics address checks, the
+watchdog-vs-batch-age rule, the group-commit-below-batch warning and the
+CLI-wide duration ceilings. `Config::from_env` / `from_file` validates
+before metrics, listeners, storage, or workers start, delegating
+per-section rules to the owning crates. The TOML overlay (`config/file.rs`)
+is the operator contract in one table: `deny_unknown_fields`, unchanged
+key names, each key applied straight into the owning crate's config. Mapping
+runs under a process-wide `mapping_concurrency` budget: because tokio cannot
+cancel `spawn_blocking`, the permit is held by the blocking job until it
+really finishes, so a timed-out export frees its stream slot while its
+abandoned mapping stays counted — retained mapping memory is bounded by
+`mapping_concurrency × grpc_max_recv_msg_size`. TLS/auth files are
+readability-checked. `check` also reports a rebuilding search index or a
+configured/installed mode mismatch. Effective config prints as JSON at
+startup with unchanged keys. `otel-sqlite check` runs the same validation
+plus PEM parsing and a read-only schema inspection as a non-mutating
+preflight (`check --json` for automation).
 
 ### 3.6 Performance model
 
