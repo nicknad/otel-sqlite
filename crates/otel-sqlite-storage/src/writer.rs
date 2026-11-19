@@ -36,7 +36,7 @@ use crate::close_ledger_on_drop;
 use crate::command::InsertScratch;
 use crate::error::StorageError;
 use crate::fault;
-use crate::maintenance;
+use crate::maintenance::{self, CheckpointReport};
 use crate::migration;
 use crate::search::{RebuildStep, SearchIndex};
 use crate::sqlite;
@@ -56,6 +56,35 @@ const SEARCH_REBUILD_TICK: Duration = Duration::from_millis(10);
 /// enough; above it the planner would limp on statistics describing a table
 /// that no longer exists in that shape.
 const PRUNE_FULL_ANALYZE_ROWS: usize = 50_000;
+
+/// Decides whether a scheduled checkpoint has anything to do.
+///
+/// The pragma's answer only arrives after the attempt, so the skip decision
+/// needs evidence the writer already holds: it is the only mutator, so an
+/// unchanged transaction count proves no frame can have been appended since an
+/// attempt that folded everything. A blocked attempt (a reader holding a
+/// snapshot) must not be skipped — retrying is how the WAL eventually shrinks
+/// once that reader is gone.
+#[derive(Debug, Default)]
+struct CheckpointTracker {
+    commits_at_last_attempt: Option<u64>,
+    last_report: Option<CheckpointReport>,
+}
+
+impl CheckpointTracker {
+    fn should_skip(&self, commits: u64) -> bool {
+        matches!(
+            (self.commits_at_last_attempt, self.last_report),
+            (Some(last_commits), Some(report))
+                if last_commits == commits && report.is_complete()
+        )
+    }
+
+    fn record(&mut self, commits: u64, report: CheckpointReport) {
+        self.commits_at_last_attempt = Some(commits);
+        self.last_report = Some(report);
+    }
+}
 
 pub(crate) fn run(
     receiver: Receiver<WriteCommand>,
@@ -129,6 +158,7 @@ fn run_inner(
     // Reused across transactions: statement lookups, resource fingerprints and
     // JSON/hex buffers are invariant work, not per-group work.
     let mut insert_scratch = InsertScratch::new();
+    let mut checkpoints = CheckpointTracker::default();
     let mut last_rebuild_step = Instant::now();
 
     loop {
@@ -169,6 +199,7 @@ fn run_inner(
                 &config,
                 group_budget,
                 &mut insert_scratch,
+                &mut checkpoints,
             )?
         };
         commands_processed = commands_processed.saturating_add(consumed);
@@ -224,6 +255,7 @@ fn execute_next(
     config: &StorageConfig,
     group_budget: usize,
     insert_scratch: &mut InsertScratch,
+    checkpoints: &mut CheckpointTracker,
 ) -> Result<u64, StorageError> {
     match command {
         WriteCommand::InsertLogs(batch) => {
@@ -255,7 +287,7 @@ fn execute_next(
         }
         other => {
             ::metrics::counter!("storage_commands_total", "kind" => other.kind()).increment(1);
-            execute_non_insert(conn, other, search, stats)?;
+            execute_non_insert(conn, other, search, stats, checkpoints)?;
             Ok(1)
         }
     }
@@ -268,13 +300,14 @@ fn execute_non_insert(
     command: WriteCommand,
     search: &mut SearchIndex,
     stats: &WriterStats,
+    checkpoints: &mut CheckpointTracker,
 ) -> Result<(), StorageError> {
     match command {
         WriteCommand::InsertLogs(_) => unreachable!("insert commands are handled by execute_next"),
         WriteCommand::Flush => {}
         WriteCommand::Maintenance(operation) => {
             let _maintenance = stats.maintenance_guard();
-            run_maintenance(conn, operation, search, stats)?;
+            run_maintenance(conn, operation, search, stats, checkpoints)?;
         }
     }
     Ok(())
@@ -324,12 +357,32 @@ fn run_maintenance(
     operation: MaintenanceOperation,
     search: &mut SearchIndex,
     stats: &WriterStats,
+    checkpoints: &mut CheckpointTracker,
 ) -> Result<(), StorageError> {
     match operation {
         // The periodic tick is cheap by contract: `PRAGMA optimize` is a no-op
         // when statistics are current, where `ANALYZE` would scan every index.
         MaintenanceOperation::Analyze => maintenance::optimize(conn)?,
-        MaintenanceOperation::Checkpoint(mode) => maintenance::checkpoint(conn, mode)?,
+        MaintenanceOperation::Checkpoint(mode) => {
+            let commits = stats.transactions_committed.load(Ordering::Relaxed);
+            if checkpoints.should_skip(commits) {
+                ::metrics::counter!("storage_checkpoints_skipped_total").increment(1);
+                tracing::debug!(
+                    commits,
+                    "checkpoint skipped: nothing committed since the last folded attempt"
+                );
+                // A skipped tick is still progress evidence: the writer
+                // executed the command it was handed.
+                stats.mark_progress();
+                return Ok(());
+            }
+            let started = Instant::now();
+            let report = maintenance::checkpoint(conn, mode)?;
+            checkpoints.record(commits, report);
+            stats.observe_wal(report);
+            ::metrics::histogram!("storage_checkpoint_duration")
+                .record(started.elapsed().as_secs_f64());
+        }
         MaintenanceOperation::Vacuum => maintenance::vacuum(conn)?,
         MaintenanceOperation::RebuildFts => {
             // The command restarts a resumable background rebuild; it never
@@ -413,6 +466,45 @@ fn enforce_quota(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scheduled checkpoint runs when there is new work, and re-runs after a
+    /// blocked attempt: skipping a blocked one is how a pinned WAL would never
+    /// shrink again.
+    #[test]
+    fn checkpoint_skips_only_after_a_folded_attempt_with_no_new_commits() {
+        let mut tracker = CheckpointTracker::default();
+        assert!(
+            !tracker.should_skip(0),
+            "the first scheduled attempt always runs"
+        );
+
+        tracker.record(
+            7,
+            CheckpointReport {
+                busy: 0,
+                log: 12,
+                done: 12,
+            },
+        );
+        assert!(
+            tracker.should_skip(7),
+            "nothing committed since a folded attempt: skip"
+        );
+        assert!(!tracker.should_skip(8), "new commits: run");
+
+        tracker.record(
+            8,
+            CheckpointReport {
+                busy: 1,
+                log: 12,
+                done: 12,
+            },
+        );
+        assert!(
+            !tracker.should_skip(8),
+            "a blocked attempt must be retried until the WAL resets"
+        );
+    }
 
     /// The writer's only cleanup guarantee on an unwind is this guard: a
     /// panic must fail durable-ack waiters instead of leaving them hanging.

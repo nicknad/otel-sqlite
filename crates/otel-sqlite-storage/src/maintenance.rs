@@ -5,9 +5,50 @@ use rusqlite::Connection;
 
 use crate::error::StorageError;
 
-pub(crate) fn checkpoint(conn: &Connection, mode: CheckpointMode) -> Result<(), StorageError> {
-    conn.execute_batch(&format!("PRAGMA wal_checkpoint({});", mode.as_str()))?;
-    Ok(())
+/// What one `PRAGMA wal_checkpoint` attempt achieved.
+///
+/// SQLite reports `(busy, log, done)` as a result row: `log` is the number of
+/// frames in the WAL when the attempt ran, `done` how many of them reached the
+/// main database file, and `busy` whether the attempt was blocked — a reader
+/// still holds a snapshot, so the WAL could not be reset even when every frame
+/// was folded. The pragma reports a blocked attempt in that row instead of
+/// failing, which is why `Ok(())` alone never proves the WAL is folded.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CheckpointReport {
+    pub busy: i64,
+    pub log: i64,
+    pub done: i64,
+}
+
+impl CheckpointReport {
+    /// True when the attempt completed: nothing blocked it and no frame was
+    /// left behind in the WAL.
+    pub(crate) const fn is_complete(self) -> bool {
+        self.busy == 0 && self.done == self.log
+    }
+}
+
+/// Runs one WAL checkpoint and returns what it achieved.
+///
+/// `execute_batch` steps a statement once and discards result rows (the trap
+/// [`incremental_vacuum`] documents), so the row has to be read with
+/// `query_row` here: it is the only evidence of whether the WAL was folded.
+pub(crate) fn checkpoint(
+    conn: &Connection,
+    mode: CheckpointMode,
+) -> Result<CheckpointReport, StorageError> {
+    let report = conn.query_row(
+        &format!("PRAGMA wal_checkpoint({});", mode.as_str()),
+        [],
+        |row| {
+            Ok(CheckpointReport {
+                busy: row.get(0)?,
+                log: row.get(1)?,
+                done: row.get(2)?,
+            })
+        },
+    )?;
+    Ok(report)
 }
 
 /// Rows deleted per prune transaction. Bounds WAL growth and lock hold time
@@ -245,11 +286,25 @@ pub(crate) fn enforce_size_quota(
     Ok(report)
 }
 
-/// Best-effort `wal_checkpoint(TRUNCATE)`; `true` when the WAL is fully
-/// folded into the main file.
+/// Best-effort `wal_checkpoint(TRUNCATE)`; `true` only when the attempt
+/// completed and every frame is in the main file.
+///
+/// A blocked attempt (a reader holding a snapshot) reports success in its
+/// result row, so `Ok` alone would let the eviction loop delete another batch
+/// behind a WAL that never shrank.
 fn try_checkpoint_truncate(conn: &Connection) -> bool {
     match checkpoint(conn, CheckpointMode::Truncate) {
-        Ok(()) => true,
+        Ok(report) if report.is_complete() => true,
+        Ok(report) => {
+            ::metrics::counter!("storage_quota_enforcement_deferred_total").increment(1);
+            tracing::warn!(
+                busy = report.busy,
+                log_frames = report.log,
+                folded_frames = report.done,
+                "size quota: checkpoint blocked; stopping eviction early"
+            );
+            false
+        }
         Err(error) => {
             tracing::warn!(
                 %error,
@@ -386,6 +441,98 @@ mod tests {
             remaining_logs(&conn) > 0,
             "eviction must stop once the file fits the quota, not wipe the table"
         );
+    }
+
+    /// A checkpoint blocked by a reader reports `busy` in its result row
+    /// instead of failing, and leaves the WAL in place.
+    ///
+    /// The size-quota loop reads this report to decide whether the WAL is
+    /// folded; treating `Ok` as "folded" would evict rows behind sidecar
+    /// bytes that never shrank.
+    #[test]
+    fn blocked_checkpoint_reports_busy_and_does_not_claim_the_wal_is_folded() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("blocked.db");
+        let mut conn = crate::sqlite::open(&path, SyncMode::default()).expect("open");
+        crate::migration::migrate(&mut conn).expect("migrate");
+        // Keep frames in the WAL: the default autocheckpoint would fold them at
+        // commit and leave nothing for the blocked checkpoint to be blocked by.
+        conn.pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("disable autocheckpoint");
+        seed_logs(&mut conn, "r", 200);
+        conn.busy_timeout(std::time::Duration::from_millis(50))
+            .expect("short busy timeout");
+
+        let wal = crate::permissions::sidecar_path(&path, "-wal");
+
+        // A reader holding a snapshot prevents the WAL from being reset.
+        let reader = Connection::open(&path).expect("reader");
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM log_event;")
+            .expect("hold a read snapshot");
+
+        let blocked = checkpoint(&conn, CheckpointMode::Truncate)
+            .expect("a blocked checkpoint reports busy instead of failing");
+        assert_eq!(blocked.busy, 1, "the blocked attempt must be visible");
+        assert!(
+            !blocked.is_complete(),
+            "a blocked checkpoint must not claim the WAL is folded"
+        );
+        assert!(
+            file_size(&wal) > 0,
+            "the WAL stays on disk while a reader holds it"
+        );
+
+        reader.execute_batch("ROLLBACK;").expect("release snapshot");
+        let folded =
+            checkpoint(&conn, CheckpointMode::Truncate).expect("checkpoint after the reader left");
+        assert!(
+            folded.is_complete(),
+            "with the reader gone the checkpoint completes: {folded:?}"
+        );
+        assert_eq!(
+            file_size(&wal),
+            0,
+            "a completed TRUNCATE checkpoint empties the WAL"
+        );
+    }
+
+    /// Quota enforcement stops when the WAL cannot be folded: a reader pinning
+    /// it means any deletion would be invisible to the file size, and the loop
+    /// would evict far more history than the budget requires.
+    #[test]
+    fn quota_eviction_stops_when_the_checkpoint_is_blocked() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("blocked_quota.db");
+        let mut conn = crate::sqlite::open(&path, SyncMode::default()).expect("open");
+        crate::migration::migrate(&mut conn).expect("migrate");
+        // Leave the seeded rows in the WAL so the first fold attempt is the
+        // one a reader blocks.
+        conn.pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("disable autocheckpoint");
+        seed_logs(&mut conn, "r", 6_000);
+        conn.busy_timeout(std::time::Duration::from_millis(50))
+            .expect("short busy timeout");
+        let quota = file_size(&path);
+
+        let reader = Connection::open(&path).expect("reader");
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM log_event;")
+            .expect("hold a read snapshot");
+
+        let report = enforce_size_quota(&mut conn, &path, quota).expect("enforce quota");
+
+        assert_eq!(
+            report.log_events, 0,
+            "a blocked fold must stop eviction before deleting anything"
+        );
+        assert_eq!(
+            remaining_logs(&conn),
+            6_000,
+            "no history may be evicted behind an unfolded WAL"
+        );
+
+        reader.execute_batch("ROLLBACK;").expect("release snapshot");
     }
 
     /// The periodic tick must not scan every index. `PRAGMA optimize` leaves

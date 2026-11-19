@@ -23,6 +23,8 @@ use otel_sqlite_core::PipelineSample;
 use otel_sqlite_core::storage::CommitLedger;
 use otel_sqlite_core::time::monotonic_millis;
 
+use crate::maintenance::CheckpointReport;
+
 /// Writer-side counters (`writer` thread).
 ///
 /// Naming contract with the batcher side: the writer counts what it
@@ -47,6 +49,11 @@ pub(crate) struct WriterStats {
     /// Extra attempts made because of transient contention (BUSY/LOCKED).
     pub transient_retries: AtomicU64,
     pub queue_depth: AtomicUsize,
+    /// Frames in the WAL, and frames the last checkpoint attempt could not fold
+    /// into the database file. The backlog is non-zero exactly while a reader
+    /// (a running verification or backup) pins the WAL.
+    pub wal_frames: AtomicU64,
+    pub wal_backlog_frames: AtomicU64,
     /// `1` while the writer is executing a command, `0` while it waits for
     /// work. Counted as pending work so a command wedged in SQLite stays
     /// visible to the watchdog even when the queue behind it is empty.
@@ -85,6 +92,19 @@ impl WriterStats {
     pub(crate) fn observe_queue_depth(&self, depth: usize) {
         self.queue_depth.store(depth, Ordering::Relaxed);
         ::metrics::gauge!("storage_queue_depth").set(depth as f64);
+    }
+
+    /// Publishes what the last checkpoint attempt saw: the WAL frame count and
+    /// the frames it left behind. A backlog that stays non-zero while nothing
+    /// is writing means a reader is pinning the WAL, not that checkpoints are
+    /// falling behind.
+    pub(crate) fn observe_wal(&self, report: CheckpointReport) {
+        let frames = u64::try_from(report.log).unwrap_or_default();
+        let backlog = u64::try_from(report.log.saturating_sub(report.done)).unwrap_or_default();
+        self.wal_frames.store(frames, Ordering::Relaxed);
+        self.wal_backlog_frames.store(backlog, Ordering::Relaxed);
+        ::metrics::gauge!("storage_wal_frames").set(frames as f64);
+        ::metrics::gauge!("storage_wal_backlog_frames").set(backlog as f64);
     }
 
     /// Marks the thread as running until the returned guard is dropped (or

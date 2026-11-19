@@ -72,7 +72,8 @@ Key overrides: `--clients`, `--records-per-request`, `--rate`,
 - **Pipeline metrics**: `otlp_requests_total`, `otlp_records_received_total`,
   `otlp_request_duration/errors`, `ingress_batch_size/queue_depth/queue_full`,
   `insert_batcher_buffered_records/batches_emitted/dropped`,
-  `storage_queue_depth/commands/records_written/transaction_batch_size/transaction_duration/errors/quarantined`.
+  `storage_queue_depth/commands/records_written/transaction_batch_size/transaction_duration/errors/quarantined`,
+  `storage_wal_frames/backlog_frames`, `storage_checkpoint_duration/checkpoints_skipped`.
 - **Storage deltas + size trajectory**: counter before→after per step;
   sampled DB/WAL growth. JSON output adds env metadata (git, rustc, SQLite,
   CPU, `native-embedded`/`native-external`, fresh vs pre-populated).

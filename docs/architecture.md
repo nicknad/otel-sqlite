@@ -172,6 +172,15 @@ no fsync per transaction — so the writer is CPU-bound, not I/O-bound. Every
 microsecond of CPU inside a transaction is throughput loss; work moved onto
 the batcher overlaps almost for free. The ingest boundary (tokio
 multi-thread runtime, one task per request) is the only parallel stage.
+
+Checkpoints follow the same cost model. A `PASSIVE` checkpoint copies WAL
+frames back into the database file on the writer thread, so the five-minute
+interval is a ceiling, not a promise: a scheduled checkpoint is skipped when
+nothing has committed since the previous attempt and that attempt folded
+cleanly. `storage_wal_frames` and `storage_wal_backlog_frames` (frames in the
+WAL, frames not yet folded) make the cost visible; a backlog that stays
+non-zero while the writer is idle means a reader — a running snapshot or
+verification — is pinning the WAL, not that checkpoints are falling behind.
 Scope metadata follows this: one `LogScope` renders per `ScopeLogs` group
 at mapping and is shared by reference, so the writer binds precomputed
 bytes. The writer also coalesces consecutive insert commands already in the

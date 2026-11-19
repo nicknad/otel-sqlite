@@ -132,6 +132,12 @@ _Avoid_: keep count, retention window
 Deleting backup files that are beyond the backup retention count.
 _Avoid_: purge, trim, delete
 
+**Checkpoint**:
+Folding committed write-ahead-log frames into the main database file so the WAL
+sidecar can be released. It deletes nothing (that is Purge), and a reader that
+still holds a snapshot can block it, leaving frames in the WAL.
+_Avoid_: flush, sync, fold, compact
+
 ### Search
 
 **Search index**:
