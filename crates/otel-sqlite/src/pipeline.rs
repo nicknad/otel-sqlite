@@ -149,8 +149,10 @@ pub enum FlushRefused {
     /// reported instead of silently ignored.
     #[error(
         "cannot flush: storage worker dead before barrier (writer_running={writer_running}, \
-         batcher_running={batcher_running}, records_written={stats.records_written}, \
-         dropped_records={stats.dropped_records}, errors={stats.errors})"
+         batcher_running={batcher_running}, records_written={}, dropped_records={}, errors={})",
+        stats.records_written,
+        stats.dropped_records,
+        stats.errors
     )]
     DeadPipeline {
         writer_running: bool,
